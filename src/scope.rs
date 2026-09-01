@@ -23,7 +23,7 @@
 //! * a record literal's field VALUES are resolved and its type name is not.
 
 use crate::ast::*;
-use crate::builtins::BUILTIN_NAMES;
+use crate::builtins::BUILTINS;
 use std::collections::HashSet;
 
 /// Where a name went wrong. The message text is upstream's, because these are
@@ -119,7 +119,7 @@ pub fn resolve(ch: &Chapter) -> Resolved {
 
     let mut names: HashSet<String> = top.iter().cloned().collect();
     names.extend(ctor_names.iter().cloned());
-    names.extend(BUILTIN_NAMES.iter().map(|s| s.to_string()));
+    names.extend(BUILTINS.iter().map(|(s, _)| s.to_string()));
     for e in &ch.effect_defs {
         names.extend(e.ops.iter().map(|o| o.name.clone()));
     }

@@ -39,7 +39,24 @@ fn main() -> ExitCode {
     }
 }
 
+/// Each program runs on its own thread with a large stack.
+///
+/// Interpreting recursion with recursion means a deeply recursive Codex
+/// program is a deeply recursive Rust one, and the default 8 MB stack is not
+/// enough for the corpus. A stack overflow ABORTS the process, so without this
+/// one program takes the whole sweep with it -- which is what the first sweep
+/// after the builtins landed did.
 fn run(path: &Path) -> Result<String, String> {
+    let p = path.to_path_buf();
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(move || run_here(&p))
+        .map_err(|e| e.to_string())?
+        .join()
+        .map_err(|_| "the interpreter thread died".to_string())?
+}
+
+fn run_here(path: &Path) -> Result<String, String> {
     let src = std::fs::read(path).map_err(|e| e.to_string())?;
     let parsed = parser::parse(&src);
     let mut dg = Desugar::new(&src);
@@ -103,7 +120,7 @@ fn sweep(units: &Path, tests: &Path) -> ExitCode {
     }
     let mut ranked: Vec<_> = by_cause.into_iter().collect();
     ranked.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(&b.0)));
-    for (cause, (n, at)) in ranked.iter().take(15) {
+    for (cause, (n, at)) in ranked.iter().take(60) {
         println!("  {n} x {cause}   e.g. {at}");
     }
     if matched == ran {

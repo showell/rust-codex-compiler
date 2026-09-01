@@ -840,10 +840,16 @@ fn binary_op(k: Kind) -> BinaryOp {
         Kind::LessOrEqual => BinaryOp::OpLtEq,
         Kind::GreaterOrEqual => BinaryOp::OpGtEq,
         Kind::TripleEquals => BinaryOp::OpDefEq,
-        Kind::Ampersand => BinaryOp::OpAppend,
+        // `&` is OpAnd, NOT OpAppend. It is overloaded -- append for text and
+        // lists, conjunction for booleans, bitwise for integers -- and
+        // upstream leaves the choice to the types. An interpreter makes it by
+        // looking at the two values, which is the whole reason it needs none.
+        Kind::Ampersand => BinaryOp::OpAnd,
         Kind::ColonColon => BinaryOp::OpCons,
         Kind::AndKeyword => BinaryOp::OpBoolAnd,
-        Kind::OrKeyword => BinaryOp::OpOr,
+        Kind::Pipe | Kind::OrKeyword => BinaryOp::OpOr,
+        // `xor` on booleans is inequality, and upstream says so directly.
+        Kind::XorKeyword => BinaryOp::OpNotEq,
         Kind::Tilde => BinaryOp::OpApproxEq,
         Kind::TildeZero => BinaryOp::OpApproxEqExact,
         _ => BinaryOp::OpAnd,
