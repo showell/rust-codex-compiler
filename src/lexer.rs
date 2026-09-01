@@ -141,13 +141,19 @@ fn is_digit(b: u8) -> bool {
     b.is_ascii_digit()
 }
 
-/// `is-tier1-start`: the lead byte of a 2-or-more-byte UTF-8 sequence, tested
-/// on the RAW byte rather than a char-code.
-fn is_tier1_start(b: u8) -> bool {
-    b & 224 == 192
+/// Does this byte start a multi-byte character?
+///
+/// Upstream tests `bit-and b 224 == 192`, the CCE two-byte lead, because
+/// **every CCE tier-1 character is two bytes**. The same characters in UTF-8
+/// are not: Devanagari is three. So the byte test here is "starts a multi-byte
+/// sequence" and the decision is left to the codepoint, which is where it
+/// belongs.
+fn is_multibyte_start(b: u8) -> bool {
+    b >= 0xC0
 }
 
-fn cce_byte_len(b: u8) -> u32 {
+/// The length of the UTF-8 sequence this byte leads.
+fn utf8_len(b: u8) -> u32 {
     if b & 128 == 0 {
         1
     } else if b & 224 == 192 {
@@ -159,25 +165,42 @@ fn cce_byte_len(b: u8) -> u32 {
     }
 }
 
-fn cce_decode_cp(src: &[u8], off: usize) -> u32 {
+fn utf8_cp(src: &[u8], off: usize) -> u32 {
     let b0 = src[off] as u32;
-    if b0 & 224 == 192 {
-        let b1 = *src.get(off + 1).unwrap_or(&0) as u32;
-        128 + ((b0 & 31) << 6) + (b1 & 63)
-    } else if b0 & 240 == 224 {
-        let b1 = *src.get(off + 1).unwrap_or(&0) as u32;
-        let b2 = *src.get(off + 2).unwrap_or(&0) as u32;
-        2176 + ((b0 & 15) << 12) + ((b1 & 63) << 6) + (b2 & 63)
-    } else {
-        b0
+    let at = |i: usize| *src.get(off + i).unwrap_or(&0) as u32 & 63;
+    match utf8_len(src[off]) {
+        2 => ((b0 & 31) << 6) | at(1),
+        3 => ((b0 & 15) << 12) | (at(1) << 6) | at(2),
+        4 => ((b0 & 7) << 18) | (at(1) << 12) | (at(2) << 6) | at(3),
+        _ => b0,
     }
 }
 
-/// Upstream's `is-tier1-letter-cp` answers True for everything under 896 and
-/// False above, so it is a RANGE on the encoded value and not a letter test at
-/// all. Ported as written.
-fn is_tier1_letter_cp(cp: u32) -> bool {
-    cp >= 128 && cp - 128 < 896
+/// Upstream's `is-tier1-letter-cp`, moved from CCE codepoints onto Unicode ones.
+///
+/// The lexer's own test is `cp - 128 < 896`, a plain range on the ENCODED
+/// value -- which is CCE tier-1 blocks 0 through 5, exactly the set
+/// `cce-is-letter-ext` calls letters. Transcribing that range and handing it a
+/// Unicode codepoint looks right and is not, because **CCE tier-1 is a block
+/// map and not Unicode order** (`cce-tier1-block-bases`, `CCE.codex`): the
+/// first block is Unicode 128..383, but the second is CYRILLIC at 1024, the
+/// third GREEK at 880, and so on. So `é` (233) passed the transcribed range by
+/// luck and `д` (1076) failed it, and `test/ident-letters.codex` -- which is in
+/// the gold bank CLEAN, with `дом` in it -- said so.
+///
+/// The blocks in table order, as Unicode half-open ranges. Blocks 6..10 exist
+/// and are not letters, which is what `block <= 5` says.
+const TIER1_LETTER_RANGES: [(u32, u32); 6] = [
+    (128, 384),   // Latin-1 Supplement and Latin Extended-A
+    (1024, 1152), // Cyrillic
+    (880, 1008),  // Greek
+    (1536, 1664), // Arabic
+    (1424, 1552), // Hebrew
+    (2304, 2432), // Devanagari
+];
+
+fn is_tier1_letter(cp: u32) -> bool {
+    TIER1_LETTER_RANGES.iter().any(|&(lo, hi)| cp >= lo && cp < hi)
 }
 
 /// `hex-digit-value`. Upstream compares char-codes, but `'0'..'9'` is contiguous
@@ -280,10 +303,10 @@ fn scan_ident_end(src: &[u8], mut off: u32) -> u32 {
         let c = src[off as usize];
         if is_letter(c) || is_digit(c) || c == b'_' {
             off += 1;
-        } else if is_tier1_start(c) {
-            let cp = cce_decode_cp(src, off as usize);
-            if is_tier1_letter_cp(cp) {
-                off += cce_byte_len(c);
+        } else if is_multibyte_start(c) {
+            let cp = utf8_cp(src, off as usize);
+            if is_tier1_letter(cp) {
+                off += utf8_len(c);
             } else {
                 return off;
             }
@@ -452,10 +475,10 @@ pub fn tokenize_into(src: &[u8], prose_mode: bool) -> Lexed {
             continue;
         }
 
-        if is_tier1_start(c) {
-            let cp = cce_decode_cp(src, lx.off as usize);
-            if is_tier1_letter_cp(cp) {
-                lx.advance_bytes(cce_byte_len(c));
+        if is_multibyte_start(c) {
+            let cp = utf8_cp(src, lx.off as usize);
+            if is_tier1_letter(cp) {
+                lx.advance_bytes(utf8_len(c));
                 let stop = scan_ident_end(src, lx.off);
                 lx.take_to(stop);
                 // Never a keyword and never a TypeIdentifier: upstream does not

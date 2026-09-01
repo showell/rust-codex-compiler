@@ -2,6 +2,7 @@
 //! Lexer first; the ladder's rungs are the plan and they run lex, parse,
 //! desugar, scope, check, lower in that order.
 
+pub mod block;
 pub mod charcode;
 pub mod cst;
 pub mod expr;

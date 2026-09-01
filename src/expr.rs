@@ -292,10 +292,16 @@ fn parse_atom(p: &mut Parser<'_>) -> NodeKind {
         Kind::LetKeyword => parse_let(p, cp),
         Kind::WhenKeyword => parse_match(p, cp, NodeKind::MatchExpr),
         Kind::InductionKeyword => parse_match(p, cp, NodeKind::Induction),
-        Kind::ActKeyword => parse_act(p, cp, NodeKind::ActBlock),
-        Kind::TryingKeyword => parse_act(p, cp, NodeKind::TryExpr),
-        Kind::WithKeyword => parse_act(p, cp, NodeKind::HandleExpr),
-        Kind::WithTimeoutKeyword => parse_act(p, cp, NodeKind::WithTimeout),
+        Kind::ActKeyword => {
+            let k = crate::block::parse_act(p, cp);
+            parse_field_access(p, cp, k)
+        }
+        Kind::TryingKeyword => crate::block::parse_trying(p, cp),
+        Kind::WithKeyword => {
+            let k = crate::block::parse_handle(p, cp);
+            parse_field_access(p, cp, k)
+        }
+        Kind::WithTimeoutKeyword => crate::block::parse_with_timeout(p, cp),
         Kind::Backslash => parse_lambda(p, cp),
         Kind::LazyKeyword => {
             p.bump();
@@ -584,37 +590,6 @@ fn parse_match(p: &mut Parser<'_>, cp: usize, kind: NodeKind) -> NodeKind {
     }
     p.b.wrap_from(cp, kind);
     kind
-}
-
-/// `act .. end`, and the three block forms that share its shape. The block is
-/// a sequence of statements terminated by `end`, and blocks nest.
-fn parse_act(p: &mut Parser<'_>, cp: usize, kind: NodeKind) -> NodeKind {
-    p.bump(); // act / trying / with / with-timeout
-    let mut depth = 1usize;
-    while let Some(t) = p.sig(0) {
-        match t.kind {
-            Kind::EndOfFile => break,
-            Kind::EndKeyword => {
-                depth -= 1;
-                p.bump();
-                if depth == 0 {
-                    break;
-                }
-            }
-            Kind::ActKeyword | Kind::TryingKeyword => {
-                depth += 1;
-                p.bump();
-            }
-            _ => {
-                p.bump();
-            }
-        }
-    }
-    if depth != 0 {
-        p.err("a block was not closed by 'end'");
-    }
-    p.b.wrap_from(cp, kind);
-    parse_field_access(p, cp, kind)
 }
 
 fn parse_lambda(p: &mut Parser<'_>, cp: usize) -> NodeKind {

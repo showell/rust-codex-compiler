@@ -118,7 +118,16 @@ pub enum NodeKind {
     VecPat,
     ErrPat,
     ActBlock,
+    /// `name <- expr` in an act block.
     ActBind,
+    /// A bare expression statement in an act block.
+    ActStmt,
+    /// `trying`'s three statement lists.
+    TryBody,
+    TryFallback,
+    TryFailure,
+    /// `[Console, Device.Block]` in front of a `with-timeout`.
+    EffectRow,
     Lambda,
     TryExpr,
     HandleExpr,

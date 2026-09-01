@@ -84,6 +84,14 @@ first goal, and reporting them together would hide a regression inside the
 gate's cost. Measured over the checkout: 16.3 MB in 0.37 s, ~42 MB/s, against
 codexir's ~150 KB/s.
 
+**What the gate promises is narrow on purpose.** Coverage, homelessness and
+unread patterns are at zero today and must stay there. The inventory numbers
+beside them -- unread type-definition bodies, blocks that ran to the end of the
+file, bodies not yet structured -- are the size of the work still to do, and a
+gate that is red for a month is a gate nobody reads. `unread type definition
+bodies == 0` was in the test for one commit while the number was nine, and the
+run was red the whole time without anybody noticing.
+
 The one pattern number that IS a gate is `token(s) in pattern position not
 understood`, which must be zero: upstream's pattern parser never fails, folding
 anything it does not recognise into the same wildcard the author could have

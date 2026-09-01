@@ -40,6 +40,9 @@ pub struct Parsed {
     pub unread_types: usize,
     /// Type definitions whose body the grammar could not finish reading.
     pub unread_type_defs: usize,
+    /// `act` and `trying` blocks that ran to the end of the file without
+    /// meeting their `end`.
+    pub unclosed_blocks: usize,
 }
 
 /// The column a top-level item sits at. Upstream compares against the literal
@@ -54,6 +57,7 @@ pub(crate) struct Parser<'a> {
     pub(crate) unparsed_bodies: usize,
     pub(crate) unread_types: usize,
     pub(crate) unread_type_defs: usize,
+    pub(crate) unclosed_blocks: usize,
     /// Newlines are skipped inside brackets and significant outside them. This
     /// is upstream's `paren-depth` and it is the whole reason a multi-line
     /// application is an error at the top level and fine inside parentheses.
@@ -160,6 +164,7 @@ pub fn parse(src: &[u8]) -> Parsed {
         unparsed_bodies: 0,
         unread_types: 0,
         unread_type_defs: 0,
+        unclosed_blocks: 0,
         paren_depth: 0,
     };
 
@@ -239,6 +244,7 @@ pub fn parse(src: &[u8]) -> Parsed {
         unparsed_bodies: p.unparsed_bodies,
         unread_types: p.unread_types,
         unread_type_defs: p.unread_type_defs,
+        unclosed_blocks: p.unclosed_blocks,
     }
 }
 
