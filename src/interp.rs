@@ -52,21 +52,37 @@ pub struct Closure {
 
 pub type Env = Rc<Scope>;
 
+/// A frame binds one to three names. A `HashMap` per call spends more on
+/// hashing and on its allocation than a linear scan of a `Vec` ever costs, and
+/// a call is the hottest thing an interpreter does.
 #[derive(Debug)]
 pub struct Scope {
-    vars: HashMap<Name, Value>,
+    vars: Vec<(Name, Value)>,
     parent: Option<Env>,
 }
 
 impl Scope {
     fn root() -> Env {
-        Rc::new(Scope { vars: HashMap::new(), parent: None })
+        Rc::new(Scope { vars: Vec::new(), parent: None })
     }
     fn get(&self, n: &str) -> Option<Value> {
-        self.vars.get(n).cloned().or_else(|| self.parent.as_ref().and_then(|p| p.get(n)))
+        let mut here = self;
+        loop {
+            // Later bindings shadow earlier ones in the same frame.
+            if let Some((_, v)) = here.vars.iter().rev().find(|(k, _)| k == n) {
+                return Some(v.clone());
+            }
+            match &here.parent {
+                Some(p) => here = p,
+                None => return None,
+            }
+        }
     }
-    fn child(parent: &Env, vars: HashMap<Name, Value>) -> Env {
+    fn child(parent: &Env, vars: Vec<(Name, Value)>) -> Env {
         Rc::new(Scope { vars, parent: Some(parent.clone()) })
+    }
+    fn one(parent: &Env, name: Name, v: Value) -> Env {
+        Rc::new(Scope { vars: vec![(name, v)], parent: Some(parent.clone()) })
     }
 }
 
@@ -116,6 +132,11 @@ pub struct Interp {
     bounds: HashMap<(String, String), FieldBound>,
     /// Which constructors exist, and how many fields each takes.
     ctors: HashMap<String, usize>,
+    /// Every top-level function as a ready closure, built ONCE. Rebuilding one
+    /// per reference deep-copied the body on every call to every function,
+    /// which is the single most expensive thing an interpreter can do.
+    funs: HashMap<Name, Value>,
+    by_chapter_fun: HashMap<(String, String), Value>,
     /// `(chapter, name) -> definition`, for the names defined in more than one
     /// chapter of a bundled unit. `drive-unit.codex` has two `bar-quad`s --
     /// one over `ScreenPt` and one over `RiderPt` -- and keeping only the last
@@ -124,8 +145,12 @@ pub struct Interp {
     /// The chapter whose body is currently running.
     cur_slug: String,
     pub collisions: Vec<String>,
+    /// The same set, for the test every lookup makes.
+    colliding: std::collections::HashSet<String>,
     pub out: String,
-    steps: u64,
+    /// How much work the run did, which is the only speed number that is not
+    /// about this machine on this day.
+    pub steps: u64,
     depth: u32,
     limit: u64,
 }
@@ -148,9 +173,12 @@ impl Interp {
             defs: HashMap::new(),
             bounds: HashMap::new(),
             ctors: HashMap::new(),
+            funs: HashMap::new(),
+            by_chapter_fun: HashMap::new(),
             by_chapter: HashMap::new(),
             cur_slug: String::new(),
             collisions: Vec::new(),
+            colliding: Default::default(),
             out: String::new(),
             steps: 0,
             depth: 0,
@@ -172,6 +200,21 @@ impl Interp {
             .map(|(n, _)| n)
             .collect();
         it.collisions.sort();
+        it.colliding = it.collisions.iter().cloned().collect();
+        for d in &ch.defs {
+            if d.params.is_empty() {
+                continue;
+            }
+            let f = Value::Fun(Rc::new(Closure {
+                params: d.params.iter().map(|p| p.name.clone()).collect(),
+                body: Rc::new(d.body.clone()),
+                env: Scope::root(),
+                applied: Vec::new(),
+                slug: Some(d.chapter_slug.clone()),
+            }));
+            it.funs.insert(d.name.clone(), f.clone());
+            it.by_chapter_fun.insert((d.chapter_slug.clone(), d.name.clone()), f);
+        }
         for t in &ch.type_defs {
             match t {
                 TypeDef::Record(name, _, fields, ..) => {
@@ -274,13 +317,15 @@ impl Interp {
                 let mut env = env.clone();
                 for b in binds {
                     let v = self.eval(&b.value, &env)?;
-                    env = Scope::child(&env, [(b.name.clone(), v)].into_iter().collect());
+                    env = Scope::one(&env, b.name.clone(), v);
                 }
                 self.eval(body, &env)
             }
+            // The body is already shared: a lambda evaluated a million times
+            // bumps a refcount rather than copying its tree.
             Expr::Lambda(params, body, _) => Ok(Value::Fun(Rc::new(Closure {
                 params: params.clone(),
-                body: Rc::new((**body).clone()),
+                body: body.clone(),
                 env: env.clone(),
                 applied: Vec::new(),
                 slug: Some(self.cur_slug.clone()),
@@ -338,7 +383,7 @@ impl Interp {
                         ActStmt::Exec(e, _) => last = self.eval(e, &env)?,
                         ActStmt::Bind(n, e, _) => {
                             let v = self.eval(e, &env)?;
-                            env = Scope::child(&env, [(n.clone(), v)].into_iter().collect());
+                            env = Scope::one(&env, n.clone(), v);
                             last = Value::Unit;
                         }
                     }
@@ -377,8 +422,21 @@ impl Interp {
         if let Some(v) = env.get(n) {
             return Ok(v);
         }
-        // The same chapter wins for a name defined in more than one.
-        let same_chapter = self.by_chapter.get(&(self.cur_slug.clone(), n.to_string())).cloned();
+        // The same chapter wins for a name defined in more than one -- but
+        // ASK ONLY WHEN IT COLLIDES. Building the (chapter, name) key
+        // allocated two Strings on every reference to every name, and almost
+        // no name collides.
+        let by_chapter = self.colliding.contains(n).then(|| {
+            let key = (self.cur_slug.clone(), n.to_string());
+            (self.by_chapter_fun.get(&key).cloned(), self.by_chapter.get(&key).cloned())
+        });
+        if let Some((Some(f), _)) = &by_chapter {
+            return Ok(f.clone());
+        }
+        if let Some(f) = self.funs.get(n) {
+            return Ok(f.clone());
+        }
+        let same_chapter = by_chapter.and_then(|(_, d)| d);
         if let Some(d) = same_chapter.or_else(|| self.defs.get(n).cloned()) {
             if d.params.is_empty() {
                 // A constant, evaluated on each reference. Codex is pure, so
@@ -437,7 +495,7 @@ impl Interp {
                     return self.builtin(&name, applied);
                 }
             }
-            let vars: HashMap<Name, Value> =
+            let vars: Vec<(Name, Value)> =
                 c.params.iter().cloned().zip(applied.into_iter()).collect();
             let env = Scope::child(&c.env, vars);
             let body = c.body.clone();
@@ -475,14 +533,14 @@ impl Interp {
                 let mut env = env.clone();
                 for b in binds {
                     let v = self.eval(&b.value, &env)?;
-                    env = Scope::child(&env, [(b.name.clone(), v)].into_iter().collect());
+                    env = Scope::one(&env, b.name.clone(), v);
                 }
                 self.eval_tail(body, &env)
             }
             Expr::Match(scrut, arms, _) | Expr::Induction(scrut, arms, _) => {
                 let v = self.eval(scrut, env)?;
                 for a in arms {
-                    let mut vars = HashMap::new();
+                    let mut vars = Vec::new();
                     if !matches_pat(&v, &a.pattern, &mut vars) {
                         continue;
                     }
@@ -505,7 +563,7 @@ impl Interp {
                         }
                         ActStmt::Bind(n, e, _) => {
                             let v = self.eval(e, &env)?;
-                            env = Scope::child(&env, [(n.clone(), v)].into_iter().collect());
+                            env = Scope::one(&env, n.clone(), v);
                         }
                     }
                 }
@@ -554,7 +612,7 @@ impl Interp {
 
     fn match_arms(&mut self, v: &Value, arms: &[MatchArm], env: &Env) -> R<Value> {
         for a in arms {
-            let mut vars = HashMap::new();
+            let mut vars = Vec::new();
             if !matches_pat(v, &a.pattern, &mut vars) {
                 continue;
             }
@@ -900,11 +958,11 @@ fn equal(a: &Value, b: &Value) -> bool {
     }
 }
 
-fn matches_pat(v: &Value, p: &Pat, vars: &mut HashMap<Name, Value>) -> bool {
+fn matches_pat(v: &Value, p: &Pat, vars: &mut Vec<(Name, Value)>) -> bool {
     match p {
         Pat::Wild(_) => true,
         Pat::Var(n, _) => {
-            vars.insert(n.clone(), v.clone());
+            vars.push((n.clone(), v.clone()));
             true
         }
         Pat::Lit(text, kind, _) => literal(text, *kind).map(|l| equal(v, &l)).unwrap_or(false),

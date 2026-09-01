@@ -20,6 +20,7 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("--check") if args.len() == 3 => check(Path::new(&args[1]), Path::new(&args[2])),
         Some("sweep") if args.len() == 3 => sweep(Path::new(&args[1]), Path::new(&args[2])),
+        Some("bench") if args.len() >= 2 => bench(&args[1..]),
         Some(p) if args.len() == 1 => match run(Path::new(p)) {
             Ok(out) => {
                 print!("{out}");
@@ -34,6 +35,7 @@ fn main() -> ExitCode {
             eprintln!("usage: codexrun <unit.codex>");
             eprintln!("       codexrun --check <unit.codex> <expected>");
             eprintln!("       codexrun sweep <units-dir> <codex-test-dir>");
+            eprintln!("       codexrun bench <unit.codex>...");
             ExitCode::from(2)
         }
     }
@@ -69,6 +71,11 @@ fn run_here(path: &Path) -> Result<String, String> {
 const SWEEP_BUDGET: u64 = 60_000_000;
 
 fn run_bounded(path: &Path, budget: Option<u64>) -> Result<String, String> {
+    timed(path, budget).map(|(out, _, _)| out)
+}
+
+/// Run, and report the work done and the wall time it took.
+fn timed(path: &Path, budget: Option<u64>) -> Result<(String, u64, f64), String> {
     let src = std::fs::read(path).map_err(|e| e.to_string())?;
     let parsed = parser::parse(&src);
     let mut dg = Desugar::new(&src);
@@ -77,12 +84,52 @@ fn run_bounded(path: &Path, budget: Option<u64>) -> Result<String, String> {
     if let Some(b) = budget {
         it = it.with_budget(b);
     }
-    match it.run() {
-        Ok(()) => Ok(std::mem::take(&mut it.out)),
+    let t0 = std::time::Instant::now();
+    let r = it.run();
+    let secs = t0.elapsed().as_secs_f64();
+    match r {
+        Ok(()) => Ok((std::mem::take(&mut it.out), it.steps, secs)),
         // The partial output comes back with the error: seeing which line it
         // reached is most of the diagnosis.
         Err(e) => Err(format!("{}\n--- output before the error ---\n{}", e.0, it.out)),
     }
+}
+
+/// Time the interpreter on the programs named, and say how much WORK each did.
+///
+/// Wall time alone is about this machine on this day; steps per second is the
+/// number that says whether a change to the interpreter helped. Not a gate --
+/// nothing here fails -- just something to run before and after.
+///
+///     codexrun bench $SAFARI_ROOT/build/camera-unit.codex ...
+fn bench(paths: &[String]) -> ExitCode {
+    println!("{:<22} {:>12} {:>9} {:>12}", "program", "steps", "seconds", "steps/sec");
+    let (mut total_steps, mut total_secs) = (0u64, 0f64);
+    for p in paths {
+        let path = Path::new(p);
+        let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        match run_timed_in_thread(path) {
+            Ok((_, steps, secs)) => {
+                total_steps += steps;
+                total_secs += secs;
+                println!("{name:<22} {steps:>12} {secs:>9.3} {:>12.0}", steps as f64 / secs.max(1e-9));
+            }
+            Err(e) => println!("{name:<22} {:>12}", e.lines().next().unwrap_or("failed")),
+        }
+    }
+    println!("{:<22} {total_steps:>12} {total_secs:>9.3} {:>12.0}", "TOTAL",
+             total_steps as f64 / total_secs.max(1e-9));
+    ExitCode::SUCCESS
+}
+
+fn run_timed_in_thread(path: &Path) -> Result<(String, u64, f64), String> {
+    let p = path.to_path_buf();
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(move || timed(&p, None))
+        .map_err(|e| e.to_string())?
+        .join()
+        .map_err(|_| "the interpreter thread died".to_string())?
 }
 
 /// Run every unit that has a `.expected` beside it in the checkout, and diff.

@@ -15,6 +15,8 @@
 /// `record { value : Text }`. A name is not a token: the desugarer has already
 /// taken the text, and some names (`__seq`, `__rev`, `MkTup3`) were never
 /// written by anybody.
+use std::rc::Rc;
+
 pub type Name = String;
 
 /// Line, column, offset and length, as `SourceSpan` carries them.
@@ -104,24 +106,24 @@ pub struct HandleClause {
 pub enum Expr {
     Lit(String, LiteralKind, Span),
     NameRef(Name, Span),
-    Apply(Box<Expr>, Box<Expr>, Span),
-    Binary(Box<Expr>, BinaryOp, Box<Expr>, Span),
-    Unary(Box<Expr>, Span),
-    If(Box<Expr>, Box<Expr>, Box<Expr>, Span),
-    Let(Vec<LetBind>, Box<Expr>, Span),
-    Lambda(Vec<Name>, Box<Expr>, Span),
-    Match(Box<Expr>, Vec<MatchArm>, Span),
+    Apply(Rc<Expr>, Rc<Expr>, Span),
+    Binary(Rc<Expr>, BinaryOp, Rc<Expr>, Span),
+    Unary(Rc<Expr>, Span),
+    If(Rc<Expr>, Rc<Expr>, Rc<Expr>, Span),
+    Let(Vec<LetBind>, Rc<Expr>, Span),
+    Lambda(Vec<Name>, Rc<Expr>, Span),
+    Match(Rc<Expr>, Vec<MatchArm>, Span),
     List(Vec<Expr>, Span),
     Record(Name, Vec<FieldExpr>, Span),
-    FieldAccess(Box<Expr>, Name, Span),
+    FieldAccess(Rc<Expr>, Name, Span),
     Act(Vec<ActStmt>, Span),
-    Handle(Name, Box<Expr>, Vec<HandleClause>, Span),
-    WithTimeout(String, Vec<Name>, Vec<String>, Box<Expr>, Span),
+    Handle(Name, Rc<Expr>, Vec<HandleClause>, Span),
+    WithTimeout(String, Vec<Name>, Vec<String>, Rc<Expr>, Span),
     Try(i64, Vec<ActStmt>, Vec<ActStmt>, Vec<ActStmt>, Span),
-    FieldAssign(Box<Expr>, Name, Box<Expr>, Span),
-    Lazy(Box<Expr>, Span),
+    FieldAssign(Rc<Expr>, Name, Rc<Expr>, Span),
+    Lazy(Rc<Expr>, Span),
     Error(String, Span),
-    Induction(Box<Expr>, Vec<MatchArm>, Span),
+    Induction(Rc<Expr>, Vec<MatchArm>, Span),
 }
 
 #[derive(Clone, Debug)]
@@ -136,14 +138,14 @@ pub enum Pat {
 #[derive(Clone, Debug)]
 pub enum TypeExpr {
     Named(Name, Span),
-    Fun(Box<TypeExpr>, Box<TypeExpr>, Span),
-    App(Box<TypeExpr>, Vec<TypeExpr>, Span),
-    Effect(Vec<Name>, Vec<String>, Vec<Name>, Box<TypeExpr>, Span),
-    BoundedInt(Box<TypeExpr>, i64, i64, OverflowMode, Span),
-    PropEq(Box<TypeExpr>, Box<TypeExpr>, Span),
-    Constrained(Name, Name, Box<TypeExpr>, Span),
-    Linear(Box<TypeExpr>, Span),
-    Forall(Name, Box<TypeExpr>, Box<TypeExpr>, Span),
+    Fun(Rc<TypeExpr>, Rc<TypeExpr>, Span),
+    App(Rc<TypeExpr>, Vec<TypeExpr>, Span),
+    Effect(Vec<Name>, Vec<String>, Vec<Name>, Rc<TypeExpr>, Span),
+    BoundedInt(Rc<TypeExpr>, i64, i64, OverflowMode, Span),
+    PropEq(Rc<TypeExpr>, Rc<TypeExpr>, Span),
+    Constrained(Name, Name, Rc<TypeExpr>, Span),
+    Linear(Rc<TypeExpr>, Span),
+    Forall(Name, Rc<TypeExpr>, Rc<TypeExpr>, Span),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

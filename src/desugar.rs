@@ -22,6 +22,7 @@
 //! structural rather than a fold.
 
 use crate::ast::*;
+use std::rc::Rc;
 use crate::cst::{Node, NodeKind};
 use crate::token::{Kind, Token};
 
@@ -80,16 +81,16 @@ impl<'a> Desugar<'a> {
             NodeKind::Name | NodeKind::Selector => Expr::NameRef(self.leading(n), sp),
             NodeKind::Paren => kids.first().map_or(Expr::Error(String::new(), sp), |k| self.expr(k)),
             NodeKind::App => match kids.as_slice() {
-                [f, a] => Expr::Apply(Box::new(self.expr(f)), Box::new(self.expr(a)), sp),
+                [f, a] => Expr::Apply(Rc::new(self.expr(f)), Rc::new(self.expr(a)), sp),
                 _ => Expr::Error("app".into(), sp),
             },
             NodeKind::Bin => self.binary(n, &kids, sp),
             NodeKind::Unary => self.unary(n, &kids, sp),
             NodeKind::IfExpr => match kids.as_slice() {
                 [c, t, e] => Expr::If(
-                    Box::new(self.expr(c)),
-                    Box::new(self.expr(t)),
-                    Box::new(self.expr(e)),
+                    Rc::new(self.expr(c)),
+                    Rc::new(self.expr(t)),
+                    Rc::new(self.expr(e)),
                     sp,
                 ),
                 _ => Expr::Error("if".into(), sp),
@@ -122,7 +123,7 @@ impl<'a> Desugar<'a> {
                             span: head_span(pn),
                             alt_group: head_span(pn).offset,
                         };
-                        inner = Expr::Match(Box::new(value), vec![arm], sp);
+                        inner = Expr::Match(Rc::new(value), vec![arm], sp);
                         break;
                     }
                     binds.push(LetBind {
@@ -134,7 +135,7 @@ impl<'a> Desugar<'a> {
                 if binds.is_empty() {
                     inner
                 } else {
-                    Expr::Let(binds, Box::new(inner), sp)
+                    Expr::Let(binds, Rc::new(inner), sp)
                 }
             }
             NodeKind::SeqExpr => match kids.as_slice() {
@@ -144,7 +145,7 @@ impl<'a> Desugar<'a> {
                     let span = head_span(&kids[0]);
                     Expr::Let(
                         vec![LetBind { name: "__seq".into(), value, span }],
-                        Box::new(self.expr(rest)),
+                        Rc::new(self.expr(rest)),
                         sp,
                     )
                 }
@@ -157,9 +158,9 @@ impl<'a> Desugar<'a> {
                     .map_or(Expr::Error(String::new(), sp), |s| self.expr(s));
                 let arms = self.arms(n);
                 if n.kind == NodeKind::Induction {
-                    Expr::Induction(Box::new(scrut), arms, sp)
+                    Expr::Induction(Rc::new(scrut), arms, sp)
                 } else {
-                    Expr::Match(Box::new(scrut), arms, sp)
+                    Expr::Match(Rc::new(scrut), arms, sp)
                 }
             }
             NodeKind::ListLit => Expr::List(kids.iter().map(|k| self.expr(k)).collect(), sp),
@@ -185,7 +186,7 @@ impl<'a> Desugar<'a> {
                     .map(|t| self.text(t))
                     .unwrap_or_default();
                 Expr::FieldAccess(
-                    Box::new(kids.first().map_or(Expr::Error(String::new(), sp), |r| self.expr(r))),
+                    Rc::new(kids.first().map_or(Expr::Error(String::new(), sp), |r| self.expr(r))),
                     field,
                     sp,
                 )
@@ -199,9 +200,9 @@ impl<'a> Desugar<'a> {
                     .unwrap_or_default();
                 match kids.as_slice() {
                     [rec, val] => Expr::FieldAssign(
-                        Box::new(self.expr(rec)),
+                        Rc::new(self.expr(rec)),
                         field,
-                        Box::new(self.expr(val)),
+                        Rc::new(self.expr(val)),
                         sp,
                     ),
                     _ => Expr::Error("field-assign".into(), sp),
@@ -211,7 +212,7 @@ impl<'a> Desugar<'a> {
                 // `(a, b)` is `MkTup2 a b`, applied one argument at a time.
                 let elems: Vec<Expr> = kids.iter().map(|k| self.expr(k)).collect();
                 let base = Expr::NameRef(format!("MkTup{}", elems.len()), Span::default());
-                elems.into_iter().fold(base, |f, a| Expr::Apply(Box::new(f), Box::new(a), sp))
+                elems.into_iter().fold(base, |f, a| Expr::Apply(Rc::new(f), Rc::new(a), sp))
             }
             NodeKind::ForExpr => {
                 // `for x in xs -> b` is `map-list (\x -> b) xs`.
@@ -224,13 +225,13 @@ impl<'a> Desugar<'a> {
                     [list, body] => {
                         let lam = Expr::Lambda(
                             vec![var],
-                            Box::new(self.expr(body)),
+                            Rc::new(self.expr(body)),
                             Span::default(),
                         );
                         let map_fn = Expr::NameRef("map-list".into(), Span::default());
                         Expr::Apply(
-                            Box::new(Expr::Apply(Box::new(map_fn), Box::new(lam), Span::default())),
-                            Box::new(self.expr(list)),
+                            Rc::new(Expr::Apply(Rc::new(map_fn), Rc::new(lam), Span::default())),
+                            Rc::new(self.expr(list)),
                             Span::default(),
                         )
                     }
@@ -245,7 +246,7 @@ impl<'a> Desugar<'a> {
                     .collect();
                 Expr::Lambda(
                     params,
-                    Box::new(kids.first().map_or(Expr::Error(String::new(), sp), |b| self.expr(b))),
+                    Rc::new(kids.first().map_or(Expr::Error(String::new(), sp), |b| self.expr(b))),
                     sp,
                 )
             }
@@ -295,7 +296,7 @@ impl<'a> Desugar<'a> {
                         }
                     })
                     .collect();
-                Expr::Handle(eff, Box::new(body), clauses, sp)
+                Expr::Handle(eff, Rc::new(body), clauses, sp)
             }
             NodeKind::WithTimeout => {
                 let timeout = n
@@ -313,7 +314,7 @@ impl<'a> Desugar<'a> {
                     timeout,
                     effs,
                     Vec::new(),
-                    Box::new(
+                    Rc::new(
                         kids.iter()
                             .find(|k| k.kind != NodeKind::EffectRow)
                             .map_or(Expr::Error(String::new(), sp), |b| self.expr(b)),
@@ -322,7 +323,7 @@ impl<'a> Desugar<'a> {
                 )
             }
             NodeKind::LazyExpr => Expr::Lazy(
-                Box::new(kids.first().map_or(Expr::Error(String::new(), sp), |i| self.expr(i))),
+                Rc::new(kids.first().map_or(Expr::Error(String::new(), sp), |i| self.expr(i))),
                 Span::default(),
             ),
             NodeKind::Revised => {
@@ -337,15 +338,15 @@ impl<'a> Desugar<'a> {
                         .last()
                         .map_or(Expr::Error(String::new(), sp), |v| self.expr(v));
                     chain = Expr::FieldAssign(
-                        Box::new(chain),
+                        Rc::new(chain),
                         self.leading(f),
-                        Box::new(value),
+                        Rc::new(value),
                         Span::default(),
                     );
                 }
                 Expr::Let(
                     vec![LetBind { name: "__rev".into(), value: base, span: Span::default() }],
-                    Box::new(chain),
+                    Rc::new(chain),
                     sp,
                 )
             }
@@ -367,9 +368,9 @@ impl<'a> Desugar<'a> {
         // `a |> f` is `f a`. The operands SWAP, and nothing about the token
         // says so.
         if op.kind == Kind::PipeForward {
-            return Expr::Apply(Box::new(r), Box::new(l), osp);
+            return Expr::Apply(Rc::new(r), Rc::new(l), osp);
         }
-        Expr::Binary(Box::new(l), binary_op(op.kind), Box::new(r), osp)
+        Expr::Binary(Rc::new(l), binary_op(op.kind), Rc::new(r), osp)
     }
 
     fn unary(&self, n: &Node, kids: &[&Node], sp: Span) -> Expr {
@@ -381,13 +382,13 @@ impl<'a> Desugar<'a> {
         // is arithmetic negation alone.
         if op.kind == Kind::NotKeyword {
             return Expr::Binary(
-                Box::new(inner),
+                Rc::new(inner),
                 BinaryOp::OpEq,
-                Box::new(Expr::Lit("False".into(), LiteralKind::BoolLit, osp)),
+                Rc::new(Expr::Lit("False".into(), LiteralKind::BoolLit, osp)),
                 osp,
             );
         }
-        Expr::Unary(Box::new(inner), osp)
+        Expr::Unary(Rc::new(inner), osp)
     }
 
     fn stmts(&self, n: &Node) -> Vec<ActStmt> {
@@ -672,10 +673,10 @@ impl<'a> Desugar<'a> {
                 sp,
             ),
             NodeKind::ParenType => first(0),
-            NodeKind::FunType => TypeExpr::Fun(Box::new(first(0)), Box::new(first(1)), sp),
+            NodeKind::FunType => TypeExpr::Fun(Rc::new(first(0)), Rc::new(first(1)), sp),
             NodeKind::AppType => match kids.split_first() {
                 Some((base, args)) => args.iter().fold(self.type_expr(base), |acc, a| {
-                    TypeExpr::App(Box::new(acc), vec![self.type_expr(a)], sp)
+                    TypeExpr::App(Rc::new(acc), vec![self.type_expr(a)], sp)
                 }),
                 None => TypeExpr::Named(String::new(), sp),
             },
@@ -686,7 +687,7 @@ impl<'a> Desugar<'a> {
                     .map(|t| self.text(t))
                     .unwrap_or_default();
                 TypeExpr::App(
-                    Box::new(TypeExpr::Named(op, sp)),
+                    Rc::new(TypeExpr::Named(op, sp)),
                     kids.iter().map(|k| self.type_expr(k)).collect(),
                     sp,
                 )
@@ -710,15 +711,15 @@ impl<'a> Desugar<'a> {
                     })
                     .unwrap_or(OverflowMode::Error);
                 TypeExpr::BoundedInt(
-                    Box::new(first(0)),
+                    Rc::new(first(0)),
                     nums.first().copied().unwrap_or(0),
                     nums.get(1).copied().unwrap_or(0),
                     mode,
                     sp,
                 )
             }
-            NodeKind::LinearType => TypeExpr::Linear(Box::new(first(0)), sp),
-            NodeKind::PropEqType => TypeExpr::PropEq(Box::new(first(0)), Box::new(first(1)), sp),
+            NodeKind::LinearType => TypeExpr::Linear(Rc::new(first(0)), sp),
+            NodeKind::PropEqType => TypeExpr::PropEq(Rc::new(first(0)), Rc::new(first(1)), sp),
             NodeKind::ConstrainedType => first(kids.len().saturating_sub(1)),
             // `for all (xs : T), P` -- the variable is the name after the
             // paren. Taking the first name under the node returns `for`,
@@ -730,7 +731,7 @@ impl<'a> Desugar<'a> {
                     .find(|t| matches!(t.kind, Kind::Identifier | Kind::TypeIdentifier))
                     .map(|t| self.text(t))
                     .unwrap_or_default();
-                TypeExpr::Forall(var, Box::new(first(0)), Box::new(first(1)), sp)
+                TypeExpr::Forall(var, Rc::new(first(0)), Rc::new(first(1)), sp)
             }
             NodeKind::EffectType => {
                 let effs: Vec<Name> = n
@@ -738,12 +739,12 @@ impl<'a> Desugar<'a> {
                     .filter(|t| matches!(t.kind, Kind::Identifier | Kind::TypeIdentifier))
                     .map(|t| self.text(t))
                     .collect();
-                TypeExpr::Effect(effs, Vec::new(), Vec::new(), Box::new(first(0)), sp)
+                TypeExpr::Effect(effs, Vec::new(), Vec::new(), Rc::new(first(0)), sp)
             }
             NodeKind::TupleType => {
                 let elems: Vec<TypeExpr> = kids.iter().map(|k| self.type_expr(k)).collect();
                 let base = TypeExpr::Named(format!("Tup{}", elems.len()), sp);
-                elems.into_iter().fold(base, |f, a| TypeExpr::App(Box::new(f), vec![a], sp))
+                elems.into_iter().fold(base, |f, a| TypeExpr::App(Rc::new(f), vec![a], sp))
             }
             _ => TypeExpr::Named(String::new(), sp),
         }
