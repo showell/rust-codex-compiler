@@ -48,6 +48,27 @@ line, column, text. Our stream projected free of trivia must equal it.
 The truth is ONE subject and exercises 41 of the 92 token kinds. It starts a
 lexer; it cannot finish one. The corpus finishes it.
 
+**The parser has the same pair, and the shallow one is shallower.**
+`parse.truth` records the DECLARATION layer only -- each definition's name,
+parameter count, annotation count, position and chapter, plus the chapter's
+sections, type definitions and counts. It says nothing whatever about
+expression structure.
+
+    cargo run --release --bin parsedump -- truth <file.codex> | diff - parse.truth
+    cargo run --release --bin parsedump -- cover <dir>
+
+`cover` is coverage AND homelessness, and the second half was added because the
+first was measured to be too weak: a parser deliberately broken to stop
+consuming definition bodies still passed a pure coverage check, because the
+orphaned tokens simply reappeared as loose lines and were still counted exactly
+once. Requiring that almost no token sit outside a named construct catches it --
+367 loose tokens across the compiler's 64 chapters when healthy, 357,339 when
+broken.
+
+Expression bodies are collected into a named `UnparsedBody` node and COUNTED,
+so the dump says how much of each file is still unread. That is the next piece
+of work.
+
 ## `char-code` is not ASCII
 
 Codex's `char-code` is a private frequency-ordered alphabet: 1 newline, 2
