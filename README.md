@@ -105,6 +105,36 @@ written, and keeping the two apart is what makes the second countable. It is
 reported next to the total pattern count, because a zero from a parser that
 never ran looks exactly like a zero from one that works.
 
+## Desugar
+
+`src/ast.rs` is Cobblestone's `AstNodes.codex`, variant for variant. It is
+deliberately SMALLER than the CST: six forms have no node there and are
+rewritten instead.
+
+    (a, b)              ->  MkTup2 a b
+    for x in xs -> b    ->  map-list (\x -> b) xs
+    (e)                 ->  e
+    not x               ->  x == False
+    a |> f              ->  f a                 -- the operands SWAP
+    s in rest           ->  let __seq = s in rest
+
+`not x` becoming `x == False` is the one that reads like a mistake and is not:
+there is no negation node, and `AUnaryExpr` is arithmetic negation alone.
+
+    desugardump truth <file.codex>     against $CODEX_GOLDS/rungs/desugar.truth
+    desugardump cover <path>...
+
+**`desugar.truth` would pass a desugarer that answered `Error` for every
+expression**, because it inspects the declaration layer alone -- one subject,
+names, parameter counts, positions and slugs. So `cover` is the baseline-free
+half: it desugars every definition in every file and counts the AST nodes that
+came out against the ones that are the error node, which carries the NAME of
+the CST kind it could not translate.
+
+    2,695 files, 39,760 definitions, 1,584,224 AST expression nodes
+    9 error nodes -- 6 in test/errors/, and none at all in the compiler,
+    foreword, plugs or os
+
 ## The IR chapter preamble: 1,012 programs, and the compiler itself
 
 Everything above `(defs` in an IR file is fixed by syntax alone -- chapter,
