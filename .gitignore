@@ -1,0 +1,5 @@
+# The repo is CLEAN BY CONSTRUCTION: no build output, no generated sources, no
+# golds, no measurements. CARGO_TARGET_DIR points at a sandbox (see README), so
+# target/ should never appear here at all -- this line is a backstop, not a plan.
+target/
+Cargo.lock
