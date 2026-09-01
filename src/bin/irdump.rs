@@ -22,7 +22,7 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some("preamble") if args.len() == 2 => match emit(Path::new(&args[1])) {
+        Some("preamble") if args.len() == 2 || args.len() == 3 => match emit(Path::new(&args[1]), args.get(2).map(String::as_str)) {
             Some(text) => {
                 let out = std::io::stdout();
                 let _ = writeln!(out.lock(), "{text}");
@@ -39,10 +39,18 @@ fn main() -> ExitCode {
     }
 }
 
-fn emit(path: &Path) -> Option<String> {
+fn emit(path: &Path, chapter: Option<&str>) -> Option<String> {
     let src = std::fs::read(path).ok()?;
     let parsed = parser::parse(&src);
-    Some(preamble::emit(&parsed.tree, &src))
+    Some(preamble::emit(&parsed.tree, &src, chapter))
+}
+
+/// The `(chapter "X"` a gold opens with. It is the driver's parameter, not
+/// ours to derive, so it is READ -- and counted, so taking it can never be
+/// silent.
+fn gold_chapter_name(ir: &str) -> Option<&str> {
+    let rest = ir.strip_prefix("(chapter \"")?;
+    rest.find('"').map(|end| &rest[..end])
 }
 
 /// The gold's preamble: everything up to and including the `(defs` opener.
@@ -104,7 +112,7 @@ fn grade(dir: &Path) -> ExitCode {
         .collect();
     names.sort();
 
-    let (mut matched, mut missing_unit, mut shown) = (0usize, 0usize, 0usize);
+    let (mut matched, mut missing_unit, mut shown, mut supplied) = (0usize, 0usize, 0usize, 0usize);
     let mut by_field: std::collections::HashMap<String, (usize, String)> = Default::default();
     for name in &names {
         let unit = dir.join(format!("{name}.codex"));
@@ -114,7 +122,12 @@ fn grade(dir: &Path) -> ExitCode {
         };
         let Ok(ir) = std::fs::read_to_string(ir_dir.join(format!("{name}.ir"))) else { continue };
         let Some(gold) = gold_preamble(&ir) else { continue };
-        let ours = preamble::emit(&parser::parse(&src).tree, &src);
+        let parsed = parser::parse(&src);
+        let named = gold_chapter_name(&ir);
+        if named.is_some_and(|n| n != preamble::derived_chapter_name(&parsed.tree, &src)) {
+            supplied += 1;
+        }
+        let ours = preamble::emit(&parsed.tree, &src, named);
         if gold == ours {
             matched += 1;
             continue;
@@ -130,6 +143,10 @@ fn grade(dir: &Path) -> ExitCode {
     let total = names.len();
     println!("{matched} of {total} preambles byte-identical ({:.1}%)",
              100.0 * matched as f64 / total.max(1) as f64);
+    if supplied > 0 {
+        println!("{supplied} took the chapter NAME from the gold: it is a driver \
+parameter (`compile-frontend source \"Program\" flags`), not a fact about the source");
+    }
     if missing_unit > 0 {
         println!("{missing_unit} gold(s) had no resolved unit in {}", dir.display());
     }

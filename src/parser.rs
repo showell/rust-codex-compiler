@@ -150,6 +150,7 @@ pub(crate) fn starts_an_item(k: Kind) -> bool {
             | Kind::CitesKeyword
             | Kind::QuotesKeyword
             | Kind::GroundsKeyword
+            | Kind::PunctualKeyword
     )
 }
 
@@ -283,6 +284,20 @@ fn looks_like_type_def(p: &Parser<'_>) -> bool {
 
 fn parse_def(p: &mut Parser<'_>, src: &[u8], first: Token) {
     p.b.start(NodeKind::Def);
+
+    // `punctual [budget] name : T` -- a modifier, and then an ordinary
+    // definition. It publishes `(ann "hard-realtime" <name> <budget>)` in the
+    // chapter header, and until it was read here the definition BEFORE it
+    // swallowed it: `punctual` was not in `starts_an_item`, so nothing ended
+    // the previous body.
+    if p.kind(0) == Some(Kind::PunctualKeyword) {
+        let pcp = p.b.checkpoint();
+        p.bump();
+        if p.kind(0) == Some(Kind::IntegerLiteral) {
+            p.bump(); // the budget
+        }
+        p.b.wrap_from(pcp, NodeKind::Punctual);
+    }
 
     // `name : Type` on its own line, optionally `name : Type = value`.
     let mut saw_equals_on_annotation = false;

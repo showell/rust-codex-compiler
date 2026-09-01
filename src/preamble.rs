@@ -298,16 +298,29 @@ fn type_def(td: &Node, src: &[u8]) -> Option<String> {
     None
 }
 
-/// The chapter header, up to and including the `(defs` opener -- upstream's
-/// `emit-ir-chapter-prefix`.
-pub fn emit(tree: &Node, src: &[u8]) -> String {
-    // The unit's own chapter is the LAST one: the resolver puts every cited
-    // chapter first and the program itself last.
-    let chapter = tree
-        .descendants(NodeKind::ChapterHeader)
+/// The chapter name a driver would supply if it derived one from the source:
+/// the unit's own chapter, which is the LAST one, since the resolver puts
+/// every cited chapter first and the program itself last.
+pub fn derived_chapter_name(tree: &Node, src: &[u8]) -> String {
+    tree.descendants(NodeKind::ChapterHeader)
         .last()
         .map(|n| header_text(n, src))
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// The chapter header, up to and including the `(defs` opener -- upstream's
+/// `emit-ir-chapter-prefix`.
+///
+/// **`(chapter "...")` is a DRIVER PARAMETER, not a fact about the source.**
+/// `compile-frontend source "Program" flags` -- the name is handed in, and the
+/// title beside it is derived. `native/codexir` passes the unit's own chapter
+/// and the transpiler's guest driver passes the literal `"Program"`, which is
+/// why the compiler's own gold says `(chapter "Program") (title
+/// "Parsmi--CodexZigHarness")`. So a caller that knows which driver it is
+/// comparing against says so, and everything else stays derived.
+pub fn emit(tree: &Node, src: &[u8], chapter_name: Option<&str>) -> String {
+    let title = derived_chapter_name(tree, src);
+    let chapter = chapter_name.unwrap_or(&title).to_string();
     let sections: String = tree
         .descendants(NodeKind::SectionHeader)
         .iter()
@@ -340,6 +353,30 @@ pub fn emit(tree: &Node, src: &[u8]) -> String {
         .iter()
         .filter_map(|td| type_def(td, src))
         .map(|t| format!("\n  {t}"))
+        .collect();
+
+    // `punctual name` publishes `(ann "hard-realtime" name budget)`. The
+    // annotation lives inside the definition it modifies, so the target is
+    // that definition's own name and needs no lookahead.
+    let anns: String = tree
+        .descendants(NodeKind::Def)
+        .iter()
+        .filter_map(|d| {
+            let punct = d.children_of(NodeKind::Punctual).next()?;
+            let budget = punct
+                .tokens()
+                .find(|t| t.kind == Kind::IntegerLiteral)
+                .map(|t| text_of(t, src))
+                .unwrap_or_default();
+            let target = d
+                .children_of(NodeKind::DefEquation)
+                .next()
+                .and_then(|e| first_name(e, src))
+                .or_else(|| {
+                    d.children_of(NodeKind::TypeAnnotation).next().and_then(|a| first_name(a, src))
+                })?;
+            Some(format!(" (ann \"hard-realtime\" {} {})", quote(&target), quote(&budget)))
+        })
         .collect();
 
     // `grounds Device.Port, Device.Block` publishes one entry per effect,
@@ -385,9 +422,9 @@ pub fn emit(tree: &Node, src: &[u8]) -> String {
         .map(|o| format!(" {}", quote(&o)))
         .collect();
 
-    let q = quote(&chapter);
+    let (q, qt) = (quote(&chapter), quote(&title));
     format!(
-        "(chapter {q}\n  (title {q})\n  (prose \"\")\n  (pblocks)\n  (anns)\n  \
+        "(chapter {q}\n  (title {qt})\n  (prose \"\")\n  (pblocks)\n  (anns{anns})\n  \
 (sections{sections})\n  (ctors{ctors})\n  (eff-ops{eff_ops})\n  (grounds{grounds})\n  \
 (type-defs{tds})\n  (defs"
     )

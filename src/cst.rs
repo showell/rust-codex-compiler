@@ -59,6 +59,10 @@ pub enum NodeKind {
     PropEqType,
     /// `A * B`, `A + B` -- type-level arithmetic on bounded integers.
     ArithType,
+    /// `punctual [budget] <name> : ...` -- a modifier on the definition that
+    /// follows it, kept INSIDE that definition so the association is
+    /// structural rather than "the next sibling".
+    Punctual,
     /// `effect Audio where <op> : <type> ...`
     EffectDef,
     /// One `<op> : <type>` of an effect declaration.
