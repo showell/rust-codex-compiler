@@ -114,13 +114,20 @@ pub enum Kind {
     /// one space and prose mode was off. Cobblestone reaches it, consumes it
     /// and records nothing.
     SkippedProse,
+    /// A byte the `char-code` alphabet does not map -- a carriage return, in
+    /// every file that has one. `scan-token`'s FIRST branch is `if c == cc-cr
+    /// then scan-token (advance-char s)`, and `cc-cr` is `-1`, the value
+    /// `char-code-at` answers for exactly these bytes. Cobblestone consumes
+    /// them and records nothing; we record them as trivia so the file still
+    /// rebuilds by concatenation.
+    Unmapped,
 }
 
 impl Kind {
     /// Is this ours rather than Cobblestone's? Filtering these out is exactly
     /// the projection that must equal `lex.truth`.
     pub fn is_trivia(self) -> bool {
-        matches!(self, Kind::Spaces | Kind::SkippedProse)
+        matches!(self, Kind::Spaces | Kind::SkippedProse | Kind::Unmapped)
     }
 
     /// The spelling `lex.truth` uses.
@@ -220,6 +227,7 @@ impl Kind {
             Kind::RevisedKeyword => "RevisedKeyword",
             Kind::Spaces => "Spaces",
             Kind::SkippedProse => "SkippedProse",
+            Kind::Unmapped => "Unmapped",
         }
     }
 }

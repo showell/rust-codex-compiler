@@ -23,6 +23,7 @@
 //! every byte lands in exactly one token and the source rebuilds by
 //! concatenation. Filter the trivia out and what remains is upstream's stream.
 
+use crate::charcode::CHAR_CODE;
 use crate::token::{Kind, Token};
 
 /// A lexer diagnostic. The message text is upstream's verbatim, because
@@ -373,11 +374,29 @@ pub fn tokenize_into(src: &[u8], prose_mode: bool) -> Lexed {
         let at = lx.mark();
         let c = lx.peek();
 
-        // Upstream's first branch is `if c == cc-cr`, and `cc-cr` is bound to
-        // -1 -- a value no byte can equal -- so that arm is unreachable. A
-        // carriage return therefore falls through to scan-operator and lexes
-        // as ErrorToken. That is consistent with CCE, which rejects `\r`
-        // outright; it is not an oversight to be repaired here.
+        // Upstream's FIRST branch: `if c == cc-cr then scan-token (advance-char
+        // s)`. `cc-cr` is `-1`, which is what `char-code-at` answers for a byte
+        // the alphabet does not map, so the arm is live and it skips every one
+        // of them -- a carriage return above all.
+        //
+        // Reading `cc-cr = -1` as "a value no byte can equal" and letting the
+        // byte fall through to scan-operator gave it an ErrorToken, and the
+        // gold IR says otherwise: 15 files in the checkout have CRLF endings,
+        // and `foreword/ai/DiffusionScheduler.codex` -- whose `record {` line
+        // ends `\r\n` -- is in the bank with `NoiseSchedule` carrying all its
+        // fields. An ErrorToken sitting between the brace and the first field
+        // would have left that record empty and the chapter uncompilable.
+        //
+        // The byte is TRIVIA, not nothing: dropping it would break
+        // `concat(tokens) == source`, which is the one property no oracle is
+        // needed for.
+        // A byte at or above 128 has a code and starts a tier-1 identifier;
+        // only the low, unmapped ones are skipped.
+        if (c as usize) < CHAR_CODE.len() && CHAR_CODE[c as usize] == 0 {
+            lx.advance_char();
+            out.push(lx.tok(Kind::Unmapped, at, 1));
+            continue;
+        }
 
         // Column 2 means exactly one leading space, which is how a prose line
         // is marked. Off prose mode the line is consumed and never recorded --
