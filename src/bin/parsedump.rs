@@ -181,6 +181,7 @@ fn cover(roots: &[String]) -> ExitCode {
     let (mut bad, mut defs, mut unparsed, mut errs) = (0usize, 0usize, 0usize, 0usize);
     let mut loose = 0usize;
     let mut shown = 0usize;
+    let (mut flat_pat, mut flat_type, mut flat_td, mut flat_act) = (0usize, 0usize, 0usize, 0usize);
     for f in &files {
         let Ok(src) = std::fs::read(f) else { continue };
         let parsed = parser::parse(&src);
@@ -197,6 +198,13 @@ fn cover(roots: &[String]) -> ExitCode {
         unparsed += parsed.unparsed_bodies;
         errs += parsed.errors.len();
         loose += loose_tokens(&parsed.tree);
+        flat_pat += parsed.tree.descendants(NodeKind::Pattern).len();
+        flat_type += parsed.tree.descendants(NodeKind::TypeExpr).len();
+        flat_td += parsed.tree.descendants(NodeKind::TypeDef).len();
+        flat_act += parsed.tree.descendants(NodeKind::ActBlock).len()
+            + parsed.tree.descendants(NodeKind::TryExpr).len()
+            + parsed.tree.descendants(NodeKind::HandleExpr).len()
+            + parsed.tree.descendants(NodeKind::WithTimeout).len();
         if shown < 12 {
             for u in parsed.tree.descendants(NodeKind::UnparsedBody) {
                 if let Some(t) = u.tokens().find(|t| !t.kind.is_trivia()) {
@@ -211,6 +219,11 @@ fn cover(roots: &[String]) -> ExitCode {
     println!("{} files, {defs} definitions, {unparsed} bodies not yet structured, {errs} parse errors",
              files.len());
     println!("{loose} token(s) landed in no construct");
+    // What is still a bag of tokens rather than a tree. The desugarer consumes
+    // exactly these, so the number is the size of the work between here and
+    // there -- not a warning, an inventory.
+    println!("still flat: {flat_pat} patterns, {flat_type} type expressions, \
+{flat_td} type definitions, {flat_act} act/trying/with blocks");
     // Coverage alone is a weak claim and was measured to be: a parser that
     // stopped consuming definition bodies still passed it, because the orphaned
     // tokens simply reappeared as loose lines and were still counted once. So
