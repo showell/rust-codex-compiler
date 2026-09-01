@@ -141,13 +141,29 @@ fn truth(path: &Path, scope: bool) -> ExitCode {
 /// baseline-free half: how many AST expression nodes exist at all, and how
 /// many are the error node -- which carries the NAME of the CST kind it could
 /// not translate, so a gap says what it is rather than that it happened.
+/// The programs the real compiler DECLINES, from the bank's `refused.tsv`.
+///
+/// An undefined name in one of those is our diagnostic agreeing with the
+/// compiler's, not a defect -- `unknown-name.codex` is refused for having an
+/// unknown name in it. Counting the two together makes a number that goes UP
+/// as the resolver gets better, which is the same trap `parsedump cover` fell
+/// into with parse errors.
+fn refused_programs() -> std::collections::HashSet<String> {
+    let Ok(golds) = std::env::var("CODEX_GOLDS") else { return Default::default() };
+    let path = std::path::PathBuf::from(golds).join("refused.tsv");
+    let Ok(text) = std::fs::read_to_string(path) else { return Default::default() };
+    text.lines().skip(1).filter_map(|l| l.split('\t').next()).map(String::from).collect()
+}
+
 fn cover(roots: &[String]) -> ExitCode {
+    let refused = refused_programs();
     let mut files = Vec::new();
     for r in roots {
         collect(Path::new(r), &mut files);
     }
     files.sort();
     let (mut nodes, mut errs, mut defs, mut resolve_errs) = (0usize, 0usize, 0usize, 0usize);
+    let mut expected_unresolved = 0usize;
     let mut by_unresolved: std::collections::HashMap<String, (usize, String)> = Default::default();
     let mut by_cause: std::collections::HashMap<String, usize> = Default::default();
     let (mut secs, mut bytes) = (0f64, 0usize);
@@ -164,14 +180,7 @@ fn cover(roots: &[String]) -> ExitCode {
         // undefined name is our scope rule being wrong, not the program's.
         // The rung truth proves the pass runs (21 errors on an unresolved
         // subject); this proves it does not fire where it must not.
-        let r = codexc::scope::resolve(&ch);
-        for e in &r.errors {
-            by_unresolved
-                .entry(e.msg.clone())
-                .or_insert_with(|| (0, format!("{}", f.display())))
-                .0 += 1;
-        }
-        resolve_errs += r.errors.len();
+
         for d in &ch.defs {
             d.body.walk(&mut |e| {
                 nodes += 1;
@@ -181,6 +190,20 @@ fn cover(roots: &[String]) -> ExitCode {
                 }
             });
         }
+        // The scope half is partitioned; the desugar half above is not,
+        // because a refused program still has to DESUGAR.
+        let r = codexc::scope::resolve(&ch);
+        if f.file_stem().is_some_and(|s| refused.contains(&s.to_string_lossy().into_owned())) {
+            expected_unresolved += r.errors.len();
+        } else {
+            for e in &r.errors {
+                by_unresolved
+                    .entry(e.msg.clone())
+                    .or_insert_with(|| (0, format!("{}", f.display())))
+                    .0 += 1;
+            }
+            resolve_errs += r.errors.len();
+        }
     }
     println!("{} files, {defs} definitions desugared", files.len());
     println!("{nodes} AST expression nodes, {errs} of them the error node ({:.3}%)",
@@ -188,6 +211,8 @@ fn cover(roots: &[String]) -> ExitCode {
     println!("desugar: {bytes} bytes in {secs:.3}s, {:.1} MB/s",
              bytes as f64 / secs.max(1e-9) / 1_048_576.0);
     println!("{resolve_errs} name(s) the scope pass could not resolve");
+    println!("{expected_unresolved} more in programs the compiler itself refuses, \
+where a diagnostic is the point");
     let mut un: Vec<_> = by_unresolved.into_iter().collect();
     un.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(&b.0)));
     for (msg, (n, at)) in un.iter().take(10) {

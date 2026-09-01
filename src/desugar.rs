@@ -720,12 +720,18 @@ impl<'a> Desugar<'a> {
             NodeKind::LinearType => TypeExpr::Linear(Box::new(first(0)), sp),
             NodeKind::PropEqType => TypeExpr::PropEq(Box::new(first(0)), Box::new(first(1)), sp),
             NodeKind::ConstrainedType => first(kids.len().saturating_sub(1)),
-            NodeKind::ForAllType => TypeExpr::Forall(
-                self.name_of(n),
-                Box::new(first(0)),
-                Box::new(first(1)),
-                sp,
-            ),
+            // `for all (xs : T), P` -- the variable is the name after the
+            // paren. Taking the first name under the node returns `for`,
+            // which is an ordinary identifier the lexer knows nothing about.
+            NodeKind::ForAllType => {
+                let var = n
+                    .own_tokens()
+                    .skip_while(|t| t.kind != Kind::LeftParen)
+                    .find(|t| matches!(t.kind, Kind::Identifier | Kind::TypeIdentifier))
+                    .map(|t| self.text(t))
+                    .unwrap_or_default();
+                TypeExpr::Forall(var, Box::new(first(0)), Box::new(first(1)), sp)
+            }
             NodeKind::EffectType => {
                 let effs: Vec<Name> = n
                     .own_tokens()

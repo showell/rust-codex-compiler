@@ -140,6 +140,15 @@ pub fn resolve(ch: &Chapter) -> Resolved {
             }
             sc.locals.insert(p.name.clone());
         }
+        // A declared type that is a `forall` BINDS its variable for the body,
+        // through as many nested binders as it has: `claim p : for all (xs :
+        // T), for all (ys : T), ..` puts both in scope for the proof, and the
+        // proof is where they are used.
+        let mut ty = d.declared_type.first();
+        while let Some(TypeExpr::Forall(v, _, inner, _)) = ty {
+            sc.locals.insert(v.clone());
+            ty = Some(inner);
+        }
         expr(&mut sc, &d.body, &mut errors);
     }
 
@@ -292,7 +301,32 @@ fn act_stmts(sc: &mut Scope<'_>, stmts: &[ActStmt], errs: &mut Vec<ResolveError>
     let mut seen = HashSet::new();
     for s in stmts {
         match s {
-            ActStmt::Exec(e, _) => expr(sc, e, errs),
+            // A `let` STATEMENT in an act block does NOT fork: its bindings
+            // stay in scope for every statement after it, and a chain of them
+            // (`let b = .. in let c = .. in ..`) contributes all of its names.
+            // `codex/test/act-let-scope.codex` is named for exactly this, and
+            // forking here left `a` undefined on the line after it.
+            ActStmt::Exec(e, _) => {
+                let mut cur = e;
+                loop {
+                    let Expr::Let(binds, body, _) = cur else {
+                        expr(sc, cur, errs);
+                        break;
+                    };
+                    let mut bound = HashSet::new();
+                    for b in binds {
+                        expr(sc, &b.value, errs);
+                        if !bound.insert(b.name.clone()) {
+                            errs.push(ResolveError {
+                                msg: format!("Duplicate binding: '{}'", b.name),
+                                span: b.span,
+                            });
+                        }
+                        sc.locals.insert(b.name.clone());
+                    }
+                    cur = body;
+                }
+            }
             ActStmt::Bind(name, e, sp) => {
                 // The value first, then the name -- a bind cannot see itself.
                 expr(sc, e, errs);
