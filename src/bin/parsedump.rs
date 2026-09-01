@@ -231,6 +231,11 @@ fn cover(roots: &[String]) -> ExitCode {
     let mut loose = 0usize;
     let (mut shown, mut shown_td) = (0usize, 0usize);
     let (mut parse_secs, mut total_bytes) = (0f64, 0usize);
+    // How many files come out with nothing unexplained: no parse error, no
+    // unread body, no unread type-definition body. It is the one number that
+    // says how much of the language is actually read, and a per-file count
+    // says it better than a total, which one bad file can dominate.
+    let mut whole = 0usize;
     let (mut flat_type, mut unclosed) = (0usize, 0usize);
     let (mut tds, mut recs, mut vars, mut ctors, mut unread_td) = (0usize, 0usize, 0usize, 0usize, 0usize);
     let (mut acts, mut stmts, mut handles, mut clauses) = (0usize, 0usize, 0usize, 0usize);
@@ -258,6 +263,12 @@ fn cover(roots: &[String]) -> ExitCode {
         }
         defs += parsed.tree.count_descendants(NodeKind::Def);
         unparsed += parsed.unparsed_bodies;
+        if parsed.errors.is_empty()
+            && parsed.unparsed_bodies == 0
+            && parsed.unread_type_defs == 0
+        {
+            whole += 1;
+        }
         if is_diagnostic_test(f) {
             expected_errs += parsed.errors.len();
         } else {
@@ -327,6 +338,8 @@ fn cover(roots: &[String]) -> ExitCode {
     println!("{} files, {defs} definitions, {unparsed} bodies not yet structured, {errs} parse errors",
              files.len());
     println!("parse: {total_bytes} bytes in {parse_secs:.3}s, {}", rate(total_bytes, parse_secs));
+    println!("{whole} of {} files read whole -- no error, no unread body ({:.1}%)",
+             files.len(), 100.0 * whole as f64 / files.len().max(1) as f64);
     println!("{expected_errs} more in test/errors/, where a diagnostic is the point");
     println!("{loose} token(s) landed in no construct");
     let mut ranked: Vec<_> = by_msg.into_iter().collect();
