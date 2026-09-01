@@ -226,6 +226,19 @@ fn atype(n: &Node, src: &[u8]) -> String {
             _ => unknown(),
         },
         NodeKind::ForAllType => "(a-forall)".to_string(),
+        // `n * 8`, `xs & ys`: ONE application of the operator to both
+        // operands, and not curried -- upstream builds `AppType (NamedType
+        // op) [left, right]` in a single node, while an ordinary type
+        // application is curried an argument at a time by the parser.
+        NodeKind::ArithType => {
+            let op = n
+                .own_tokens()
+                .find(|t| !t.kind.is_trivia())
+                .map(|t| text_of(t, src))
+                .unwrap_or_default();
+            let args: String = kids.iter().map(|k| format!(" {}", atype(k, src))).collect();
+            format!("(a-app (a-named {}) (args{args}))", quote(&op))
+        }
         // `(A, B)` is `TupN A B`, and the effect row and everything else is
         // not reachable from a type definition in this corpus.
         NodeKind::TupleType => {

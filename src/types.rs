@@ -227,25 +227,50 @@ fn bound_or_arith(p: &mut Parser<'_>, cp: usize) {
         p.b.wrap_from(cp, NodeKind::BoundedIntType);
         return;
     }
-    // Type-level arithmetic: `*` and `/` bind tighter than `+` and `-`.
-    let mut arith = false;
+    // Type-level operators, loosest first: `&` appends, then `+`/`-`, then
+    // `*`/`/`. Each builds one node holding the operator and BOTH operands --
+    // upstream's `AppType (NamedType op) [left, right]` -- which is a
+    // different shape from an ordinary type application, and that one the
+    // parser curries an argument at a time.
+    append_tail(p, cp);
+}
+
+/// An operand of a type-level operator: an atom AND its arguments.
+/// `parse-type-arith-operand` is `parse-type-atom` followed by
+/// `parse-type-args`, so `xs & Cons 7 Nil` appends a three-token application
+/// and not the bare name `Cons`.
+fn arith_operand(p: &mut Parser<'_>) {
+    let cp = p.b.checkpoint();
+    parse_type_atom(p);
+    type_args(p, cp);
+}
+
+fn mul_tail(p: &mut Parser<'_>, cp: usize) {
     while matches!(p.kind(0), Some(Kind::Star) | Some(Kind::Slash)) {
         p.bump();
-        parse_type_atom(p);
-        arith = true;
+        arith_operand(p);
+        p.b.wrap_from(cp, NodeKind::ArithType);
     }
+}
+
+fn add_tail(p: &mut Parser<'_>, cp: usize) {
+    mul_tail(p, cp);
     while matches!(p.kind(0), Some(Kind::Plus) | Some(Kind::Minus)) {
         p.bump();
-        parse_type_atom(p);
-        let acp = p.b.checkpoint();
-        let _ = acp;
-        while matches!(p.kind(0), Some(Kind::Star) | Some(Kind::Slash)) {
-            p.bump();
-            parse_type_atom(p);
-        }
-        arith = true;
+        let rhs = p.b.checkpoint();
+        arith_operand(p);
+        mul_tail(p, rhs);
+        p.b.wrap_from(cp, NodeKind::ArithType);
     }
-    if arith {
+}
+
+fn append_tail(p: &mut Parser<'_>, cp: usize) {
+    add_tail(p, cp);
+    while p.kind(0) == Some(Kind::Ampersand) {
+        p.bump();
+        let rhs = p.b.checkpoint();
+        arith_operand(p);
+        add_tail(p, rhs);
         p.b.wrap_from(cp, NodeKind::ArithType);
     }
 }

@@ -66,6 +66,8 @@ pub enum NodeKind {
     /// follows it, kept INSIDE that definition so the association is
     /// structural rather than "the next sibling".
     Punctual,
+    /// `claim <name> : <prop>` in front of the definition that proves it.
+    Claim,
     /// `effect Audio where <op> : <type> ...`
     EffectDef,
     /// `class [Super => ] Name where <method> : <type> ...`

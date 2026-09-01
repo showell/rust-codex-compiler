@@ -323,6 +323,19 @@ fn parse_def(p: &mut Parser<'_>, src: &[u8], first: Token) {
     // chapter header, and until it was read here the definition BEFORE it
     // swallowed it: `punctual` was not in `starts_an_item`, so nothing ended
     // the previous body.
+    // `claim <name> : <prop>` is a MODIFIER on the definition that proves it,
+    // exactly as `punctual` is: the name and the type that follow are the
+    // definition's own annotation, and the equation line below carries an
+    // optional `proof`. Reading `claim` as the name is what produced
+    // `expected '=' after the parameters of 'claim'` 69 times.
+    if p.kind(0) == Some(Kind::ClaimKeyword)
+        && matches!(p.kind(1), Some(Kind::Identifier) | Some(Kind::TypeIdentifier))
+        && p.kind(2) == Some(Kind::Colon)
+    {
+        let ccp = p.b.checkpoint();
+        p.bump();
+        p.b.wrap_from(ccp, NodeKind::Claim);
+    }
     if p.kind(0) == Some(Kind::PunctualKeyword) {
         let pcp = p.b.checkpoint();
         p.bump();
