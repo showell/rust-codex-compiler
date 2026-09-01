@@ -65,9 +65,12 @@ once. Requiring that almost no token sit outside a named construct catches it --
 367 loose tokens across the compiler's 64 chapters when healthy, 357,339 when
 broken.
 
-Expression bodies are collected into a named `UnparsedBody` node and COUNTED,
-so the dump says how much of each file is still unread. That is the next piece
-of work.
+**What the scale gate cannot see.** It proves the grammar is TOTAL -- every
+definition in the compiler's own 64 chapters parses, with no unread body and no
+error -- and it says nothing about whether the shape is RIGHT. Giving `+` and
+`*` the same precedence leaves it entirely green. Shape is guarded by unit
+tests today and by the IR golds later; neither `parse.truth` nor
+`desugar.truth` inspects an expression at all.
 
 ## `char-code` is not ASCII
 

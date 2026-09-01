@@ -42,23 +42,35 @@ pub struct Parsed {
 /// 3 in a dozen places; naming it makes those comparisons readable.
 const TOP_LEVEL_COL: u32 = 3;
 
-struct Parser {
-    b: Builder,
-    toks: Vec<Token>,
-    errors: Vec<ParseError>,
-    unparsed_bodies: usize,
+pub(crate) struct Parser<'a> {
+    pub(crate) b: Builder,
+    pub(crate) src: &'a [u8],
+    pub(crate) toks: Vec<Token>,
+    pub(crate) errors: Vec<ParseError>,
+    pub(crate) unparsed_bodies: usize,
+    /// Newlines are skipped inside brackets and significant outside them. This
+    /// is upstream's `paren-depth` and it is the whole reason a multi-line
+    /// application is an error at the top level and fine inside parentheses.
+    pub(crate) paren_depth: u32,
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
+    /// Is this token exactly this word? `for` is a keyword the lexer does not
+    /// know about -- it arrives as an ordinary identifier -- so the parser is
+    /// the only place that can tell.
+    pub(crate) fn text_is(&self, t: Token, word: &[u8]) -> bool {
+        t.text(self.src) == word
+    }
+
     /// The index of the next token the builder has not eaten.
-    fn at(&self) -> usize {
+    pub(crate) fn at(&self) -> usize {
         self.b.consumed()
     }
 
     /// The next `n`th token that the parser can make a decision on. Spaces and
     /// skipped prose are ours, not upstream's, so they never influence a
     /// choice -- but they are still eaten into the tree in order.
-    fn sig(&self, n: usize) -> Option<Token> {
+    pub(crate) fn sig(&self, n: usize) -> Option<Token> {
         self.toks[self.at()..]
             .iter()
             .filter(|t| !t.kind.is_trivia())
@@ -66,16 +78,16 @@ impl Parser {
             .copied()
     }
 
-    fn kind(&self, n: usize) -> Option<Kind> {
+    pub(crate) fn kind(&self, n: usize) -> Option<Kind> {
         self.sig(n).map(|t| t.kind)
     }
 
-    fn done(&self) -> bool {
+    pub(crate) fn done(&self) -> bool {
         self.at() >= self.toks.len()
     }
 
     /// Eat trivia into whatever node is open, then eat one real token.
-    fn bump(&mut self) -> Option<Token> {
+    pub(crate) fn bump(&mut self) -> Option<Token> {
         while self.toks.get(self.at()).is_some_and(|t| t.kind.is_trivia()) {
             self.b.eat();
         }
@@ -84,13 +96,13 @@ impl Parser {
 
     /// Eat trivia only, so it attaches to the enclosing node rather than to
     /// the construct about to start.
-    fn drift(&mut self) {
+    pub(crate) fn drift(&mut self) {
         while self.toks.get(self.at()).is_some_and(|t| t.kind.is_trivia()) {
             self.b.eat();
         }
     }
 
-    fn eat_to_end_of_line(&mut self) {
+    pub(crate) fn eat_to_end_of_line(&mut self) {
         while let Some(k) = self.kind(0) {
             if k == Kind::Newline || k == Kind::EndOfFile {
                 break;
@@ -99,13 +111,13 @@ impl Parser {
         }
     }
 
-    fn skip_newlines(&mut self) {
+    pub(crate) fn skip_newlines(&mut self) {
         while self.kind(0) == Some(Kind::Newline) {
             self.bump();
         }
     }
 
-    fn err(&mut self, msg: impl Into<String>) {
+    pub(crate) fn err(&mut self, msg: impl Into<String>) {
         let (line, col) = self.sig(0).map(|t| (t.line, t.col)).unwrap_or((0, 0));
         self.errors.push(ParseError { msg: msg.into(), line, col });
     }
@@ -136,9 +148,11 @@ pub fn parse(src: &[u8]) -> Parsed {
     let toks = lexed.tokens;
     let mut p = Parser {
         b: Builder::new(toks.clone()),
+        src,
         toks,
         errors: Vec::new(),
         unparsed_bodies: 0,
+        paren_depth: 0,
     };
 
     while !p.done() {
@@ -215,7 +229,7 @@ pub fn parse(src: &[u8]) -> Parsed {
 /// `Name = record { .. }`, `Name = | A | B`, `Name a b = ..`, and the `mutable`
 /// / `effect` / `class` / `instance` / `unit` forms. A value definition never
 /// has a TypeIdentifier for a name, which is what separates the two.
-fn looks_like_type_def(p: &Parser) -> bool {
+fn looks_like_type_def(p: &Parser<'_>) -> bool {
     let Some(first) = p.sig(0) else { return false };
     let start = match first.kind {
         Kind::MutableKeyword
@@ -237,7 +251,7 @@ fn looks_like_type_def(p: &Parser) -> bool {
     p.kind(n) == Some(Kind::Equals)
 }
 
-fn parse_type_def(p: &mut Parser, first: Token) {
+fn parse_type_def(p: &mut Parser<'_>, first: Token) {
     p.b.start(NodeKind::TypeDef);
     // Everything up to the next top-level item belongs to the body, which for
     // a record or variant runs over several lines.
@@ -245,7 +259,7 @@ fn parse_type_def(p: &mut Parser, first: Token) {
     p.b.end();
 }
 
-fn parse_def(p: &mut Parser, src: &[u8], first: Token) {
+fn parse_def(p: &mut Parser<'_>, src: &[u8], first: Token) {
     p.b.start(NodeKind::Def);
 
     // `name : Type` on its own line, optionally `name : Type = value`.
@@ -329,16 +343,75 @@ fn parse_def(p: &mut Parser, src: &[u8], first: Token) {
     p.b.end(); // Def
 }
 
-fn body(p: &mut Parser, def_col: u32) {
-    p.b.start(NodeKind::UnparsedBody);
-    p.unparsed_bodies += 1;
-    eat_item_body(p, def_col);
+/// A definition body is one expression, parsed with the equation name's column
+/// as the floor: the binary loop stops at any token at or left of it, which is
+/// how the next definition ends this one.
+fn body(p: &mut Parser<'_>, def_col: u32) {
+    // The body almost always begins on the line after the `=`, so the newline
+    // has to go first. Upstream does the same (`skip-newlines` before
+    // `parse-def-body-seq`); without it the expression parser meets a Newline
+    // in atom position, calls it an error and hands the whole body back.
+    p.skip_newlines();
+    crate::expr::parse_expr_col(p, def_col);
+    // Anything the expression grammar declined to take still belongs to this
+    // body. It is kept under a name that says it was not understood, and it is
+    // counted, so an unread body cannot pass for an understood one.
+    if let Some(t) = p.sig(0) {
+        let unread = !(t.kind == Kind::EndOfFile || (t.col <= def_col && starts_an_item(t.kind)));
+        if unread {
+            if in_prose_block(p) {
+                eat_prose_block(p);
+            } else {
+                p.b.start(NodeKind::UnparsedBody);
+                p.unparsed_bodies += 1;
+                eat_item_body(p, def_col);
+                p.b.end();
+            }
+        }
+    }
+}
+
+/// Are we sitting under a prose line?
+///
+/// A line at column 2 is prose and the lexer has already turned it into
+/// trivia, but the lines UNDER it -- indented past the top-level column --
+/// continue that prose and are not code. Upstream keeps skipping while
+/// `column > 3`. Looking back for the trivia is how we know a run of
+/// deeply-indented words is a paragraph and not an unread expression.
+fn in_prose_block(p: &Parser<'_>) -> bool {
+    let mut i = p.at();
+    while i > 0 {
+        i -= 1;
+        match p.toks[i].kind {
+            Kind::SkippedProse => return true,
+            Kind::Newline | Kind::Spaces => continue,
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn eat_prose_block(p: &mut Parser<'_>) {
+    p.b.start(NodeKind::ProseBlock);
+    loop {
+        p.eat_to_end_of_line();
+        // Take the newline, then decide whether the next line is still prose.
+        if p.kind(0) == Some(Kind::Newline) {
+            p.bump();
+        } else {
+            break;
+        }
+        match p.sig(0) {
+            Some(t) if t.col > TOP_LEVEL_COL && t.kind != Kind::EndOfFile => continue,
+            _ => break,
+        }
+    }
     p.b.end();
 }
 
 /// Consume up to the next top-level item, which upstream defines as a
 /// definition-starting token at or left of the current item's column.
-fn eat_item_body(p: &mut Parser, col: u32) {
+fn eat_item_body(p: &mut Parser<'_>, col: u32) {
     // The item's own first token is still ahead of us on the first call, so
     // always take one before testing.
     if !p.done() {

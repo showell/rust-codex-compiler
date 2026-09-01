@@ -45,6 +45,46 @@ pub enum NodeKind {
     /// yet. It is a NAMED placeholder and is counted in the dump, because a
     /// body silently swallowed would look exactly like a body understood.
     UnparsedBody,
+
+    // Expressions. The vocabulary is Cobblestone's `Expr`, one node kind per
+    // variant, so the tree can be read as their AST without a mapping table.
+    Lit,
+    Name,
+    App,
+    Bin,
+    Unary,
+    Paren,
+    Tuple,
+    ListLit,
+    RecordLit,
+    RecordField,
+    FieldAccess,
+    FieldAssign,
+    IfExpr,
+    LetExpr,
+    LetBinding,
+    MatchExpr,
+    MatchArm,
+    Pattern,
+    ActBlock,
+    ActBind,
+    Lambda,
+    TryExpr,
+    HandleExpr,
+    HandleClause,
+    WithTimeout,
+    LazyExpr,
+    ForExpr,
+    Revised,
+    Induction,
+    Selector,
+    /// An expression position that held something unreadable. Its tokens stay
+    /// in the tree; only the shape is lost.
+    ErrExpr,
+    /// A prose block's continuation lines. A line at column 2 is prose and the
+    /// lexer has already made it trivia; the lines UNDER it, indented past the
+    /// top-level column, continue it and are not code.
+    ProseBlock,
     /// Trivia and stray tokens that belong to no construct, kept so the tree
     /// still covers the file.
     Loose,
@@ -86,6 +126,27 @@ impl Node {
 
     pub fn count(&self, kind: NodeKind) -> usize {
         self.children_of(kind).count()
+    }
+
+    /// The shape, with tokens and trivia dropped: `(Bin (Name) (Bin (Name)
+    /// (Name)))`. Precedence and associativity are claims about SHAPE, and a
+    /// test that checked tokens would pass whatever tree they were hung on.
+    pub fn shape(&self) -> String {
+        let mut out = String::new();
+        self.write_shape(&mut out);
+        out
+    }
+
+    fn write_shape(&self, out: &mut String) {
+        out.push('(');
+        out.push_str(&format!("{:?}", self.kind));
+        for c in &self.children {
+            if let Child::Node(n) = c {
+                out.push(' ');
+                n.write_shape(out);
+            }
+        }
+        out.push(')');
     }
 
     /// Every node of `kind` anywhere below here, in source order.
@@ -153,6 +214,24 @@ impl Builder {
 
     pub fn consumed(&self) -> usize {
         self.at
+    }
+
+    /// Remember where the open node's children currently end.
+    ///
+    /// A Pratt parser only learns what it was building AFTER it has built the
+    /// pieces: the left operand is parsed before the operator that will own it.
+    /// So `checkpoint` marks a position and [`Builder::wrap_from`] later folds
+    /// everything added since into a node. Tokens are still only ever consumed
+    /// in order, so the coverage guarantee is untouched.
+    pub fn checkpoint(&self) -> usize {
+        self.stack.last().unwrap().children.len()
+    }
+
+    /// Fold every child added since `cp` into one node of `kind`.
+    pub fn wrap_from(&mut self, cp: usize, kind: NodeKind) {
+        let top = self.stack.last_mut().unwrap();
+        let taken: Vec<Child> = top.children.drain(cp..).collect();
+        top.children.push(Child::Node(Node { kind, children: taken }));
     }
 
     pub fn finish(mut self) -> Result<Node, String> {

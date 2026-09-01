@@ -180,6 +180,7 @@ fn cover(roots: &[String]) -> ExitCode {
     files.sort();
     let (mut bad, mut defs, mut unparsed, mut errs) = (0usize, 0usize, 0usize, 0usize);
     let mut loose = 0usize;
+    let mut shown = 0usize;
     for f in &files {
         let Ok(src) = std::fs::read(f) else { continue };
         let parsed = parser::parse(&src);
@@ -196,6 +197,16 @@ fn cover(roots: &[String]) -> ExitCode {
         unparsed += parsed.unparsed_bodies;
         errs += parsed.errors.len();
         loose += loose_tokens(&parsed.tree);
+        if shown < 12 {
+            for u in parsed.tree.descendants(NodeKind::UnparsedBody) {
+                if let Some(t) = u.tokens().find(|t| !t.kind.is_trivia()) {
+                    println!("UNREAD {}:{}:{}: {} |{}|", f.display(), t.line, t.col,
+                             t.kind.name(), String::from_utf8_lossy(t.text(&src)));
+                    shown += 1;
+                    break;
+                }
+            }
+        }
     }
     println!("{} files, {defs} definitions, {unparsed} bodies not yet structured, {errs} parse errors",
              files.len());
