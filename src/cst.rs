@@ -59,6 +59,10 @@ pub enum NodeKind {
     PropEqType,
     /// `A * B`, `A + B` -- type-level arithmetic on bounded integers.
     ArithType,
+    /// `effect Audio where <op> : <type> ...`
+    EffectDef,
+    /// One `<op> : <type>` of an effect declaration.
+    EffectOp,
     /// `Name = record { .. }` / `Name = | A | B`
     TypeDef,
     /// The `a b` / `(a) (b)` after a type definition's name.

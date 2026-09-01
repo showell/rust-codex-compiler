@@ -219,6 +219,11 @@ pub fn parse(src: &[u8]) -> Parsed {
                 p.eat_to_end_of_line();
                 p.b.end();
             }
+            // `effect` is checked before the type-definition test because it
+            // has no `=` and would otherwise fall through to parse_def.
+            Kind::EffectKeyword if t.col == TOP_LEVEL_COL => {
+                crate::decl::parse_effect_def(&mut p)
+            }
             _ if t.col == TOP_LEVEL_COL && looks_like_type_def(&p) => {
                 crate::typedef::parse_type_def(&mut p, t)
             }

@@ -1,0 +1,148 @@
+//! The IR chapter preamble, and the gold set that grades it.
+//!
+//!     irdump preamble <unit.codex>
+//!     irdump grade <units-dir>            against $CODEX_GOLDS/ir/*.ir
+//!
+//! **The input must be a RESOLVED unit** -- the ladder's `resolve_corpus.py`
+//! writes them -- because that is what the golds were cut from. Handed a raw
+//! program, every section and constructor the prelude contributes is missing
+//! and the diff is uninformative rather than wrong.
+//!
+//! `grade` is the first whole-corpus check this front end has. `lex.truth` and
+//! `parse.truth` are one subject each; this is 1,012 programs, and it is the
+//! only oracle available before the type checker, since everything below
+//! `(defs` carries an inferred type on every node.
+
+use codexc::parser;
+use codexc::preamble;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("preamble") if args.len() == 2 => match emit(Path::new(&args[1])) {
+            Some(text) => {
+                let out = std::io::stdout();
+                let _ = writeln!(out.lock(), "{text}");
+                ExitCode::SUCCESS
+            }
+            None => ExitCode::from(2),
+        },
+        Some("grade") if args.len() == 2 => grade(Path::new(&args[1])),
+        _ => {
+            eprintln!("usage: irdump preamble <unit.codex>");
+            eprintln!("       irdump grade <units-dir>");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn emit(path: &Path) -> Option<String> {
+    let src = std::fs::read(path).ok()?;
+    let parsed = parser::parse(&src);
+    Some(preamble::emit(&parsed.tree, &src))
+}
+
+/// The gold's preamble: everything up to and including the `(defs` opener.
+fn gold_preamble(ir: &str) -> Option<&str> {
+    let at = ir.find("\n  (defs")?;
+    Some(&ir[..at + "\n  (defs".len()])
+}
+
+/// Which line first differs, and what the two sides say there. A whole-file
+/// diff of a 60 KB preamble names nothing; the first differing line names the
+/// form that is wrong.
+fn first_difference(gold: &str, ours: &str) -> (usize, String, String) {
+    let (g, o): (Vec<&str>, Vec<&str>) = (gold.lines().collect(), ours.lines().collect());
+    for i in 0..g.len().max(o.len()) {
+        let (a, b) = (g.get(i).copied().unwrap_or("<none>"), o.get(i).copied().unwrap_or("<none>"));
+        if a != b {
+            return (i + 1, clip(a), clip(b));
+        }
+    }
+    (0, String::new(), String::new())
+}
+
+fn clip(s: &str) -> String {
+    if s.len() <= 150 {
+        return s.to_string();
+    }
+    format!("{}...", &s[..150.min(s.len())])
+}
+
+/// The field a differing line belongs to, so failures group by CAUSE rather
+/// than by program. One missing form in the prelude is 1,012 programs.
+fn field_of(line: &str) -> String {
+    let t = line.trim_start();
+    for name in [
+        "(chapter", "(title", "(prose", "(pblocks", "(anns", "(sections", "(ctors", "(eff-ops",
+        "(grounds", "(type-defs", "(rec-def", "(var-def", "(unit-def", "(defs",
+    ] {
+        if t.starts_with(name) {
+            return name.trim_start_matches('(').to_string();
+        }
+    }
+    "other".to_string()
+}
+
+fn grade(dir: &Path) -> ExitCode {
+    let Ok(golds) = std::env::var("CODEX_GOLDS") else {
+        eprintln!("CODEX_GOLDS is not set; it names the bank, and a bank is never guessed at");
+        return ExitCode::from(2);
+    };
+    let ir_dir = PathBuf::from(&golds).join("ir");
+    let Ok(rd) = std::fs::read_dir(&ir_dir) else {
+        eprintln!("{}: cannot read", ir_dir.display());
+        return ExitCode::from(2);
+    };
+    let mut names: Vec<String> = rd
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "ir"))
+        .filter_map(|e| e.path().file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .collect();
+    names.sort();
+
+    let (mut matched, mut missing_unit, mut shown) = (0usize, 0usize, 0usize);
+    let mut by_field: std::collections::HashMap<String, (usize, String)> = Default::default();
+    for name in &names {
+        let unit = dir.join(format!("{name}.codex"));
+        let Ok(src) = std::fs::read(&unit) else {
+            missing_unit += 1;
+            continue;
+        };
+        let Ok(ir) = std::fs::read_to_string(ir_dir.join(format!("{name}.ir"))) else { continue };
+        let Some(gold) = gold_preamble(&ir) else { continue };
+        let ours = preamble::emit(&parser::parse(&src).tree, &src);
+        if gold == ours {
+            matched += 1;
+            continue;
+        }
+        let (line, want, got) = first_difference(gold, &ours);
+        let slot = by_field
+            .entry(field_of(&want))
+            .or_insert_with(|| (0, format!("{name}:{line}\n      gold {want}\n      ours {got}")));
+        slot.0 += 1;
+        shown += 1;
+    }
+
+    let total = names.len();
+    println!("{matched} of {total} preambles byte-identical ({:.1}%)",
+             100.0 * matched as f64 / total.max(1) as f64);
+    if missing_unit > 0 {
+        println!("{missing_unit} gold(s) had no resolved unit in {}", dir.display());
+    }
+    let mut ranked: Vec<_> = by_field.into_iter().collect();
+    ranked.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    for (field, (n, example)) in &ranked {
+        println!("  {n} x first differ in {field}   e.g. {example}");
+    }
+    let _ = shown;
+    if matched == total {
+        println!("PREAMBLE MATCHES: every gold chapter header reproduces byte for byte");
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}

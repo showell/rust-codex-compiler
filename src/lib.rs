@@ -5,9 +5,11 @@
 pub mod block;
 pub mod charcode;
 pub mod cst;
+pub mod decl;
 pub mod expr;
 pub mod lexer;
 pub mod parser;
+pub mod preamble;
 pub mod pattern;
 pub mod token;
 pub mod typedef;
