@@ -10,6 +10,7 @@ pub mod cst;
 pub mod decl;
 pub mod desugar;
 pub mod expr;
+pub mod interp;
 pub mod lexer;
 pub mod parser;
 pub mod preamble;
