@@ -47,21 +47,36 @@ fn main() -> ExitCode {
 /// one program takes the whole sweep with it -- which is what the first sweep
 /// after the builtins landed did.
 fn run(path: &Path) -> Result<String, String> {
+    run_in_thread(path, None)
+}
+
+fn run_in_thread(path: &Path, budget: Option<u64>) -> Result<String, String> {
     let p = path.to_path_buf();
     std::thread::Builder::new()
         .stack_size(512 * 1024 * 1024)
-        .spawn(move || run_here(&p))
+        .spawn(move || run_bounded(&p, budget))
         .map_err(|e| e.to_string())?
         .join()
         .map_err(|_| "the interpreter thread died".to_string())?
 }
 
 fn run_here(path: &Path) -> Result<String, String> {
+    run_bounded(path, None)
+}
+
+/// The sweep bounds each program; a single run does not. `ride-unit` simulates
+/// a whole ride and legitimately needs hundreds of millions of steps.
+const SWEEP_BUDGET: u64 = 60_000_000;
+
+fn run_bounded(path: &Path, budget: Option<u64>) -> Result<String, String> {
     let src = std::fs::read(path).map_err(|e| e.to_string())?;
     let parsed = parser::parse(&src);
     let mut dg = Desugar::new(&src);
     let ch = dg.chapter(&parsed.tree);
     let mut it = Interp::new(&ch);
+    if let Some(b) = budget {
+        it = it.with_budget(b);
+    }
     match it.run() {
         Ok(()) => Ok(std::mem::take(&mut it.out)),
         // The partial output comes back with the error: seeing which line it
@@ -94,7 +109,7 @@ fn sweep(units: &Path, tests: &Path) -> ExitCode {
         }
         ran += 1;
         let want = std::fs::read_to_string(exp).unwrap_or_default();
-        match run(&unit) {
+        match run_in_thread(&unit, Some(SWEEP_BUDGET)) {
             Ok(got) if got == want => matched += 1,
             Ok(got) => {
                 let first = want

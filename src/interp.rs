@@ -43,6 +43,11 @@ pub struct Closure {
     pub body: Rc<Expr>,
     pub env: Env,
     pub applied: Vec<Value>,
+    /// The chapter this closure's body was written in, when it came from a
+    /// top-level definition. A name that COLLIDES across chapters resolves to
+    /// the one in the same chapter as the reference, so a body has to know
+    /// where it lives.
+    pub slug: Option<String>,
 }
 
 pub type Env = Rc<Scope>;
@@ -87,6 +92,16 @@ fn err<T>(msg: impl Into<String>) -> R<T> {
     Err(Error(msg.into()))
 }
 
+/// Stamp a location on an error that does not have one. The innermost frame
+/// wins, which is the one a reader wants.
+fn at(e: Error, sp: Span) -> Error {
+    if e.0.starts_with('L') {
+        e
+    } else {
+        Error(format!("L{}C{}: {}", sp.line, sp.col, e.0))
+    }
+}
+
 /// A record field whose declared type carries a bound, and what to do at it.
 struct FieldBound {
     lo: i64,
@@ -101,16 +116,27 @@ pub struct Interp {
     bounds: HashMap<(String, String), FieldBound>,
     /// Which constructors exist, and how many fields each takes.
     ctors: HashMap<String, usize>,
+    /// `(chapter, name) -> definition`, for the names defined in more than one
+    /// chapter of a bundled unit. `drive-unit.codex` has two `bar-quad`s --
+    /// one over `ScreenPt` and one over `RiderPt` -- and keeping only the last
+    /// silently gave the wrong one to every caller of the other.
+    by_chapter: HashMap<(String, String), Rc<Def>>,
+    /// The chapter whose body is currently running.
+    cur_slug: String,
+    pub collisions: Vec<String>,
     pub out: String,
     steps: u64,
     depth: u32,
+    limit: u64,
 }
 
-/// A budget, not a limit on legitimate work: `arith.codex` solves eight queens
-/// in about 4 million steps, so this is roughly 25x the densest program we
-/// know finishes. A sweep has to be bounded by SOMETHING or one runaway
-/// program owns the machine.
-const STEP_LIMIT: u64 = 100_000_000;
+/// The default budget for ONE program: effectively none.
+///
+/// A step limit exists to bound a SWEEP, where one runaway program would
+/// otherwise own the machine. Applying a sweep's budget to a single run makes
+/// the tool refuse work it could do -- `ride-unit` simulates a whole ride and
+/// legitimately needs hundreds of millions of steps.
+const STEP_LIMIT: u64 = u64::MAX;
 /// Codex recursion is unbounded and ours is a Rust call stack, so a runaway
 /// program has to be caught by a counter rather than by the operating system:
 /// a stack overflow aborts the process and takes the whole sweep with it.
@@ -122,13 +148,30 @@ impl Interp {
             defs: HashMap::new(),
             bounds: HashMap::new(),
             ctors: HashMap::new(),
+            by_chapter: HashMap::new(),
+            cur_slug: String::new(),
+            collisions: Vec::new(),
             out: String::new(),
             steps: 0,
             depth: 0,
+            limit: STEP_LIMIT,
         };
+        let mut owners: HashMap<String, Vec<String>> = HashMap::new();
         for d in &ch.defs {
-            it.defs.insert(d.name.clone(), Rc::new(d.clone()));
+            let rc = Rc::new(d.clone());
+            it.defs.insert(d.name.clone(), rc.clone());
+            it.by_chapter.insert((d.chapter_slug.clone(), d.name.clone()), rc);
+            let slugs = owners.entry(d.name.clone()).or_default();
+            if !slugs.contains(&d.chapter_slug) {
+                slugs.push(d.chapter_slug.clone());
+            }
         }
+        it.collisions = owners
+            .into_iter()
+            .filter(|(_, s)| s.len() > 1)
+            .map(|(n, _)| n)
+            .collect();
+        it.collisions.sort();
         for t in &ch.type_defs {
             match t {
                 TypeDef::Record(name, _, fields, ..) => {
@@ -152,11 +195,19 @@ impl Interp {
         it
     }
 
+    /// Bound this run to a number of steps. The sweep sets one; a single run
+    /// does not.
+    pub fn with_budget(mut self, steps: u64) -> Self {
+        self.limit = steps;
+        self
+    }
+
     /// Run `opening`, the entry point every Codex program has.
     pub fn run(&mut self) -> R<()> {
         let Some(open) = self.defs.get("opening").cloned() else {
             return err("no `opening` definition to run");
         };
+        self.cur_slug = open.chapter_slug.clone();
         let env = Scope::root();
         self.eval(&open.body, &env)?;
         Ok(())
@@ -164,7 +215,7 @@ impl Interp {
 
     fn eval(&mut self, e: &Expr, env: &Env) -> R<Value> {
         self.steps += 1;
-        if self.steps > STEP_LIMIT {
+        if self.steps > self.limit {
             return err("step limit reached; the program did not finish");
         }
         self.depth += 1;
@@ -181,13 +232,31 @@ impl Interp {
         match e {
             Expr::Lit(text, kind, _) => literal(text, *kind),
             Expr::NameRef(n, _) => self.lookup(n, env),
-            Expr::Apply(f, a, _) => {
+            Expr::Apply(f, a, sp) => {
                 let func = self.eval(f, env)?;
                 let arg = self.eval(a, env)?;
-                self.apply(func, arg)
+                // The innermost application is the one worth naming, so a
+                // location is added only if none is there yet.
+                self.apply(func, arg).map_err(|e| at(e, *sp))
             }
             Expr::Binary(l, op, r, _) => {
+                // `and` and `or` SHORT-CIRCUIT, and programs depend on it for
+                // safety rather than speed:
+                //
+                //   list-length c.segs > 0 and list-at c.segs (... - 1) == s
+                //
+                // evaluates `list-at` on an empty list if the right operand is
+                // taken eagerly. `&` is short-circuited too when its left is a
+                // boolean -- for text, lists and integers it is not a
+                // conjunction at all, and the left says which.
                 let a = self.eval(l, env)?;
+                match (op, &a) {
+                    (BinaryOp::OpBoolAnd | BinaryOp::OpAnd, Value::Bool(false)) => {
+                        return Ok(Value::Bool(false))
+                    }
+                    (BinaryOp::OpOr, Value::Bool(true)) => return Ok(Value::Bool(true)),
+                    _ => {}
+                }
                 let b = self.eval(r, env)?;
                 binary(*op, a, b)
             }
@@ -214,6 +283,7 @@ impl Interp {
                 body: Rc::new((**body).clone()),
                 env: env.clone(),
                 applied: Vec::new(),
+                slug: Some(self.cur_slug.clone()),
             }))),
             Expr::Match(scrut, arms, _) | Expr::Induction(scrut, arms, _) => {
                 let v = self.eval(scrut, env)?;
@@ -240,13 +310,25 @@ impl Interp {
                 }
                 Ok(Value::Record(Rc::new(name.clone()), Rc::new(out)))
             }
-            Expr::FieldAccess(obj, field, _) => match self.eval(obj, env)? {
-                Value::Record(_, fs) => fs
+            Expr::FieldAccess(obj, field, sp) => match self.eval(obj, env)? {
+                Value::Record(name, fs) => fs
                     .iter()
                     .find(|(n, _)| n == field)
                     .map(|(_, v)| v.clone())
-                    .ok_or_else(|| Error(format!("no field `{field}`"))),
-                v => err(format!("field access on {}", type_name(&v))),
+                    .ok_or_else(|| {
+                        Error(format!(
+                            "L{}C{}: `{name}` has no field `{field}` (it has {})",
+                            sp.line,
+                            sp.col,
+                            fs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ")
+                        ))
+                    }),
+                v => err(format!(
+                    "L{}C{}: field `{field}` read from {}",
+                    sp.line,
+                    sp.col,
+                    type_name(&v)
+                )),
             },
             Expr::Act(stmts, _) => {
                 let mut env = env.clone();
@@ -295,7 +377,9 @@ impl Interp {
         if let Some(v) = env.get(n) {
             return Ok(v);
         }
-        if let Some(d) = self.defs.get(n).cloned() {
+        // The same chapter wins for a name defined in more than one.
+        let same_chapter = self.by_chapter.get(&(self.cur_slug.clone(), n.to_string())).cloned();
+        if let Some(d) = same_chapter.or_else(|| self.defs.get(n).cloned()) {
             if d.params.is_empty() {
                 // A constant, evaluated on each reference. Codex is pure, so
                 // this is a cost and not a semantic difference.
@@ -307,6 +391,7 @@ impl Interp {
                 body: Rc::new(d.body.clone()),
                 env: Scope::root(),
                 applied: Vec::new(),
+                slug: Some(d.chapter_slug.clone()),
             })));
         }
         if let Some(arity) = self.ctors.get(n).copied() {
@@ -318,6 +403,7 @@ impl Interp {
                 body: Rc::new(Expr::NameRef(format!("__ctor:{n}"), Span::default())),
                 env: Scope::root(),
                 applied: Vec::new(),
+                slug: None,
             })));
         }
         if is_builtin(n) {
@@ -326,6 +412,7 @@ impl Interp {
                 body: Rc::new(Expr::NameRef(format!("__builtin:{n}"), Span::default())),
                 env: Scope::root(),
                 applied: Vec::new(),
+                slug: None,
             })));
         }
         // A capitalised unknown is a nullary constructor the type definitions
@@ -354,7 +441,11 @@ impl Interp {
                 c.params.iter().cloned().zip(applied.into_iter()).collect();
             let env = Scope::child(&c.env, vars);
             let body = c.body.clone();
-            match self.eval_tail(&body, &env)? {
+            let next_slug = c.slug.clone().unwrap_or_else(|| self.cur_slug.clone());
+            let saved = std::mem::replace(&mut self.cur_slug, next_slug);
+            let stepped = self.eval_tail(&body, &env);
+            self.cur_slug = saved;
+            match stepped? {
                 Step::Done(v) => return Ok(v),
                 Step::Call(next, args) => {
                     c = next;
@@ -371,7 +462,7 @@ impl Interp {
     /// and the last statement of an `act`.
     fn eval_tail(&mut self, e: &Expr, env: &Env) -> R<Step> {
         self.steps += 1;
-        if self.steps > STEP_LIMIT {
+        if self.steps > self.limit {
             return err("step limit reached; the program did not finish");
         }
         match e {
@@ -448,6 +539,7 @@ impl Interp {
                 body: c.body.clone(),
                 env: c.env.clone(),
                 applied,
+                slug: c.slug.clone(),
             }))));
         }
         Ok(Step::Call(c, applied))
@@ -533,10 +625,10 @@ impl Interp {
 
             // -- lists --------------------------------------------------------
             ("list-length", [List(xs)]) => Ok(Int(xs.len() as i64)),
-            ("list-at", [List(xs), Int(i)]) => xs
-                .get(*i as usize)
-                .cloned()
-                .ok_or_else(|| Error(format!("list-at {i} past the end"))),
+            ("list-at", [List(xs), Int(i)]) => (*i >= 0)
+                .then(|| xs.get(*i as usize).cloned())
+                .flatten()
+                .ok_or_else(|| Error(format!("list-at {i} of a {}-element list", xs.len()))),
             ("list-push", [List(xs), v]) => {
                 let mut out = (**xs).clone();
                 out.push(v.clone());
