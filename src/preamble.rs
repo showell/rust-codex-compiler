@@ -51,7 +51,7 @@ use crate::token::Kind;
 ///
 /// A byte at or above 128 is a CCE tier-1 lead, and every char-code is under
 /// 97, so any such character sorts after every tier-0 one either way.
-fn cce_key(s: &str) -> Vec<u8> {
+pub fn cce_key(s: &str) -> Vec<u8> {
     s.bytes()
         .map(|b| if (b as usize) < CHAR_CODE.len() { CHAR_CODE[b as usize] } else { b })
         .collect()

@@ -95,22 +95,47 @@ impl<'a> Desugar<'a> {
                 _ => Expr::Error("if".into(), sp),
             },
             NodeKind::LetExpr => {
-                let binds: Vec<LetBind> = n
-                    .children_of(NodeKind::LetBinding)
-                    .map(|b| LetBind {
-                        name: self.name_of(b),
-                        value: b
-                            .child_nodes()
-                            .last()
-                            .map_or(Expr::Error(String::new(), sp), |v| self.expr(v)),
-                        span: head_span(b),
-                    })
-                    .collect();
                 let body = kids
                     .iter()
                     .rfind(|k| k.kind != NodeKind::LetBinding)
                     .map_or(Expr::Error(String::new(), sp), |b| self.expr(b));
-                Expr::Let(binds, Box::new(body), sp)
+                let mut binds: Vec<LetBind> = Vec::new();
+                let mut inner = body;
+                for b in n.children_of(NodeKind::LetBinding) {
+                    let value = b
+                        .child_nodes()
+                        .last()
+                        .map_or(Expr::Error(String::new(), sp), |v| self.expr(v));
+                    // `let (x, y) = p in body` is NOT a binding: upstream's
+                    // `finish-let-pattern` makes it a one-armed MATCH over the
+                    // value, which is the only way the pattern's variables
+                    // reach the body. Reading it as a binding named after the
+                    // first variable loses every other one -- `y` was
+                    // undefined in all 1,226 units of the corpus, because the
+                    // prelude's `snd` is written this way.
+                    if let Some(pn) = b.child_nodes().into_iter().find(|k| is_pattern(k.kind)) {
+                        let dp = self.pat(pn);
+                        let arm = MatchArm {
+                            pattern: dp,
+                            body: inner,
+                            guard: Expr::Lit("True".into(), LiteralKind::BoolLit, Span::default()),
+                            span: head_span(pn),
+                            alt_group: head_span(pn).offset,
+                        };
+                        inner = Expr::Match(Box::new(value), vec![arm], sp);
+                        break;
+                    }
+                    binds.push(LetBind {
+                        name: self.name_of(b),
+                        value,
+                        span: head_span(b),
+                    });
+                }
+                if binds.is_empty() {
+                    inner
+                } else {
+                    Expr::Let(binds, Box::new(inner), sp)
+                }
             }
             NodeKind::SeqExpr => match kids.as_slice() {
                 // `stmt in rest` is a let binding nobody wrote.

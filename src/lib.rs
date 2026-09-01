@@ -4,6 +4,7 @@
 
 pub mod ast;
 pub mod block;
+pub mod builtins;
 pub mod charcode;
 pub mod cst;
 pub mod decl;
@@ -12,6 +13,7 @@ pub mod expr;
 pub mod lexer;
 pub mod parser;
 pub mod preamble;
+pub mod scope;
 pub mod pattern;
 pub mod token;
 pub mod typedef;

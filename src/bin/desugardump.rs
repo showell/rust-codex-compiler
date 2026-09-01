@@ -22,17 +22,21 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some("truth") if args.len() == 2 => truth(Path::new(&args[1])),
+        Some("truth") if args.len() == 2 => truth(Path::new(&args[1]), false),
+        // The scope rung's truth is the desugar one with a `--- scope ---`
+        // section after it: every rung truth carries the ones below it.
+        Some("scope") if args.len() == 2 => truth(Path::new(&args[1]), true),
         Some("cover") if args.len() >= 2 => cover(&args[1..]),
         _ => {
             eprintln!("usage: desugardump truth <file.codex>");
+            eprintln!("       desugardump scope <file.codex>");
             eprintln!("       desugardump cover <path>...");
             ExitCode::from(2)
         }
     }
 }
 
-fn truth(path: &Path) -> ExitCode {
+fn truth(path: &Path, scope: bool) -> ExitCode {
     let Ok(src) = std::fs::read(path) else {
         eprintln!("{}: cannot read", path.display());
         return ExitCode::from(2);
@@ -104,6 +108,27 @@ fn truth(path: &Path) -> ExitCode {
     let _ = writeln!(w, ".");
     let _ = writeln!(w, "a-rt-names {}", ch.rt_names.len());
     let _ = writeln!(w, "a-conversions {}", ch.conversions.len());
+    if scope {
+        let r = codexc::scope::resolve(&ch);
+        let _ = writeln!(w, "--- scope ---");
+        // The count belongs in the dump; WHICH names belong on stderr, so a
+        // diff against the truth stays clean while a failure is diagnosable.
+        for e in &r.errors {
+            eprintln!("{}:{}:{}: {}", path.display(), e.span.line, e.span.col, e.msg);
+        }
+        let _ = writeln!(w, "resolve-errors {}", codexc::scope::bag_error_count(r.errors.len()));
+        let _ = writeln!(w, "top-level-names {}", r.top_level_names.len());
+        let _ = writeln!(w, "type-names {}", r.type_names.len());
+        let _ = writeln!(w, "ctor-names {}", r.ctor_names.len());
+        for c in &r.ctor_names {
+            let _ = writeln!(w, "ctor {c}");
+        }
+        let _ = writeln!(w, ".");
+        for t in &r.top_level_names {
+            let _ = writeln!(w, "top {t}");
+        }
+        let _ = writeln!(w, ".");
+    }
     let _ = writeln!(w, "---");
     let _: &ast::Chapter = &ch;
     ExitCode::SUCCESS
@@ -122,7 +147,8 @@ fn cover(roots: &[String]) -> ExitCode {
         collect(Path::new(r), &mut files);
     }
     files.sort();
-    let (mut nodes, mut errs, mut defs) = (0usize, 0usize, 0usize);
+    let (mut nodes, mut errs, mut defs, mut resolve_errs) = (0usize, 0usize, 0usize, 0usize);
+    let mut by_unresolved: std::collections::HashMap<String, (usize, String)> = Default::default();
     let mut by_cause: std::collections::HashMap<String, usize> = Default::default();
     let (mut secs, mut bytes) = (0f64, 0usize);
     for f in &files {
@@ -134,6 +160,18 @@ fn cover(roots: &[String]) -> ExitCode {
         secs += t0.elapsed().as_secs_f64();
         bytes += src.len();
         defs += ch.defs.len();
+        // Every gold program compiles, so a RESOLVED unit that reports an
+        // undefined name is our scope rule being wrong, not the program's.
+        // The rung truth proves the pass runs (21 errors on an unresolved
+        // subject); this proves it does not fire where it must not.
+        let r = codexc::scope::resolve(&ch);
+        for e in &r.errors {
+            by_unresolved
+                .entry(e.msg.clone())
+                .or_insert_with(|| (0, format!("{}", f.display())))
+                .0 += 1;
+        }
+        resolve_errs += r.errors.len();
         for d in &ch.defs {
             d.body.walk(&mut |e| {
                 nodes += 1;
@@ -149,12 +187,18 @@ fn cover(roots: &[String]) -> ExitCode {
              100.0 * errs as f64 / nodes.max(1) as f64);
     println!("desugar: {bytes} bytes in {secs:.3}s, {:.1} MB/s",
              bytes as f64 / secs.max(1e-9) / 1_048_576.0);
+    println!("{resolve_errs} name(s) the scope pass could not resolve");
+    let mut un: Vec<_> = by_unresolved.into_iter().collect();
+    un.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(&b.0)));
+    for (msg, (n, at)) in un.iter().take(10) {
+        println!("  {n} x {msg}   e.g. {at}");
+    }
     let mut ranked: Vec<_> = by_cause.into_iter().collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     for (why, n) in ranked.iter().take(12) {
         println!("  {n} x could not translate {why}");
     }
-    if errs == 0 && nodes > 0 {
+    if errs == 0 && nodes > 0 && resolve_errs == 0 {
         println!("DESUGARED: every expression in every definition became an AST node");
         ExitCode::SUCCESS
     } else {
