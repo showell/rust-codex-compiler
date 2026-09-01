@@ -156,6 +156,32 @@ fn collect(root: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Is this one of the compiler's own diagnostic tests?
+///
+/// `codex/test/errors/` holds programs the compiler is SUPPOSED to decline,
+/// and they are the second gold set -- a diagnostic we produce there is output,
+/// not a defect. Lumping them in with the rest makes a parse-error total that
+/// goes UP as the front end gets better, which is a number nobody can use. The
+/// test is the directory, so it is a heuristic and named as one; the gold
+/// bank's `refused.tsv` is the authority when the two disagree.
+fn is_diagnostic_test(p: &Path) -> bool {
+    p.components().any(|c| c.as_os_str() == "errors")
+}
+
+fn is_pattern(k: NodeKind) -> bool {
+    matches!(
+        k,
+        NodeKind::VarPat
+            | NodeKind::LitPat
+            | NodeKind::CtorPat
+            | NodeKind::WildPat
+            | NodeKind::TuplePat
+            | NodeKind::ParenPat
+            | NodeKind::VecPat
+            | NodeKind::ErrPat
+    )
+}
+
 /// Nodes of `kind` that hold no child NODE -- a bag of tokens and nothing else.
 fn childless(tree: &Node, kind: NodeKind) -> usize {
     tree.descendants(kind).iter().filter(|n| n.count_any_node() == 0).count()
@@ -184,13 +210,21 @@ fn cover(roots: &[String]) -> ExitCode {
     }
     files.sort();
     let (mut bad, mut defs, mut unparsed, mut errs) = (0usize, 0usize, 0usize, 0usize);
+    let mut expected_errs = 0usize;
     // What the parser is complaining ABOUT, not just how often. A total of 144
     // says nothing; "expected 'in' after a let binding, 96 times" names the
     // grammar rule that is missing.
-    let mut by_msg: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut by_msg: std::collections::HashMap<String, (usize, String)> =
+        std::collections::HashMap::new();
     let mut loose = 0usize;
     let mut shown = 0usize;
-    let (mut flat_pat, mut flat_type, mut flat_td, mut flat_act) = (0usize, 0usize, 0usize, 0usize);
+    let (mut flat_type, mut flat_td, mut flat_act) = (0usize, 0usize, 0usize);
+    // Patterns are no longer a token bag, so "flat" says nothing about them --
+    // `is Red` is a childless CtorPat and is exactly right. What matters is
+    // how many tokens landed in pattern position without being understood,
+    // and, so that a zero cannot come from a parser that never ran, how many
+    // patterns there are at all.
+    let (mut pats, mut err_pats, mut arms, mut guards, mut alts) = (0usize, 0usize, 0usize, 0usize, 0usize);
     let mut unread_ty = 0usize;
     for f in &files {
         let Ok(src) = std::fs::read(f) else { continue };
@@ -206,16 +240,38 @@ fn cover(roots: &[String]) -> ExitCode {
         }
         defs += parsed.tree.descendants(NodeKind::Def).len();
         unparsed += parsed.unparsed_bodies;
-        errs += parsed.errors.len();
+        if is_diagnostic_test(f) {
+            expected_errs += parsed.errors.len();
+        } else {
+            errs += parsed.errors.len();
+        }
         for e in &parsed.errors {
-            *by_msg.entry(e.msg.clone()).or_default() += 1;
+            // One example location per message. A count says a rule is
+            // missing; the location says which line to go and read.
+            let slot = by_msg
+                .entry(e.msg.clone())
+                .or_insert_with(|| (0, format!("{}:{}:{}", f.display(), e.line, e.col)));
+            slot.0 += 1;
         }
         loose += loose_tokens(&parsed.tree);
         unread_ty += parsed.unread_types;
         // FLAT means childless: a node holding only tokens. Counting the
         // wrapper instead would have kept reporting 4,858 flat type
         // expressions the moment they all gained structure.
-        flat_pat += childless(&parsed.tree, NodeKind::Pattern);
+        for k in [NodeKind::VarPat, NodeKind::LitPat, NodeKind::CtorPat, NodeKind::WildPat,
+                  NodeKind::TuplePat, NodeKind::ParenPat, NodeKind::VecPat] {
+            pats += parsed.tree.descendants(k).len();
+        }
+        err_pats += parsed.tree.descendants(NodeKind::ErrPat).len();
+        guards += parsed.tree.descendants(NodeKind::Guard).len();
+        for a in parsed.tree.descendants(NodeKind::MatchArm) {
+            arms += 1;
+            // An arm's children are its patterns, an optional guard and its
+            // body, so more than one pattern means `|` fanned it out.
+            if a.child_nodes().iter().filter(|n| is_pattern(n.kind)).count() > 1 {
+                alts += 1;
+            }
+        }
         flat_type += childless(&parsed.tree, NodeKind::TypeExpr);
         flat_td += childless(&parsed.tree, NodeKind::TypeDef);
         for k in [NodeKind::ActBlock, NodeKind::TryExpr, NodeKind::HandleExpr, NodeKind::WithTimeout] {
@@ -234,24 +290,27 @@ fn cover(roots: &[String]) -> ExitCode {
     }
     println!("{} files, {defs} definitions, {unparsed} bodies not yet structured, {errs} parse errors",
              files.len());
+    println!("{expected_errs} more in test/errors/, where a diagnostic is the point");
     println!("{loose} token(s) landed in no construct");
     let mut ranked: Vec<_> = by_msg.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    for (msg, n) in ranked.iter().take(10) {
-        println!("  {n} x {msg}");
+    ranked.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(&b.0)));
+    for (msg, (n, at)) in ranked.iter().take(30) {
+        println!("  {n} x {msg}   e.g. {at}");
     }
     // What is still a bag of tokens rather than a tree. The desugarer consumes
     // exactly these, so the number is the size of the work between here and
     // there -- not a warning, an inventory.
     println!("{unread_ty} annotation(s) whose type was not fully read");
-    println!("still flat: {flat_pat} patterns, {flat_type} type expressions, \
-{flat_td} type definitions, {flat_act} act/trying/with blocks");
+    println!("{pats} patterns in {arms} match arms; {alts} arms alternate, {guards} are guarded");
+    println!("{err_pats} token(s) in pattern position not understood");
+    println!("still flat: {flat_type} type expressions, {flat_td} type definitions, \
+{flat_act} act/trying/with blocks");
     // Coverage alone is a weak claim and was measured to be: a parser that
     // stopped consuming definition bodies still passed it, because the orphaned
     // tokens simply reappeared as loose lines and were still counted once. So
     // the gate is coverage AND homelessness -- every token in the tree, and
     // almost none of them outside a named construct.
-    if bad == 0 && loose <= loose_budget(files.len()) {
+    if bad == 0 && loose <= loose_budget(files.len()) && err_pats == 0 {
         println!("COVERED: every lexer token reaches the tree exactly once, inside a construct");
         ExitCode::SUCCESS
     } else {
@@ -260,6 +319,9 @@ fn cover(roots: &[String]) -> ExitCode {
         }
         if loose > loose_budget(files.len()) {
             println!("TOO MANY LOOSE TOKENS: {loose} > {}", loose_budget(files.len()));
+        }
+        if err_pats > 0 {
+            println!("UNREAD PATTERNS: {err_pats}");
         }
         ExitCode::FAILURE
     }

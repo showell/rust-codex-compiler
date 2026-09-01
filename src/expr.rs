@@ -429,16 +429,75 @@ fn parse_if(p: &mut Parser<'_>, cp: usize) -> NodeKind {
     NodeKind::IfExpr
 }
 
+/// `let a = 1, b = 2 in body`.
+///
+/// **A `let` binds a LIST**, and the comma between bindings is optional:
+/// upstream loops back into `parse-let-bindings` whether or not it saw one, so
+/// bindings stacked on their own lines are as ordinary as a comma-separated
+/// run. Reading exactly one binding and then demanding `in` is what made ten
+/// files in the checkout report a parse error they do not have.
+///
+/// **A parenthesised binding is a PATTERN binding and it ends the list**:
+/// `let (a, b) = p in body`. Upstream turns it into a one-armed match over the
+/// value, which is a desugaring; the tree keeps the pattern where it was
+/// written.
 fn parse_let(p: &mut Parser<'_>, cp: usize) -> NodeKind {
     p.bump(); // let
-    let bcp = p.b.checkpoint();
-    // A binding is `name = expr` or a pattern followed by `=`.
-    while let Some(t) = p.sig(0) {
-        if t.kind == Kind::Equals || t.kind == Kind::EndOfFile || t.kind == Kind::Newline {
-            break;
+    p.skip_newlines();
+    loop {
+        let bcp = p.b.checkpoint();
+        match p.kind(0) {
+            Some(Kind::LeftParen) => {
+                p.bump();
+                crate::pattern::paren_or_tuple(p, bcp);
+                let_value(p);
+                p.b.wrap_from(bcp, NodeKind::LetBinding);
+                break; // a pattern binding is the last one
+            }
+            Some(Kind::Identifier) => {
+                p.bump();
+                let_value(p);
+                p.b.wrap_from(bcp, NodeKind::LetBinding);
+            }
+            // A keyword used as a binding name is taken as the name and
+            // reported, so one mistake is one diagnostic. The `=` lookahead is
+            // upstream's: without it, the `in` that ends the list would be
+            // read as a binding called `in`.
+            Some(k)
+                if crate::pattern::is_reserved_keyword(k) && p.kind(1) == Some(Kind::Equals) =>
+            {
+                if let Some(t) = p.sig(0) {
+                    p.err(format!(
+                        "'{}' is a reserved keyword and cannot be used as a let-binding name; rename it",
+                        String::from_utf8_lossy(&t.text(p.src))
+                    ));
+                }
+                p.bump();
+                let_value(p);
+                p.b.wrap_from(bcp, NodeKind::LetBinding);
+            }
+            _ => break,
         }
-        p.bump();
+        p.skip_newlines();
+        if p.kind(0) == Some(Kind::Comma) {
+            p.bump();
+            p.skip_newlines();
+        }
     }
+    if p.kind(0) == Some(Kind::InKeyword) {
+        p.bump();
+        p.skip_newlines();
+        parse_expr(p);
+    } else {
+        p.err("expected 'in' after let bindings");
+        parse_expr(p);
+    }
+    p.b.wrap_from(cp, NodeKind::LetExpr);
+    NodeKind::LetExpr
+}
+
+/// The `= value` half of a binding, shared by the name and pattern forms.
+fn let_value(p: &mut Parser<'_>) {
     if p.kind(0) == Some(Kind::Equals) {
         p.bump();
         p.skip_newlines();
@@ -446,45 +505,80 @@ fn parse_let(p: &mut Parser<'_>, cp: usize) -> NodeKind {
     } else {
         p.err("expected '=' in a let binding");
     }
-    p.b.wrap_from(bcp, NodeKind::LetBinding);
-    p.skip_newlines();
-    if p.kind(0) == Some(Kind::InKeyword) {
-        p.bump();
-        p.skip_newlines();
-        parse_expr(p);
-    } else {
-        p.err("expected 'in' after a let binding");
-    }
-    p.b.wrap_from(cp, NodeKind::LetExpr);
-    NodeKind::LetExpr
 }
 
-/// `when e is Pat -> body is otherwise -> body`, and `induction` shares the
-/// shape. Arms run until something that is not another `is`.
+/// `when e is Pat -> body`, and `induction` shares the shape.
+///
+/// Three things here are not guessable from the surface.
+///
+/// **An arm continues the match when it starts on the same line as the arm
+/// before it, or at the column the arms are aligned on** -- upstream's
+/// `parse-match-branches`, and `ln` means the line of the arm being continued
+/// FROM, not the line the match started on. Passing the match's own line
+/// through instead silently ends the match at the second arm of the second
+/// line, taking every later arm with it.
+///
+/// **`|` separates alternative patterns for one body.** Upstream fans them out
+/// into one `MatchArm` per pattern sharing a body; a lossless tree cannot
+/// duplicate the body, so the arm keeps all its patterns and the desugarer
+/// does the fanning.
+///
+/// **`when` after a pattern is a GUARD**, not a nested match. Reading to the
+/// arrow and calling the lot a pattern swallows the guard whole.
 fn parse_match(p: &mut Parser<'_>, cp: usize, kind: NodeKind) -> NodeKind {
     p.bump(); // when / induction
-    parse_expr(p);
-    p.skip_newlines();
-    while p.kind(0) == Some(Kind::IsKeyword) {
-        let acp = p.b.checkpoint();
-        p.bump(); // is
-        let pcp = p.b.checkpoint();
-        // The pattern runs to the arrow. Patterns have their own grammar; the
-        // tokens are kept under one node until it is written.
-        while let Some(t) = p.sig(0) {
-            if t.kind == Kind::FatArrow || t.kind == Kind::Arrow || t.kind == Kind::EndOfFile {
-                break;
-            }
+    if kind == NodeKind::Induction {
+        // `induction on n`: the `on` is noise, and the scrutinee is an ATOM,
+        // not an expression. Reading an expression there takes `on n` as an
+        // application and loses the subject.
+        if p.sig(0).is_some_and(|t| p.text_is(t, b"on")) {
             p.bump();
         }
-        p.b.wrap_from(pcp, NodeKind::Pattern);
+        parse_atom(p);
+    } else {
+        parse_expr(p);
+    }
+    p.skip_newlines();
+    // The arms' alignment is set by whatever follows the scrutinee, which is
+    // where upstream reads it too -- before knowing that an arm is there.
+    let Some(anchor) = p.sig(0) else {
+        p.b.wrap_from(cp, kind);
+        return kind;
+    };
+    let col = anchor.col;
+    let mut ln = anchor.line;
+    while let Some(t) = p.sig(0) {
+        if t.kind != Kind::IsKeyword || !(t.line == ln || t.col == col) {
+            break;
+        }
+        ln = t.line;
+        let acp = p.b.checkpoint();
+        p.bump(); // is
+        crate::pattern::parse_pattern(p);
+        while p.kind(0) == Some(Kind::Pipe) {
+            p.bump();
+            p.skip_newlines();
+            if matches!(p.kind(0), Some(Kind::Arrow) | Some(Kind::FatArrow)) {
+                p.err("expected a pattern after '|' in a match arm");
+                break;
+            }
+            crate::pattern::parse_pattern(p);
+        }
+        if p.kind(0) == Some(Kind::WhenKeyword) {
+            let gcp = p.b.checkpoint();
+            p.bump();
+            parse_expr(p);
+            p.b.wrap_from(gcp, NodeKind::Guard);
+        }
         if matches!(p.kind(0), Some(Kind::Arrow) | Some(Kind::FatArrow)) {
             p.bump();
         } else {
             p.err("expected '->' in a match arm");
         }
         p.skip_newlines();
-        parse_expr(p);
+        // The body is floored at the arms' column, so an arm ends where the
+        // next one begins even though nothing punctuates the boundary.
+        parse_binary(p, 0, col);
         p.b.wrap_from(acp, NodeKind::MatchArm);
         p.skip_newlines();
     }
@@ -661,7 +755,55 @@ mod tests {
         let s = body_shape("when e\n    is A -> 1\n    is otherwise -> 2");
         assert_eq!(
             s,
-            "(MatchExpr (Name) (MatchArm (Pattern) (Lit)) (MatchArm (Pattern) (Lit)))"
+            "(MatchExpr (Name) (MatchArm (CtorPat) (Lit)) (MatchArm (WildPat) (Lit)))"
+        );
+    }
+
+    #[test]
+    fn arms_continue_on_their_own_line_and_on_the_line_before() {
+        // Two arms per line, three lines. An arm continues the match when it
+        // is on the same line as the arm before it OR at the arms' column, and
+        // "the arm before it" moves with every arm accepted. Pinning it to the
+        // line the match started on keeps arm 1, 2 and 3 here and SILENTLY
+        // drops the rest -- including the `is otherwise`.
+        let s = body_shape(
+            "when e\n    is 1 -> a is 2 -> b\n    is 3 -> c is 4 -> d\n    is otherwise -> f",
+        );
+        assert_eq!(s.matches("(MatchArm").count(), 5);
+    }
+
+    #[test]
+    fn an_arm_that_is_neither_aligned_nor_trailing_ends_the_match() {
+        // The arms sit at one column; a stray `is` at another is not an arm.
+        // It has to land somewhere, and that somewhere is not this match -- it
+        // comes back as an unread body, which is the parser saying so rather
+        // than swallowing it.
+        let src = "Chapter: T\n\nSection: S\n  f : A\n  f (x) =\n   when e\n    is 1 -> a\n     is 2 -> b\n";
+        let p = parse(src.as_bytes());
+        assert_eq!(p.tree.descendants(NodeKind::MatchArm).len(), 1);
+        assert_eq!(p.unparsed_bodies, 1);
+    }
+
+    #[test]
+    fn a_let_binds_a_list_and_the_comma_is_optional() {
+        assert_eq!(
+            body_shape("let a = 1, b = 2 in a"),
+            "(LetExpr (LetBinding (Lit)) (LetBinding (Lit)) (Name))"
+        );
+        // Ten files in the checkout stack their bindings on separate lines
+        // with no comma, and reading exactly one binding reported a parse
+        // error on every one of them.
+        assert_eq!(
+            body_shape("let a = 1\n    b = 2\n   in a"),
+            "(LetExpr (LetBinding (Lit)) (LetBinding (Lit)) (Name))"
+        );
+    }
+
+    #[test]
+    fn a_parenthesised_let_binding_binds_a_pattern() {
+        assert_eq!(
+            body_shape("let (a, b) = p in a"),
+            "(LetExpr (LetBinding (TuplePat (VarPat) (VarPat)) (Name)) (Name))"
         );
     }
 }

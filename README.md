@@ -65,12 +65,25 @@ once. Requiring that almost no token sit outside a named construct catches it --
 367 loose tokens across the compiler's 64 chapters when healthy, 357,339 when
 broken.
 
+`cover` also splits the parse-error count. `codex/test/errors/` holds programs
+the compiler is SUPPOSED to decline, so a diagnostic we raise there is output
+rather than a defect, and counting the two together gives a total that goes UP
+as the front end improves. They are reported on their own line. The gold bank's
+`refused.tsv` is the authority; the directory test is a heuristic.
+
 **What the scale gate cannot see.** It proves the grammar is TOTAL -- every
 definition in the compiler's own 64 chapters parses, with no unread body and no
 error -- and it says nothing about whether the shape is RIGHT. Giving `+` and
 `*` the same precedence leaves it entirely green. Shape is guarded by unit
 tests today and by the IR golds later; neither `parse.truth` nor
 `desugar.truth` inspects an expression at all.
+
+The one pattern number that IS a gate is `token(s) in pattern position not
+understood`, which must be zero: upstream's pattern parser never fails, folding
+anything it does not recognise into the same wildcard the author could have
+written, and keeping the two apart is what makes the second countable. It is
+reported next to the total pattern count, because a zero from a parser that
+never ran looks exactly like a zero from one that works.
 
 ## `char-code` is not ASCII
 

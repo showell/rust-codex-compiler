@@ -7,5 +7,6 @@ pub mod cst;
 pub mod expr;
 pub mod lexer;
 pub mod parser;
+pub mod pattern;
 pub mod token;
 pub mod types;

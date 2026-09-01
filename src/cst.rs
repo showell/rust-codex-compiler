@@ -85,7 +85,21 @@ pub enum NodeKind {
     LetBinding,
     MatchExpr,
     MatchArm,
-    Pattern,
+    /// A match arm's `when guard`, between its patterns and its arrow.
+    Guard,
+
+    // Patterns. Cobblestone's `Pat` has six variants; `ParenPat` is ours,
+    // because the tree is lossless and the parentheses of `(x)` have to live
+    // somewhere, and `ErrPat` is ours because upstream's catch-all folds a
+    // token it did not understand into the same `WildPat` the author wrote.
+    VarPat,
+    LitPat,
+    CtorPat,
+    WildPat,
+    TuplePat,
+    ParenPat,
+    VecPat,
+    ErrPat,
     ActBlock,
     ActBind,
     Lambda,
