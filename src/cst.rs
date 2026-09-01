@@ -58,8 +58,11 @@ pub enum NodeKind {
     LinearType,
     /// `forall (a : K), T`
     ForAllType,
-    /// `A == B` in type position: a propositional equality.
+    /// `A === B` in type position: a propositional equality.
     PropEqType,
+    /// `Showable a => a -> Text` -- a class constraint in front of a type. The
+    /// IR emits the BODY alone, so the constraint is transparent there.
+    ConstrainedType,
     /// `A * B`, `A + B` -- type-level arithmetic on bounded integers.
     ArithType,
     /// `punctual [budget] <name> : ...` -- a modifier on the definition that
@@ -68,6 +71,14 @@ pub enum NodeKind {
     Punctual,
     /// `claim <name> : <prop>` in front of the definition that proves it.
     Claim,
+    /// `bounded <class> <name>` in front of a definition -- the same shape as
+    /// `punctual`, publishing `(ann "bounded" <name> <class>)`.
+    Bounded,
+    /// The `qed` that closes a proof.
+    Qed,
+    /// Two statements joined -- upstream's `SeqExpr`. Only a FIELD ASSIGNMENT
+    /// can be the left of one.
+    SeqExpr,
     /// `effect Audio where <op> : <type> ...`
     EffectDef,
     /// `class [Super => ] Name where <method> : <type> ...`

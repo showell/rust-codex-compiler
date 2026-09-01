@@ -65,6 +65,12 @@ once. Requiring that almost no token sit outside a named construct catches it --
 367 loose tokens across the compiler's 64 chapters when healthy, 357,339 when
 broken.
 
+Over the whole checkout the parser now leaves **no unread body, no unread
+annotation type, and two parse errors** -- both in `parser-resync.codex`, whose
+definitions are named `broken1` and `broken2`. One type definition is not fully
+read: six lines of `--- Sorted builtin table` rule, which the language has no
+syntax for.
+
 `cover` also splits the parse-error count. `codex/test/errors/` holds programs
 the compiler is SUPPOSED to decline, so a diagnostic we raise there is output
 rather than a defect, and counting the two together gives a total that goes UP

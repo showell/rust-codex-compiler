@@ -199,6 +199,8 @@ fn cover(roots: &[String]) -> ExitCode {
     // grammar rule that is missing.
     let mut by_msg: std::collections::HashMap<String, (usize, String)> =
         std::collections::HashMap::new();
+    let mut by_unread: std::collections::HashMap<&'static str, (usize, String)> =
+        std::collections::HashMap::new();
     let mut loose = 0usize;
     let (mut shown, mut shown_td) = (0usize, 0usize);
     let (mut parse_secs, mut total_bytes) = (0f64, 0usize);
@@ -207,7 +209,7 @@ fn cover(roots: &[String]) -> ExitCode {
     // says how much of the language is actually read, and a per-file count
     // says it better than a total, which one bad file can dominate.
     let mut whole = 0usize;
-    let (mut flat_type, mut unclosed) = (0usize, 0usize);
+    let (mut flat_type, mut unclosed, mut resynced) = (0usize, 0usize, 0usize);
     let (mut tds, mut recs, mut vars, mut ctors, mut unread_td) = (0usize, 0usize, 0usize, 0usize, 0usize);
     let (mut acts, mut stmts, mut handles, mut clauses) = (0usize, 0usize, 0usize, 0usize);
     // Patterns are no longer a token bag, so "flat" says nothing about them --
@@ -279,6 +281,7 @@ fn cover(roots: &[String]) -> ExitCode {
         ctors += parsed.tree.count_descendants(NodeKind::VariantCtor);
         unread_td += parsed.unread_type_defs;
         unclosed += parsed.unclosed_blocks;
+        resynced += parsed.resynced_lines;
         acts += parsed.tree.count_descendants(NodeKind::ActBlock);
         stmts += parsed.tree.count_descendants(NodeKind::ActBind)
             + parsed.tree.count_descendants(NodeKind::ActStmt);
@@ -295,16 +298,19 @@ fn cover(roots: &[String]) -> ExitCode {
                 }
             }
         }
-        if shown < 12 {
-            for u in parsed.tree.descendants(NodeKind::UnparsedBody) {
-                if let Some(t) = u.tokens().find(|t| !t.kind.is_trivia()) {
-                    println!("UNREAD {}:{}:{}: {} |{}|", f.display(), t.line, t.col,
-                             t.kind.name(), String::from_utf8_lossy(t.text(&src)));
-                    shown += 1;
-                    break;
-                }
+        // Every unread body, ranked by the token it starts on. A dozen
+        // examples say which files; the histogram says which RULE is missing,
+        // and that is what picks the next piece of work.
+        for u in parsed.tree.descendants(NodeKind::UnparsedBody) {
+            if let Some(t) = u.tokens().find(|t| !t.kind.is_trivia()) {
+                let slot = by_unread
+                    .entry(t.kind.name())
+                    .or_insert_with(|| (0, format!("{}:{}:{} |{}|", f.display(), t.line, t.col,
+                                                   String::from_utf8_lossy(t.text(&src)))));
+                slot.0 += 1;
             }
         }
+        let _ = &mut shown;
     }
     println!("{} files, {defs} definitions, {unparsed} bodies not yet structured, {errs} parse errors",
              files.len());
@@ -321,6 +327,11 @@ fn cover(roots: &[String]) -> ExitCode {
     // What is still a bag of tokens rather than a tree. The desugarer consumes
     // exactly these, so the number is the size of the work between here and
     // there -- not a warning, an inventory.
+    let mut unread_ranked: Vec<_> = by_unread.into_iter().collect();
+    unread_ranked.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(b.0)));
+    for (kind, (n, at)) in unread_ranked.iter().take(12) {
+        println!("  {n} unread bodies start on {kind}   e.g. {at}");
+    }
     println!("{unread_ty} annotation(s) whose type was not fully read");
     println!("{pats} patterns in {arms} match arms; {alts} arms alternate, {guards} are guarded");
     println!("{err_pats} token(s) in pattern position not understood");
@@ -332,6 +343,8 @@ fn cover(roots: &[String]) -> ExitCode {
     // block in silence and a gate at zero would fail on correct behaviour. The
     // number is here because "0 blocks still flat" was also true of a parser
     // that ate the rest of the file.
+    println!("{resynced} line(s) skipped after a body -- upstream's own resync, \
+which its document loop does in silence");
     println!("{unclosed} block(s) ran to the end of the file without an 'end'");
     println!("still flat: {flat_type} type expressions");
     // Coverage alone is a weak claim and was measured to be: a parser that

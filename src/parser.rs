@@ -43,6 +43,9 @@ pub struct Parsed {
     /// `act` and `trying` blocks that ran to the end of the file without
     /// meeting their `end`.
     pub unclosed_blocks: usize,
+    /// Single lines skipped after a body, the way upstream's document loop
+    /// skips anything past column 3 that starts no item.
+    pub resynced_lines: usize,
 }
 
 /// The column a top-level item sits at. Upstream compares against the literal
@@ -58,6 +61,7 @@ pub(crate) struct Parser<'a> {
     pub(crate) unread_types: usize,
     pub(crate) unread_type_defs: usize,
     pub(crate) unclosed_blocks: usize,
+    pub(crate) resynced_lines: usize,
     /// Newlines are skipped inside brackets and significant outside them. This
     /// is upstream's `paren-depth` and it is the whole reason a multi-line
     /// application is an error at the top level and fine inside parentheses.
@@ -162,6 +166,7 @@ pub(crate) fn starts_an_item(k: Kind) -> bool {
             | Kind::QuotesKeyword
             | Kind::GroundsKeyword
             | Kind::PunctualKeyword
+            | Kind::BoundedKeyword
     )
 }
 
@@ -177,6 +182,7 @@ pub fn parse(src: &[u8]) -> Parsed {
         unread_types: 0,
         unread_type_defs: 0,
         unclosed_blocks: 0,
+        resynced_lines: 0,
         paren_depth: 0,
     };
 
@@ -284,6 +290,7 @@ pub fn parse(src: &[u8]) -> Parsed {
         unread_types: p.unread_types,
         unread_type_defs: p.unread_type_defs,
         unclosed_blocks: p.unclosed_blocks,
+        resynced_lines: p.resynced_lines,
     }
 }
 
@@ -335,6 +342,15 @@ fn parse_def(p: &mut Parser<'_>, src: &[u8], first: Token) {
         let ccp = p.b.checkpoint();
         p.bump();
         p.b.wrap_from(ccp, NodeKind::Claim);
+    }
+    // `bounded <class> <name> : T`, the same modifier shape as `punctual`.
+    if p.kind(0) == Some(Kind::BoundedKeyword) {
+        let bcp = p.b.checkpoint();
+        p.bump();
+        if matches!(p.kind(0), Some(Kind::Identifier) | Some(Kind::TypeIdentifier)) {
+            p.bump(); // the bound class
+        }
+        p.b.wrap_from(bcp, NodeKind::Bounded);
     }
     if p.kind(0) == Some(Kind::PunctualKeyword) {
         let pcp = p.b.checkpoint();
@@ -447,7 +463,19 @@ fn body(p: &mut Parser<'_>, def_col: u32) {
     // `parse-def-body-seq`); without it the expression parser meets a Newline
     // in atom position, calls it an error and hands the whole body back.
     p.skip_newlines();
-    crate::expr::parse_expr_col(p, def_col);
+    crate::expr::parse_def_body_seq(p, def_col);
+    // `qed` closes a proof and belongs to it. Upstream reaches it at the
+    // document level and skips the line because its column is past 3; here it
+    // is a named child of the definition it ends, which is where a reader
+    // looks for it.
+    if p.kind(0) == Some(Kind::QedKeyword) {
+        let qcp = p.b.checkpoint();
+        p.bump();
+        p.b.wrap_from(qcp, NodeKind::Qed);
+        // The newline after it belongs to nobody, and leaving it made every
+        // proof in the checkout report an unread body starting on a Newline.
+        p.skip_newlines();
+    }
     // Anything the expression grammar declined to take still belongs to this
     // body. It is kept under a name that says it was not understood, and it is
     // counted, so an unread body cannot pass for an understood one.
@@ -457,10 +485,29 @@ fn body(p: &mut Parser<'_>, def_col: u32) {
             if in_prose_block(p) {
                 eat_prose_block(p);
             } else {
-                p.b.start(NodeKind::UnparsedBody);
-                p.unparsed_bodies += 1;
-                eat_item_body(p, def_col);
-                p.b.end();
+                // ONE stray line is upstream's resync, not a gap. Its document
+                // loop ends with `if (current st).column > 3 then
+                // skip-to-next-line`, so a lone `end` left over by a source
+                // that wrote three of them for two `act` blocks is skipped in
+                // silence -- 23 of them in the checkout. A RUN of real code is
+                // a different thing and stays an unread body.
+                let cp = p.b.checkpoint();
+                p.eat_to_end_of_line();
+                p.skip_newlines();
+                let done = match p.sig(0) {
+                    None => true,
+                    Some(t) => t.kind == Kind::EndOfFile
+                        || (t.col <= def_col && starts_an_item(t.kind))
+                        || starts_conversion(p),
+                };
+                if done {
+                    p.resynced_lines += 1;
+                    p.b.wrap_from(cp, NodeKind::Loose);
+                } else {
+                    p.unparsed_bodies += 1;
+                    eat_item_body(p, def_col);
+                    p.b.wrap_from(cp, NodeKind::UnparsedBody);
+                }
             }
         }
     }

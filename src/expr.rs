@@ -104,8 +104,53 @@ fn is_compound(kind: NodeKind) -> bool {
 /// other reading type-checks perfectly and is never what anybody meant.
 const PREC_COMPARISON: i32 = 5;
 
-pub(crate) fn parse_expr_col(p: &mut Parser<'_>, min_col: u32) -> NodeKind {
-    parse_binary(p, 0, min_col)
+/// A definition body is a SEQUENCE when its statements are field assignments.
+///
+/// `upstream's continue-def-seq`: only a field assignment may be the left of a
+/// sequence, and the next statement is recognised by sitting further right
+/// than the definition's own column. Nothing punctuates the join.
+pub(crate) fn parse_def_body_seq(p: &mut Parser<'_>, min_col: u32) -> NodeKind {
+    let cp = p.b.checkpoint();
+    let kind = parse_binary(p, 0, min_col);
+    if kind != NodeKind::FieldAssign {
+        return kind;
+    }
+    p.skip_newlines();
+    match p.sig(0) {
+        Some(t) if t.kind != Kind::EndOfFile && t.col > min_col => {
+            parse_def_body_seq(p, min_col);
+            p.b.wrap_from(cp, NodeKind::SeqExpr);
+            NodeKind::SeqExpr
+        }
+        _ => kind,
+    }
+}
+
+/// The same sequence inside a `let` body, where `in` is the join.
+///
+/// ```text
+/// in port.tx-bytes = port.tx-bytes + n
+/// in port.faults   = port.faults + 1
+/// in port
+/// ```
+///
+/// `continue-let-seq` takes the `in` only after a field assignment, which is
+/// what keeps an ordinary `let ... in body` from swallowing the next one.
+fn parse_let_body_seq(p: &mut Parser<'_>) -> NodeKind {
+    let cp = p.b.checkpoint();
+    let kind = parse_expr(p);
+    if kind != NodeKind::FieldAssign {
+        return kind;
+    }
+    p.skip_newlines();
+    if p.kind(0) != Some(Kind::InKeyword) {
+        return kind;
+    }
+    p.bump();
+    p.skip_newlines();
+    parse_let_body_seq(p);
+    p.b.wrap_from(cp, NodeKind::SeqExpr);
+    NodeKind::SeqExpr
 }
 
 pub(crate) fn parse_expr(p: &mut Parser<'_>) -> NodeKind {
@@ -493,10 +538,10 @@ fn parse_let(p: &mut Parser<'_>, cp: usize) -> NodeKind {
     if p.kind(0) == Some(Kind::InKeyword) {
         p.bump();
         p.skip_newlines();
-        parse_expr(p);
+        parse_let_body_seq(p);
     } else {
         p.err("expected 'in' after let bindings");
-        parse_expr(p);
+        parse_let_body_seq(p);
     }
     p.b.wrap_from(cp, NodeKind::LetExpr);
     NodeKind::LetExpr
@@ -750,13 +795,14 @@ mod tests {
     #[test]
     fn an_arm_that_is_neither_aligned_nor_trailing_ends_the_match() {
         // The arms sit at one column; a stray `is` at another is not an arm.
-        // It has to land somewhere, and that somewhere is not this match -- it
-        // comes back as an unread body, which is the parser saying so rather
-        // than swallowing it.
+        // It has to land somewhere, and that somewhere is not this match: one
+        // line left over after a body is upstream's resync, and it is counted
+        // rather than swallowed.
         let src = "Chapter: T\n\nSection: S\n  f : A\n  f (x) =\n   when e\n    is 1 -> a\n     is 2 -> b\n";
         let p = parse(src.as_bytes());
         assert_eq!(p.tree.descendants(NodeKind::MatchArm).len(), 1);
-        assert_eq!(p.unparsed_bodies, 1);
+        assert_eq!(p.unparsed_bodies, 0);
+        assert_eq!(p.resynced_lines, 1);
     }
 
     #[test]

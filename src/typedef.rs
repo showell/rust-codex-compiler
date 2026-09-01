@@ -90,8 +90,26 @@ fn trailer(p: &mut Parser<'_>, col: u32) {
             crate::parser::eat_prose_block(p);
             continue;
         }
+        // One stray line is a resync, the same as after a definition body: a
+        // `--- Sorted builtin table` rule between two type definitions is not
+        // an unread body, and calling it one made the only remaining
+        // type-definition gap in the checkout.
         let tcp = p.b.checkpoint();
-        p.bump();
+        p.eat_to_end_of_line();
+        p.skip_newlines();
+        let done = match p.sig(0) {
+            None => true,
+            Some(t) => {
+                t.kind == Kind::EndOfFile
+                    || (t.col <= col && (starts_an_item(t.kind) || starts_conversion(p)))
+                    || crate::parser::in_prose_block(p)
+            }
+        };
+        if done {
+            p.resynced_lines += 1;
+            p.b.wrap_from(tcp, NodeKind::Loose);
+            continue;
+        }
         while let Some(t) = p.sig(0) {
             if t.kind == Kind::EndOfFile
                 || (t.col <= col && (starts_an_item(t.kind) || starts_conversion(p)))

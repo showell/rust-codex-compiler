@@ -312,10 +312,21 @@ fn parse_type_continue(p: &mut Parser<'_>, cp: usize, allow_comma: bool) {
             }
             p.b.wrap_from(cp, NodeKind::FunType);
         }
-        Some(Kind::DoubleEquals) => {
+        // `===`, not `==`. Upstream's continue arm is `current-kind ==
+        // TripleEquals` and it handles no other equality, so a claim's
+        // proposition -- `list-length xs === 1 + n`, which is where
+        // propositional equality actually appears -- stopped at the operator
+        // and left the rest of the annotation unread, 69 times.
+        Some(Kind::TripleEquals) => {
             p.bump();
             parse_type(p);
             p.b.wrap_from(cp, NodeKind::PropEqType);
+        }
+        // `Showable a => a -> Text`: a class constraint in front of a type.
+        Some(Kind::FatArrow) => {
+            p.bump();
+            parse_type(p);
+            p.b.wrap_from(cp, NodeKind::ConstrainedType);
         }
         Some(Kind::Comma) if allow_comma && comma_starts_type_param(p) => {
             p.bump();

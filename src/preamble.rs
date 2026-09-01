@@ -221,6 +221,9 @@ fn atype(n: &Node, src: &[u8]) -> String {
         NodeKind::LinearType => {
             format!("(a-linear {})", kids.first().map_or_else(unknown, |k| atype(k, src)))
         }
+        // A constraint is transparent in the IR: `is AConstrainedType (cn)
+        // (cv) (body) -> ir-emit-atype-expr body`.
+        NodeKind::ConstrainedType => kids.last().map_or_else(unknown, |k| atype(k, src)),
         NodeKind::PropEqType => match kids.as_slice() {
             [l, r] => format!("(a-propeq {} {})", atype(l, src), atype(r, src)),
             _ => unknown(),
