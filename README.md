@@ -163,6 +163,40 @@ flags` -- so `grade` reads that one field from the gold and COUNTS how often it
 had to. On the corpus it never has to, which is what says our derived rule
 matches `native/codexir`.
 
+## The interpreter, and safari as a fourth arm
+
+`codexrun` walks the desugared AST. No types, no IR, no zig, no guest -- which
+is the point: it shares NOTHING with the other arms below the text, so when it
+disagrees the disagreement is attributable. It is also the first oracle here
+that sees MEANING rather than shape; five byte-comparison oracles are one
+oracle, and `and` failed to short-circuit under all of them.
+
+    codexrun <unit.codex>                     print what it prints
+    codexrun --check <unit.codex> <expected>
+    codexrun sweep <units-dir> <codex-test-dir>
+    codexrun bench <unit.codex>...            steps, seconds, steps/sec
+
+    ./safari.sh                               the fourth arm, from the outside
+
+`safari.sh` needs no gold and no fixture. safari-codex bundles each check into
+`build/<mod>-unit.codex` and compiles that same unit to `build/<mod>` with
+codexzig, so both are already there after its `./harness/run.sh`: ONE SOURCE,
+TWO IMPLEMENTATIONS, run now and diffed. Nothing is vendored; point
+`SAFARI_ROOT` elsewhere if your checkout is.
+
+    25 of 27 units byte-identical to the zig arm, including render and ride
+     1 differs AS IT MUST -- literal_main is FINDINGS 1B's repro, where
+       Cobblestone accumulates a 19-digit Real literal into a wrapping i64 and
+       we read it as an f64. A second front end that does not reproduce the bug
+       is the evidence, so the script FAILS if the two ever agree.
+
+**It is slow and the number is not close.** Measured on this box against the
+Debug binaries `run.sh` builds: `render` 2.5s there and minutes here, `ride`
+1.3s there. The light checks are instant; the two that simulate finish but not
+quickly, so `safari.sh` bounds each side (`ZIG_SECS`, `RUST_SECS`). A
+tree-walking interpreter over persistent lists is what that costs today, and
+`codexrun bench` is the thing to run before and after trying to change it.
+
 ## `char-code` is not ASCII
 
 Codex's `char-code` is a private frequency-ordered alphabet: 1 newline, 2

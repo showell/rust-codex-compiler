@@ -62,10 +62,6 @@ fn run_in_thread(path: &Path, budget: Option<u64>) -> Result<String, String> {
         .map_err(|_| "the interpreter thread died".to_string())?
 }
 
-fn run_here(path: &Path) -> Result<String, String> {
-    run_bounded(path, None)
-}
-
 /// The sweep bounds each program; a single run does not. `ride-unit` simulates
 /// a whole ride and legitimately needs hundreds of millions of steps.
 const SWEEP_BUDGET: u64 = 60_000_000;
