@@ -25,7 +25,7 @@
 //! the same way it is between `let` bindings.
 
 use crate::cst::NodeKind;
-use crate::parser::{starts_an_item, Parser};
+use crate::parser::{starts_an_item, starts_conversion, Parser};
 use crate::token::{Kind, Token};
 
 /// `(a)` and `(A)` are type parameters; `(a, b)` and `(f x)` are not.
@@ -74,7 +74,9 @@ pub(crate) fn parse_type_def(p: &mut Parser<'_>, first: Token) {
 fn trailer(p: &mut Parser<'_>, col: u32) {
     loop {
         let Some(t) = p.sig(0) else { return };
-        if t.kind == Kind::EndOfFile || (t.col <= col && starts_an_item(t.kind)) {
+        if t.kind == Kind::EndOfFile
+            || (t.col <= col && (starts_an_item(t.kind) || starts_conversion(p)))
+        {
             return;
         }
         // A blank line belongs to no construct. Counting one as an unread body
@@ -92,7 +94,7 @@ fn trailer(p: &mut Parser<'_>, col: u32) {
         p.bump();
         while let Some(t) = p.sig(0) {
             if t.kind == Kind::EndOfFile
-                || (t.col <= col && starts_an_item(t.kind))
+                || (t.col <= col && (starts_an_item(t.kind) || starts_conversion(p)))
                 || crate::parser::in_prose_block(p)
             {
                 break;

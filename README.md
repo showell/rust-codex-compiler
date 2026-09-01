@@ -99,6 +99,34 @@ written, and keeping the two apart is what makes the second countable. It is
 reported next to the total pattern count, because a zero from a parser that
 never ran looks exactly like a zero from one that works.
 
+## The IR chapter preamble: 1,012 programs, and the compiler itself
+
+Everything above `(defs` in an IR file is fixed by syntax alone -- chapter,
+title, prose, pblocks, anns, sections, ctors, eff-ops, grounds, type-defs --
+and it is present in every gold. Everything BELOW it carries an inferred type
+on every node, so reaching that needs scope, check and lower.
+
+    irdump preamble <unit.codex> [chapter-name]
+    irdump grade <units-dir>              against $CODEX_GOLDS/ir/*.ir
+
+    codex corpus     1012 of 1012 byte-identical
+    safari app         27 of 27
+    the compiler        1 of 1   -- 2.98 MB, 310 lines, in 0.9s
+
+The input must be a RESOLVED unit; the ladder's `resolve_corpus.py` writes
+them, and safari's `build/*-unit.codex` already are. A gold names sections from
+`Foreword ListUtils` and constructors from `Foreword Tuple` that appear nowhere
+in the program's own file.
+
+It is a SLICE and it is worth saying which: the preamble is 7.7% of the corpus
+IR by bytes and 0.5% of safari's, and type definitions are three quarters of
+it. Every expression body is still unchecked by anything but unit tests.
+
+`(chapter "...")` is a DRIVER PARAMETER -- `compile-frontend source "Program"
+flags` -- so `grade` reads that one field from the gold and COUNTS how often it
+had to. On the corpus it never has to, which is what says our derived rule
+matches `native/codexir`.
+
 ## `char-code` is not ASCII
 
 Codex's `char-code` is a private frequency-ordered alphabet: 1 newline, 2

@@ -29,6 +29,9 @@ pub enum NodeKind {
     Grounds,
     /// `quotes ..`
     Quotes,
+    /// `1 Minute = 60 Second` -- a unit conversion, which publishes an
+    /// annotation and is not a definition however much it looks like one.
+    Conversion,
     /// A whole definition: its annotation line, its equation line, its body.
     Def,
     /// `name : Type`
@@ -65,6 +68,13 @@ pub enum NodeKind {
     Punctual,
     /// `effect Audio where <op> : <type> ...`
     EffectDef,
+    /// `class [Super => ] Name where <method> : <type> ...`
+    ClassDef,
+    /// The `Super =>` in front of a class's own name.
+    Superclass,
+    /// `instance Class Type where <method> (p) = <expr> ...`
+    InstanceDef,
+    InstanceMethod,
     /// One `<op> : <type>` of an effect declaration.
     EffectOp,
     /// `Name = record { .. }` / `Name = | A | B`
@@ -189,6 +199,16 @@ impl Node {
         self.children.iter().filter_map(move |c| match c {
             Child::Node(n) if n.kind == kind => Some(n),
             _ => None,
+        })
+    }
+
+    /// The tokens this node holds DIRECTLY, not those inside its child nodes.
+    /// A class declaration's header is its direct tokens; its methods are
+    /// nodes, and reading them all together names the class after a method.
+    pub fn own_tokens(&self) -> impl Iterator<Item = &Token> {
+        self.children.iter().filter_map(|c| match c {
+            Child::Token(t) => Some(t),
+            Child::Node(_) => None,
         })
     }
 

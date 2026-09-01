@@ -180,9 +180,14 @@ fn atype(n: &Node, src: &[u8]) -> String {
         // `AppType base [arg]` and loops -- while our CST keeps the arguments
         // flat under one node, so the fold happens here.
         NodeKind::AppType => match kids.split_first() {
-            Some((base, args)) => args.iter().fold(atype(base, src), |acc, a| {
-                format!("(a-app {acc} (args {}))", atype(a, src))
-            }),
+            Some((base, args)) => {
+                if let Some(word) = real_qualifier(base, args, src) {
+                    return format!("(a-named {})", quote(&word));
+                }
+                args.iter().fold(atype(base, src), |acc, a| {
+                    format!("(a-app {acc} (args {}))", atype(a, src))
+                })
+            }
             None => unknown(),
         },
         NodeKind::BoundedIntType => {
@@ -233,6 +238,48 @@ fn atype(n: &Node, src: &[u8]) -> String {
         }
         _ => unknown(),
     }
+}
+
+/// `Real approximate trapping` is ONE atom, not an application.
+///
+/// When the base is `Real` and EVERY argument is a qualifier word, upstream
+/// collapses the whole thing to a single name -- `ast-real-qual-app-p`, then
+/// `ir-real-qual-atom` folds the words into a width and a mode. `approximate`
+/// sets f32; `trapping` and `saturating` set the mode; anything else is
+/// ignored, though the predicate has already refused the application if any
+/// argument is not one of the three.
+fn real_qualifier(base: &Node, args: &[&Node], src: &[u8]) -> Option<String> {
+    if args.is_empty() || base.kind != NodeKind::NamedType {
+        return None;
+    }
+    if leading_token(base, src)? != "Real" {
+        return None;
+    }
+    let words: Vec<String> = args
+        .iter()
+        .map(|a| {
+            if a.kind == NodeKind::NamedType {
+                leading_token(a, src).unwrap_or_default()
+            } else {
+                String::new()
+            }
+        })
+        .collect();
+    if !words.iter().all(|w| matches!(w.as_str(), "approximate" | "trapping" | "saturating")) {
+        return None;
+    }
+    let f32_ = words.iter().any(|w| w == "approximate");
+    let mode = words.iter().rev().find_map(|w| match w.as_str() {
+        "trapping" => Some("trapping"),
+        "saturating" => Some("saturating"),
+        _ => None,
+    });
+    Some(match (f32_, mode) {
+        (true, None) => "real-approx".into(),
+        (true, Some(m)) => format!("real-approx-{m}"),
+        (false, None) => "real".into(),
+        (false, Some(m)) => format!("real-{m}"),
+    })
 }
 
 fn unknown() -> String {
@@ -298,6 +345,66 @@ fn type_def(td: &Node, src: &[u8]) -> Option<String> {
     None
 }
 
+/// The dictionary record a `class` declaration desugars into.
+///
+/// `class Showable where to-text : a -> Text` becomes `(rec-def "ShowableDict"
+/// (tparams "a") (fields (rec-field "to-text-impl" (a-fun (a-named "a")
+/// (a-named "Text")))))`, and a superclass adds a leading `__super-<Super>`
+/// field of type `<Super>Dict`.
+///
+/// **The type parameter is an INSTANCE COUNT, not free-variable analysis.**
+/// `synth-class-type-defs` reads `if count-class-instances > 1 then ["a"] else
+/// []` -- so a class with one instance gets `(tparams)` however many type
+/// variables its methods mention, and a class with three gets `(tparams "a")`
+/// whether or not they mention any. Deriving it from the method types is the
+/// reading that looks right and is wrong.
+fn class_dicts(tree: &Node, src: &[u8]) -> Vec<String> {
+    let instances = tree.descendants(NodeKind::InstanceDef);
+    tree.descendants(NodeKind::ClassDef)
+        .iter()
+        .filter_map(|cd| {
+            // `class Eq => Ord where`: the superclass is eaten first, so the
+            // class's own name is the token after the arrow. These are the
+            // HEADER's tokens only -- taking every name under the node reads
+            // the first method's name as the class's.
+            let names: Vec<String> = cd
+                .own_tokens()
+                .filter(|t| matches!(t.kind, Kind::Identifier | Kind::TypeIdentifier))
+                .map(|t| text_of(t, src))
+                .collect();
+            let sup = cd.children_of(NodeKind::Superclass).next().is_some();
+            let name = if sup { names.get(1)? } else { names.first()? };
+            let n_inst = instances
+                .iter()
+                .filter(|i| {
+                    i.tokens()
+                        .find(|t| t.kind == Kind::TypeIdentifier)
+                        .is_some_and(|t| text_of(t, src) == *name)
+                })
+                .count();
+            let tparams = if n_inst > 1 { " \"a\"" } else { "" };
+            let mut fields = String::new();
+            if sup {
+                let s = names.first()?;
+                fields.push_str(&format!(
+                    " (rec-field {} (a-named {}))",
+                    quote(&format!("__super-{s}")),
+                    quote(&format!("{s}Dict"))
+                ));
+            }
+            for m in cd.children_of(NodeKind::EffectOp) {
+                let mname = leading_token(m, src).unwrap_or_default();
+                let ty = m.child_nodes().first().map_or_else(unknown, |t| atype(t, src));
+                fields.push_str(&format!(" (rec-field {} {ty})", quote(&format!("{mname}-impl"))));
+            }
+            Some(format!(
+                "(rec-def {} (tparams{tparams}) (fields{fields}))",
+                quote(&format!("{name}Dict"))
+            ))
+        })
+        .collect()
+}
+
 /// The chapter name a driver would supply if it derived one from the source:
 /// the unit's own chapter, which is the LAST one, since the resolver puts
 /// every cited chapter first and the program itself last.
@@ -349,11 +456,9 @@ pub fn emit(tree: &Node, src: &[u8], chapter_name: Option<&str>) -> String {
     ctor_names.sort_by(|a, b| cce_key(a).cmp(&cce_key(b)));
     ctor_names.dedup();
     let ctors: String = ctor_names.iter().map(|c| format!(" {}", quote(c))).collect();
-    let tds: String = type_defs
-        .iter()
-        .filter_map(|td| type_def(td, src))
-        .map(|t| format!("\n  {t}"))
-        .collect();
+    let mut tds: Vec<String> = type_defs.iter().filter_map(|td| type_def(td, src)).collect();
+    tds.extend(class_dicts(tree, src));
+    let tds: String = tds.iter().map(|t| format!("\n  {t}")).collect();
 
     // `punctual name` publishes `(ann "hard-realtime" name budget)`. The
     // annotation lives inside the definition it modifies, so the target is
@@ -384,10 +489,29 @@ pub fn emit(tree: &Node, src: &[u8], chapter_name: Option<&str>) -> String {
     // why this walks the document in order rather than collecting the
     // declarations on their own. A dotted effect is one name.
     let mut grounds: Vec<String> = Vec::new();
+    let mut conversions: Vec<String> = Vec::new();
     let mut current_chapter = String::new();
     for child in tree.child_nodes() {
         match child.kind {
             NodeKind::ChapterHeader => current_chapter = header_text(child, src),
+            NodeKind::Conversion => {
+                // `<n> <Unit> = <m> <Unit>` publishes
+                // `(ann "conversion" <from-unit> "<m/n> <to-unit>")`.
+                let t: Vec<String> = child
+                    .tokens()
+                    .filter(|t| !t.kind.is_trivia() && t.kind != Kind::Newline)
+                    .map(|t| text_of(t, src))
+                    .collect();
+                if let [from_val, from_unit, _eq, to_val, to_unit, ..] = t.as_slice() {
+                    let factor = to_val.parse::<i64>().unwrap_or(1)
+                        / from_val.parse::<i64>().unwrap_or(1).max(1);
+                    conversions.push(format!(
+                        " (ann \"conversion\" {} {})",
+                        quote(from_unit),
+                        quote(&format!("{factor} {to_unit}"))
+                    ));
+                }
+            }
             NodeKind::Grounds => {
                 let mut name = String::new();
                 for t in child.tokens().filter(|t| !t.kind.is_trivia()) {
@@ -410,6 +534,7 @@ pub fn emit(tree: &Node, src: &[u8], chapter_name: Option<&str>) -> String {
         }
     }
     let grounds: String = grounds.iter().map(|g| format!(" {}", quote(g))).collect();
+    let anns = format!("{anns}{}", conversions.concat());
 
     // Source order, not the sorted order `ctors` uses: the gold reads
     // `(eff-ops "print-line-uni" "read-line")` and char-code order would put

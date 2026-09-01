@@ -135,6 +135,17 @@ impl<'a> Parser<'a> {
 
 /// Upstream's `is-claim-or-def-start`: what may begin a top-level item, and so
 /// what ends the body of the one before it.
+/// `1 Minute = 60 Second`. It starts a top-level item and no token KIND says
+/// so -- an integer begins nothing else -- so anything looking for the end of
+/// a body has to ask this as well as `starts_an_item`. Without it the type
+/// definition above swallowed the conversion, which is exactly what `punctual`
+/// did before it was read.
+pub(crate) fn starts_conversion(p: &Parser<'_>) -> bool {
+    p.kind(0) == Some(Kind::IntegerLiteral)
+        && p.kind(1) == Some(Kind::TypeIdentifier)
+        && p.kind(2) == Some(Kind::Equals)
+}
+
 pub(crate) fn starts_an_item(k: Kind) -> bool {
     matches!(
         k,
@@ -224,6 +235,28 @@ pub fn parse(src: &[u8]) -> Parsed {
             // has no `=` and would otherwise fall through to parse_def.
             Kind::EffectKeyword if t.col == TOP_LEVEL_COL => {
                 crate::decl::parse_effect_def(&mut p)
+            }
+            // `class` and `instance` are NOT column-bound: upstream finds them
+            // with a scan that advances a token at a time, and every one in
+            // the checkout sits at column 1.
+            Kind::ClassKeyword
+                if matches!(p.kind(1), Some(Kind::Identifier) | Some(Kind::TypeIdentifier)) =>
+            {
+                crate::decl::parse_class_def(&mut p)
+            }
+            Kind::InstanceKeyword if p.kind(1) == Some(Kind::TypeIdentifier) => {
+                crate::decl::parse_instance_def(&mut p)
+            }
+            // `1 Minute = 60 Second`: a unit CONVERSION. It has a name and an
+            // `=` and is not a definition, and nothing else in the language
+            // starts an item with an integer.
+            Kind::IntegerLiteral
+                if p.kind(1) == Some(Kind::TypeIdentifier)
+                    && p.kind(2) == Some(Kind::Equals) =>
+            {
+                p.b.start(NodeKind::Conversion);
+                p.eat_to_end_of_line();
+                p.b.end();
             }
             _ if t.col == TOP_LEVEL_COL && looks_like_type_def(&p) => {
                 crate::typedef::parse_type_def(&mut p, t)
