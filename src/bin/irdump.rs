@@ -31,9 +31,11 @@ fn main() -> ExitCode {
             None => ExitCode::from(2),
         },
         Some("grade") if args.len() == 2 => grade(Path::new(&args[1])),
+        Some("defs") if args.len() == 2 => defs(Path::new(&args[1])),
         _ => {
             eprintln!("usage: irdump preamble <unit.codex>");
             eprintln!("       irdump grade <units-dir>");
+            eprintln!("       irdump defs <units-dir>");
             ExitCode::from(2)
         }
     }
@@ -93,6 +95,112 @@ fn field_of(line: &str) -> String {
         }
     }
     "other".to_string()
+}
+
+/// Every `(def "<name>" "<slug>" (params ...)` header a gold carries, checked
+/// against what our desugarer produced.
+///
+/// **A SUPERSET check, deliberately.** The emitter prunes the definition list
+/// by reachability over the emitted IR text, so a gold holds FEWER definitions
+/// than the source has and we cannot demand equality. What we can demand is
+/// that every definition the gold kept exists in ours with the same name, the
+/// same chapter slug and the same parameter count -- and that is the only
+/// oracle the desugarer's SYNTHESIS passes have, because `deriving Show`
+/// invents `<type>-show` and nothing else in the tree mentions it.
+fn defs(dir: &Path) -> ExitCode {
+    let Ok(golds) = std::env::var("CODEX_GOLDS") else {
+        eprintln!("CODEX_GOLDS is not set; it names the bank, and a bank is never guessed at");
+        return ExitCode::from(2);
+    };
+    let ir_dir = PathBuf::from(&golds).join("ir");
+    let Ok(rd) = std::fs::read_dir(&ir_dir) else {
+        eprintln!("{}: cannot read", ir_dir.display());
+        return ExitCode::from(2);
+    };
+    let mut names: Vec<String> = rd
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "ir"))
+        .filter_map(|e| e.path().file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .collect();
+    names.sort();
+
+    let (mut want, mut have, mut whole) = (0usize, 0usize, 0usize);
+    let mut missing: std::collections::HashMap<String, (usize, String)> = Default::default();
+    for name in &names {
+        let Ok(src) = std::fs::read(&dir.join(format!("{name}.codex"))) else { continue };
+        let Ok(ir) = std::fs::read_to_string(ir_dir.join(format!("{name}.ir"))) else { continue };
+        let parsed = parser::parse(&src);
+        let mut dg = codexc::desugar::Desugar::new(&src);
+        let ch = dg.chapter(&parsed.tree);
+        let ours: std::collections::HashSet<(String, usize)> =
+            ch.defs.iter().map(|d| (d.name.clone(), d.params.len())).collect();
+        let mut file_ok = true;
+        for (dn, dp) in gold_defs(&ir) {
+            want += 1;
+            if ours.contains(&(dn.clone(), dp)) {
+                have += 1;
+            } else {
+                file_ok = false;
+                let why = if ch.defs.iter().any(|d| d.name == dn) {
+                    format!("{dn}: parameter count")
+                } else {
+                    format!("{dn}: no such definition")
+                };
+                missing.entry(why).or_insert_with(|| (0, name.clone())).0 += 1;
+            }
+        }
+        if file_ok {
+            whole += 1;
+        }
+    }
+    println!("{have} of {want} gold definitions present ({:.2}%), {whole} of {} files whole",
+             100.0 * have as f64 / want.max(1) as f64, names.len());
+    let mut ranked: Vec<_> = missing.into_iter().collect();
+    ranked.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(&b.0)));
+    for (why, (n, at)) in ranked.iter().take(12) {
+        println!("  {n} x {why}   e.g. {at}");
+    }
+    if have == want {
+        println!("DEFS PRESENT: every definition a gold kept exists in ours");
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// `(def "name" "slug" (params (param "a" <type>) ...) ...` -- the header only.
+///
+/// A parameter is `(param "name" <type>)` and not a bare string, so the list
+/// has to be read to its MATCHING paren rather than the first one: stopping at
+/// the first `)` counts one parameter for every definition and reports the
+/// rest as mismatched, which is what it did.
+fn gold_defs(ir: &str) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    let mut rest = ir;
+    while let Some(at) = rest.find("(def \"") {
+        rest = &rest[at + 6..];
+        let Some(q) = rest.find('"') else { break };
+        let name = rest[..q].to_string();
+        let Some(pa) = rest.find("(params") else { break };
+        let tail = &rest[pa..];
+        let mut depth = 0usize;
+        let mut end = tail.len();
+        for (i, c) in tail.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.push((name, tail[..end].matches("(param \"").count()));
+    }
+    out
 }
 
 fn grade(dir: &Path) -> ExitCode {
