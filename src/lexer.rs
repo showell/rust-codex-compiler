@@ -165,7 +165,7 @@ fn utf8_len(b: u8) -> u32 {
     }
 }
 
-fn utf8_cp(src: &[u8], off: usize) -> u32 {
+pub(crate) fn utf8_cp(src: &[u8], off: usize) -> u32 {
     let b0 = src[off] as u32;
     let at = |i: usize| *src.get(off + i).unwrap_or(&0) as u32 & 63;
     match utf8_len(src[off]) {
@@ -199,7 +199,7 @@ const TIER1_LETTER_RANGES: [(u32, u32); 6] = [
     (2304, 2432), // Devanagari
 ];
 
-fn is_tier1_letter(cp: u32) -> bool {
+pub(crate) fn is_tier1_letter(cp: u32) -> bool {
     TIER1_LETTER_RANGES.iter().any(|&(lo, hi)| cp >= lo && cp < hi)
 }
 

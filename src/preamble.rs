@@ -73,11 +73,39 @@ fn quote(s: &str) -> String {
     out
 }
 
+/// `is-letter-code c | is-digit-code c`, on a CHARACTER.
+///
+/// `join-title-parts` tests the last character written and the first arriving,
+/// not the last and first BYTE. On ASCII the two readings agree and on nothing
+/// else do they: a chapter section called
+/// `Cyrillic (CCE 113-127->а о е и н т с р в л к м д п у)` keeps every one of
+/// those spaces in the gold, because Cyrillic is a CCE tier-1 LETTER -- while
+/// a byte test sees a UTF-8 continuation byte, calls it punctuation and joins
+/// the letters into one word.
+fn is_letter_or_digit(cp: u32) -> bool {
+    (cp < 128 && (cp as u8 as char).is_ascii_alphanumeric()) || crate::lexer::is_tier1_letter(cp)
+}
+
+/// The first character of a byte slice, and the last, as codepoints.
+fn first_cp(b: &[u8]) -> Option<u32> {
+    (!b.is_empty()).then(|| crate::lexer::utf8_cp(b, 0))
+}
+
+fn last_cp(b: &[u8]) -> Option<u32> {
+    // Walk back over continuation bytes to the lead of the final character.
+    let mut i = b.len().checked_sub(1)?;
+    while i > 0 && b[i] & 0xC0 == 0x80 {
+        i -= 1;
+    }
+    Some(crate::lexer::utf8_cp(b, i))
+}
+
 /// The text after `Chapter:` / `Section:`, joined the way `join-title-parts`
-/// joins it: a space goes in only when the last byte already written and the
-/// first byte arriving are BOTH alphanumeric. So `Section: Slicing (extended)`
-/// is stored as `Slicing(extended)` -- the space before `(` disappears because
-/// `(` is punctuation, and the one after it never existed.
+/// joins it: a space goes in only when the last character already written and
+/// the first character arriving are BOTH a letter or a digit. So `Section:
+/// Slicing (extended)` is stored as `Slicing(extended)` -- the space before
+/// `(` disappears because `(` is punctuation, and the one after it never
+/// existed.
 pub fn header_text(n: &Node, src: &[u8]) -> String {
     let mut acc: Vec<u8> = Vec::new();
     let mut past_colon = false;
@@ -90,11 +118,11 @@ pub fn header_text(n: &Node, src: &[u8]) -> String {
             continue;
         }
         let next = t.text(src);
-        let (Some(&last), Some(&first)) = (acc.last(), next.first()) else {
+        let (Some(last), Some(first)) = (last_cp(&acc), first_cp(next)) else {
             acc.extend_from_slice(next);
             continue;
         };
-        if last.is_ascii_alphanumeric() && first.is_ascii_alphanumeric() {
+        if is_letter_or_digit(last) && is_letter_or_digit(first) {
             acc.push(b' ');
         }
         acc.extend_from_slice(next);
@@ -145,12 +173,16 @@ fn atype(n: &Node, src: &[u8]) -> String {
             [p, r] => format!("(a-fun {} {})", atype(p, src), atype(r, src)),
             _ => unknown(),
         },
+        // A type application is CURRIED: `Vector 4 Integer` is
+        // `(a-app (a-app (a-named "Vector") (args (a-named "4"))) (args
+        // (a-named "Integer")))`, one argument per node. Upstream builds it
+        // that way an argument at a time -- `continue-type-args` wraps
+        // `AppType base [arg]` and loops -- while our CST keeps the arguments
+        // flat under one node, so the fold happens here.
         NodeKind::AppType => match kids.split_first() {
-            Some((base, args)) => {
-                let args: String =
-                    args.iter().map(|a| format!(" {}", atype(a, src))).collect();
-                format!("(a-app {} (args{}))", atype(base, src), args)
-            }
+            Some((base, args)) => args.iter().fold(atype(base, src), |acc, a| {
+                format!("(a-app {acc} (args {}))", atype(a, src))
+            }),
             None => unknown(),
         },
         NodeKind::BoundedIntType => {
@@ -257,6 +289,12 @@ fn type_def(td: &Node, src: &[u8]) -> Option<String> {
         let base = unit.child_nodes().first().map_or_else(unknown, |t| atype(t, src));
         return Some(format!("(unit-def {name} {base})"));
     }
+    // `Energy = unit family Millijoule` is an ordinary unit definition over
+    // Integer -- a unit family IS integer-backed, and its `Member = <factor>`
+    // lines are conversion factors, not type definitions of their own.
+    if td.children_of(NodeKind::UnitFamilyBody).next().is_some() {
+        return Some(format!("(unit-def {name} (a-named \"Integer\"))"));
+    }
     None
 }
 
@@ -288,7 +326,10 @@ pub fn emit(tree: &Node, src: &[u8]) -> String {
     ctor_names.extend(
         type_defs
             .iter()
-            .filter(|td| td.children_of(NodeKind::UnitBody).next().is_some())
+            .filter(|td| {
+                td.children_of(NodeKind::UnitBody).next().is_some()
+                    || td.children_of(NodeKind::UnitFamilyBody).next().is_some()
+            })
             .filter_map(|td| first_name(td, src)),
     );
     // A sorted skip list: sorted by `text-compare`, and unique.

@@ -28,36 +28,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// The text after `Chapter:` / `Section:`, joined the way upstream joins it.
-///
-/// `join-title-parts` inserts a space only when the last byte already written
-/// and the first byte arriving are BOTH alphanumeric -- a character test, not a
-/// token test. So `Section: Header Scanning (streaming)` is stored as
-/// `Header Scanning(streaming)`: the space before `(` disappears because `(` is
-/// punctuation, and the one after it never existed.
-fn header_text(n: &Node, src: &[u8]) -> String {
-    let mut acc: Vec<u8> = Vec::new();
-    let mut past_colon = false;
-    for t in n.tokens() {
-        if t.kind == Kind::Colon && !past_colon {
-            past_colon = true;
-            continue;
-        }
-        if !past_colon || t.kind.is_trivia() || t.kind == Kind::Newline {
-            continue;
-        }
-        let next = t.text(src);
-        let (Some(&last), Some(&first)) = (acc.last(), next.first()) else {
-            acc.extend_from_slice(next);
-            continue;
-        };
-        if last.is_ascii_alphanumeric() && first.is_ascii_alphanumeric() {
-            acc.push(b' ');
-        }
-        acc.extend_from_slice(next);
-    }
-    String::from_utf8_lossy(&acc).into_owned()
-}
+use codexc::preamble::header_text;
 
 fn first_named(n: &Node, src: &[u8]) -> Option<(Token, String)> {
     n.tokens()
