@@ -156,6 +156,11 @@ fn collect(root: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Nodes of `kind` that hold no child NODE -- a bag of tokens and nothing else.
+fn childless(tree: &Node, kind: NodeKind) -> usize {
+    tree.descendants(kind).iter().filter(|n| n.count_any_node() == 0).count()
+}
+
 /// A `Page 1 of 3` footer is genuinely outside every construct, and there is
 /// about one per file. Anything much beyond that is a parser losing structure.
 fn loose_budget(files: usize) -> usize {
@@ -182,6 +187,7 @@ fn cover(roots: &[String]) -> ExitCode {
     let mut loose = 0usize;
     let mut shown = 0usize;
     let (mut flat_pat, mut flat_type, mut flat_td, mut flat_act) = (0usize, 0usize, 0usize, 0usize);
+    let mut unread_ty = 0usize;
     for f in &files {
         let Ok(src) = std::fs::read(f) else { continue };
         let parsed = parser::parse(&src);
@@ -198,13 +204,16 @@ fn cover(roots: &[String]) -> ExitCode {
         unparsed += parsed.unparsed_bodies;
         errs += parsed.errors.len();
         loose += loose_tokens(&parsed.tree);
-        flat_pat += parsed.tree.descendants(NodeKind::Pattern).len();
-        flat_type += parsed.tree.descendants(NodeKind::TypeExpr).len();
-        flat_td += parsed.tree.descendants(NodeKind::TypeDef).len();
-        flat_act += parsed.tree.descendants(NodeKind::ActBlock).len()
-            + parsed.tree.descendants(NodeKind::TryExpr).len()
-            + parsed.tree.descendants(NodeKind::HandleExpr).len()
-            + parsed.tree.descendants(NodeKind::WithTimeout).len();
+        unread_ty += parsed.unread_types;
+        // FLAT means childless: a node holding only tokens. Counting the
+        // wrapper instead would have kept reporting 4,858 flat type
+        // expressions the moment they all gained structure.
+        flat_pat += childless(&parsed.tree, NodeKind::Pattern);
+        flat_type += childless(&parsed.tree, NodeKind::TypeExpr);
+        flat_td += childless(&parsed.tree, NodeKind::TypeDef);
+        for k in [NodeKind::ActBlock, NodeKind::TryExpr, NodeKind::HandleExpr, NodeKind::WithTimeout] {
+            flat_act += childless(&parsed.tree, k);
+        }
         if shown < 12 {
             for u in parsed.tree.descendants(NodeKind::UnparsedBody) {
                 if let Some(t) = u.tokens().find(|t| !t.kind.is_trivia()) {
@@ -222,6 +231,7 @@ fn cover(roots: &[String]) -> ExitCode {
     // What is still a bag of tokens rather than a tree. The desugarer consumes
     // exactly these, so the number is the size of the work between here and
     // there -- not a warning, an inventory.
+    println!("{unread_ty} annotation(s) whose type was not fully read");
     println!("still flat: {flat_pat} patterns, {flat_type} type expressions, \
 {flat_td} type definitions, {flat_act} act/trying/with blocks");
     // Coverage alone is a weak claim and was measured to be: a parser that

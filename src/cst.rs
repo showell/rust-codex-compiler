@@ -37,8 +37,28 @@ pub enum NodeKind {
     DefEquation,
     /// One `(param)`.
     ParamGroup,
-    /// A type expression. Not yet given internal structure.
+    /// A type expression, and its shapes.
     TypeExpr,
+    /// `A, B -> C`. Built right-nested, one parameter per node, from both the
+    /// comma and the arrow.
+    FunType,
+    /// `Maybe a`, `Vector 4 Integer` -- a type applied to arguments.
+    AppType,
+    NamedType,
+    ParenType,
+    TupleType,
+    /// `[Console] Nothing` -- an effect row in front of a return type.
+    EffectType,
+    /// `Integer between 0 and 255 wrapping`
+    BoundedIntType,
+    /// `linear T` / `mutable T`
+    LinearType,
+    /// `forall (a : K), T`
+    ForAllType,
+    /// `A == B` in type position: a propositional equality.
+    PropEqType,
+    /// `A * B`, `A + B` -- type-level arithmetic on bounded integers.
+    ArithType,
     /// `Name = record { .. }` / `Name = | A | B`
     TypeDef,
     /// A run of body tokens the expression parser has not been written for
@@ -122,6 +142,22 @@ impl Node {
             Child::Node(n) if n.kind == kind => Some(n),
             _ => None,
         })
+    }
+
+    /// This node's child nodes, in source order.
+    pub fn child_nodes(&self) -> Vec<&Node> {
+        self.children
+            .iter()
+            .filter_map(|c| match c {
+                Child::Node(n) => Some(n),
+                Child::Token(_) => None,
+            })
+            .collect()
+    }
+
+    /// How many child NODES this node has, of any kind.
+    pub fn count_any_node(&self) -> usize {
+        self.children.iter().filter(|c| matches!(c, Child::Node(_))).count()
     }
 
     pub fn count(&self, kind: NodeKind) -> usize {
@@ -225,6 +261,15 @@ impl Builder {
     /// in order, so the coverage guarantee is untouched.
     pub fn checkpoint(&self) -> usize {
         self.stack.last().unwrap().children.len()
+    }
+
+    /// The kind of the node sitting at `cp`, if a node is there. Used to
+    /// refuse a chained arrow without re-parsing what was just built.
+    pub fn kind_at(&self, cp: usize) -> Option<NodeKind> {
+        match self.stack.last()?.children.get(cp)? {
+            Child::Node(n) => Some(n.kind),
+            Child::Token(_) => None,
+        }
     }
 
     /// Fold every child added since `cp` into one node of `kind`.

@@ -581,13 +581,14 @@ mod tests {
         assert_eq!(p.unparsed_bodies, 0, "body not understood: {expr}");
         assert!(p.errors.is_empty(), "{:?} for {expr}", p.errors);
         let def = p.tree.descendants(NodeKind::Def).into_iter().next().unwrap();
-        // Strip the Def wrapper -- its opening text and its ONE closing paren.
-        // `trim_end_matches` would eat the body's own closers too.
-        let shape = def.shape();
-        let inner = shape
-            .strip_prefix("(Def (TypeAnnotation (TypeExpr)) (DefEquation (ParamGroup)) ")
-            .unwrap_or(&shape);
-        inner.strip_suffix(')').unwrap_or(inner).to_string()
+        // Take the body NODE rather than slicing the Def's rendered text. The
+        // text form broke the moment type expressions grew children, which is
+        // exactly the kind of coupling a shape test should not have.
+        def.child_nodes()
+            .into_iter()
+            .find(|n| !matches!(n.kind, NodeKind::TypeAnnotation | NodeKind::DefEquation))
+            .expect("a body")
+            .shape()
     }
 
     #[test]

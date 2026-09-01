@@ -36,6 +36,8 @@ pub struct Parsed {
     pub errors: Vec<ParseError>,
     /// Bodies collected but not yet given structure. Reported, never hidden.
     pub unparsed_bodies: usize,
+    /// Annotations whose type the type grammar could not finish reading.
+    pub unread_types: usize,
 }
 
 /// The column a top-level item sits at. Upstream compares against the literal
@@ -48,6 +50,7 @@ pub(crate) struct Parser<'a> {
     pub(crate) toks: Vec<Token>,
     pub(crate) errors: Vec<ParseError>,
     pub(crate) unparsed_bodies: usize,
+    pub(crate) unread_types: usize,
     /// Newlines are skipped inside brackets and significant outside them. This
     /// is upstream's `paren-depth` and it is the whole reason a multi-line
     /// application is an error at the top level and fine inside parentheses.
@@ -152,6 +155,7 @@ pub fn parse(src: &[u8]) -> Parsed {
         toks,
         errors: Vec::new(),
         unparsed_bodies: 0,
+        unread_types: 0,
         paren_depth: 0,
     };
 
@@ -223,7 +227,12 @@ pub fn parse(src: &[u8]) -> Parsed {
     }
 
     let tree = p.b.finish().expect("the builder guarantees full coverage");
-    Parsed { tree, errors: p.errors, unparsed_bodies: p.unparsed_bodies }
+    Parsed {
+        tree,
+        errors: p.errors,
+        unparsed_bodies: p.unparsed_bodies,
+        unread_types: p.unread_types,
+    }
 }
 
 /// `Name = record { .. }`, `Name = | A | B`, `Name a b = ..`, and the `mutable`
@@ -269,15 +278,27 @@ fn parse_def(p: &mut Parser<'_>, src: &[u8], first: Token) {
         p.bump(); // the name
         p.bump(); // the colon
         p.b.start(NodeKind::TypeExpr);
-        while let Some(k) = p.kind(0) {
-            if k == Kind::Newline || k == Kind::EndOfFile {
-                break;
+        crate::types::parse_type(p);
+        // Whatever the type grammar declined still belongs to the annotation.
+        // It is kept under Error and COUNTED: a type read halfway must not
+        // look like a type read whole.
+        match p.kind(0) {
+            Some(Kind::Equals) => saw_equals_on_annotation = true,
+            Some(Kind::Newline) | Some(Kind::EndOfFile) | None => {}
+            _ => {
+                p.b.start(NodeKind::Error);
+                p.unread_types += 1;
+                while let Some(k) = p.kind(0) {
+                    if k == Kind::Newline || k == Kind::EndOfFile || k == Kind::Equals {
+                        if k == Kind::Equals {
+                            saw_equals_on_annotation = true;
+                        }
+                        break;
+                    }
+                    p.bump();
+                }
+                p.b.end();
             }
-            if k == Kind::Equals {
-                saw_equals_on_annotation = true;
-                break;
-            }
-            p.bump();
         }
         p.b.end(); // TypeExpr
         p.b.end(); // TypeAnnotation
