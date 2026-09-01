@@ -78,6 +78,12 @@ error -- and it says nothing about whether the shape is RIGHT. Giving `+` and
 tests today and by the IR golds later; neither `parse.truth` nor
 `desugar.truth` inspects an expression at all.
 
+`cover` also reports what the parse ALONE cost, separately from the sweep's
+own -- a second tokenize, a dozen tree walks. Compile speed is this project's
+first goal, and reporting them together would hide a regression inside the
+gate's cost. Measured over the checkout: 16.3 MB in 0.37 s, ~42 MB/s, against
+codexir's ~150 KB/s.
+
 The one pattern number that IS a gate is `token(s) in pattern position not
 understood`, which must be zero: upstream's pattern parser never fails, folding
 anything it does not recognise into the same wildcard the author could have

@@ -206,7 +206,7 @@ fn is_abutted_negation(p: &Parser<'_>) -> bool {
 /// Upstream's `is-field-name-token`. A field name may be a keyword -- `span.end`
 /// and `.record` are real -- but it may NOT be a TypeIdentifier, so the set is
 /// neither "any identifier" nor "any word".
-fn is_field_name(k: Kind) -> bool {
+pub(crate) fn is_field_name(k: Kind) -> bool {
     matches!(
         k,
         Kind::Identifier

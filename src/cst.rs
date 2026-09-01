@@ -61,6 +61,23 @@ pub enum NodeKind {
     ArithType,
     /// `Name = record { .. }` / `Name = | A | B`
     TypeDef,
+    /// The `a b` / `(a) (b)` after a type definition's name.
+    TypeParams,
+    RecordBody,
+    RecordFieldDef,
+    VariantBody,
+    VariantCtor,
+    /// One `(T)` of a constructor.
+    CtorField,
+    /// A constructor's `: T`, which fixes its result type.
+    CtorReturn,
+    /// `= unit T`
+    UnitBody,
+    /// `= unit family Millimeter`, and its `Member = <factor>` lines.
+    UnitFamilyBody,
+    UnitFamilyMember,
+    /// `deriving Show, Eq, Ord`
+    Deriving,
     /// A run of body tokens the expression parser has not been written for
     /// yet. It is a NAMED placeholder and is counted in the dump, because a
     /// body silently swallowed would look exactly like a body understood.
@@ -197,6 +214,28 @@ impl Node {
             }
         }
         out.push(')');
+    }
+
+    /// How many nodes of `kind` are anywhere below here.
+    ///
+    /// [`Node::descendants`] collects and then SORTS, which is right when the
+    /// caller wants them in source order and pure waste when it only wants the
+    /// number. A dozen of those per file is what took the coverage sweep from
+    /// six seconds to fifteen.
+    pub fn count_descendants(&self, kind: NodeKind) -> usize {
+        let mut n = 0;
+        let mut stack: Vec<&Node> = vec![self];
+        while let Some(node) = stack.pop() {
+            if node.kind == kind {
+                n += 1;
+            }
+            for c in &node.children {
+                if let Child::Node(sub) = c {
+                    stack.push(sub);
+                }
+            }
+        }
+        n
     }
 
     /// Every node of `kind` anywhere below here, in source order.

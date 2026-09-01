@@ -38,6 +38,8 @@ pub struct Parsed {
     pub unparsed_bodies: usize,
     /// Annotations whose type the type grammar could not finish reading.
     pub unread_types: usize,
+    /// Type definitions whose body the grammar could not finish reading.
+    pub unread_type_defs: usize,
 }
 
 /// The column a top-level item sits at. Upstream compares against the literal
@@ -51,6 +53,7 @@ pub(crate) struct Parser<'a> {
     pub(crate) errors: Vec<ParseError>,
     pub(crate) unparsed_bodies: usize,
     pub(crate) unread_types: usize,
+    pub(crate) unread_type_defs: usize,
     /// Newlines are skipped inside brackets and significant outside them. This
     /// is upstream's `paren-depth` and it is the whole reason a multi-line
     /// application is an error at the top level and fine inside parentheses.
@@ -128,7 +131,7 @@ impl<'a> Parser<'a> {
 
 /// Upstream's `is-claim-or-def-start`: what may begin a top-level item, and so
 /// what ends the body of the one before it.
-fn starts_an_item(k: Kind) -> bool {
+pub(crate) fn starts_an_item(k: Kind) -> bool {
     matches!(
         k,
         Kind::Identifier
@@ -156,6 +159,7 @@ pub fn parse(src: &[u8]) -> Parsed {
         errors: Vec::new(),
         unparsed_bodies: 0,
         unread_types: 0,
+        unread_type_defs: 0,
         paren_depth: 0,
     };
 
@@ -210,7 +214,9 @@ pub fn parse(src: &[u8]) -> Parsed {
                 p.eat_to_end_of_line();
                 p.b.end();
             }
-            _ if t.col == TOP_LEVEL_COL && looks_like_type_def(&p) => parse_type_def(&mut p, t),
+            _ if t.col == TOP_LEVEL_COL && looks_like_type_def(&p) => {
+                crate::typedef::parse_type_def(&mut p, t)
+            }
             _ if t.col == TOP_LEVEL_COL && starts_an_item(t.kind) => parse_def(&mut p, src, t),
             _ => {
                 // Whatever this is, it is not a top-level item, and upstream
@@ -232,6 +238,7 @@ pub fn parse(src: &[u8]) -> Parsed {
         errors: p.errors,
         unparsed_bodies: p.unparsed_bodies,
         unread_types: p.unread_types,
+        unread_type_defs: p.unread_type_defs,
     }
 }
 
@@ -252,20 +259,15 @@ fn looks_like_type_def(p: &Parser<'_>) -> bool {
     if p.kind(start) != Some(Kind::TypeIdentifier) {
         return false;
     }
-    // Skip type parameters: `Maybe a`, `Either a b`.
+    // Skip type parameters: `Maybe a`, `Either a b`, `Iter (a)`. Missing the
+    // paren form does not fail loudly -- the definition parses perfectly as a
+    // VALUE definition whose name happens to be capitalised, and 26 of them in
+    // the checkout did.
     let mut n = start + 1;
-    while p.kind(n) == Some(Kind::Identifier) {
-        n += 1;
+    while crate::typedef::starts_type_params(p, n) {
+        n += if p.kind(n) == Some(Kind::LeftParen) { 3 } else { 1 };
     }
     p.kind(n) == Some(Kind::Equals)
-}
-
-fn parse_type_def(p: &mut Parser<'_>, first: Token) {
-    p.b.start(NodeKind::TypeDef);
-    // Everything up to the next top-level item belongs to the body, which for
-    // a record or variant runs over several lines.
-    eat_item_body(p, first.col);
-    p.b.end();
 }
 
 fn parse_def(p: &mut Parser<'_>, src: &[u8], first: Token) {
@@ -399,7 +401,7 @@ fn body(p: &mut Parser<'_>, def_col: u32) {
 /// continue that prose and are not code. Upstream keeps skipping while
 /// `column > 3`. Looking back for the trivia is how we know a run of
 /// deeply-indented words is a paragraph and not an unread expression.
-fn in_prose_block(p: &Parser<'_>) -> bool {
+pub(crate) fn in_prose_block(p: &Parser<'_>) -> bool {
     let mut i = p.at();
     while i > 0 {
         i -= 1;
@@ -412,7 +414,7 @@ fn in_prose_block(p: &Parser<'_>) -> bool {
     false
 }
 
-fn eat_prose_block(p: &mut Parser<'_>) {
+pub(crate) fn eat_prose_block(p: &mut Parser<'_>) {
     p.b.start(NodeKind::ProseBlock);
     loop {
         p.eat_to_end_of_line();
@@ -422,12 +424,34 @@ fn eat_prose_block(p: &mut Parser<'_>) {
         } else {
             break;
         }
-        match p.sig(0) {
-            Some(t) if t.col > TOP_LEVEL_COL && t.kind != Kind::EndOfFile => continue,
-            _ => break,
+        if !prose_continues(p) {
+            break;
         }
     }
     p.b.end();
+}
+
+/// Does the block go on after the line just consumed?
+///
+/// It does if the next line is indented past the top-level column, and it also
+/// does if -- ACROSS ONE OR MORE BLANK LINES -- the next line is another prose
+/// line, which the lexer has already ruled on by making it `SkippedProse`.
+/// Stopping at the blank line left the paragraph after it looking like an
+/// unread body, which is a phenomenon of paragraph spacing and not a fact
+/// about the grammar.
+fn prose_continues(p: &Parser<'_>) -> bool {
+    let mut i = p.at();
+    loop {
+        match p.toks.get(i) {
+            None => return false,
+            Some(t) => match t.kind {
+                Kind::SkippedProse => return true,
+                Kind::Spaces | Kind::Newline => i += 1,
+                Kind::EndOfFile => return false,
+                _ => return t.col > TOP_LEVEL_COL,
+            },
+        }
+    }
 }
 
 /// Consume up to the next top-level item, which upstream defines as a

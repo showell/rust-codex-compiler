@@ -187,6 +187,18 @@ fn childless(tree: &Node, kind: NodeKind) -> usize {
     tree.descendants(kind).iter().filter(|n| n.count_any_node() == 0).count()
 }
 
+/// Wall time spent in `parse` alone, and the rate it implies. Compile speed is
+/// this project's first goal, so the sweep that proves the grammar total is
+/// also the place to watch it: everything else here -- a second tokenize for
+/// the coverage check, a dozen tree walks -- is the GATE's cost and not the
+/// front end's, and reporting them together hides a regression inside it.
+fn rate(bytes: usize, secs: f64) -> String {
+    if secs <= 0.0 {
+        return "-".to_string();
+    }
+    format!("{:.1} MB/s", bytes as f64 / secs / 1_048_576.0)
+}
+
 /// A `Page 1 of 3` footer is genuinely outside every construct, and there is
 /// about one per file. Anything much beyond that is a parser losing structure.
 fn loose_budget(files: usize) -> usize {
@@ -217,8 +229,10 @@ fn cover(roots: &[String]) -> ExitCode {
     let mut by_msg: std::collections::HashMap<String, (usize, String)> =
         std::collections::HashMap::new();
     let mut loose = 0usize;
-    let mut shown = 0usize;
-    let (mut flat_type, mut flat_td, mut flat_act) = (0usize, 0usize, 0usize);
+    let (mut shown, mut shown_td) = (0usize, 0usize);
+    let (mut parse_secs, mut total_bytes) = (0f64, 0usize);
+    let (mut flat_type, mut flat_act) = (0usize, 0usize);
+    let (mut tds, mut recs, mut vars, mut ctors, mut unread_td) = (0usize, 0usize, 0usize, 0usize, 0usize);
     // Patterns are no longer a token bag, so "flat" says nothing about them --
     // `is Red` is a childless CtorPat and is exactly right. What matters is
     // how many tokens landed in pattern position without being understood,
@@ -228,7 +242,10 @@ fn cover(roots: &[String]) -> ExitCode {
     let mut unread_ty = 0usize;
     for f in &files {
         let Ok(src) = std::fs::read(f) else { continue };
+        let t0 = std::time::Instant::now();
         let parsed = parser::parse(&src);
+        parse_secs += t0.elapsed().as_secs_f64();
+        total_bytes += src.len();
         let lexed = codexc::lexer::tokenize(&src);
         let in_tree: Vec<_> = parsed.tree.tokens().copied().collect();
         if in_tree != lexed.tokens {
@@ -238,7 +255,7 @@ fn cover(roots: &[String]) -> ExitCode {
                          f.display(), in_tree.len(), lexed.tokens.len());
             }
         }
-        defs += parsed.tree.descendants(NodeKind::Def).len();
+        defs += parsed.tree.count_descendants(NodeKind::Def);
         unparsed += parsed.unparsed_bodies;
         if is_diagnostic_test(f) {
             expected_errs += parsed.errors.len();
@@ -262,8 +279,8 @@ fn cover(roots: &[String]) -> ExitCode {
                   NodeKind::TuplePat, NodeKind::ParenPat, NodeKind::VecPat] {
             pats += parsed.tree.descendants(k).len();
         }
-        err_pats += parsed.tree.descendants(NodeKind::ErrPat).len();
-        guards += parsed.tree.descendants(NodeKind::Guard).len();
+        err_pats += parsed.tree.count_descendants(NodeKind::ErrPat);
+        guards += parsed.tree.count_descendants(NodeKind::Guard);
         for a in parsed.tree.descendants(NodeKind::MatchArm) {
             arms += 1;
             // An arm's children are its patterns, an optional guard and its
@@ -273,9 +290,24 @@ fn cover(roots: &[String]) -> ExitCode {
             }
         }
         flat_type += childless(&parsed.tree, NodeKind::TypeExpr);
-        flat_td += childless(&parsed.tree, NodeKind::TypeDef);
+        tds += parsed.tree.count_descendants(NodeKind::TypeDef);
+        recs += parsed.tree.count_descendants(NodeKind::RecordFieldDef);
+        vars += parsed.tree.count_descendants(NodeKind::VariantBody);
+        ctors += parsed.tree.count_descendants(NodeKind::VariantCtor);
+        unread_td += parsed.unread_type_defs;
         for k in [NodeKind::ActBlock, NodeKind::TryExpr, NodeKind::HandleExpr, NodeKind::WithTimeout] {
             flat_act += childless(&parsed.tree, k);
+        }
+        if parsed.unread_type_defs > 0 && shown_td < 12 {
+            for td in parsed.tree.descendants(NodeKind::TypeDef) {
+                for e in td.children_of(NodeKind::Error) {
+                    if let Some(t) = e.tokens().find(|t| !t.kind.is_trivia()) {
+                        println!("UNREAD-TYPEDEF {}:{}:{}: {} |{}|", f.display(), t.line, t.col,
+                                 t.kind.name(), String::from_utf8_lossy(t.text(&src)));
+                        shown_td += 1;
+                    }
+                }
+            }
         }
         if shown < 12 {
             for u in parsed.tree.descendants(NodeKind::UnparsedBody) {
@@ -290,6 +322,7 @@ fn cover(roots: &[String]) -> ExitCode {
     }
     println!("{} files, {defs} definitions, {unparsed} bodies not yet structured, {errs} parse errors",
              files.len());
+    println!("parse: {total_bytes} bytes in {parse_secs:.3}s, {}", rate(total_bytes, parse_secs));
     println!("{expected_errs} more in test/errors/, where a diagnostic is the point");
     println!("{loose} token(s) landed in no construct");
     let mut ranked: Vec<_> = by_msg.into_iter().collect();
@@ -303,14 +336,15 @@ fn cover(roots: &[String]) -> ExitCode {
     println!("{unread_ty} annotation(s) whose type was not fully read");
     println!("{pats} patterns in {arms} match arms; {alts} arms alternate, {guards} are guarded");
     println!("{err_pats} token(s) in pattern position not understood");
-    println!("still flat: {flat_type} type expressions, {flat_td} type definitions, \
-{flat_act} act/trying/with blocks");
+    println!("{tds} type definitions: {recs} record fields, {vars} variants of {ctors} constructors");
+    println!("{unread_td} type definition(s) whose body was not fully read");
+    println!("still flat: {flat_type} type expressions, {flat_act} act/trying/with blocks");
     // Coverage alone is a weak claim and was measured to be: a parser that
     // stopped consuming definition bodies still passed it, because the orphaned
     // tokens simply reappeared as loose lines and were still counted once. So
     // the gate is coverage AND homelessness -- every token in the tree, and
     // almost none of them outside a named construct.
-    if bad == 0 && loose <= loose_budget(files.len()) && err_pats == 0 {
+    if bad == 0 && loose <= loose_budget(files.len()) && err_pats == 0 && unread_td == 0 {
         println!("COVERED: every lexer token reaches the tree exactly once, inside a construct");
         ExitCode::SUCCESS
     } else {
@@ -322,6 +356,9 @@ fn cover(roots: &[String]) -> ExitCode {
         }
         if err_pats > 0 {
             println!("UNREAD PATTERNS: {err_pats}");
+        }
+        if unread_td > 0 {
+            println!("UNREAD TYPE DEFINITION BODIES: {unread_td}");
         }
         ExitCode::FAILURE
     }

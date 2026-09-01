@@ -9,4 +9,5 @@ pub mod lexer;
 pub mod parser;
 pub mod pattern;
 pub mod token;
+pub mod typedef;
 pub mod types;
