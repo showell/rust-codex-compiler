@@ -184,6 +184,10 @@ fn cover(roots: &[String]) -> ExitCode {
     }
     files.sort();
     let (mut bad, mut defs, mut unparsed, mut errs) = (0usize, 0usize, 0usize, 0usize);
+    // What the parser is complaining ABOUT, not just how often. A total of 144
+    // says nothing; "expected 'in' after a let binding, 96 times" names the
+    // grammar rule that is missing.
+    let mut by_msg: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut loose = 0usize;
     let mut shown = 0usize;
     let (mut flat_pat, mut flat_type, mut flat_td, mut flat_act) = (0usize, 0usize, 0usize, 0usize);
@@ -203,6 +207,9 @@ fn cover(roots: &[String]) -> ExitCode {
         defs += parsed.tree.descendants(NodeKind::Def).len();
         unparsed += parsed.unparsed_bodies;
         errs += parsed.errors.len();
+        for e in &parsed.errors {
+            *by_msg.entry(e.msg.clone()).or_default() += 1;
+        }
         loose += loose_tokens(&parsed.tree);
         unread_ty += parsed.unread_types;
         // FLAT means childless: a node holding only tokens. Counting the
@@ -228,6 +235,11 @@ fn cover(roots: &[String]) -> ExitCode {
     println!("{} files, {defs} definitions, {unparsed} bodies not yet structured, {errs} parse errors",
              files.len());
     println!("{loose} token(s) landed in no construct");
+    let mut ranked: Vec<_> = by_msg.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    for (msg, n) in ranked.iter().take(10) {
+        println!("  {n} x {msg}");
+    }
     // What is still a bag of tokens rather than a tree. The desugarer consumes
     // exactly these, so the number is the size of the work between here and
     // there -- not a warning, an inventory.
