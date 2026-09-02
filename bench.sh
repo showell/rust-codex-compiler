@@ -15,10 +15,20 @@ SAFARI="${SAFARI_ROOT:-$HOME/showell_repos/safari-codex}"
 BIN="${CODEXRUN:-${CARGO_TARGET_DIR:-target}/release/codexrun}"
 [ -x "$BIN" ] || { echo "no codexrun at $BIN; cargo build --release, or set CODEXRUN"; exit 2; }
 
+# Named, not globbed: a benchmark whose subject list drifts with the corpus
+# stops being comparable to yesterday's number. `drive` and `scene` were in
+# this list and are not unit names -- the units are `drive_main` and
+# `scene_main` -- so two of the eight subjects were silently absent and the
+# total was a different measurement than it said it was. A missing subject is
+# now REPORTED.
 SUBJECTS=()
-for u in camera world truck_body cat_draw critter tree drive scene; do
+for u in camera world truck_body cat_draw critter tree drive_main scene_main; do
     f="$SAFARI/build/$u-unit.codex"
-    [ -f "$f" ] && SUBJECTS+=("$f")
+    if [ -f "$f" ]; then
+        SUBJECTS+=("$f")
+    else
+        echo "no $u-unit.codex under $SAFARI/build -- NOT benched" >&2
+    fi
 done
 [ -n "${ARITH_UNIT:-}" ] && [ -f "$ARITH_UNIT" ] && SUBJECTS+=("$ARITH_UNIT")
 
