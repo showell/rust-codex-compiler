@@ -152,8 +152,11 @@ fn sweep(units: &Path, tests: &Path) -> ExitCode {
         }
         ran += 1;
         let want = std::fs::read_to_string(exp).unwrap_or_default();
-        match run_in_thread(&unit, Some(SWEEP_BUDGET)) {
-            Ok(got) if got == want => matched += 1,
+        let verdict = match run_in_thread(&unit, Some(SWEEP_BUDGET)) {
+            Ok(got) if got == want => {
+                matched += 1;
+                "ok".to_string()
+            }
             Ok(got) => {
                 let first = want
                     .lines()
@@ -161,15 +164,25 @@ fn sweep(units: &Path, tests: &Path) -> ExitCode {
                     .position(|(a, b)| a != b)
                     .map(|i| format!("line {} differs", i + 1))
                     .unwrap_or_else(|| "output length differs".to_string());
-                by_cause.entry(first).or_insert_with(|| (0, stem.clone())).0 += 1;
+                by_cause.entry(first.clone()).or_insert_with(|| (0, stem.clone())).0 += 1;
+                first
             }
             Err(e) => {
                 // The first line of the error is the cause; group by it so a
                 // missing builtin shows up once with a count.
                 let cause = e.lines().next().unwrap_or("?").to_string();
-                by_cause.entry(cause).or_insert_with(|| (0, stem.clone())).0 += 1;
+                by_cause.entry(cause.clone()).or_insert_with(|| (0, stem.clone())).0 += 1;
+                cause
             }
-        }
+        };
+        // ONE LINE PER PROGRAM, AS IT FINISHES, on stderr.
+        //
+        // The summary below is written once, after the loop. A sweep that is
+        // stopped -- and a long one will be -- would otherwise leave nothing
+        // at all, and every program it did run would have to be run again to
+        // learn what it already knew. stderr keeps it out of the verdict
+        // stdout carries, so `2>` names the record and `>` names the answer.
+        eprintln!("{stem}\t{verdict}");
     }
     println!("{matched} of {ran} programs print exactly what they should ({:.1}%), in {:.1}s",
              100.0 * matched as f64 / ran.max(1) as f64, t0.elapsed().as_secs_f64());
