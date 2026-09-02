@@ -37,40 +37,83 @@ pub enum Value {
     Unit,
 }
 
+/// What a saturated closure RUNS.
+///
+/// A constructor and a builtin used to be encoded as a `NameRef` holding
+/// `__ctor:`/`__builtin:` and the name -- which meant a `format!` on every
+/// reference and a `to_string` on every call to take the prefix back off.
+/// Naming the three cases allocates nothing.
+#[derive(Clone, Debug)]
+pub enum Body {
+    /// A definition's or a lambda's body.
+    Expr(Rc<Expr>),
+    /// A variant constructor: the arguments ARE the value.
+    Ctor(Rc<String>),
+    /// A compiler builtin, resolved to its name once.
+    Builtin(&'static str),
+}
+
 #[derive(Debug)]
 pub struct Closure {
-    pub params: Vec<Name>,
-    pub body: Rc<Expr>,
+    /// SHARED with every partial application of the same function. Cloning a
+    /// `Vec<String>` once per argument applied was the largest single caller
+    /// of `malloc` in the profile.
+    pub params: Rc<Vec<Name>>,
+    pub body: Body,
     pub env: Env,
     pub applied: Vec<Value>,
     /// The chapter this closure's body was written in, when it came from a
     /// top-level definition. A name that COLLIDES across chapters resolves to
     /// the one in the same chapter as the reference, so a body has to know
-    /// where it lives.
-    pub slug: Option<String>,
+    /// where it lives. INTERNED: a call installs it, and that has to be a
+    /// refcount rather than a copy of the text.
+    pub slug: Option<Rc<str>>,
 }
 
 pub type Env = Rc<Scope>;
+
+/// What one frame binds.
+///
+/// A CALL binds the closure's whole parameter list at once, and the closure
+/// already owns that list -- so the frame SHARES it and carries the values
+/// beside it, instead of cloning a `String` per parameter per call. A `let`,
+/// an `act` bind and a match arm's captures name themselves and stay pairs.
+#[derive(Debug)]
+enum Frame {
+    Call(Rc<Vec<Name>>, Vec<Value>),
+    Binds(Vec<(Name, Value)>),
+}
 
 /// A frame binds one to three names. A `HashMap` per call spends more on
 /// hashing and on its allocation than a linear scan of a `Vec` ever costs, and
 /// a call is the hottest thing an interpreter does.
 #[derive(Debug)]
 pub struct Scope {
-    vars: Vec<(Name, Value)>,
+    frame: Frame,
     parent: Option<Env>,
 }
 
 impl Scope {
     fn root() -> Env {
-        Rc::new(Scope { vars: Vec::new(), parent: None })
+        Rc::new(Scope { frame: Frame::Binds(Vec::new()), parent: None })
     }
     fn get(&self, n: &str) -> Option<Value> {
         let mut here = self;
         loop {
             // Later bindings shadow earlier ones in the same frame.
-            if let Some((_, v)) = here.vars.iter().rev().find(|(k, _)| k == n) {
-                return Some(v.clone());
+            match &here.frame {
+                Frame::Call(names, vals) => {
+                    if let Some(i) = names.iter().rposition(|k| k == n) {
+                        if let Some(v) = vals.get(i) {
+                            return Some(v.clone());
+                        }
+                    }
+                }
+                Frame::Binds(vars) => {
+                    if let Some((_, v)) = vars.iter().rev().find(|(k, _)| k == n) {
+                        return Some(v.clone());
+                    }
+                }
             }
             match &here.parent {
                 Some(p) => here = p,
@@ -79,10 +122,15 @@ impl Scope {
         }
     }
     fn child(parent: &Env, vars: Vec<(Name, Value)>) -> Env {
-        Rc::new(Scope { vars, parent: Some(parent.clone()) })
+        Rc::new(Scope { frame: Frame::Binds(vars), parent: Some(parent.clone()) })
     }
     fn one(parent: &Env, name: Name, v: Value) -> Env {
-        Rc::new(Scope { vars: vec![(name, v)], parent: Some(parent.clone()) })
+        Rc::new(Scope { frame: Frame::Binds(vec![(name, v)]), parent: Some(parent.clone()) })
+    }
+    /// The frame a saturated call runs in: the closure's own parameter list,
+    /// shared, and one value per name.
+    fn call(parent: &Env, names: Rc<Vec<Name>>, vals: Vec<Value>) -> Env {
+        Rc::new(Scope { frame: Frame::Call(names, vals), parent: Some(parent.clone()) })
     }
 }
 
@@ -137,13 +185,20 @@ pub struct Interp {
     /// which is the single most expensive thing an interpreter can do.
     funs: HashMap<Name, Value>,
     by_chapter_fun: HashMap<(String, String), Value>,
+    /// Every builtin and every constructor as a ready value, built ONCE. A
+    /// reference used to build a fresh `Vec<String>` of parameter names, a
+    /// `format!`ed marker and two `Rc`s -- every time.
+    builtin_funs: HashMap<&'static str, Value>,
+    ctor_funs: HashMap<String, Value>,
+    /// The empty environment, shared: every top-level closure closes over it.
+    root: Env,
     /// `(chapter, name) -> definition`, for the names defined in more than one
     /// chapter of a bundled unit. `drive-unit.codex` has two `bar-quad`s --
     /// one over `ScreenPt` and one over `RiderPt` -- and keeping only the last
     /// silently gave the wrong one to every caller of the other.
     by_chapter: HashMap<(String, String), Rc<Def>>,
     /// The chapter whose body is currently running.
-    cur_slug: String,
+    cur_slug: Rc<str>,
     pub collisions: Vec<String>,
     /// The same set, for the test every lookup makes.
     colliding: std::collections::HashSet<String>,
@@ -169,14 +224,18 @@ const DEPTH_LIMIT: u32 = 20_000;
 
 impl Interp {
     pub fn new(ch: &Chapter) -> Interp {
+        let root = Scope::root();
         let mut it = Interp {
             defs: HashMap::new(),
             bounds: HashMap::new(),
             ctors: HashMap::new(),
             funs: HashMap::new(),
             by_chapter_fun: HashMap::new(),
+            builtin_funs: HashMap::new(),
+            ctor_funs: HashMap::new(),
+            root: root.clone(),
             by_chapter: HashMap::new(),
-            cur_slug: String::new(),
+            cur_slug: Rc::from(""),
             collisions: Vec::new(),
             colliding: Default::default(),
             out: String::new(),
@@ -201,16 +260,23 @@ impl Interp {
             .collect();
         it.collisions.sort();
         it.colliding = it.collisions.iter().cloned().collect();
+        // Chapter slugs are interned here, once per chapter rather than once
+        // per closure, because a call installs one.
+        let mut slugs: HashMap<&str, Rc<str>> = HashMap::new();
         for d in &ch.defs {
             if d.params.is_empty() {
                 continue;
             }
+            let slug = slugs
+                .entry(d.chapter_slug.as_str())
+                .or_insert_with(|| Rc::from(d.chapter_slug.as_str()))
+                .clone();
             let f = Value::Fun(Rc::new(Closure {
-                params: d.params.iter().map(|p| p.name.clone()).collect(),
-                body: Rc::new(d.body.clone()),
-                env: Scope::root(),
+                params: Rc::new(d.params.iter().map(|p| p.name.clone()).collect()),
+                body: Body::Expr(Rc::new(d.body.clone())),
+                env: root.clone(),
                 applied: Vec::new(),
-                slug: Some(d.chapter_slug.clone()),
+                slug: Some(slug),
             }));
             it.funs.insert(d.name.clone(), f.clone());
             it.by_chapter_fun.insert((d.chapter_slug.clone(), d.name.clone()), f);
@@ -235,6 +301,43 @@ impl Interp {
                 TypeDef::Unit(..) => {}
             }
         }
+        // Constructors and builtins are FIXED for the run, so their closures
+        // are built here and every reference clones a `Value` -- which is one
+        // refcount -- rather than rebuilding one.
+        let ctors: Vec<(String, usize)> = it.ctors.iter().map(|(n, a)| (n.clone(), *a)).collect();
+        for (name, arity) in ctors {
+            let rc = Rc::new(name.clone());
+            let v = if arity == 0 {
+                Value::Ctor(rc, Rc::new(Vec::new()))
+            } else {
+                Value::Fun(Rc::new(Closure {
+                    params: Rc::new((0..arity).map(|i| format!("__f{i}")).collect()),
+                    body: Body::Ctor(rc),
+                    env: root.clone(),
+                    applied: Vec::new(),
+                    slug: None,
+                }))
+            };
+            it.ctor_funs.insert(name, v);
+        }
+        // The arity comes from the compiler's own table, not from a list here:
+        // a builtin applied to the wrong number of arguments would otherwise be
+        // a silent partial application rather than a call.
+        for (name, arity) in crate::builtins::BUILTINS {
+            // An arity of 0 means the entry declares no type; treat it as one
+            // argument, the way the old per-reference path did.
+            let arity = if arity == 0 { 1 } else { arity };
+            it.builtin_funs.insert(
+                name,
+                Value::Fun(Rc::new(Closure {
+                    params: Rc::new((0..arity).map(|i| format!("__a{i}")).collect()),
+                    body: Body::Builtin(name),
+                    env: root.clone(),
+                    applied: Vec::new(),
+                    slug: None,
+                })),
+            );
+        }
         it
     }
 
@@ -250,8 +353,8 @@ impl Interp {
         let Some(open) = self.defs.get("opening").cloned() else {
             return err("no `opening` definition to run");
         };
-        self.cur_slug = open.chapter_slug.clone();
-        let env = Scope::root();
+        self.cur_slug = Rc::from(open.chapter_slug.as_str());
+        let env = self.root.clone();
         self.eval(&open.body, &env)?;
         Ok(())
     }
@@ -324,8 +427,8 @@ impl Interp {
             // The body is already shared: a lambda evaluated a million times
             // bumps a refcount rather than copying its tree.
             Expr::Lambda(params, body, _) => Ok(Value::Fun(Rc::new(Closure {
-                params: params.clone(),
-                body: body.clone(),
+                params: Rc::new(params.clone()),
+                body: Body::Expr(body.clone()),
                 env: env.clone(),
                 applied: Vec::new(),
                 slug: Some(self.cur_slug.clone()),
@@ -427,7 +530,7 @@ impl Interp {
         // allocated two Strings on every reference to every name, and almost
         // no name collides.
         let by_chapter = self.colliding.contains(n).then(|| {
-            let key = (self.cur_slug.clone(), n.to_string());
+            let key = (self.cur_slug.to_string(), n.to_string());
             (self.by_chapter_fun.get(&key).cloned(), self.by_chapter.get(&key).cloned())
         });
         if let Some((Some(f), _)) = &by_chapter {
@@ -441,37 +544,22 @@ impl Interp {
             if d.params.is_empty() {
                 // A constant, evaluated on each reference. Codex is pure, so
                 // this is a cost and not a semantic difference.
-                let root = Scope::root();
+                let root = self.root.clone();
                 return self.eval(&d.body, &root);
             }
             return Ok(Value::Fun(Rc::new(Closure {
-                params: d.params.iter().map(|p| p.name.clone()).collect(),
-                body: Rc::new(d.body.clone()),
-                env: Scope::root(),
+                params: Rc::new(d.params.iter().map(|p| p.name.clone()).collect()),
+                body: Body::Expr(Rc::new(d.body.clone())),
+                env: self.root.clone(),
                 applied: Vec::new(),
-                slug: Some(d.chapter_slug.clone()),
+                slug: Some(Rc::from(d.chapter_slug.as_str())),
             })));
         }
-        if let Some(arity) = self.ctors.get(n).copied() {
-            if arity == 0 {
-                return Ok(Value::Ctor(Rc::new(n.to_string()), Rc::new(Vec::new())));
-            }
-            return Ok(Value::Fun(Rc::new(Closure {
-                params: (0..arity).map(|i| format!("__f{i}")).collect(),
-                body: Rc::new(Expr::NameRef(format!("__ctor:{n}"), Span::default())),
-                env: Scope::root(),
-                applied: Vec::new(),
-                slug: None,
-            })));
+        if let Some(c) = self.ctor_funs.get(n) {
+            return Ok(c.clone());
         }
-        if is_builtin(n) {
-            return Ok(Value::Fun(Rc::new(Closure {
-                params: builtin_params(n),
-                body: Rc::new(Expr::NameRef(format!("__builtin:{n}"), Span::default())),
-                env: Scope::root(),
-                applied: Vec::new(),
-                slug: None,
-            })));
+        if let Some(b) = self.builtin_funs.get(n) {
+            return Ok(b.clone());
         }
         // A capitalised unknown is a nullary constructor the type definitions
         // did not mention -- `Nothing`, `True` from another chapter.
@@ -486,19 +574,15 @@ impl Interp {
     /// for; this is only about the ones that do not need to.
     fn call(&mut self, mut c: Rc<Closure>, mut applied: Vec<Value>) -> R<Value> {
         loop {
-            if let Expr::NameRef(marker, _) = &*c.body {
-                if let Some(name) = marker.strip_prefix("__ctor:") {
-                    return Ok(Value::Ctor(Rc::new(name.to_string()), Rc::new(applied)));
+            let body = match &c.body {
+                Body::Ctor(name) => return Ok(Value::Ctor(name.clone(), Rc::new(applied))),
+                Body::Builtin(name) => {
+                    let name = *name;
+                    return self.builtin(name, applied);
                 }
-                if let Some(name) = marker.strip_prefix("__builtin:") {
-                    let name = name.to_string();
-                    return self.builtin(&name, applied);
-                }
-            }
-            let vars: Vec<(Name, Value)> =
-                c.params.iter().cloned().zip(applied.into_iter()).collect();
-            let env = Scope::child(&c.env, vars);
-            let body = c.body.clone();
+                Body::Expr(b) => b.clone(),
+            };
+            let env = Scope::call(&c.env, c.params.clone(), applied);
             let next_slug = c.slug.clone().unwrap_or_else(|| self.cur_slug.clone());
             let saved = std::mem::replace(&mut self.cur_slug, next_slug);
             let stepped = self.eval_tail(&body, &env);
@@ -1027,22 +1111,4 @@ fn type_name(v: &Value) -> &'static str {
         Value::Fun(_) => "a function",
         Value::Unit => "nothing",
     }
-}
-
-/// The arity comes from the compiler's own table, not from a list here: a
-/// builtin applied to the wrong number of arguments would otherwise be a
-/// silent partial application rather than a call.
-fn builtin_arity(n: &str) -> Option<usize> {
-    crate::builtins::BUILTINS
-        .iter()
-        .find(|(name, _)| *name == n)
-        .map(|(_, a)| if *a == 0 { 1 } else { *a })
-}
-
-fn is_builtin(n: &str) -> bool {
-    builtin_arity(n).is_some()
-}
-
-fn builtin_params(n: &str) -> Vec<Name> {
-    (0..builtin_arity(n).unwrap_or(1)).map(|i| format!("__a{i}")).collect()
 }
