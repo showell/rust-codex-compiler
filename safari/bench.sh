@@ -4,12 +4,12 @@
 # NOT a gate: nothing here fails, and the number to watch is steps per second
 # rather than seconds, because seconds are about this machine on this day.
 #
-#   ./bench.sh
+#   ./safari/bench.sh
 #
 # The subjects are safari's committed units plus the transpiler's arith sample
-# -- real programs with real work in them, tested from the OUTSIDE. Point
-# SAFARI_ROOT and TRANSPILER_ROOT elsewhere if your checkouts are elsewhere;
-# nothing is vendored here.
+# -- real programs with real work in them, tested from the OUTSIDE. SAFARI_ROOT
+# points at the safari checkout and ARITH_UNIT optionally adds the
+# transpiler's arith sample; nothing is vendored here.
 set -u
 # The default target dir is resolved from THIS SCRIPT, not the working
 # directory. `target/release/codexrun` only ever worked when you happened to be

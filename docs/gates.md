@@ -4,7 +4,7 @@ A gate that is green tells you something narrow. This file is the narrowness,
 one section per gate, because that is the part a reader needs and the command
 line is not.
 
-## Losslessness -- `lexdump --check-lossless <dir>`
+## Losslessness -- `lexdump lossless <path>...`
 
 Every byte of the source is covered by exactly one token or one piece of
 trivia, so `concat(tokens) == source`. **Needs no oracle**: the file answers
@@ -13,7 +13,7 @@ it. Runs over every `.codex` in the checkout, thousands of them, no compute.
 **Cannot see:** whether any token has the right KIND. A lexer that called
 everything `Word` passes.
 
-## Token agreement -- `lexdump --truth <file> | diff - lex.truth`
+## Token agreement -- `lexdump truth <file>`
 
 The ladder's `lex.truth` is a bare-metal dump of Cobblestone's own lexer over
 `Syntax/Lexer.codex`: kind, offset+length, line, column, text. Our stream
@@ -50,9 +50,25 @@ keeping ours able to say "I did not understand this" is what makes the
 difference countable. It is reported beside the total pattern count, because a
 zero from a parser that never ran looks exactly like a zero from one that works.
 
+**Three of the rows `cover` prints are the gate; the rest are inventory.** The
+gate rows are unread bodies, loose tokens above the threshold, and
+unrecognised pattern tokens -- those fail the run. Everything beside them --
+unread type-definition bodies, blocks that ran to the end of the file, bodies
+not yet structured -- is the SIZE OF THE WORK LEFT, and a gate that is red for
+a month is a gate nobody reads. `unread type definition bodies == 0` was in
+the test for one commit while the number was nine, and the run was red the
+whole time without anybody noticing.
+
 `cover` also reports what the parse ALONE cost, separately from the sweep's
-own. Compile speed is this project's first goal and reporting them together
+own. Compile speed is this project's first goal -- the front end reads the
+checkout at roughly 42 MB/s against `native/codexir`'s ~150 KB/s, and that
+ratio is the whole reason the goal is stated -- so reporting the two together
 would hide a regression inside the gate's cost.
+
+`cover` has a SECOND half, which the name does not suggest: it also runs the
+scope pass over every file and reports unresolved names, splitting out those
+in programs the compiler itself refuses -- the same refused/not partition the
+parse errors get, and for the same reason.
 
 **`codex/test/errors/` holds programs the compiler is SUPPOSED to decline**, so
 a diagnostic raised there is output rather than a defect. The two counts are
@@ -71,7 +87,9 @@ node -- which carries the NAME of the CST kind it could not translate.
 
 ## IR preamble -- `irdump grade <units-dir>`
 
-Everything above `(defs` in an IR file is fixed by syntax alone: chapter,
+Everything above `(defs` in an IR file is fixed by syntax alone, and it is
+present in EVERY gold, which is what makes it gradeable across the whole
+corpus at once: chapter,
 title, prose, pblocks, anns, sections, ctors, eff-ops, grounds, type-defs.
 Everything BELOW it carries an inferred type on every node, so reaching that
 needs scope, check and lower.
@@ -88,6 +106,26 @@ in the program's own file.
 `(chapter "...")` is a DRIVER PARAMETER -- `compile-frontend source "Program"
 flags` -- so `grade` reads that one field from the gold and COUNTS how often it
 had to. Never having to is what says our derived rule matches `native/codexir`.
+
+## Definition agreement over the whole corpus -- `irdump defs <units-dir>`
+
+For all 1,012 golds, every definition the gold names must be present in our
+desugared chapter, by NAME and by ARITY -- reported as "no such definition" and
+"parameter count" separately, because they fail for different reasons.
+
+This is the widest gate here: whole-corpus, and it reaches the definition layer
+rather than stopping at the preamble.
+
+**Cannot see:** any expression body, still. A definition can have the right name
+and the right parameter count and the wrong meaning.
+
+## Scope -- `desugardump scope <file>`
+
+`desugar.truth` plus a `--- scope ---` section, against
+`$CODEX_GOLDS/rungs/scope.truth`.
+
+**Cannot see:** the same thing every truth here cannot -- it is the declaration
+layer with names resolved, not expressions.
 
 ## The interpreter -- `codexrun`, `safari/run.sh`
 

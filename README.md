@@ -14,10 +14,10 @@ shape -- see `docs/gates.md`.
 1. **Canonical equality is the gate; byte-identity is a ratchet.** The IR text
    publishes unification-variable numbers, which are a function of allocation
    ORDER, so demanding byte-identity would demand reproducing Cobblestone's
-   walk. Compare with ids renumbered in first-appearance order; count
+   walk -- and would foreclose ever improving on it. Compare with ids renumbered in first-appearance order; count
    byte-identical programs separately and ratchet that up, never down.
-2. **Lossless CST from day one.** Trivia is kept and the AST is lowered from
-   it. The one place we deliberately do not copy Cobblestone, which throws
+2. **Lossless CST from day one.** Trivia -- spaces, skipped prose, exact spans
+   -- is kept and the AST is lowered from it. The one place we deliberately do not copy Cobblestone, which throws
    trivia away: retrofitting a CST later is a rewrite, and the linting goal
    wants one.
 3. **Golds come from `master-plus-outbound`**, not plain master -- two of our
@@ -30,8 +30,18 @@ shape -- see `docs/gates.md`.
 
     export CARGO_TARGET_DIR=~/runs/<sandbox>/rust-target
     cargo build --release
+    cargo test                    # needs no checkout and no bank
 
-## The tools, one per stage
+The gold-backed gates need two things pointed at other checkouts:
+
+    export CODEX_ROOT=~/showell_repos/NewRepository      # the Codex checkout
+    export CODEX_GOLDS=~/golds/<bank>                    # the bank; never guessed at
+
+A bank holds `rungs/` (the per-stage truths) and `ir/` (the IR golds). The
+corpus gates want RESOLVED units, which the ladder's `resolve_corpus.py`
+writes; safari's `build/*-unit.codex` already are.
+
+## The tools
 
 | binary | stage | reads |
 |---|---|---|
@@ -39,7 +49,7 @@ shape -- see `docs/gates.md`.
 | `parsedump` | parser | ditto |
 | `desugardump` | desugarer | ditto |
 | `irdump` | IR preamble | a RESOLVED unit |
-| `codexrun` | interpreter | a resolved unit |
+| `codexrun` | interpreter (not on the path above) | a resolved unit |
 
     ./safari/run.sh     safari's own checks through our interpreter
     ./safari/bench.sh   time the interpreter on a fixed set of safari units
@@ -49,14 +59,19 @@ has its own README there. Nothing is vendored; `SAFARI_ROOT` points elsewhere.
 
 ## The gates
 
-    lexdump --check-lossless <dir>          concat(tokens) == source
-    lexdump --truth <file> | diff - lex.truth
+    lexdump lossless <path>...              concat(tokens) == source
+    lexdump truth <file> | diff - $CODEX_GOLDS/rungs/lex.truth
     parsedump truth <file> | diff - parse.truth
     parsedump cover <dir>                   coverage AND homelessness
-    desugardump truth <file>                against $CODEX_GOLDS/rungs/
-    desugardump cover <path>...             error nodes, by CST kind
+    desugardump truth <file>                against $CODEX_GOLDS/rungs/desugar.truth
+    desugardump scope <file>                ditto, plus scope.truth
+    desugardump cover <path>...             error nodes by CST kind, and unresolved names
+    irdump preamble <unit.codex> [chapter]  print one
     irdump grade <units-dir>                against $CODEX_GOLDS/ir/*.ir
+    irdump defs <units-dir>                 every gold definition present, by name and arity
+    codexrun --check <unit.codex> <expected>
     codexrun sweep <units-dir> <codex-test-dir>
+    cargo test                              65 unit tests; needs no checkout at all
 
 **Every gate here has something it cannot see, and each one is worth knowing
 before you trust a green run.** They are written down in `docs/gates.md`

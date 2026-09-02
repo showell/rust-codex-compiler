@@ -1,6 +1,6 @@
 //! The CST to the AST: Cobblestone's `Desugarer.codex`.
 //!
-//! Six forms are REWRITTEN rather than translated, and each one is a rule
+//! Seven forms are REWRITTEN rather than translated, and each one is a rule
 //! nothing in the parse tree hints at:
 //!
 //! ```text
@@ -12,6 +12,14 @@
 //! s in rest           ->  let __seq = s in rest
 //! e revised { f = v } ->  let __rev = e in ... a chain of field assignments
 //! ```
+//!
+//! Two are easy to get subtly wrong and neither is caught by a
+//! declaration-layer gate:
+//!
+//! - `|>` SWAPS its operands. `a |> f` is `f a`.
+//! - `for .. ->` is a comprehension, not a loop, and lowers to `map-list` over
+//!   a lambda. That is why a chapter using comprehensions needs `Foreword
+//!   ListUtils` in scope even though it never writes `map-list`.
 //!
 //! `not x` becoming `x == False` is the one that looks like a mistake and is
 //! not: there is no negation node in the AST, and `AUnaryExpr` is arithmetic

@@ -15,8 +15,11 @@ are not meaningful again until the bank is re-cut against U54, which needs the
 ladder and a box. Until then, treat a red row as unattributable rather than as
 a defect on this side.
 
-The gates that need no oracle -- `--check-lossless`, `cover`, `codexrun sweep`,
-`safari/run.sh` -- are unaffected, which is most of the reason they exist.
+**The gates that need no GOLD BANK are unaffected**, which is most of the
+reason they exist: `lexdump lossless` and `parsedump cover` need no oracle at
+all, and `codexrun sweep` and `safari/run.sh` have oracles of their own -- a
+`.expected` beside each unit, and the codexzig binary built from the same
+source. None of the four reads the bank.
 
 ## No byte oracle sees an expression
 
@@ -25,22 +28,12 @@ PREAMBLE. `parse.truth` says nothing about expression structure.
 `desugar.truth` would pass a desugarer that answered `Error` for everything.
 `irdump grade` stops above `(defs`.
 
-Expression shape is guarded today by unit tests and by the interpreter, and
-neither is a byte oracle. Reaching a real one needs scope, check and lower,
-which is the point of the project and is not done.
+Expression shape is guarded today by `cargo test` and by the interpreter, and
+neither is a byte oracle. Reaching a real one needs check and lower.
 
-## The front end stops at the IR preamble
-
-The preamble is 7.7% of the corpus IR by bytes and 0.5% of safari's, and type
-definitions are three quarters of it. Everything below `(defs` carries an
-inferred type on every node.
-
-## The interpreter is slow, and the number is not close
-
-`render` takes 2.5s under safari's zig build and minutes here. The two heavy
-units are held back by default. Details, bounds and how to benchmark are in
-`safari/README.md`; a tree-walking interpreter over persistent lists is what it
-costs today.
+**Where the front end stands:** lexer, parser, desugarer and scope are done --
+scope resolves every name in every program the compiler accepts. Check and
+lower are not written, which is why this stops at the IR preamble.
 
 ## Two parse errors, and they are correct
 

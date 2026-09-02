@@ -148,15 +148,27 @@ fn truth(path: &Path, scope: bool) -> ExitCode {
 /// unknown name in it. Counting the two together makes a number that goes UP
 /// as the resolver gets better, which is the same trap `parsedump cover` fell
 /// into with parse errors.
-fn refused_programs() -> std::collections::HashSet<String> {
-    let Ok(golds) = std::env::var("CODEX_GOLDS") else { return Default::default() };
+///
+/// NONE when the bank is not reachable, and the caller must SAY SO rather than
+/// print a split. Returning an empty set instead makes the partition line read
+/// "0 more in programs the compiler itself refuses", which is a measurement
+/// nobody took: it cannot be told apart from a run where the resolver really
+/// did account for everything. `irdump defs` refuses outright on the same
+/// input; this one still has work to do without a bank, so it warns instead.
+fn refused_programs() -> Option<std::collections::HashSet<String>> {
+    let golds = std::env::var("CODEX_GOLDS").ok()?;
     let path = std::path::PathBuf::from(golds).join("refused.tsv");
-    let Ok(text) = std::fs::read_to_string(path) else { return Default::default() };
-    text.lines().skip(1).filter_map(|l| l.split('\t').next()).map(String::from).collect()
+    let text = std::fs::read_to_string(path).ok()?;
+    Some(text.lines().skip(1).filter_map(|l| l.split('\t').next()).map(String::from).collect())
 }
 
 fn cover(roots: &[String]) -> ExitCode {
-    let refused = refused_programs();
+    let refused_known = refused_programs();
+    if refused_known.is_none() {
+        eprintln!("note: no CODEX_GOLDS/refused.tsv, so the refused/not split below \
+is NOT available -- every unresolved name is counted on the first line");
+    }
+    let refused = refused_known.unwrap_or_default();
     let mut files = Vec::new();
     for r in roots {
         collect(Path::new(r), &mut files);

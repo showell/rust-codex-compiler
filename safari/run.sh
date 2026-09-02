@@ -2,7 +2,7 @@
 # THE FOURTH ARM, FROM THE OUTSIDE: run safari-codex's own checks through this
 # interpreter and demand the zig arm's exact output.
 #
-#   ./safari.sh
+#   ./safari/run.sh
 #
 # safari-codex bundles each check into `build/<mod>-unit.codex` and compiles that
 # same unit to `build/<mod>` with codexzig; `./harness/run.sh` over there leaves
