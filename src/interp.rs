@@ -185,10 +185,16 @@ pub struct Interp {
     /// which is the single most expensive thing an interpreter can do.
     funs: HashMap<Name, Value>,
     by_chapter_fun: HashMap<(String, String), Value>,
-    /// Every builtin and every constructor as a ready value, built ONCE. A
-    /// reference used to build a fresh `Vec<String>` of parameter names, a
-    /// `format!`ed marker and two `Rc`s -- every time.
+    /// Every builtin OF ONE ARGUMENT OR MORE, and every constructor, as a
+    /// ready value built ONCE. A reference used to build a fresh `Vec<String>`
+    /// of parameter names, a `format!`ed marker and two `Rc`s -- every time.
     builtin_funs: HashMap<&'static str, Value>,
+    /// `Some(0)` in the table: the declared type is NOT AN ARROW, so the
+    /// builtin is a value and a reference to it is already the call.
+    builtin_nullary: std::collections::HashSet<&'static str>,
+    /// `None` in the table: no declared type at all, so nothing here knows the
+    /// arity. Eight names, and guessing one for them is what this fixes.
+    builtin_undeclared: std::collections::HashSet<&'static str>,
     ctor_funs: HashMap<String, Value>,
     /// The empty environment, shared: every top-level closure closes over it.
     root: Env,
@@ -232,6 +238,8 @@ impl Interp {
             funs: HashMap::new(),
             by_chapter_fun: HashMap::new(),
             builtin_funs: HashMap::new(),
+            builtin_nullary: Default::default(),
+            builtin_undeclared: Default::default(),
             ctor_funs: HashMap::new(),
             root: root.clone(),
             by_chapter: HashMap::new(),
@@ -323,20 +331,35 @@ impl Interp {
         // The arity comes from the compiler's own table, not from a list here:
         // a builtin applied to the wrong number of arguments would otherwise be
         // a silent partial application rather than a call.
+        //
+        // **`Some(0)` IS NOT `None` AND NEITHER IS ONE.** Both used to be read
+        // as "declares no type" and given an arity of one, so `get-ticks :
+        // Integer` -- a value -- became a function of one argument, and a
+        // reference to it bound a `Fun` where an Integer belonged. Nothing
+        // failed there: it failed fifteen lines away, in `keys-collision`, as
+        // ``builtin `bit-and` is not interpreted yet (given a function, an
+        // integer)`` -- a wrong-arity bug wearing a missing-feature message.
         for (name, arity) in crate::builtins::BUILTINS {
-            // An arity of 0 means the entry declares no type; treat it as one
-            // argument, the way the old per-reference path did.
-            let arity = if arity == 0 { 1 } else { arity };
-            it.builtin_funs.insert(
-                name,
-                Value::Fun(Rc::new(Closure {
-                    params: Rc::new((0..arity).map(|i| format!("__a{i}")).collect()),
-                    body: Body::Builtin(name),
-                    env: root.clone(),
-                    applied: Vec::new(),
-                    slug: None,
-                })),
-            );
+            match arity {
+                None => {
+                    it.builtin_undeclared.insert(name);
+                }
+                Some(0) => {
+                    it.builtin_nullary.insert(name);
+                }
+                Some(arity) => {
+                    it.builtin_funs.insert(
+                        name,
+                        Value::Fun(Rc::new(Closure {
+                            params: Rc::new((0..arity).map(|i| format!("__a{i}")).collect()),
+                            body: Body::Builtin(name),
+                            env: root.clone(),
+                            applied: Vec::new(),
+                            slug: None,
+                        })),
+                    );
+                }
+            }
         }
         it
     }
@@ -558,10 +581,23 @@ impl Interp {
         if let Some(b) = self.builtin_funs.get(n) {
             return Ok(b.clone());
         }
+        // A builtin whose declared type is not an arrow is a VALUE, so the
+        // reference IS the call. There is no closure to hand back.
+        if let Some(name) = self.builtin_nullary.get(n).copied() {
+            return self.builtin(name, Vec::new());
+        }
         // A capitalised unknown is a nullary constructor the type definitions
-        // did not mention -- `Nothing`, `True` from another chapter.
+        // did not mention -- `Nothing`, `True` from another chapter. This is
+        // BEFORE the undeclared-builtin refusal on purpose: `True`, `False` and
+        // `Nothing` are three of the eight that declare no type, and they are
+        // constructors rather than anything to call.
         if n.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
             return Ok(Value::Ctor(Rc::new(n.to_string()), Rc::new(Vec::new())));
+        }
+        if let Some(name) = self.builtin_undeclared.get(n).copied() {
+            return err(format!(
+                "builtin `{name}` declares no type, so its arity is not known"
+            ));
         }
         err(format!("undefined name `{n}`"))
     }
@@ -898,7 +934,6 @@ impl Interp {
             // `__narrow` is a codegen hint: it tells the emitter a value fits
             // a narrower machine type. At the value level it is the identity.
             ("__narrow", [v]) => Ok(v.clone()),
-            ("deck-record" | "__heap-save" | "__deck-pos", [v]) => Ok(v.clone()),
             // `__record-set` is how a mutable record is updated: record, field
             // NAME as text, value.
             ("__record-set", [Record(n, fs), Text(field), v]) => {
@@ -915,8 +950,14 @@ impl Interp {
                 Ok(Record(n.clone(), Rc::new(out)))
             }
 
+            // NOT "is not interpreted yet" -- this arm cannot tell an absent
+            // builtin from one that is here and was handed the wrong things,
+            // and asserting the first hid the second. `bit-and` reached here
+            // as ``not interpreted yet (given a function, an integer)`` while
+            // being fully implemented; the argument types are the finding and
+            // they go in front.
             _ => err(format!(
-                "builtin `{name}` is not interpreted yet (given {})",
+                "builtin `{name}` has no rule for ({})",
                 args.iter().map(type_name).collect::<Vec<_>>().join(", ")
             )),
         }
