@@ -11,8 +11,13 @@
 # SAFARI_ROOT and TRANSPILER_ROOT elsewhere if your checkouts are elsewhere;
 # nothing is vendored here.
 set -u
+# The default target dir is resolved from THIS SCRIPT, not the working
+# directory. `target/release/codexrun` only ever worked when you happened to be
+# standing in the repo root, and moving this file under safari/ would have made
+# that silently worse.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SAFARI="${SAFARI_ROOT:-$HOME/showell_repos/safari-codex}"
-BIN="${CODEXRUN:-${CARGO_TARGET_DIR:-target}/release/codexrun}"
+BIN="${CODEXRUN:-${CARGO_TARGET_DIR:-$ROOT/target}/release/codexrun}"
 [ -x "$BIN" ] || { echo "no codexrun at $BIN; cargo build --release, or set CODEXRUN"; exit 2; }
 
 # Named, not globbed: a benchmark whose subject list drifts with the corpus

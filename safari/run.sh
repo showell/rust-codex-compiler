@@ -20,8 +20,13 @@
 # SAFARI_ALL=1 runs everything.
 set -u
 
+# The default target dir is resolved from THIS SCRIPT, not the working
+# directory. `target/release/codexrun` only ever worked when you happened to be
+# standing in the repo root, and moving this file under safari/ would have made
+# that silently worse.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SAFARI="${SAFARI_ROOT:-$HOME/showell_repos/safari-codex}"
-BIN="${CODEXRUN:-${CARGO_TARGET_DIR:-target}/release/codexrun}"
+BIN="${CODEXRUN:-${CARGO_TARGET_DIR:-$ROOT/target}/release/codexrun}"
 ZIG_SECS="${ZIG_SECS:-300}"
 RUST_SECS="${RUST_SECS:-900}"
 
