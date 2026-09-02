@@ -378,13 +378,10 @@ impl Interp {
         match e {
             Expr::Lit(text, kind, _) => literal(text, *kind),
             Expr::NameRef(n, _) => self.lookup(n, env),
-            Expr::Apply(f, a, sp) => {
-                let func = self.eval(f, env)?;
-                let arg = self.eval(a, env)?;
-                // The innermost application is the one worth naming, so a
-                // location is added only if none is there yet.
-                self.apply(func, arg).map_err(|e| at(e, *sp))
-            }
+            Expr::Apply(..) => match self.apply_spine(e, env, false)? {
+                Step::Done(v) => Ok(v),
+                Step::Call(c, applied) => self.call(c, applied),
+            },
             Expr::Binary(l, op, r, _) => {
                 // `and` and `or` SHORT-CIRCUIT, and programs depend on it for
                 // safety rather than speed:
@@ -653,13 +650,81 @@ impl Interp {
                 }
                 Ok(Step::Done(Value::Unit))
             }
-            Expr::Apply(f, a, _) => {
-                let func = self.eval(f, env)?;
-                let arg = self.eval(a, env)?;
-                self.apply_step(func, arg)
-            }
+            Expr::Apply(..) => self.apply_spine(e, env, true),
             _ => Ok(Step::Done(self.eval(e, env)?)),
         }
+    }
+
+    /// Evaluate a whole application SPINE, gathering the arguments for one
+    /// call instead of building a closure per argument.
+    ///
+    /// **Application is curried -- `f a b c` is three nested `Apply` nodes --
+    /// but the call is not.** Taking them one at a time allocated an
+    /// intermediate closure, its argument vector and a clone of every argument
+    /// already applied, per argument: `map-list-loop` has five parameters, so
+    /// every one of its calls built four closures it then threw away.
+    ///
+    /// **The ORDER is unchanged, and that is the whole constraint.** Arguments
+    /// are still evaluated left to right, and a call that saturates PART WAY
+    /// down the spine still runs before the arguments after it are evaluated
+    /// -- `f a b` where `f` takes one argument runs `f a` before `b`.
+    ///
+    /// `tail` says whether the caller can loop on the last call rather than
+    /// nesting; only `eval_tail` can.
+    fn apply_spine(&mut self, e: &Expr, env: &Env, tail: bool) -> R<Step> {
+        // Down the left spine to the head. Each argument keeps the span of the
+        // application that CONSUMES it, so an error still names the innermost
+        // application rather than the outermost.
+        let mut args: Vec<(&Expr, Span)> = Vec::new();
+        let mut head = e;
+        while let Expr::Apply(f, a, sp) = head {
+            args.push((a, *sp));
+            head = f;
+        }
+        args.reverse();
+        // The nodes are still there and still evaluated; only the closures in
+        // between are gone. Counting them keeps `steps` a measure of the
+        // PROGRAM's work rather than of this interpreter's shape, so a rate
+        // before this change and one after it are the same number.
+        self.steps += args.len() as u64 - 1;
+        let mut f = self.eval(head, env)?;
+        let mut i = 0;
+        while i < args.len() {
+            let fun = match &f {
+                Value::Fun(c) => Some(c.clone()),
+                _ => None,
+            };
+            let Some(c) = fun.filter(|c| c.params.len() > c.applied.len()) else {
+                // A constructor takes its fields one at a time, and anything
+                // else is an error the one-argument path words properly.
+                let (a, sp) = args[i];
+                let arg = self.eval(a, env)?;
+                f = self.apply(f, arg).map_err(|e| at(e, sp))?;
+                i += 1;
+                continue;
+            };
+            let take = (c.params.len() - c.applied.len()).min(args.len() - i);
+            let mut applied = c.applied.clone();
+            let sp = args[i + take - 1].1;
+            for (a, _) in &args[i..i + take] {
+                applied.push(self.eval(a, env)?);
+            }
+            i += take;
+            if applied.len() < c.params.len() {
+                f = Value::Fun(Rc::new(Closure {
+                    params: c.params.clone(),
+                    body: c.body.clone(),
+                    env: c.env.clone(),
+                    applied,
+                    slug: c.slug.clone(),
+                }));
+            } else if tail && i == args.len() {
+                return Ok(Step::Call(c, applied));
+            } else {
+                f = self.call(c, applied).map_err(|e| at(e, sp))?;
+            }
+        }
+        Ok(Step::Done(f))
     }
 
     /// Apply one argument. A saturated closure comes back as a pending call so
