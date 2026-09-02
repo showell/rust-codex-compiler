@@ -931,7 +931,11 @@ impl Interp {
             }
 
             // -- arithmetic ---------------------------------------------------
+            // `negate : forall a. a -> a` -- polymorphic upstream, and the one
+            // arithmetic builtin that is. `abs`, `max` and `min` are Integer
+            // only, and stay that way.
             ("negate", [Int(i)]) => Ok(Int(-i)),
+            ("negate", [Real(f)]) => Ok(Real(-f)),
             ("abs", [Int(i)]) => Ok(Int(i.abs())),
             ("max", [Int(a), Int(b)]) => Ok(Int(*a.max(b))),
             ("min", [Int(a), Int(b)]) => Ok(Int(*a.min(b))),
@@ -975,6 +979,18 @@ impl Interp {
             ("real-from-int", [Int(i)]) => Ok(Real(*i as f64)),
             ("real-approx-from-int", [Int(i)]) => Ok(Real(*i as f32 as f64)),
             ("to-real-approx", [Real(f)]) => Ok(Real(*f as f32 as f64)),
+            // The `from-real-*` direction WIDENS or drops an overflow mode --
+            // `from-real-approx : f32 -> f64`, `from-real-trapping :
+            // f64-trapping -> f64`. Every Real here is already an f64, and the
+            // f32 ones arrived rounded, so each is the identity on the value.
+            (
+                "from-real-approx"
+                | "from-real-approx-trapping"
+                | "from-real-approx-saturating"
+                | "from-real-trapping"
+                | "from-real-saturating",
+                [Real(f)],
+            ) => Ok(Real(*f)),
             (
                 "to-real-trapping"
                 | "to-real-saturating"
