@@ -61,6 +61,37 @@ pub struct Resolved {
     pub ctor_names: Vec<String>,
 }
 
+/// What one walk of a chapter collects.
+///
+/// `errors` is the phase's product. `refs` is a SIDE CHANNEL: every
+/// `NameRef` that was not a local at the point it was read, tagged with the
+/// definition it was read in. The resolver does not want it and does not pay
+/// for it -- `collect_refs` is false for `resolve` -- but the call graph
+/// cannot be built without the locals set at each point, and that set is
+/// exactly what this walk maintains. Rebuilding it in a second walker is how
+/// the two would come to disagree about `let`, `induction on` and pattern
+/// binders, which are the three rules a reasonable guess gets backwards.
+pub struct Walk {
+    pub errors: Vec<ResolveError>,
+    pub refs: Vec<(usize, String)>,
+    collect_refs: bool,
+    def_index: usize,
+}
+
+impl Walk {
+    fn new(collect_refs: bool) -> Self {
+        Walk { errors: Vec::new(), refs: Vec::new(), collect_refs, def_index: 0 }
+    }
+    fn push(&mut self, e: ResolveError) {
+        self.errors.push(e);
+    }
+    fn saw(&mut self, n: &str) {
+        if self.collect_refs {
+            self.refs.push((self.def_index, n.to_string()));
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Scope<'a> {
     names: &'a HashSet<String>,
@@ -89,6 +120,23 @@ fn undefined(name: &str, span: Span) -> ResolveError {
 }
 
 pub fn resolve(ch: &Chapter) -> Resolved {
+    walk(ch, false).0
+}
+
+/// The same walk, keeping the free-name side channel. `refs[i]` names every
+/// non-local read inside `ch.defs[i]`, in encounter order and with
+/// duplicates -- the caller decides whether a name read twice is one edge or
+/// two.
+pub fn resolve_refs(ch: &Chapter) -> (Resolved, Vec<Vec<String>>) {
+    let (r, w) = walk(ch, true);
+    let mut per_def: Vec<Vec<String>> = vec![Vec::new(); ch.defs.len()];
+    for (i, n) in w.refs {
+        per_def[i].push(n);
+    }
+    (r, per_def)
+}
+
+fn walk(ch: &Chapter, collect_refs: bool) -> (Resolved, Walk) {
     // The chapter's own set, built once.
     let mut top: Vec<String> = ch.defs.iter().map(|d| d.name.clone()).collect();
     top.sort_by(|a, b| crate::preamble::cce_key(a).cmp(&crate::preamble::cce_key(b)));
@@ -127,13 +175,14 @@ pub fn resolve(ch: &Chapter) -> Resolved {
         names.extend(c.methods.iter().map(|m| m.name.clone()));
     }
 
-    let mut errors = Vec::new();
-    for d in &ch.defs {
+    let mut w = Walk::new(collect_refs);
+    for (i, d) in ch.defs.iter().enumerate() {
+        w.def_index = i;
         let mut sc = Scope { names: &names, locals: HashSet::new() };
         let mut seen = HashSet::new();
         for p in &d.params {
             if !seen.insert(p.name.clone()) {
-                errors.push(ResolveError {
+                w.push(ResolveError {
                     msg: format!("Duplicate parameter: '{}'", p.name),
                     span: p.span,
                 });
@@ -149,29 +198,33 @@ pub fn resolve(ch: &Chapter) -> Resolved {
             sc.locals.insert(v.clone());
             ty = Some(inner);
         }
-        expr(&mut sc, &d.body, &mut errors);
+        expr(&mut sc, &d.body, &mut w);
     }
 
-    Resolved { errors, top_level_names: top, type_names, ctor_names }
+    let errors = std::mem::take(&mut w.errors);
+    (Resolved { errors, top_level_names: top, type_names, ctor_names }, w)
 }
 
-fn expr(sc: &mut Scope<'_>, e: &Expr, errs: &mut Vec<ResolveError>) {
+fn expr(sc: &mut Scope<'_>, e: &Expr, w: &mut Walk) {
     match e {
         Expr::Lit(..) | Expr::Error(..) => {}
         Expr::NameRef(n, s) => {
+            if !sc.locals.contains(n) {
+                w.saw(n);
+            }
             if !sc.has(n) && !is_type_name(n) {
-                errs.push(undefined(n, *s));
+                w.push(undefined(n, *s));
             }
         }
         Expr::Apply(a, b, _) | Expr::Binary(a, _, b, _) | Expr::FieldAssign(a, _, b, _) => {
-            expr(sc, a, errs);
-            expr(sc, b, errs);
+            expr(sc, a, w);
+            expr(sc, b, w);
         }
-        Expr::Unary(a, _) | Expr::Lazy(a, _) | Expr::FieldAccess(a, _, _) => expr(sc, a, errs),
+        Expr::Unary(a, _) | Expr::Lazy(a, _) | Expr::FieldAccess(a, _, _) => expr(sc, a, w),
         Expr::If(a, b, c, _) => {
-            expr(sc, a, errs);
-            expr(sc, b, errs);
-            expr(sc, c, errs);
+            expr(sc, a, w);
+            expr(sc, b, w);
+            expr(sc, c, w);
         }
         Expr::Let(binds, body, _) => {
             let mut fork = sc.fork();
@@ -179,34 +232,34 @@ fn expr(sc: &mut Scope<'_>, e: &Expr, errs: &mut Vec<ResolveError>) {
             for b in binds {
                 // The value is resolved BEFORE the name is added: a binding
                 // cannot see itself, but it can see every one before it.
-                expr(&mut fork, &b.value, errs);
+                expr(&mut fork, &b.value, w);
                 if !seen.insert(b.name.clone()) {
-                    errs.push(ResolveError {
+                    w.push(ResolveError {
                         msg: format!("Duplicate binding: '{}'", b.name),
                         span: b.span,
                     });
                 }
                 fork.locals.insert(b.name.clone());
             }
-            expr(&mut fork, body, errs);
+            expr(&mut fork, body, w);
         }
         Expr::Lambda(params, body, _) => {
             let mut fork = sc.fork();
             let mut seen = HashSet::new();
             for p in params {
                 if !seen.insert(p.clone()) {
-                    errs.push(ResolveError {
+                    w.push(ResolveError {
                         msg: format!("Duplicate parameter: '{p}'"),
                         span: Span::default(),
                     });
                 }
                 fork.locals.insert(p.clone());
             }
-            expr(&mut fork, body, errs);
+            expr(&mut fork, body, w);
         }
         Expr::Match(scrut, arms, _) => {
-            expr(sc, scrut, errs);
-            match_arms(sc, arms, errs);
+            expr(sc, scrut, w);
+            match_arms(sc, arms, w);
         }
         Expr::Induction(scrut, arms, _) => {
             // `induction on n` binds `n` for the arms, and only when the
@@ -215,58 +268,58 @@ fn expr(sc: &mut Scope<'_>, e: &Expr, errs: &mut Vec<ResolveError>) {
             if let Expr::NameRef(n, _) = &**scrut {
                 fork.locals.insert(n.clone());
             }
-            match_arms(&mut fork, arms, errs);
+            match_arms(&mut fork, arms, w);
         }
         Expr::List(xs, _) => {
             for x in xs {
-                expr(sc, x, errs);
+                expr(sc, x, w);
             }
         }
         // A record literal's TYPE name is not resolved -- only its values.
         Expr::Record(_, fs, _) => {
             for f in fs {
-                expr(sc, &f.value, errs);
+                expr(sc, &f.value, w);
             }
         }
         Expr::Act(ss, _) => {
             let mut fork = sc.fork();
-            act_stmts(&mut fork, ss, errs);
+            act_stmts(&mut fork, ss, w);
         }
         Expr::Handle(_, body, clauses, _) => {
-            expr(sc, body, errs);
+            expr(sc, body, w);
             for c in clauses {
                 let mut fork = sc.fork();
                 fork.locals.insert(c.resume_name.clone());
                 let mut seen: HashSet<String> = [c.resume_name.clone()].into_iter().collect();
                 for p in &c.params {
                     if !seen.insert(p.clone()) {
-                        errs.push(ResolveError {
+                        w.push(ResolveError {
                             msg: format!("Duplicate parameter: '{p}'"),
                             span: c.span,
                         });
                     }
                     fork.locals.insert(p.clone());
                 }
-                expr(&mut fork, &c.body, errs);
+                expr(&mut fork, &c.body, w);
             }
         }
-        Expr::WithTimeout(_, _, _, body, _) => expr(sc, body, errs),
+        Expr::WithTimeout(_, _, _, body, _) => expr(sc, body, w),
         Expr::Try(_, a, b, c, _) => {
             for region in [a, b, c] {
                 let mut fork = sc.fork();
-                act_stmts(&mut fork, region, errs);
+                act_stmts(&mut fork, region, w);
             }
         }
     }
 }
 
-fn match_arms(sc: &mut Scope<'_>, arms: &[MatchArm], errs: &mut Vec<ResolveError>) {
+fn match_arms(sc: &mut Scope<'_>, arms: &[MatchArm], w: &mut Walk) {
     for a in arms {
         let mut fork = sc.fork();
         let mut seen = HashSet::new();
-        pattern(&mut fork, &a.pattern, &mut seen, errs);
-        expr(&mut fork, &a.guard, errs);
-        expr(&mut fork, &a.body, errs);
+        pattern(&mut fork, &a.pattern, &mut seen, w);
+        expr(&mut fork, &a.guard, w);
+        expr(&mut fork, &a.body, w);
     }
 }
 
@@ -274,12 +327,12 @@ fn pattern(
     sc: &mut Scope<'_>,
     p: &Pat,
     seen: &mut HashSet<String>,
-    errs: &mut Vec<ResolveError>,
+    w: &mut Walk,
 ) {
     match p {
         Pat::Var(n, s) => {
             if !seen.insert(n.clone()) {
-                errs.push(ResolveError {
+                w.push(ResolveError {
                     msg: format!("Duplicate pattern variable: '{n}'"),
                     span: *s,
                 });
@@ -290,14 +343,14 @@ fn pattern(
         // A constructor's NAME is not resolved here -- only its sub-patterns.
         Pat::Ctor(_, subs, _) | Pat::Vec_(subs, _) => {
             for s in subs {
-                pattern(sc, s, seen, errs);
+                pattern(sc, s, seen, w);
             }
         }
         Pat::Lit(..) | Pat::Wild(..) => {}
     }
 }
 
-fn act_stmts(sc: &mut Scope<'_>, stmts: &[ActStmt], errs: &mut Vec<ResolveError>) {
+fn act_stmts(sc: &mut Scope<'_>, stmts: &[ActStmt], w: &mut Walk) {
     let mut seen = HashSet::new();
     for s in stmts {
         match s {
@@ -310,14 +363,14 @@ fn act_stmts(sc: &mut Scope<'_>, stmts: &[ActStmt], errs: &mut Vec<ResolveError>
                 let mut cur = e;
                 loop {
                     let Expr::Let(binds, body, _) = cur else {
-                        expr(sc, cur, errs);
+                        expr(sc, cur, w);
                         break;
                     };
                     let mut bound = HashSet::new();
                     for b in binds {
-                        expr(sc, &b.value, errs);
+                        expr(sc, &b.value, w);
                         if !bound.insert(b.name.clone()) {
-                            errs.push(ResolveError {
+                            w.push(ResolveError {
                                 msg: format!("Duplicate binding: '{}'", b.name),
                                 span: b.span,
                             });
@@ -329,9 +382,9 @@ fn act_stmts(sc: &mut Scope<'_>, stmts: &[ActStmt], errs: &mut Vec<ResolveError>
             }
             ActStmt::Bind(name, e, sp) => {
                 // The value first, then the name -- a bind cannot see itself.
-                expr(sc, e, errs);
+                expr(sc, e, w);
                 if !seen.insert(name.clone()) {
-                    errs.push(ResolveError {
+                    w.push(ResolveError {
                         msg: format!("Duplicate binding: '{name}'"),
                         span: *sp,
                     });
