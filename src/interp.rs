@@ -863,8 +863,34 @@ impl Interp {
                     std::cmp::Ordering::Greater => 1,
                 }))
             }
-            ("is-letter", [Char(c)]) => Ok(Bool(c.is_alphabetic())),
-            ("is-digit", [Char(c)]) => Ok(Bool(c.is_ascii_digit())),
+            // THESE THREE ARE RANGES ON THE CHAR-CODE, not Unicode classes,
+            // and the emitter is the oracle for them. Each is a `sub`, a `cmp`
+            // and a `setbe` -- an UNSIGNED window on the frequency alphabet:
+            //
+            //   is-whitespace   (c - 1)  <= 1   ->  1..=2    newline, space
+            //   is-digit        (c - 3)  <= 9   ->  3..=12   the ten digits
+            //   is-letter       (c - 13) <= 51  ->  13..=64  lower then upper
+            //                or (c - 97) <= 30  ->  97..=127 the extended band
+            //
+            // Rust's `is_alphabetic` and `is_ascii_digit` agree on ASCII, but
+            // only because the alphabet was built that way -- they agree by
+            // coincidence and disagree above it. `is-whitespace` is the one
+            // that shows it: a tab and a carriage return are NOT whitespace
+            // here, because the alphabet gives them no code at all.
+            ("is-letter", [Char(c)]) => {
+                let k = char_code(*c as u8);
+                Ok(Bool((13..=64).contains(&k) || (97..=127).contains(&k)))
+            }
+            ("is-digit", [Char(c)]) => Ok(Bool((3..=12).contains(&char_code(*c as u8)))),
+            ("is-whitespace", [Char(c)]) => {
+                Ok(Bool((1..=2).contains(&char_code(*c as u8))))
+            }
+            // `List Integer -> Text`, the bytes as written.
+            ("raw-bytes-to-text", [List(xs)]) => {
+                let bytes: Vec<u8> =
+                    xs.iter().map(|v| if let Int(i) = v { *i as u8 } else { 0 }).collect();
+                text(String::from_utf8_lossy(&bytes).into_owned())
+            }
 
             // -- lists --------------------------------------------------------
             ("list-length", [List(xs)]) => Ok(Int(xs.len() as i64)),
@@ -872,11 +898,28 @@ impl Interp {
                 .then(|| xs.get(*i as usize).cloned())
                 .flatten()
                 .ok_or_else(|| Error(format!("list-at {i} of a {}-element list", xs.len()))),
-            ("list-push", [List(xs), v]) => {
+            // `list-snoc` and `list-push` are ONE operation: the zig emitter
+            // gives both the same `cx_ll_push(l, v)`, an append at the end.
+            ("list-push" | "list-snoc", [List(xs), v]) => {
                 let mut out = (**xs).clone();
                 out.push(v.clone());
                 Ok(List(Rc::new(out)))
             }
+            ("list-insert-at", [List(xs), Int(i), v]) => {
+                let mut out = (**xs).clone();
+                let i = *i;
+                if i < 0 || i as usize > out.len() {
+                    return err(format!("list-insert-at {i} of a {}-element list", out.len()));
+                }
+                out.insert(i as usize, v.clone());
+                Ok(List(Rc::new(out)))
+            }
+            // The capacity is an allocation hint upstream -- `cx_ll_empty` then
+            // `ensureTotalCapacityPrecise` -- and the LIST IS EMPTY. It is
+            // load-bearing over there for a reason that cannot exist here: a
+            // reallocation inside emit-all-defs' save/restore bracket lands in
+            // scratch the bracket reclaims. Nothing here reclaims anything.
+            ("__list-with-capacity", [Int(_)]) => Ok(List(Rc::new(Vec::new()))),
             ("list-set-at", [List(xs), Int(i), v]) => {
                 let mut out = (**xs).clone();
                 let i = *i as usize;
@@ -912,17 +955,33 @@ impl Interp {
             ))),
 
             // -- reals --------------------------------------------------------
+            // ONE ARM FOR EIGHT NAMES WAS WRONG ABOUT FIVE OF THEM. Only the
+            // two `*-from-int` take an Integer; the rest take a REAL, so the
+            // arm never matched and they failed as "no rule for (a real)".
+            // `to-real` is not a builtin at all. The declared types:
+            //
+            //   real-from-int              Integer -> f64
+            //   real-approx-from-int       Integer -> f32   <- NARROWS
+            //   to-real-approx             f64     -> f32   <- NARROWS
+            //   to-real-trapping           f64     -> f64-trapping
+            //   to-real-saturating         f64     -> f64-saturating
+            //   to-real-approx-trapping    f32     -> f32-trapping
+            //   to-real-approx-saturating  f32     -> f32-saturating
+            //
+            // The trapping and saturating ones change the OVERFLOW MODE and
+            // not the value, so they are the identity here; the two that end
+            // in f32 must round through f32 or a large value comes back with
+            // digits an f32 cannot hold.
+            ("real-from-int", [Int(i)]) => Ok(Real(*i as f64)),
+            ("real-approx-from-int", [Int(i)]) => Ok(Real(*i as f32 as f64)),
+            ("to-real-approx", [Real(f)]) => Ok(Real(*f as f32 as f64)),
             (
-                "to-real-approx"
-                | "to-real-approx-trapping"
-                | "to-real-approx-saturating"
-                | "to-real-trapping"
+                "to-real-trapping"
                 | "to-real-saturating"
-                | "to-real"
-                | "real-from-int"
-                | "real-approx-from-int",
-                [Int(i)],
-            ) => Ok(Real(*i as f64)),
+                | "to-real-approx-trapping"
+                | "to-real-approx-saturating",
+                [Real(f)],
+            ) => Ok(Real(*f)),
             ("real-approx-to-int", [Real(f)]) => Ok(Int(*f as i64)),
             ("real-approx-to-bits", [Real(f)]) => Ok(Int((*f as f32).to_bits() as i64)),
             ("bits-to-real-approx", [Int(i)]) => Ok(Real(f32::from_bits(*i as u32) as f64)),
@@ -1017,8 +1076,14 @@ fn literal(text: &str, kind: LiteralKind) -> R<Value> {
         LiteralKind::IntLit => {
             let clean = text.replace('_', "");
             match clean.strip_prefix('#') {
-                Some(hex) => i64::from_str_radix(hex, 16)
-                    .map(Value::Int)
+                // THROUGH u64, NOT i64. `#8000000000000000` is sixteen digits
+                // and sets the sign bit, which `i64::from_str_radix` refuses as
+                // out of range -- so the one literal a program writes to mean
+                // "the most negative integer" was the one that would not parse.
+                // A hexadecimal literal names a BIT PATTERN, and the pattern is
+                // 64 bits wide either way round.
+                Some(hex) => u64::from_str_radix(hex, 16)
+                    .map(|u| Value::Int(u as i64))
                     .map_err(|_| Error(format!("bad hex literal `{text}`"))),
                 None => clean
                     .parse()
