@@ -67,10 +67,21 @@ pub struct Index {
     pub read_anywhere: BTreeMap<String, Vec<usize>>,
 }
 
+/// A TYPE VARIABLE IS NOT A REFERENCE, and Codex tells them apart by case.
+/// Type names are capitalised -- `Fat16Volume`, `IRChapter`, `Maybe` -- and a
+/// lowercase name in type position is the `a` of `List a` or the variable a
+/// `forall` bound. Collecting those as reads makes every generic chapter look
+/// like it depends on definitions called `a`, `b` and `c`, which is what a
+/// bundle check reported on a bundle that compiles.
+///
+/// Checked against the whole checkout before relying on it: no chapter declares
+/// a lowercase record or variant.
 fn type_names(t: &TypeExpr, out: &mut BTreeSet<String>) {
     match t {
         TypeExpr::Named(n, _) => {
-            out.insert(n.clone());
+            if !n.starts_with(|c: char| c.is_lowercase()) {
+                out.insert(n.clone());
+            }
         }
         TypeExpr::Fun(a, b, _) | TypeExpr::PropEq(a, b, _) => {
             type_names(a, out);

@@ -4,6 +4,7 @@
 //!     xref chapter <Name> <dir>...  what one chapter reads, grouped by definer
 //!     xref dangling <dir>...        names read that nothing in the tree defines
 //!     xref dead <dir>...            definitions nothing in the tree reads
+//!     xref bundle <subject.codex> <dir>...   names a BUNDLE reads and does not define
 //!
 //! The grep replacement. See `xref.rs` for why grep cannot do this in a
 //! literate language whose names carry hyphens.
@@ -41,11 +42,13 @@ fn main() -> ExitCode {
         Some("chapter") if args.len() >= 3 => ("chapter", Some(&args[1]), &args[2..]),
         Some("dangling") if args.len() >= 2 => ("dangling", None, &args[1..]),
         Some("dead") if args.len() >= 2 => ("dead", None, &args[1..]),
+        Some("bundle") if args.len() >= 2 => ("bundle", Some(&args[1]), &args[2..]),
         _ => {
             eprintln!("usage: xref who <name> <dir>...");
             eprintln!("       xref chapter <Name> <dir>...");
             eprintln!("       xref dangling <dir>...");
             eprintln!("       xref dead <dir>...  [--roots a,b,c] [--in <path substring>] [--all-files]");
+            eprintln!("       xref bundle <subject.codex> <dir>...");
             return ExitCode::from(2);
         }
     };
@@ -100,6 +103,7 @@ fn main() -> ExitCode {
         "who" => who(&ix, arg.unwrap()),
         "chapter" => chapter(&ix, arg.unwrap()),
         "dead" => dead(&ix, &full, paths, &roots, only.as_deref(), all_files),
+        "bundle" => return bundle(arg.unwrap(), &ix, paths),
         _ => dangling(&ix),
     }
     ExitCode::SUCCESS
@@ -435,4 +439,114 @@ fn collect_other(p: &Path, out: &mut Vec<(PathBuf, String)>, exts: Option<&[&str
     if let Ok(body) = std::fs::read_to_string(p) {
         out.push((p.to_path_buf(), body));
     }
+}
+
+/// What a BUNDLE reads and does not define -- the missing cites, before a guest.
+///
+/// A bundled subject is one file holding every chapter, so the parser reads it
+/// as a single chapter whose `reads` set is exactly "named, not supplied here".
+/// That is the whole computation; the rest is filtering builtins out of it and
+/// saying WHICH file in the tree would answer each name, because "add
+/// IR/Passes.codex" is the actionable form of "run-ir-pipeline is missing".
+///
+/// **It answers names, not types.** A bundle this calls complete can still fail
+/// to compile on a shape. It shrinks the guest loop; it does not replace it.
+/// Measured 2026-09-03: bundling the driver into a rung subject took three
+/// guest compiles -- about nine minutes -- to discover a list this prints in
+/// under a second.
+fn bundle(subject: &str, ix: &Index, tree: &[String]) -> ExitCode {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let Ok(src) = std::fs::read(subject) else {
+        eprintln!("cannot read {subject}");
+        return ExitCode::from(2);
+    };
+    let parsed = parser::parse(&src);
+    let mut dg = Desugar::new(&src);
+    let ch = dg.chapter(&parsed.tree);
+    let refs = xref::chapter_refs(&ch, subject);
+
+    // A builtin is supplied by the language, not by a chapter, so a bundle never
+    // carries one. THE LIST COMES FROM THE TREE rather than from our own table:
+    // `Types/Builtins.codex` spells each one as `bs-name = "..."`, and our
+    // compiled-in copy is already behind it -- U55's `hosted-kind` is in the
+    // checkout and not in `builtins.rs`, which would have read as a missing
+    // cite forever. The compiled-in table stays as the floor for a tree that
+    // has no such chapter.
+    let mut builtin_owned: BTreeSet<String> =
+        codexc::builtins::BUILTINS.iter().map(|(n, _)| n.to_string()).collect();
+    let mut from_tree = 0usize;
+    for d in tree {
+        let mut fs: Vec<PathBuf> = Vec::new();
+        collect(Path::new(d), &mut fs);
+        for f in fs {
+            if !f.ends_with("Types/Builtins.codex") {
+                continue;
+            }
+            let Ok(body) = std::fs::read_to_string(&f) else { continue };
+            for seg in body.split("bs-name = \"").skip(1) {
+                if let Some(n) = seg.split('"').next() {
+                    if builtin_owned.insert(n.to_string()) {
+                        from_tree += 1;
+                    }
+                }
+            }
+        }
+    }
+    let builtins: BTreeSet<&str> = builtin_owned.iter().map(String::as_str).collect();
+    // Primitive type names are not in that table and are not definitions
+    // either; they are spelled by the type language itself.
+    const PRIMS: &[&str] = &[
+        "Integer", "Real", "Text", "Boolean", "Char", "Nothing", "List", "Vector",
+        "LinkedList", "Maybe", "Just", "None", "Type", "Effect", "Prop", "Refl",
+    ];
+
+    let mut missing: Vec<&str> = refs
+        .reads
+        .iter()
+        .map(String::as_str)
+        .filter(|n| !builtins.contains(n) && !PRIMS.contains(n))
+        .collect();
+    missing.sort();
+
+    if missing.is_empty() {
+        println!("{}: {} definitions, nothing read that it does not define \
+({} builtins known, {} learned from the tree)",
+                 short(Path::new(subject)), refs.defines.len(), builtins.len(), from_tree);
+        return ExitCode::SUCCESS;
+    }
+
+    // Group by the file that would answer, so the report is a list of chapters
+    // to add rather than a list of names to look up one at a time.
+    let mut by_file: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    let mut nowhere: Vec<&str> = Vec::new();
+    for n in &missing {
+        match ix.defined_in.get(*n) {
+            Some(ds) if !ds.is_empty() => {
+                let paths: Vec<&str> =
+                    ds.iter().map(|&i| ix.chapters[i].path.as_str()).collect();
+                by_file.entry(paths.join(" | ")).or_default().push(n);
+            }
+            _ => nowhere.push(n),
+        }
+    }
+
+    println!("{}: {} definitions, {} names read and not defined",
+             short(Path::new(subject)), refs.defines.len(), missing.len());
+    println!("({} builtins known, {} of them learned from the tree)\n",
+             builtins.len(), from_tree);
+    for (file, names) in &by_file {
+        println!("  ADD {file}");
+        for line in wrap(names, 68) {
+            println!("        {line}");
+        }
+    }
+    if !nowhere.is_empty() {
+        println!("\n  DEFINED NOWHERE in the tree searched ({}):", nowhere.len());
+        for line in wrap(&nowhere, 68) {
+            println!("        {line}");
+        }
+        println!("  (a builtin this tool does not know, or a genuine dangling name)");
+    }
+    ExitCode::from(1)
 }
