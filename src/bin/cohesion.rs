@@ -2,6 +2,7 @@
 //!
 //!     cohesion <file.codex|dir>...      one line per chapter, then the splits
 //!     cohesion --graph <file.codex>     the chapter's own call edges
+//!     cohesion --blocks <file.codex>    each definition's byte range, for moving it
 //!
 //! The summary line is the whole point of the default mode: a chapter with one
 //! component is finished business, and the reader should be able to skip it in
@@ -21,7 +22,8 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let graph = args.first().map(String::as_str) == Some("--graph");
-    let paths = if graph { &args[1..] } else { &args[..] };
+    let blocks = args.first().map(String::as_str) == Some("--blocks");
+    let paths = if graph || blocks { &args[1..] } else { &args[..] };
     if paths.is_empty() {
         eprintln!("usage: cohesion <file.codex|dir>...");
         eprintln!("       cohesion --graph <file.codex>");
@@ -57,6 +59,8 @@ fn main() -> ExitCode {
         let c = cohesion::analyse(&ch, &parsed.tree, &src);
         if graph {
             print_graph(&mut w, f, &c);
+        } else if blocks {
+            print_blocks(&mut w, &c);
         } else {
             let n = c.components.len();
             let nfn = c.is_fn.iter().filter(|&&b| b).count();
@@ -80,7 +84,7 @@ fn main() -> ExitCode {
         }
     }
 
-    if graph {
+    if graph || blocks {
         return ExitCode::SUCCESS;
     }
 
@@ -145,6 +149,19 @@ fn main() -> ExitCode {
         );
     }
     ExitCode::SUCCESS
+}
+
+/// One line per definition: the half-open byte range of the block that moves
+/// with it, then its name, then the section it sits in. Ranges are in source
+/// order and do not overlap, so a caller can cut and paste them without
+/// re-finding anything by text -- which is the whole point, since matching a
+/// definition by regex is what misattributes prose.
+fn print_blocks<W: Write>(w: &mut W, c: &Cohesion) {
+    for (i, name) in c.def_names.iter().enumerate() {
+        let (a, b) = c.def_span[i];
+        let s = &c.def_section[i];
+        let _ = writeln!(w, "block {a} {b} {name}{}", if s.is_empty() { String::new() } else { format!("  [{s}]") });
+    }
 }
 
 fn print_graph<W: Write>(w: &mut W, f: &Path, c: &Cohesion) {

@@ -103,6 +103,11 @@ pub struct Cohesion {
     /// The FIRST definition is the exception and gets its own extent only:
     /// the prose above it is the chapter's opening, and it stays behind.
     pub def_lines: Vec<u32>,
+    /// Per definition, the byte range of that same block, so a tool can MOVE it
+    /// rather than re-find it by matching text. Blocks never overlap and never
+    /// cross a `Section:` header -- the header belongs to the chapter, not to
+    /// the definition under it.
+    pub def_span: Vec<(u32, u32)>,
 }
 
 /// Which section each definition was written in: the last `Section:` header at
@@ -126,14 +131,51 @@ fn sections_by_offset(tree: &Node, src: &[u8]) -> Vec<(u32, String)> {
 /// what the author wrote for it. Blocks partition the chapter: one ends where
 /// the next begins.
 fn def_blocks(tree: &Node) -> Vec<(u32, u32, u32)> {
+    // Where a `Section:` header sits, a block cannot start before it: the header
+    // introduces the chapter's own division and stays behind when a definition
+    // is moved out.
+    let mut heads: Vec<u32> = Vec::new();
+    for n in tree.descendants(NodeKind::SectionHeader) {
+        let mut last = None;
+        for t in n.tokens() {
+            last = Some(t);
+        }
+        if let Some(t) = last {
+            heads.push(t.offset + t.len);
+        }
+    }
+
     let mut out: Vec<(u32, u32, u32)> = Vec::new();
     let mut prev_end_line = 0u32;
+    let mut prev_end_off = 0u32;
     for n in tree.descendants(NodeKind::Def) {
         let mut toks = n.tokens();
         let Some(first) = toks.next() else { continue };
+        // THE PROSE AFTER A DEFINITION IS INSIDE ITS NODE, not the next one's.
+        // The tree is lossless and every token belongs to something, so the
+        // paragraph a reader sees as an introduction to the definition BELOW is
+        // parked at the tail of the definition above. Taking the node's last
+        // token as the end therefore attributes prose backwards -- which moved
+        // the parts table's own introduction out from under it, and left it
+        // stranded above an unrelated definition.
+        //
+        // The end of a definition is its last token that is not prose or
+        // layout. Everything between that and the next definition's code is
+        // the next one's, which is what a reader means by "the prose above it".
         let mut last = first;
         for t in n.tokens() {
-            last = t;
+            if !matches!(
+                t.kind,
+                crate::token::Kind::ProseText
+                    | crate::token::Kind::SkippedProse
+                    | crate::token::Kind::Spaces
+                    | crate::token::Kind::Newline
+                    | crate::token::Kind::Indent
+                    | crate::token::Kind::Dedent
+                    | crate::token::Kind::Unmapped
+            ) {
+                last = t;
+            }
         }
         // Nested definitions do not exist, but `descendants` cannot know that,
         // so a node starting inside the previous one is skipped rather than
@@ -146,8 +188,19 @@ fn def_blocks(tree: &Node) -> Vec<(u32, u32, u32)> {
         } else {
             last.line.saturating_sub(prev_end_line)
         };
-        out.push((first.offset, last.offset + last.len, lines));
+        // The block reaches back over the prose above the definition, stopping
+        // at whichever came last: the previous definition or a section header.
+        let mut start = if out.is_empty() { first.offset } else { prev_end_off };
+        for &h in &heads {
+            if h > start && h <= first.offset {
+                start = h;
+            }
+        }
+        let end = last.offset + last.len;
+        out.push((start, end, lines));
+        // Keyed for lookup by the NAME token, which is inside the block.
         prev_end_line = last.line;
+        prev_end_off = end;
     }
     out
 }
@@ -155,11 +208,11 @@ fn def_blocks(tree: &Node) -> Vec<(u32, u32, u32)> {
 /// The block a name token at `offset` belongs to: the last one that starts at
 /// or before it. A `Def`'s name is inside its own node, so this cannot reach
 /// past it.
-fn block_lines_for(blocks: &[(u32, u32, u32)], offset: u32) -> u32 {
-    let mut cur = 0u32;
-    for &(start, _, lines) in blocks {
-        if start <= offset {
-            cur = lines;
+fn block_at(blocks: &[(u32, u32, u32)], offset: u32) -> (u32, u32, u32) {
+    let mut cur = (0u32, 0u32, 0u32);
+    for &b in blocks {
+        if b.0 <= offset {
+            cur = b;
         } else {
             break;
         }
@@ -225,8 +278,10 @@ pub fn analyse(ch: &Chapter, tree: &Node, src: &[u8]) -> Cohesion {
     }
 
     let blocks = def_blocks(tree);
-    let def_lines: Vec<u32> =
-        ch.defs.iter().map(|d| block_lines_for(&blocks, d.span.offset)).collect();
+    let found: Vec<(u32, u32, u32)> =
+        ch.defs.iter().map(|d| block_at(&blocks, d.span.offset)).collect();
+    let def_lines: Vec<u32> = found.iter().map(|b| b.2).collect();
+    let def_span: Vec<(u32, u32)> = found.iter().map(|b| (b.0, b.1)).collect();
 
     let sections = sections_by_offset(tree, src);
     let def_section: Vec<String> = if sections.is_empty() {
@@ -278,5 +333,6 @@ pub fn analyse(ch: &Chapter, tree: &Node, src: &[u8]) -> Cohesion {
         edges,
         isolated,
         def_lines,
+        def_span,
     }
 }
