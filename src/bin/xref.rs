@@ -5,6 +5,7 @@
 //!     xref dangling <dir>...        names read that nothing in the tree defines
 //!     xref dead <dir>...            definitions nothing in the tree reads
 //!     xref bundle <subject.codex> <dir>...   names a BUNDLE reads and does not define
+//!     xref arity <ours> <compiler-dir>...    OUR calls whose argument count no longer matches
 //!
 //! The grep replacement. See `xref.rs` for why grep cannot do this in a
 //! literate language whose names carry hyphens.
@@ -43,12 +44,14 @@ fn main() -> ExitCode {
         Some("dangling") if args.len() >= 2 => ("dangling", None, &args[1..]),
         Some("dead") if args.len() >= 2 => ("dead", None, &args[1..]),
         Some("bundle") if args.len() >= 2 => ("bundle", Some(&args[1]), &args[2..]),
+        Some("arity") if args.len() >= 3 => ("arity", Some(&args[1]), &args[2..]),
         _ => {
             eprintln!("usage: xref who <name> <dir>...");
             eprintln!("       xref chapter <Name> <dir>...");
             eprintln!("       xref dangling <dir>...");
             eprintln!("       xref dead <dir>...  [--roots a,b,c] [--in <path substring>] [--all-files]");
             eprintln!("       xref bundle <subject.codex> <dir>...");
+            eprintln!("       xref arity <ours.codex|dir> <compiler-dir>...  [--partial] [--phases]");
             return ExitCode::from(2);
         }
     };
@@ -75,6 +78,21 @@ fn main() -> ExitCode {
     let mut all_files = false;
     if let Some(i) = paths.iter().position(|a| a == "--all-files") {
         all_files = true;
+        paths.remove(i);
+    }
+    // Partial application is legal, so a short call in ARGUMENT position is
+    // ordinary and dropped. `--partial` shows those too, for the reader chasing
+    // one specific name.
+    let mut partial = false;
+    if let Some(i) = paths.iter().position(|a| a == "--partial") {
+        partial = true;
+        paths.remove(i);
+    }
+    // The driver's phase functions are the ones that have actually cost us
+    // time; `--phases` reports nothing else.
+    let mut phases_only = false;
+    if let Some(i) = paths.iter().position(|a| a == "--phases") {
+        phases_only = true;
         paths.remove(i);
     }
     let paths = &paths[..];
@@ -104,6 +122,7 @@ fn main() -> ExitCode {
         "chapter" => chapter(&ix, arg.unwrap()),
         "dead" => dead(&ix, &full, paths, &roots, only.as_deref(), all_files),
         "bundle" => return bundle(arg.unwrap(), &ix, paths),
+        "arity" => return arity_mode(arg.unwrap(), paths, partial, phases_only),
         _ => dangling(&ix),
     }
     ExitCode::SUCCESS
@@ -600,5 +619,134 @@ fn bundle(subject: &str, ix: &Index, tree: &[String]) -> ExitCode {
         }
         println!("  (a builtin this tool does not know, or a genuine dangling name)");
     }
+    ExitCode::from(1)
+}
+
+
+/// OUR calls against THEIR signatures.
+///
+/// The subject is our side -- a harness file, or a directory of them -- and the
+/// remaining paths are the compiler checkout that owns the definitions. Both
+/// are parsed; nothing is compiled and no guest runs, so this is seconds
+/// against an Update rather than the hour a rung takes to die.
+fn arity_mode(ours: &str, tree: &[String], partial: bool, phases_only: bool) -> ExitCode {
+    let load = |p: &Path| -> Vec<(String, codexc::ast::Chapter)> {
+        let mut fs: Vec<PathBuf> = Vec::new();
+        collect(p, &mut fs);
+        fs.sort();
+        let mut out = Vec::new();
+        for f in fs {
+            let Ok(src) = std::fs::read(&f) else { continue };
+            let parsed = parser::parse(&src);
+            let mut dg = Desugar::new(&src);
+            let ch = dg.chapter(&parsed.tree);
+            if ch.name.is_empty() {
+                continue;
+            }
+            out.push((short(&f), ch));
+        }
+        out
+    };
+
+    let mut theirs: Vec<(String, codexc::ast::Chapter)> = Vec::new();
+    for d in tree {
+        theirs.extend(load(Path::new(d)));
+    }
+    if theirs.is_empty() {
+        eprintln!("no chapters under {}", tree.join(" "));
+        return ExitCode::from(2);
+    }
+    let ix = codexc::arity::index(&theirs);
+
+    let mine = load(Path::new(ours));
+    if mine.is_empty() {
+        eprintln!("no chapters at {ours}");
+        return ExitCode::from(2);
+    }
+
+    // A name OUR side defines is ours, whatever the tree also calls it. Grading
+    // our own definitions against the compiler's arity is how a name collision
+    // becomes a false alarm.
+    let ours_defines: std::collections::BTreeSet<String> =
+        mine.iter().flat_map(|(_, c)| c.defs.iter().map(|d| d.name.clone())).collect();
+
+    let (mut short_all, mut over_all, mut skipped) = (Vec::new(), Vec::new(), 0usize);
+    let mut per_file: Vec<(String, usize)> = Vec::new();
+    for (path, ch) in &mine {
+        let cs: Vec<codexc::arity::Call> = codexc::arity::calls(ch)
+            .into_iter()
+            .filter(|c| !ours_defines.contains(&c.name))
+            .filter(|c| !phases_only || codexc::arity::is_driver_phase(&c.name))
+            .collect();
+        per_file.push((path.clone(), cs.len()));
+        let (s, o, k) = codexc::arity::compare(&cs, &ix, partial);
+        skipped += k;
+        for d in s {
+            short_all.push((path.clone(), d));
+        }
+        for d in o {
+            over_all.push((path.clone(), d));
+        }
+    }
+
+    let graded: usize = per_file.iter().map(|(_, n)| n).sum();
+    println!(
+        "{} definition(s) indexed from the checkout; {} call(s) graded in {} of our chapter(s)",
+        ix.len(),
+        graded,
+        mine.len()
+    );
+
+    // A definition with no parameter list has no arity to check. Saying how
+    // many were skipped keeps the clean sheet honest: a run that graded nothing
+    // and a run that graded everything both print no findings.
+    if skipped > 0 {
+        println!("  ({skipped} call(s) skipped: the definition is point-free, so its arity is in its TYPE)");
+    }
+
+    let sort = |v: &mut Vec<(String, codexc::arity::Drift)>| {
+        v.sort_by(|a, b| {
+            codexc::arity::is_driver_phase(&b.1.call.name)
+                .cmp(&codexc::arity::is_driver_phase(&a.1.call.name))
+                .then(a.1.call.name.cmp(&b.1.call.name))
+                .then(a.0.cmp(&b.0))
+                .then(a.1.call.line.cmp(&b.1.call.line))
+        })
+    };
+    sort(&mut over_all);
+    sort(&mut short_all);
+
+    if !over_all.is_empty() {
+        println!("\nOVER-APPLIED -- more arguments than the definition takes:");
+        for (path, d) in &over_all {
+            println!(
+                "  {}:{}  {} applied to {}, declared {}   [{}]",
+                path, d.call.line, d.call.name, d.call.applied, d.declared, d.defined_at
+            );
+        }
+    }
+
+    if !short_all.is_empty() {
+        println!("\nUNDER-APPLIED -- fewer arguments than the definition takes:");
+        println!("  In Codex this is a VALUE, not an error. Where it is not deliberate, the type");
+        println!("  error lands one line later against whatever consumed it.");
+        for (path, d) in &short_all {
+            let star = if codexc::arity::is_driver_phase(&d.call.name) { " <-- driver phase" } else { "" };
+            println!(
+                "  {}:{}  {} applied to {}, declared {}   [{}]{}",
+                path, d.call.line, d.call.name, d.call.applied, d.declared, d.defined_at, star
+            );
+        }
+    }
+
+    if over_all.is_empty() && short_all.is_empty() {
+        println!("\nok  every call matches the arity the checkout declares");
+        return ExitCode::SUCCESS;
+    }
+    println!(
+        "\n{} over-applied, {} under-applied",
+        over_all.len(),
+        short_all.len()
+    );
     ExitCode::from(1)
 }
