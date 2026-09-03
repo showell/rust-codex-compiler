@@ -366,6 +366,14 @@ fn dead(
 /// parse: `sub` is inside `subject`, and `-` is not a word character, so a
 /// plain `contains` reported every `run.ps1` in the tree as a reader of `sub`.
 fn names_it(body: &str, n: &str) -> bool {
+    // AN EMPTY NEEDLE MATCHES EVERYWHERE AND ADVANCES BY ONE BYTE, which walks
+    // into the middle of a multi-byte character and PANICS on the next slice.
+    // The checkout produces empty definition names (a `bounded` declaration
+    // parses one), so this is reachable, and an abort is worse than any wrong
+    // answer this tool could give.
+    if n.is_empty() {
+        return false;
+    }
     let bs = body.as_bytes();
     let mut from = 0usize;
     while let Some(rel) = body[from..].find(n) {
@@ -380,7 +388,11 @@ fn names_it(body: &str, n: &str) -> bool {
         if boundary(before) && boundary(after) {
             return true;
         }
+        // Advance to the next CHARACTER boundary, not the next byte.
         from = i + 1;
+        while from < body.len() && !body.is_char_boundary(from) {
+            from += 1;
+        }
     }
     false
 }
@@ -494,18 +506,29 @@ fn bundle(subject: &str, ix: &Index, tree: &[String]) -> ExitCode {
         }
     }
     let builtins: BTreeSet<&str> = builtin_owned.iter().map(String::as_str).collect();
-    // Primitive type names are not in that table and are not definitions
-    // either; they are spelled by the type language itself.
+    // Primitive type names are spelled by the type language and defined by no
+    // chapter. THE LIST ONLY APPLIES TO NAMES THE TREE DOES NOT DEFINE, which
+    // is the fix for a false clean: `Maybe`, `Just` and `None` were on it and
+    // are `foreword/core/Maybe.codex`, so a bundle using `Just` without
+    // carrying that chapter was reported complete and then failed in a guest.
+    // A name the tree DOES define is never a primitive, whatever it is called.
     const PRIMS: &[&str] = &[
         "Integer", "Real", "Text", "Boolean", "Char", "Nothing", "List", "Vector",
-        "LinkedList", "Maybe", "Just", "None", "Type", "Effect", "Prop", "Refl",
+        "LinkedList", "Type", "Effect", "Prop", "Refl",
     ];
 
+    // A BUILTIN IS ALWAYS FILTERED, even where a chapter also defines the name.
+    // `text-split`, `text-length` and `text-to-integer` are builtins AND are
+    // defined by chapters somewhere in the tree; requiring those chapters made
+    // three subjects that compile clean report as incomplete.
+    let defined_somewhere = |n: &str| ix.defined_in.get(n).is_some_and(|d| !d.is_empty());
     let mut missing: Vec<&str> = refs
         .reads
         .iter()
         .map(String::as_str)
-        .filter(|n| !builtins.contains(n) && !PRIMS.contains(n))
+        .filter(|n| !builtins.contains(n))
+        .filter(|n| !refs.effect_reads.contains(*n))
+        .filter(|n| defined_somewhere(n) || !PRIMS.contains(n))
         .collect();
     missing.sort();
 

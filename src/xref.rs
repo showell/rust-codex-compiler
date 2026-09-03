@@ -41,6 +41,12 @@ pub struct ChapterRefs {
     /// and the one dead code turns on. A definition only its own chapter calls
     /// is alive; a definition nothing calls, its own chapter included, is not.
     pub reads_all: BTreeSet<String>,
+    /// Names that appear only in an EFFECT ROW (`[Console] Nothing`). They are
+    /// reads -- `who` and `dead` must see them -- but a bundle does NOT carry a
+    /// chapter for them: an effect is grounded by the plug, and the real driver
+    /// subject uses `[Console]` without bundling core/Console.codex and
+    /// compiles. `bundle` subtracts this set for that reason.
+    pub effect_reads: BTreeSet<String>,
     /// name -> what kind of definition it is. A dead record and a dead
     /// function do not read the same way to someone deciding whether to delete.
     pub kinds: BTreeMap<String, &'static str>,
@@ -76,6 +82,14 @@ pub struct Index {
 ///
 /// Checked against the whole checkout before relying on it: no chapter declares
 /// a lowercase record or variant.
+thread_local! {
+    /// Effect-row names seen while walking one chapter. A thread-local keeps
+    /// `type_names`' signature -- it has eleven call sites -- and this is a
+    /// single-threaded tool.
+    static EFFECT_SEEN: std::cell::RefCell<BTreeSet<String>> =
+        std::cell::RefCell::new(BTreeSet::new());
+}
+
 fn type_names(t: &TypeExpr, out: &mut BTreeSet<String>) {
     match t {
         TypeExpr::Named(n, _) => {
@@ -93,7 +107,19 @@ fn type_names(t: &TypeExpr, out: &mut BTreeSet<String>) {
                 type_names(a, out);
             }
         }
-        TypeExpr::Effect(_, _, _, r, _) => type_names(r, out),
+        // AN EFFECT ROW NAMES CHAPTERS. `[Console] Nothing` reads `Console`,
+        // which core/Console.codex defines, and dropping the row made `xref who
+        // Console` answer "read by NOTHING" across 1,501 files that write it --
+        // and put Display, Microphone and Sensors in `dead`'s delete list.
+        TypeExpr::Effect(names, _, _, r, _) => {
+            for n in names {
+                if !n.starts_with(|c: char| c.is_lowercase()) {
+                    out.insert(n.clone());
+                    EFFECT_SEEN.with(|e| e.borrow_mut().insert(n.clone()));
+                }
+            }
+            type_names(r, out)
+        }
         TypeExpr::BoundedInt(b, ..) | TypeExpr::Linear(b, _) => type_names(b, out),
         TypeExpr::Constrained(_, _, b, _) => type_names(b, out),
         TypeExpr::Forall(_, v, b, _) => {
@@ -187,6 +213,7 @@ fn pat_names(p: &Pat, out: &mut BTreeSet<String>) {
 }
 
 pub fn chapter_refs(ch: &Chapter, path: &str) -> ChapterRefs {
+    EFFECT_SEEN.with(|e| e.borrow_mut().clear());
     let mut kinds: BTreeMap<String, &'static str> = BTreeMap::new();
     let mut lines: BTreeMap<String, u32> = BTreeMap::new();
     let mut defines: BTreeSet<String> = ch.defs.iter().map(|d| d.name.clone()).collect();
@@ -238,6 +265,21 @@ pub fn chapter_refs(ch: &Chapter, path: &str) -> ChapterRefs {
             }
         }
     }
+    // A3: their SIGNATURES are reads, and were walked nowhere. GpuEffect's
+    // `kernel-launch : KernelDescriptor, LaunchConfig, ... -> [Gpu.Compute] Nothing`
+    // reads three types from two other chapters, and `xref bundle` called that
+    // file complete.
+    let mut sig_reads: BTreeSet<String> = BTreeSet::new();
+    for e in &ch.effect_defs {
+        for o in &e.ops {
+            type_names(&o.type_expr, &mut sig_reads);
+        }
+    }
+    for c in &ch.class_defs {
+        for m in &c.methods {
+            type_names(&m.type_expr, &mut sig_reads);
+        }
+    }
     for e in &ch.effect_defs {
         defines.insert(e.name.clone());
         kinds.insert(e.name.clone(), "effect");
@@ -259,13 +301,31 @@ pub fn chapter_refs(ch: &Chapter, path: &str) -> ChapterRefs {
         }
     }
 
-    let mut reads: BTreeSet<String> = BTreeSet::new();
+    let mut reads: BTreeSet<String> = sig_reads.clone();
     // Reads ATTRIBUTED TO THEIR READER, so a definition's reference to itself
     // can be dropped. A self-recursive function that nothing calls is dead, and
     // counting its own recursive call as a read makes it immortal: that is
     // exactly what hid `emit-zig-apply-args`, which calls only itself and
     // `emit-zig-expr`, from the first version of this.
     let mut by_reader: BTreeSet<(String, String)> = BTreeSet::new();
+    for e in &ch.effect_defs {
+        for o in &e.ops {
+            let mut mine = BTreeSet::new();
+            type_names(&o.type_expr, &mut mine);
+            for n in mine {
+                by_reader.insert((o.name.clone(), n));
+            }
+        }
+    }
+    for c in &ch.class_defs {
+        for m in &c.methods {
+            let mut mine = BTreeSet::new();
+            type_names(&m.type_expr, &mut mine);
+            for n in mine {
+                by_reader.insert((m.name.clone(), n));
+            }
+        }
+    }
     let (_, per_def) = crate::scope::resolve_refs(ch);
     for (i, names) in per_def.into_iter().enumerate() {
         let reader = ch.defs.get(i).map(|d| d.name.clone()).unwrap_or_default();
@@ -337,6 +397,7 @@ pub fn chapter_refs(ch: &Chapter, path: &str) -> ChapterRefs {
         kinds,
         lines,
         claims,
+        effect_reads: EFFECT_SEEN.with(|e| e.borrow().clone()),
         edges: by_reader.into_iter().filter(|(r, n)| r != n).collect(),
     }
 }
