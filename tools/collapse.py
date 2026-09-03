@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Collapse every single-caller definition into its caller, repeatedly.
 
+`--roots a,b,c` treats those names as exported too, which answers the question
+"if I split these out, what would still be shared?" -- the leftovers are what
+must sink into a chapter everything cites.
+
 A node with exactly one predecessor is dominated by that predecessor, so
 absorbing it changes no reachability. Iterate to a fixed point and what
 survives is the SHARED SPINE: definitions two or more callers need, which are
@@ -10,8 +14,14 @@ Interface names (read by another chapter) are roots and are never absorbed.
 """
 import collections, subprocess, sys
 
-chapter, path = sys.argv[1], sys.argv[2]
-dirs = sys.argv[3:]
+argv = sys.argv[1:]
+extra_roots = set()
+if '--roots' in argv:
+    i = argv.index('--roots')
+    extra_roots = set(argv[i + 1].split(','))
+    del argv[i:i + 2]
+chapter, path = argv[0], argv[1]
+dirs = argv[2:]
 BIN = '/home/steve/showell_repos/rust-codex-compiler/target/release'
 
 graph = subprocess.run([BIN + '/cohesion', '--graph', path],
@@ -37,6 +47,7 @@ for line in seams.splitlines():
     if grab:
         if not line.startswith('      '): break
         iface.update(line.split())
+iface |= extra_roots
 
 absorbed = {n: {n} for n in nodes}
 changed = True
