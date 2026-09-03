@@ -8,7 +8,9 @@
 //! whatever consumed the value, naming neither the call nor the argument it
 //! wanted:
 //!
-//!     CDX2001: Type mismatch: Rec:IRChapter vs Fun     (at run-ir-pipeline)
+//! ```text
+//! CDX2001: Type mismatch: Rec:IRChapter vs Fun     (at run-ir-pipeline)
+//! ```
 //!
 //! `lower-chapter` moved three Updates running -- 8 parameters at U53, 9 at U54
 //! (`rename`), 11 at U55 with a tuple return -- and each move was found by a

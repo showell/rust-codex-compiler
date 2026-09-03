@@ -87,10 +87,18 @@ fn lossless(roots: &[String]) -> ExitCode {
     let mut bytes = 0usize;
     let mut tokens = 0usize;
     let mut bad = 0usize;
-    // ErrorToken is not a losslessness failure -- upstream emits it too -- but
-    // a file full of them means the byte-level dispatch is wrong, so it is
-    // counted and reported rather than hidden.
+    // ErrorToken is not a losslessness failure -- upstream emits it too, for
+    // any character its byte dispatch does not know (Lexer.codex:451) -- but a
+    // file full of them means OUR dispatch is wrong, so they are reported.
+    //
+    // A BARE COUNT CRIES WOLF. "3 file(s) contain an ErrorToken" gives the
+    // reader nothing to check and no way to tell an expected one from a real
+    // one, so it gets dismissed every run until the run where it mattered.
+    // Every occurrence is now located and shown in its line, because all three
+    // in the compiler are a backtick or a semicolon sitting in PROSE, which is
+    // obvious the moment you see the line and invisible when you see a count.
     let mut with_error_tokens = 0usize;
+    let mut error_sites: Vec<String> = Vec::new();
 
     for f in &files {
         let Ok(src) = std::fs::read(f) else { continue };
@@ -103,13 +111,45 @@ fn lossless(roots: &[String]) -> ExitCode {
                 println!("GAP {}: first unaccounted byte at offset {at}", f.display());
             }
         }
-        if lexed.tokens.iter().any(|t| t.kind == Kind::ErrorToken) {
+        let errs: Vec<_> =
+            lexed.tokens.iter().filter(|t| t.kind == Kind::ErrorToken).collect();
+        if !errs.is_empty() {
             with_error_tokens += 1;
+            for tk in errs.iter().take(8) {
+                let off = tk.offset as usize;
+                let ls = src[..off.min(src.len())]
+                    .iter()
+                    .rposition(|&b| b == b'\n')
+                    .map_or(0, |i| i + 1);
+                let le = src[off.min(src.len())..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(src.len(), |i| off + i);
+                let line = String::from_utf8_lossy(&src[ls..le]);
+                let ch = String::from_utf8_lossy(
+                    &src[off..(off + tk.len as usize).min(src.len())]).to_string();
+                error_sites.push(format!(
+                    "  {}:{}:{}  |{}|  in: {}",
+                    f.display(), tk.line, tk.col, ch, line.trim()));
+            }
         }
     }
 
     println!("{} files, {bytes} bytes, {tokens} tokens", files.len());
-    println!("{with_error_tokens} file(s) contain an ErrorToken");
+    if with_error_tokens == 0 {
+        println!("0 file(s) contain an ErrorToken");
+    } else {
+        println!(
+            "{with_error_tokens} file(s) contain an ErrorToken \
+             (upstream emits these too, for any character its dispatch does not know):"
+        );
+        for s in error_sites.iter().take(40) {
+            println!("{s}");
+        }
+        if error_sites.len() > 40 {
+            println!("  ... and {} more", error_sites.len() - 40);
+        }
+    }
     if bad == 0 {
         println!("LOSSLESS: every byte of every file lands in exactly one token");
         ExitCode::SUCCESS
