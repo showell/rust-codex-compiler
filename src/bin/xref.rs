@@ -136,15 +136,44 @@ fn who(ix: &Index, name: &str) {
 }
 
 fn chapter(ix: &Index, name: &str) {
-    let Some(me) = ix.chapters.iter().position(|c| c.chapter == name) else {
+    // A CHAPTER IS NOT A FILE. One chapter may span several files, each a PAGE
+    // carrying `Page N of M` at its foot -- `Zig Emitter` is four of them. This
+    // took the FIRST page and reported it as the whole chapter: 194 definitions
+    // where the chapter has 421, and the missing pages then showed up as a
+    // foreign definer, so the chapter appeared to read itself from outside.
+    let pages: Vec<usize> =
+        (0..ix.chapters.len()).filter(|&i| ix.chapters[i].chapter == name).collect();
+    if pages.is_empty() {
         eprintln!("no chapter named {name}");
         return;
-    };
-    let c = &ix.chapters[me];
-    println!("{} ({}) defines {}, reads {}", c.chapter, c.path, c.defines.len(), c.reads.len());
+    }
+    let mut defines: std::collections::BTreeSet<&str> = Default::default();
+    let mut reads: std::collections::BTreeSet<&str> = Default::default();
+    for &i in &pages {
+        defines.extend(ix.chapters[i].defines.iter().map(String::as_str));
+        reads.extend(ix.chapters[i].reads.iter().map(String::as_str));
+    }
+    let where_: Vec<&str> = pages.iter().map(|&i| ix.chapters[i].path.as_str()).collect();
+    if pages.len() == 1 {
+        println!("{} ({}) defines {}, reads {}", name, where_[0], defines.len(), reads.len());
+    } else {
+        println!(
+            "{} defines {}, reads {} -- {} pages: {}",
+            name,
+            defines.len(),
+            reads.len(),
+            pages.len(),
+            where_.join(", ")
+        );
+    }
     let mut by_definer: std::collections::BTreeMap<String, Vec<&str>> = Default::default();
     let mut unknown: Vec<&str> = Vec::new();
-    for n in &c.reads {
+    for n in reads {
+        // A name this chapter defines on ANY page is its own, not a foreign
+        // read, however many files the chapter is spread across.
+        if defines.contains(n) {
+            continue;
+        }
         match ix.defined_in.get(n) {
             Some(ds) if !ds.is_empty() => {
                 by_definer.entry(ix.chapters[ds[0]].chapter.clone()).or_default().push(n)
