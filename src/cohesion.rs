@@ -93,6 +93,16 @@ pub struct Cohesion {
     /// nothing in it. Isolated vertices are single-def components; this is
     /// the same set, named, because it reads differently.
     pub isolated: Vec<usize>,
+    /// Per definition, the source lines of the BLOCK that moves when the
+    /// definition moves: the definition itself plus the prose written above
+    /// it, back to where the previous definition ended.
+    ///
+    /// Prose above a definition is about that definition, so it travels with
+    /// it -- which is what `split_chapter.py` already does by hand and what
+    /// makes a size here comparable to "how long will the new chapter be".
+    /// The FIRST definition is the exception and gets its own extent only:
+    /// the prose above it is the chapter's opening, and it stays behind.
+    pub def_lines: Vec<u32>,
 }
 
 /// Which section each definition was written in: the last `Section:` header at
@@ -107,6 +117,54 @@ fn sections_by_offset(tree: &Node, src: &[u8]) -> Vec<(u32, String)> {
     }
     out.sort_by_key(|(o, _)| *o);
     out
+}
+
+/// The line extent of each definition's block, keyed by the offset of the
+/// definition's NAME token so it can be joined to the AST's `Def`s.
+///
+/// The CST is lossless, so a `Def` node's first and last tokens bracket exactly
+/// what the author wrote for it. Blocks partition the chapter: one ends where
+/// the next begins.
+fn def_blocks(tree: &Node) -> Vec<(u32, u32, u32)> {
+    let mut out: Vec<(u32, u32, u32)> = Vec::new();
+    let mut prev_end_line = 0u32;
+    for n in tree.descendants(NodeKind::Def) {
+        let mut toks = n.tokens();
+        let Some(first) = toks.next() else { continue };
+        let mut last = first;
+        for t in n.tokens() {
+            last = t;
+        }
+        // Nested definitions do not exist, but `descendants` cannot know that,
+        // so a node starting inside the previous one is skipped rather than
+        // counted twice.
+        if !out.is_empty() && first.line < prev_end_line {
+            continue;
+        }
+        let lines = if out.is_empty() {
+            last.line.saturating_sub(first.line) + 1
+        } else {
+            last.line.saturating_sub(prev_end_line)
+        };
+        out.push((first.offset, last.offset + last.len, lines));
+        prev_end_line = last.line;
+    }
+    out
+}
+
+/// The block a name token at `offset` belongs to: the last one that starts at
+/// or before it. A `Def`'s name is inside its own node, so this cannot reach
+/// past it.
+fn block_lines_for(blocks: &[(u32, u32, u32)], offset: u32) -> u32 {
+    let mut cur = 0u32;
+    for &(start, _, lines) in blocks {
+        if start <= offset {
+            cur = lines;
+        } else {
+            break;
+        }
+    }
+    cur
 }
 
 fn section_for(sections: &[(u32, String)], offset: u32) -> String {
@@ -166,6 +224,10 @@ pub fn analyse(ch: &Chapter, tree: &Node, src: &[u8]) -> Cohesion {
         }
     }
 
+    let blocks = def_blocks(tree);
+    let def_lines: Vec<u32> =
+        ch.defs.iter().map(|d| block_lines_for(&blocks, d.span.offset)).collect();
+
     let sections = sections_by_offset(tree, src);
     let def_section: Vec<String> = if sections.is_empty() {
         vec![String::new(); n]
@@ -215,5 +277,6 @@ pub fn analyse(ch: &Chapter, tree: &Node, src: &[u8]) -> Cohesion {
         components,
         edges,
         isolated,
+        def_lines,
     }
 }

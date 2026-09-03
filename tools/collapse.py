@@ -30,7 +30,7 @@ seams = subprocess.run([BIN + '/seams', chapter] + dirs,
                        capture_output=True, text=True).stdout
 
 succ = collections.defaultdict(set)
-nodes, section = set(), {}
+nodes, section, lines = set(), {}, {}
 for line in graph.splitlines():
     p = line.split()
     if not p: continue
@@ -39,6 +39,12 @@ for line in graph.splitlines():
     elif p[0] in ('def', 'isolated'):
         nodes.add(p[1])
         section[p[1]] = line.split('[', 1)[1].rstrip(']') if '[' in line else ''
+        # `lines=N` is the block that MOVES with the definition -- its own text
+        # plus the prose above it. Summed over a block it answers the only
+        # question a split really asks: how big is the chapter this would make.
+        for f in p:
+            if f.startswith('lines='):
+                lines[p[1]] = int(f[6:])
 
 iface = set()
 grab = False
@@ -72,16 +78,28 @@ for a, bs in succ.items():
     for b in bs:
         if a != b: preds[b].add(a)
 
-print(f"{chapter}: collapsed to {len(nodes)} nodes from {len(absorbed) and sum(len(v) for v in absorbed.values())}\n")
+def block_lines(n):
+    return sum(lines.get(m, 0) for m in absorbed[n])
+
+total = sum(lines.values())
+print(f"{chapter}: collapsed to {len(nodes)} nodes from {sum(len(v) for v in absorbed.values())}"
+      f", {total} lines\n")
 print("SURVIVING BLOCKS -- each absorbed everything only it calls:")
-for n in sorted(nodes, key=lambda n: -len(absorbed[n])):
+# By LINES, not by definition count: a block of 104 one-line constants and a
+# block of 20 dense functions are the same size to the first and not to a
+# reader. Size is the question a split is actually asking.
+for n in sorted(nodes, key=lambda n: -block_lines(n)):
     if len(absorbed[n]) == 1: continue
     secs = sorted({section.get(m, '') for m in absorbed[n]} - {''})
-    print(f"\n  {n}  ({len(absorbed[n])} defs)  callers={len(preds.get(n, ()))}")
+    ln = block_lines(n)
+    print(f"\n  {n}  ({ln} lines, {len(absorbed[n])} defs, {100*ln//max(total,1)}%)"
+          f"  callers={len(preds.get(n, ()))}")
     print(f"      sections: {' + '.join(secs)}")
     print(f"      {' '.join(sorted(absorbed[n]))}")
 
-print("\nSHARED SPINE -- survived because two or more blocks call them:")
-for n in sorted(nodes):
-    if len(absorbed[n]) == 1 and len(preds.get(n, ())) >= 2:
-        print(f"  {n:22s} called by {len(preds[n])}: {' '.join(sorted(preds[n]))}")
+spine = [n for n in sorted(nodes)
+         if len(absorbed[n]) == 1 and len(preds.get(n, ())) >= 2]
+print(f"\nSHARED SPINE -- survived because two or more blocks call them"
+      f" ({sum(lines.get(n, 0) for n in spine)} lines in {len(spine)}):")
+for n in spine:
+    print(f"  {n:22s} {lines.get(n, 0):>3}L  called by {len(preds[n])}: {' '.join(sorted(preds[n]))}")

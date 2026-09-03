@@ -151,7 +151,15 @@ fn print_graph<W: Write>(w: &mut W, f: &Path, c: &Cohesion) {
     let _ = writeln!(w, "# {} — {}", short(f), c.chapter);
     for (i, name) in c.def_names.iter().enumerate() {
         let s = &c.def_section[i];
-        let _ = writeln!(w, "def {name}{}", if s.is_empty() { String::new() } else { format!("  [{s}]") });
+        // `lines=` goes BEFORE the section bracket: a reader of this stream
+        // takes the section as everything inside `[..]`, and a trailing field
+        // would land inside it.
+        let _ = writeln!(
+            w,
+            "def {name}  lines={}{}",
+            c.def_lines[i],
+            if s.is_empty() { String::new() } else { format!("  [{s}]") }
+        );
     }
     for &(a, b) in &c.edges {
         let _ = writeln!(w, "call {} -> {}", c.def_names[a], c.def_names[b]);
