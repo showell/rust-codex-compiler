@@ -35,6 +35,25 @@ pub struct ChapterRefs {
     pub defines: BTreeSet<String>,
     /// Every name read that this chapter does not itself define.
     pub reads: BTreeSet<String>,
+    /// Every name read, INCLUDING the ones this chapter defines itself. The
+    /// field above answers "what does this chapter need from elsewhere"; this
+    /// one answers "is this name read at all", which is a different question
+    /// and the one dead code turns on. A definition only its own chapter calls
+    /// is alive; a definition nothing calls, its own chapter included, is not.
+    pub reads_all: BTreeSet<String>,
+    /// name -> what kind of definition it is. A dead record and a dead
+    /// function do not read the same way to someone deciding whether to delete.
+    pub kinds: BTreeMap<String, &'static str>,
+    /// name -> the source line it is defined on, for jumping to it.
+    pub lines: BTreeMap<String, u32>,
+    /// Definitions that PROVE a claim. The checker enters them and no
+    /// definition calls them, so they are read by nothing and alive anyway.
+    pub claims: BTreeSet<String>,
+    /// (reader, read) with self-references dropped. Keeping the reader is what
+    /// lets a caller ask "is this read by anything STILL ALIVE", which is a
+    /// stronger question than "is this read at all" -- the callees of a dead
+    /// function are dead too, and only the pairs can see that.
+    pub edges: BTreeSet<(String, String)>,
 }
 
 pub struct Index {
@@ -44,6 +63,8 @@ pub struct Index {
     pub defined_in: BTreeMap<String, Vec<usize>>,
     /// name -> the chapters reading it.
     pub read_in: BTreeMap<String, Vec<usize>>,
+    /// name -> the chapters reading it, self-reads included. See `reads_all`.
+    pub read_anywhere: BTreeMap<String, Vec<usize>>,
 }
 
 fn type_names(t: &TypeExpr, out: &mut BTreeSet<String>) {
@@ -155,7 +176,41 @@ fn pat_names(p: &Pat, out: &mut BTreeSet<String>) {
 }
 
 pub fn chapter_refs(ch: &Chapter, path: &str) -> ChapterRefs {
+    let mut kinds: BTreeMap<String, &'static str> = BTreeMap::new();
+    let mut lines: BTreeMap<String, u32> = BTreeMap::new();
     let mut defines: BTreeSet<String> = ch.defs.iter().map(|d| d.name.clone()).collect();
+    let mut claims: BTreeSet<String> = BTreeSet::new();
+    for d in &ch.defs {
+        kinds.insert(
+            d.name.clone(),
+            if d.is_claim {
+                "proof"
+            } else if d.params.is_empty() {
+                "constant"
+            } else {
+                "function"
+            },
+        );
+        lines.insert(d.name.clone(), d.span.line);
+        if d.is_claim {
+            claims.insert(d.name.clone());
+        }
+    }
+    for t in &ch.type_defs {
+        let (n, sp) = match t {
+            TypeDef::Record(n, _, _, _, sp) => (n, sp),
+            TypeDef::Unit(n, _, sp) => (n, sp),
+            TypeDef::Variant(n, _, _, sp) => (n, sp),
+        };
+        kinds.insert(n.clone(), "type");
+        lines.insert(n.clone(), sp.line);
+        if let TypeDef::Variant(_, _, cs, _) = t {
+            for c in cs {
+                kinds.insert(c.name.clone(), "constructor");
+                lines.insert(c.name.clone(), c.span.line);
+            }
+        }
+    }
     for t in &ch.type_defs {
         match t {
             TypeDef::Record(n, ..) => {
@@ -174,61 +229,111 @@ pub fn chapter_refs(ch: &Chapter, path: &str) -> ChapterRefs {
     }
     for e in &ch.effect_defs {
         defines.insert(e.name.clone());
+        kinds.insert(e.name.clone(), "effect");
+        lines.insert(e.name.clone(), e.span.line);
         for o in &e.ops {
             defines.insert(o.name.clone());
+            kinds.insert(o.name.clone(), "effect op");
+            lines.insert(o.name.clone(), o.span.line);
         }
     }
     for c in &ch.class_defs {
         defines.insert(c.name.clone());
+        kinds.insert(c.name.clone(), "class");
+        lines.insert(c.name.clone(), c.span.line);
         for m in &c.methods {
             defines.insert(m.name.clone());
+            kinds.insert(m.name.clone(), "class method");
+            lines.insert(m.name.clone(), m.span.line);
         }
     }
 
     let mut reads: BTreeSet<String> = BTreeSet::new();
+    // Reads ATTRIBUTED TO THEIR READER, so a definition's reference to itself
+    // can be dropped. A self-recursive function that nothing calls is dead, and
+    // counting its own recursive call as a read makes it immortal: that is
+    // exactly what hid `emit-zig-apply-args`, which calls only itself and
+    // `emit-zig-expr`, from the first version of this.
+    let mut by_reader: BTreeSet<(String, String)> = BTreeSet::new();
     let (_, per_def) = crate::scope::resolve_refs(ch);
-    for names in per_def {
-        reads.extend(names);
+    for (i, names) in per_def.into_iter().enumerate() {
+        let reader = ch.defs.get(i).map(|d| d.name.clone()).unwrap_or_default();
+        for n in names {
+            reads.insert(n.clone());
+            by_reader.insert((reader.clone(), n));
+        }
     }
     for d in &ch.defs {
+        let mut mine: BTreeSet<String> = BTreeSet::new();
         for t in &d.declared_type {
-            type_names(t, &mut reads);
+            type_names(t, &mut mine);
         }
-        ctor_and_record_names(&d.body, &mut reads);
+        ctor_and_record_names(&d.body, &mut mine);
+        for n in mine {
+            reads.insert(n.clone());
+            by_reader.insert((d.name.clone(), n));
+        }
     }
     // A type definition's own field and constructor types are references too:
     // `RiderPt = record { right : Real }` reads `Real`, and a variant's
     // payloads reach other chapters' types.
     for t in &ch.type_defs {
-        match t {
-            TypeDef::Record(_, _, fs, ..) => {
+        let mut mine: BTreeSet<String> = BTreeSet::new();
+        let owner = match t {
+            TypeDef::Record(n, _, fs, ..) => {
                 for f in fs {
-                    type_names(&f.type_expr, &mut reads);
+                    type_names(&f.type_expr, &mut mine);
                 }
+                n.clone()
             }
-            TypeDef::Variant(_, _, cs, _) => {
+            TypeDef::Variant(n, _, cs, _) => {
                 for c in cs {
                     for f in &c.fields {
-                        type_names(f, &mut reads);
+                        type_names(f, &mut mine);
                     }
                     for r in &c.return_type {
-                        type_names(r, &mut reads);
+                        type_names(r, &mut mine);
                     }
                 }
+                n.clone()
             }
-            TypeDef::Unit(_, inner, _) => type_names(inner, &mut reads),
+            TypeDef::Unit(n, inner, _) => {
+                type_names(inner, &mut mine);
+                n.clone()
+            }
+        };
+        for n in mine {
+            reads.insert(n.clone());
+            by_reader.insert((owner.clone(), n));
         }
     }
 
+    // A recursive type or function reads only itself; that is not a reader.
+    let reads_all: BTreeSet<String> =
+        by_reader.iter().filter(|(r, n)| r != n).map(|(_, n)| n.clone()).collect();
     for d in &defines {
         reads.remove(d);
     }
-    ChapterRefs { chapter: ch.name.clone(), path: path.to_string(), defines, reads }
+    for n in &defines {
+        kinds.entry(n.clone()).or_insert("other");
+    }
+    ChapterRefs {
+        chapter: ch.name.clone(),
+        path: path.to_string(),
+        defines,
+        reads,
+        reads_all,
+        kinds,
+        lines,
+        claims,
+        edges: by_reader.into_iter().filter(|(r, n)| r != n).collect(),
+    }
 }
 
 pub fn build(chapters: Vec<ChapterRefs>) -> Index {
     let mut defined_in: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     let mut read_in: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut read_anywhere: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (i, c) in chapters.iter().enumerate() {
         for n in &c.defines {
             defined_in.entry(n.clone()).or_default().push(i);
@@ -236,6 +341,9 @@ pub fn build(chapters: Vec<ChapterRefs>) -> Index {
         for n in &c.reads {
             read_in.entry(n.clone()).or_default().push(i);
         }
+        for n in &c.reads_all {
+            read_anywhere.entry(n.clone()).or_default().push(i);
+        }
     }
-    Index { chapters, defined_in, read_in }
+    Index { chapters, defined_in, read_in, read_anywhere }
 }

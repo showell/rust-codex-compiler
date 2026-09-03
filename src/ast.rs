@@ -171,6 +171,10 @@ pub struct Def {
     pub body: Expr,
     pub chapter_slug: String,
     pub span: Span,
+    /// This definition PROVES a `claim`, and the claim sits inside it. A proof
+    /// is entered by the checker, never called, so nothing reads it and it is
+    /// alive anyway -- the one fact that separates a proposition from a corpse.
+    pub is_claim: bool,
 }
 
 #[derive(Clone, Debug)]

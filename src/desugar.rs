@@ -587,6 +587,10 @@ impl<'a> Desugar<'a> {
             body,
             chapter_slug: self.slug.clone(),
             span: name_tok.map(|t| span_of(&t)).unwrap_or_default(),
+            // The `claim` is parked INSIDE the definition that proves it, which
+            // is what makes the association structural rather than "the next
+            // sibling". That is also what makes it readable here.
+            is_claim: d.child_nodes().iter().any(|k| k.kind == NodeKind::Claim),
         }
     }
 
