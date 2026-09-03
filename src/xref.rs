@@ -1,0 +1,241 @@
+//! Who reads this name, and which chapter defines it -- across a whole tree.
+//!
+//! **This is a grep replacement, and it exists because grep cannot do the job
+//! in this language.** Codex is literate: the prose lives in the same file as
+//! the code, so `grep near` finds the near plane, "near zero" and "near-plane
+//! clipping" and has no way to tell them apart. Codex names also carry hyphens,
+//! and `-` is not a word character, so `grep -w near` matches inside
+//! `clip-near`. Every usage table built by hand for the Camera split had to be
+//! rebuilt twice for those two reasons before it was right.
+//!
+//! **It needs no cite resolution, and that is not a shortcut.**
+//! `PORTING_NOTES` B5: "chapters share ONE FLAT NAMESPACE inside a bundle" --
+//! CDX3001 refuses a bundle holding two definitions of one name. So within any
+//! bundle a name has exactly one definition, and the index can map name to
+//! chapter directly. Where a name IS defined twice in the tree, that is two
+//! chapters that never share a bundle -- every entry chapter defines `opening`
+//! -- and the index reports the ambiguity rather than choosing.
+//!
+//! **Types and constructors count as definitions**, because a cite is as often
+//! for `Vec3` or `ScreenPt` as for a function. The resolver's walk does not
+//! see them: a record literal's type name is deliberately not resolved and
+//! type annotations are not expressions. So they are collected here, by a
+//! second and much simpler walk that needs no scope -- a type name cannot be
+//! shadowed by a local.
+
+use crate::ast::*;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// What one chapter defines and what it reads.
+pub struct ChapterRefs {
+    pub chapter: String,
+    pub path: String,
+    /// Value definitions, type definitions and constructors, all of which
+    /// occupy the one flat namespace.
+    pub defines: BTreeSet<String>,
+    /// Every name read that this chapter does not itself define.
+    pub reads: BTreeSet<String>,
+}
+
+pub struct Index {
+    pub chapters: Vec<ChapterRefs>,
+    /// name -> the chapters defining it. More than one is legal across the
+    /// tree and illegal inside one bundle.
+    pub defined_in: BTreeMap<String, Vec<usize>>,
+    /// name -> the chapters reading it.
+    pub read_in: BTreeMap<String, Vec<usize>>,
+}
+
+fn type_names(t: &TypeExpr, out: &mut BTreeSet<String>) {
+    match t {
+        TypeExpr::Named(n, _) => {
+            out.insert(n.clone());
+        }
+        TypeExpr::Fun(a, b, _) | TypeExpr::PropEq(a, b, _) => {
+            type_names(a, out);
+            type_names(b, out);
+        }
+        TypeExpr::App(c, args, _) => {
+            type_names(c, out);
+            for a in args {
+                type_names(a, out);
+            }
+        }
+        TypeExpr::Effect(_, _, _, r, _) => type_names(r, out),
+        TypeExpr::BoundedInt(b, ..) | TypeExpr::Linear(b, _) => type_names(b, out),
+        TypeExpr::Constrained(_, _, b, _) => type_names(b, out),
+        TypeExpr::Forall(_, v, b, _) => {
+            type_names(v, out);
+            type_names(b, out);
+        }
+    }
+}
+
+/// Record-literal type names and constructor patterns: the two places a name
+/// is used that the resolver's expression walk deliberately skips.
+fn ctor_and_record_names(e: &Expr, out: &mut BTreeSet<String>) {
+    let mut kids: Vec<&Expr> = Vec::new();
+    match e {
+        Expr::Record(n, fs, _) => {
+            out.insert(n.clone());
+            for f in fs {
+                kids.push(&f.value);
+            }
+        }
+        Expr::Apply(a, b, _) | Expr::Binary(a, _, b, _) | Expr::FieldAssign(a, _, b, _) => {
+            kids.push(a);
+            kids.push(b);
+        }
+        Expr::Unary(a, _) | Expr::Lazy(a, _) | Expr::FieldAccess(a, _, _) => kids.push(a),
+        Expr::If(a, b, c, _) => {
+            kids.push(a);
+            kids.push(b);
+            kids.push(c);
+        }
+        Expr::Let(binds, body, _) => {
+            for b in binds {
+                kids.push(&b.value);
+            }
+            kids.push(body);
+        }
+        Expr::Lambda(_, body, _) | Expr::WithTimeout(_, _, _, body, _) => kids.push(body),
+        Expr::Match(scrut, arms, _) | Expr::Induction(scrut, arms, _) => {
+            kids.push(scrut);
+            for a in arms {
+                pat_names(&a.pattern, out);
+                kids.push(&a.guard);
+                kids.push(&a.body);
+            }
+        }
+        Expr::List(xs, _) => kids.extend(xs.iter()),
+        Expr::Act(ss, _) => {
+            for s in ss {
+                match s {
+                    ActStmt::Exec(x, _) | ActStmt::Bind(_, x, _) => kids.push(x),
+                }
+            }
+        }
+        Expr::Handle(_, body, cs, _) => {
+            kids.push(body);
+            for c in cs {
+                kids.push(&c.body);
+            }
+        }
+        Expr::Try(_, a, b, c, _) => {
+            for region in [a, b, c] {
+                for s in region {
+                    match s {
+                        ActStmt::Exec(x, _) | ActStmt::Bind(_, x, _) => kids.push(x),
+                    }
+                }
+            }
+        }
+        Expr::Lit(..) | Expr::NameRef(..) | Expr::Error(..) => {}
+    }
+    for k in kids {
+        ctor_and_record_names(k, out);
+    }
+}
+
+fn pat_names(p: &Pat, out: &mut BTreeSet<String>) {
+    match p {
+        Pat::Ctor(n, subs, _) => {
+            out.insert(n.clone());
+            for s in subs {
+                pat_names(s, out);
+            }
+        }
+        Pat::Vec_(subs, _) => {
+            for s in subs {
+                pat_names(s, out);
+            }
+        }
+        Pat::Var(..) | Pat::Lit(..) | Pat::Wild(_) => {}
+    }
+}
+
+pub fn chapter_refs(ch: &Chapter, path: &str) -> ChapterRefs {
+    let mut defines: BTreeSet<String> = ch.defs.iter().map(|d| d.name.clone()).collect();
+    for t in &ch.type_defs {
+        match t {
+            TypeDef::Record(n, ..) => {
+                defines.insert(n.clone());
+            }
+            TypeDef::Unit(n, ..) => {
+                defines.insert(n.clone());
+            }
+            TypeDef::Variant(n, _, cs, _) => {
+                defines.insert(n.clone());
+                for c in cs {
+                    defines.insert(c.name.clone());
+                }
+            }
+        }
+    }
+    for e in &ch.effect_defs {
+        defines.insert(e.name.clone());
+        for o in &e.ops {
+            defines.insert(o.name.clone());
+        }
+    }
+    for c in &ch.class_defs {
+        defines.insert(c.name.clone());
+        for m in &c.methods {
+            defines.insert(m.name.clone());
+        }
+    }
+
+    let mut reads: BTreeSet<String> = BTreeSet::new();
+    let (_, per_def) = crate::scope::resolve_refs(ch);
+    for names in per_def {
+        reads.extend(names);
+    }
+    for d in &ch.defs {
+        for t in &d.declared_type {
+            type_names(t, &mut reads);
+        }
+        ctor_and_record_names(&d.body, &mut reads);
+    }
+    // A type definition's own field and constructor types are references too:
+    // `RiderPt = record { right : Real }` reads `Real`, and a variant's
+    // payloads reach other chapters' types.
+    for t in &ch.type_defs {
+        match t {
+            TypeDef::Record(_, _, fs, ..) => {
+                for f in fs {
+                    type_names(&f.type_expr, &mut reads);
+                }
+            }
+            TypeDef::Variant(_, _, cs, _) => {
+                for c in cs {
+                    for f in &c.fields {
+                        type_names(f, &mut reads);
+                    }
+                    for r in &c.return_type {
+                        type_names(r, &mut reads);
+                    }
+                }
+            }
+            TypeDef::Unit(_, inner, _) => type_names(inner, &mut reads),
+        }
+    }
+
+    for d in &defines {
+        reads.remove(d);
+    }
+    ChapterRefs { chapter: ch.name.clone(), path: path.to_string(), defines, reads }
+}
+
+pub fn build(chapters: Vec<ChapterRefs>) -> Index {
+    let mut defined_in: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut read_in: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, c) in chapters.iter().enumerate() {
+        for n in &c.defines {
+            defined_in.entry(n.clone()).or_default().push(i);
+        }
+        for n in &c.reads {
+            read_in.entry(n.clone()).or_default().push(i);
+        }
+    }
+    Index { chapters, defined_in, read_in }
+}
