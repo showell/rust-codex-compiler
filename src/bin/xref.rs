@@ -658,9 +658,19 @@ fn arity_mode(ours: &str, tree: &[String], partial: bool, phases_only: bool) -> 
     }
     let ix = codexc::arity::index(&theirs);
 
-    let mine = load(Path::new(ours));
+    // A BUNDLED SUBJECT IS NOT OUR SOURCE. `ast/<m>-subject.codex` is generated
+    // by concatenating the compiler's own chapters with a harness, so it
+    // DEFINES everything it calls -- and the "a name we define is ours" filter
+    // below then drops every call in the directory. Pointed at `ast/` that read
+    // "0 call(s) graded in 46 of our chapter(s)" and called it ok, which is the
+    // exact shape of green this tool exists to refuse.
+    let mine: Vec<(String, codexc::ast::Chapter)> = load(Path::new(ours))
+        .into_iter()
+        .filter(|(p, _)| !p.ends_with("-subject.codex"))
+        .collect();
     if mine.is_empty() {
-        eprintln!("no chapters at {ours}");
+        eprintln!("no chapters at {ours} (bundled *-subject.codex files are skipped: \
+                   they are generated, and they define what they call)");
         return ExitCode::from(2);
     }
 
@@ -737,6 +747,17 @@ fn arity_mode(ours: &str, tree: &[String], partial: bool, phases_only: bool) -> 
                 path, d.call.line, d.call.name, d.call.applied, d.declared, d.defined_at, star
             );
         }
+    }
+
+    // GRADING NOTHING IS NOT PASSING. A filter that swallowed every call and a
+    // codebase that is genuinely correct print the same clean sheet otherwise.
+    if graded == 0 {
+        println!(
+            "\nREFUSING: 0 calls graded. Nothing here applies a name the checkout defines --\n\
+             check the subject path, and note that generated *-subject.codex bundles are\n\
+             skipped because they define what they call."
+        );
+        return ExitCode::from(2);
     }
 
     if over_all.is_empty() && short_all.is_empty() {
