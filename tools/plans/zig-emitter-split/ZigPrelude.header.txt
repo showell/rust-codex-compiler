@@ -1,0 +1,29 @@
+Chapter: Zig Emitter
+  cites Foreword chapter Shake
+
+ THE ZIG RUNTIME, AS SOURCE. Every definition here is a fragment of the zig
+ program the emitter writes above its own output: the allocator, the linked
+ lists, the text and CCE routines, the deck, and the entry point's plumbing.
+ None of it decides anything. `zig-prelude-parts` is the table naming the
+ fragments, and the emitter shakes that table against a program to keep only
+ the parts that program reaches.
+
+ IT IS THE SAME CHAPTER AS `ZigEmitter.codex`, split the way `CSharpEmitter`
+ and `CSharpEmitterExpressions` are split -- one chapter, two files. Nothing
+ needs a cite it did not already have, and the emitter reads these names
+ exactly as it did when they sat below it.
+
+ WHY IT IS ITS OWN FILE. This is zig, and everything else in the chapter is
+ Codex reasoning about IR. A reader who knows zig can correct a routine here
+ without meeting the emitter at all, and a reader working on the emitter never
+ has to scroll through four hundred and seventy-five lines of someone else's
+ language. The two halves also change for different reasons: a fragment moves
+ when zig or the runtime contract moves, and the emitter moves when the IR does.
+
+ A FRAGMENT LIST IS NOT A STRING. `ShakeLit` is literal text and `ShakeUse`
+ names another part, so the shaker can follow one fragment to the next and drop
+ what nothing reaches. Writing a part's name inside a `ShakeLit` makes it
+ invisible to that walk, and the part it needed is then shaken out of a program
+ that calls it.
+
+

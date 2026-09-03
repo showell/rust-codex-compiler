@@ -1,0 +1,48 @@
+Section: Lambdas and What They Capture
+zig-params-have
+zig-captures
+zig-capture-type-decls
+zig-capture-fields
+zig-capture-inits
+zig-push-capture-renames
+zig-lambda-param-name
+zig-push-lambda-renames
+zig-lambda-param-types
+zig-lambda-param-type
+zig-lambda-closure
+zig-lambda-unused-discards
+zig-fn-nth-param
+emit-zig-lambda-params
+Section: The Closure Struct
+zig-fn-param-type-list
+zig-closure-fields
+zig-closure-inits
+zig-closure-env-refs
+zig-closure-pass
+zig-closure-params
+zig-closure-pass-tail
+zig-closure-call-body
+zig-closure-make
+Section: Applying It
+emit-zig-apply
+zig-callee-param-type
+lookup-zig-builtin
+zig-bind-tvars
+zig-call-ctx
+zig-closure-args
+zig-closure-invoke
+zig-list-take
+zig-list-take-loop
+zig-list-drop
+zig-list-drop-loop
+zig-over-apply
+emit-zig-expr-curried
+zig-arg-types
+Section: Constructor Application
+emit-zig-ctor-apply
+emit-zig-call-args
+emit-zig-ctor-arg
+zig-ctor-ll-elem
+zig-ctor-ll-scan
+zig-ctor-field-scan
+emit-zig-ctor-args

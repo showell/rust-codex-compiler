@@ -1,0 +1,120 @@
+Section: The Module Preamble
+zig-p-std
+zig-p-cxfn1
+zig-p-cxfn2
+zig-p-cxfn3
+zig-p-cxfn4
+zig-p-cxlist
+Section: Linked Lists
+zig-p-cx-ll-empty
+zig-p-cx-ll-push
+zig-p-cx-ll-of
+zig-p-cx-ll-concat
+zig-p-cx-ll-cons
+zig-p-cx-ll-insert-at
+zig-p-cx-ll-with-capacity
+zig-p-cx-list-len
+zig-p-cx-list-at
+zig-p-cx-list-set-at
+Section: Reals and Their Bits
+zig-p-cx-text-to-double-bits
+zig-p-cx-bits-to-real-approx
+zig-p-cx-real-from-int
+zig-p-cx-real-to-bits
+zig-p-cx-bits-to-real
+zig-p-cx-real-to-int
+Section: Integer Arithmetic
+zig-p-cx-ipow
+zig-p-cx-shl
+zig-p-cx-shr
+zig-p-cx-shru
+zig-p-cx-mod
+Section: Text and Characters
+zig-p-cx-text-compare
+zig-p-cx-char-to-text
+zig-p-cx-char-encode
+zig-p-cx-text-len
+zig-p-cx-char-at
+zig-p-cx-text-dup
+zig-p-cx-substring
+zig-p-cx-text-eq
+zig-p-cx-is-letter
+zig-p-cx-is-digit
+zig-p-cx-new
+zig-p-cx-concat
+zig-p-cx-text-starts-with
+zig-p-cx-text-contains
+zig-p-cx-text-concat-list
+zig-p-cx-text-to-integer
+zig-p-cx-text-replace
+zig-p-cx-text-split
+Section: The Heap
+zig-p-cx-heap-reserve
+zig-p-cx-heap-mem
+zig-p-cx-hp
+zig-p-cx-heap-base
+zig-p-cx-buf-want
+zig-p-cx-frontier-crosses
+zig-p-cx-bump-alloc
+zig-p-cx-bump-resize
+zig-p-cx-bump-remap
+zig-p-cx-bump-free
+zig-p-cx-heap-vtable
+zig-p-cx-gpa
+zig-p-cx-heap-save
+zig-p-cx-heap-advance
+zig-p-cx-heap-restore
+Section: Raw Memory
+zig-p-cx-peek-qword
+zig-p-cx-address-of
+zig-p-cx-peek-byte
+zig-p-cx-poke-byte
+zig-p-cx-memset
+zig-p-cx-poke-32
+zig-p-cx-alloc-bytes
+zig-p-cx-peek-32
+Section: The Deck
+zig-p-cx-dptr
+zig-p-cx-bivy
+zig-p-cx-nest
+zig-p-cx-deck-base
+zig-p-cx-deck-hw
+zig-p-cx-deck-top
+zig-p-cx-deck-best
+zig-p-cx-deck-stride
+zig-p-cx-deck-armed
+zig-p-cx-deck-slack
+zig-p-cx-deck-report
+zig-p-cx-deck-enter
+zig-p-cx-deck-exit
+zig-p-cx-deck-pos
+zig-p-cx-deck-set
+Section: Files and Standard Output
+zig-p-cx-read-file-uni
+zig-p-cx-write-all
+zig-p-cx-write-binary
+zig-p-cx-write-binary-buf
+zig-p-cx-vtag
+zig-p-cx-buf-write-byte
+zig-p-cx-buf-write-bytes
+zig-p-cx-buf-read-bytes
+zig-p-cx-show-int
+zig-p-cx-print-line
+zig-p-cx-print
+Section: The Compact Codex Encoding
+zig-p-cce-table
+zig-p-cce-t1-uni
+zig-p-cce-t1-size
+zig-p-cce-t1-code
+zig-p-cce-t2-uni
+zig-p-cce-t2-size
+zig-p-cx-cce-to-cp
+zig-p-cx-cp-to-cce
+zig-p-cx-cce-frame
+zig-p-cx-cce-to-utf8
+zig-p-cx-utf8-to-cce
+Section: The Parts Table
+zig-prelude-parts
+zig-prelude-part-names
+zig-prelude-names-loop
+zig-prelude

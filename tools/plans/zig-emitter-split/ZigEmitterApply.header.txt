@@ -1,0 +1,28 @@
+Chapter: Zig Emitter
+
+ APPLICATION, AND THE CLOSURE STRUCT THAT MAKES IT ONE PROBLEM. Zig has no
+ function values, so every Codex function value is emitted as a struct carrying
+ its captures and a `call` method. That single decision is why making a closure
+ and applying one belong in the same file: a lambda, a partially applied name
+ and an over-applied call all end at the same struct, and a change to its shape
+ has to be made in all three places at once or in none.
+
+ It is also why `(e.emit) st args` is `.call(.ctx, st, args)` and never zig call
+ syntax. An apply whose root is not a name took the curried path once and emitted
+ `e.emit(st)(args)`; zig answered "CxFn2 is not a function".
+
+ WHAT IS HERE. Lambdas and the captures they close over; the struct itself --
+ its fields, its initialisers and the environment it passes on; application,
+ including the under- and over-applied cases that need a partial closure built
+ or an extra `.call` chained; and constructor application, which looks like a
+ call and is not one.
+
+ WHAT IS NOT. Deciding WHICH expression this is -- that is Expression Emission,
+ on page 2. This file is entered from `emit-zig-expr` and from `emit-zig-name`,
+ and answers only "how does a function value get made, and how does it get run".
+
+ A CAPTURE IS NOT A SHADOW. A lambda parameter that shadows an enclosing local
+ is not a capture; leaving it in gives the environment a field nothing reads,
+ which surfaces as an unused `_e<d>`.
+
+

@@ -1,0 +1,26 @@
+Chapter: Zig Emitter
+  cites Foreword chapter Sort
+
+ EVERY EXPRESSION SHAPE, AND THE ANSWER FOR EACH. `emit-zig-expr` is the switch
+ over the IR's expression nodes, and everything else here is one arm of it or
+ something an arm needs: names and how they are renamed, the builtin table,
+ binary operators, list and record literals, match in both its switch and its
+ else-chain form, and act blocks.
+
+ The split follows csharp's, which took the same seam: CSharpEmitter.codex and
+ CSharpEmitterExpressions.codex are one chapter across two files, and the
+ expressions are the half that grew.
+
+ WHAT IS NOT HERE. Application and closures are on page 3, because zig has no
+ function values and the struct that stands in for one is a subject of its own.
+ Definitions, types and chapter emission stay on page 1.
+
+ AN EMPTY LIST CANNOT ANSWER FOR ITSELF, which is why `ZigCtx.expected` exists
+ and why every construct that knows the type sets it for its children. Read it
+ in one place -- `emit-zig-list` -- and set it wherever a type is known.
+
+ A NAME IS LOOKED UP THROUGH THE RENAME TABLE FIRST, before builtins and before
+ constructors, because zig forbids shadowing and Codex does not. `zig-renamed-scan`
+ scans from the END so the binding in scope now is the one that answers.
+
+

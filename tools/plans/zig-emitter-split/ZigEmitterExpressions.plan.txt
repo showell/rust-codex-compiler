@@ -1,0 +1,89 @@
+Section: Expression Emission
+emit-zig-expr
+zig-local-ref
+zig-is-int-lit
+zig-is-num-lit
+zig-pin-lit
+emit-zig-if-branch
+Section: Names
+zig-is-builtin
+zig-name-known
+zig-unknown-name
+zig-name-map
+zig-lookup-name
+zig-renamed
+zig-renamed-scan
+emit-zig-name
+zig-slash-pos
+zig-field-name
+zig-plain-field-name
+Section: Builtins
+bsearch-zig-builtin-pos
+sort-zig-builtins
+zig-builtin-emitters
+zig-ll-elem
+zig-elem-annotation
+zig-record-set-field
+zig-record-set-plain-field
+zig-record-set
+lookup-arity
+Section: Binary Operators
+zig-bin-op-symbol
+zig-bin-op-plain
+emit-zig-binary
+Section: Lists
+emit-zig-list
+emit-zig-list-elems
+emit-zig-list-span
+zig-list-arg-text
+Section: Records
+zig-field-value-text
+zig-clamp-field-val
+zig-clamp-def-scan
+zig-clamp-field-scan
+zig-clamp-atype
+zig-field-receiver
+emit-zig-record
+emit-zig-record-vals
+Section: Match Emission
+emit-zig-match
+zig-arms-list-type
+zig-occurs-either
+zig-chain-scrut
+zig-chain-uses-scrut
+zig-pin-lit-arms
+emit-zig-match-chain
+emit-zig-chain-arms
+emit-zig-chain-tail
+emit-zig-chain-arm
+zig-any-sub-occurs-g
+emit-zig-pat-unpack-g
+Section: Act Emission
+emit-zig-act
+emit-zig-act-stmts
+Section: The Type Questions Expressions Ask
+zig-type-is-void
+zig-is-text-type
+zig-is-real-type
+zig-strip-unit
+zig-is-boolean-type
+zig-show-arg
+zig-show-real-refusal
+Section: Constructor and Type Arguments
+zig-atype-mentions
+zig-atype-list-mentions
+zig-atype-mentions-any
+zig-tparam-index
+zig-rec-type-args
+zig-elem-atype-text
+zig-atype-ll-elem
+zig-record-field-ll-elem
+zig-record-field-ll-scan
+zig-field-ll-scan
+zig-find-ctor
+zig-drop-trailing-sep
+zig-call-type-args
+zig-call-type-args-loop
+zig-resolve-tvar
+zig-tvar-refusal
+zig-ctor-type-args
