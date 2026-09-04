@@ -46,6 +46,22 @@ declare -A MUST_DIFFER=(
   [literal_main]="FINDINGS 1B: a 19-digit Real literal wraps an i64 in Cobblestone and does not here"
 )
 
+# KNOWN DIVERGENCES, which is a WEAKER claim than the table above and must not
+# be confused with it. A MUST_DIFFER entry fails if the two arms agree, because
+# the disagreement IS the evidence. These are the opposite: they are filed
+# defects we expect to be fixed, so agreement here is the good news and the
+# right response is to delete the line.
+#
+# Both are finding 74 / issue 125, which is finding 1B's routine seen at
+# ordinary precision: Cobblestone builds a Real literal's significand as an
+# integer and scales it, rounding twice, so about 8% of ordinary doubles land an
+# ULP out. These two specs grade computed Reals against written-down ones at
+# tolerance 0.0, which is the shape that sees it.
+declare -A KNOWN_DIFFER=(
+  [bikespec]="issue 125: a Real literal is one ULP out in Cobblestone's front end"
+  [viewyawspec]="issue 125: as above, on 0.012500000000000011"
+)
+
 # HELD BACK BY DEFAULT, and each one has to earn that too.
 #
 # None of these is slow because anything is wrong. They ask for hundreds of
@@ -71,6 +87,7 @@ declare -A HEAVY=(
   [drive_main]="115,152,004 steps"
   [rider]="111,647,964 steps"
 )
+known=0
 
 same=0; differ=0; bad=0; nobin=0; held=0
 for unit in "$SAFARI"/build/*-unit.codex; do
@@ -109,6 +126,9 @@ for unit in "$SAFARI"/build/*-unit.codex; do
     elif [ -n "${MUST_DIFFER[$mod]:-}" ]; then
         echo "$label differs as it must -- ${MUST_DIFFER[$mod]}"
         differ=$((differ + 1))
+    elif [ -n "${KNOWN_DIFFER[$mod]:-}" ]; then
+        echo "$label differs, filed -- ${KNOWN_DIFFER[$mod]}"
+        known=$((known + 1))
     else
         echo "$label DIFFERS"
         diff <(printf '%s\n' "$zout") <(printf '%s\n' "$rout") | head -6 | sed 's/^/    /'
@@ -117,7 +137,7 @@ for unit in "$SAFARI"/build/*-unit.codex; do
 done
 
 echo
-echo "$same agree, $differ differ on purpose, $bad wrong, $nobin without a binary, $held held back"
+echo "$same agree, $differ differ on purpose, $known differ for a filed reason, $bad wrong, $nobin without a binary, $held held back"
 [ $bad -eq 0 ] || { echo RED; exit 1; }
 [ $same -gt 0 ] || { echo "nothing was compared"; echo RED; exit 1; }
 echo GREEN

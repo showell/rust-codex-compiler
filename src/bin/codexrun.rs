@@ -72,7 +72,10 @@ fn run_bounded(path: &Path, budget: Option<u64>) -> Result<String, String> {
 
 /// Run, and report the work done and the wall time it took.
 fn timed(path: &Path, budget: Option<u64>) -> Result<(String, u64, f64), String> {
-    let src = std::fs::read(path).map_err(|e| e.to_string())?;
+    // RESOLVING CITES IS A COMPILER PHASE, not another tool's job. Handed a root
+    // chapter this pulls in what it cites; handed a unit that already carries
+    // its chapters, every cite is satisfied by presence and this is a line scan.
+    let src = codexc::bundle::load(path)?;
     let parsed = parser::parse(&src);
     let mut dg = Desugar::new(&src);
     let ch = dg.chapter(&parsed.tree);

@@ -254,6 +254,88 @@ fn embedded(src: &[u8]) -> BTreeSet<(String, String)> {
     out
 }
 
+/// The chapter names a source already carries, by NAME alone.
+///
+/// **Name and not quire::name, which is upstream's own rule** -- the generator
+/// for `quire-map.ps1` says so where `Get-PresentChapterNames` is written, and
+/// it is the same flat namespace that makes `Pond` and `DuckPond` two different
+/// spellings of one idea. A cite is satisfied when the chapter is PRESENT.
+///
+/// A line scan rather than a parse: this runs before the decision to resolve at
+/// all, and on an already-resolved unit it is the only work done.
+pub fn present_chapters(src: &[u8]) -> BTreeSet<String> {
+    let text = String::from_utf8_lossy(src);
+    let mut out = BTreeSet::new();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("Chapter:") else { continue };
+        let name = rest.trim().trim_end_matches('\r');
+        // `Quire--Name` in a bundle written by the depot; plain elsewhere.
+        out.insert(name.rsplit("--").next().unwrap_or(name).trim().to_string());
+    }
+    out
+}
+
+/// The project's own quire file, found by walking up from the file being read.
+///
+/// A project's quires belong to the project, so finding them should not need an
+/// argument. `CODEX_QUIRES` overrides.
+pub fn local_quires(near: &Path) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("CODEX_QUIRES") {
+        return Some(PathBuf::from(p));
+    }
+    let mut d = near.canonicalize().ok();
+    while let Some(dir) = d {
+        let cand = dir.join("quires.tsv");
+        if cand.is_file() {
+            return Some(cand);
+        }
+        d = dir.parent().map(Path::to_path_buf);
+    }
+    None
+}
+
+/// Read a program, resolving anything it cites that is not already there.
+///
+/// **THIS IS WHY BUNDLING IS NOT A SEPARATE PROCESS.** Resolving cites is a
+/// compiler phase -- it is what every other language calls finding the modules
+/// -- and the only reason it lived in another tool was that the other tool was
+/// written first. Handed a root chapter this resolves it; handed a unit that
+/// already carries its chapters, every cite is satisfied by presence and this
+/// returns the bytes unchanged, so it is idempotent and the corpus's
+/// pre-resolved units cost one line scan.
+///
+/// The registry is read LAZILY, only when something actually needs resolving,
+/// so a resolved unit runs with no checkout in sight and `CODEX_ROOT` unset.
+pub fn load(path: &Path) -> Result<Vec<u8>, String> {
+    let src = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let present = present_chapters(&src);
+    let wanted: Vec<(String, String)> = IMPLICIT
+        .iter()
+        .map(|(q, c)| (q.to_string(), c.to_string()))
+        .chain(cites_of(&src))
+        .filter(|(_, c)| !present.contains(c))
+        .collect();
+    if wanted.is_empty() {
+        return Ok(src);
+    }
+    let root = std::env::var("CODEX_ROOT").map_err(|_| {
+        format!(
+            "{} cites {} chapter(s) it does not carry, and CODEX_ROOT is not set",
+            path.display(),
+            wanted.len()
+        )
+    })?;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let qs = Quires::read(Path::new(&root), local_quires(dir).as_deref())?;
+    let b = resolve(path, &qs)?;
+    for c in &b.complaints {
+        if matches!(c, Complaint::UnregisteredQuire { .. } | Complaint::NoSuchChapter { .. }) {
+            eprintln!("{c}");
+        }
+    }
+    Ok(b.text.into_bytes())
+}
+
 pub struct Bundle {
     pub text: String,
     pub complaints: Vec<Complaint>,
@@ -268,12 +350,17 @@ pub fn resolve(root: &Path, quires: &Quires) -> Result<Bundle, String> {
     let mut parts: Vec<String> = Vec::new();
 
     let here = embedded(&src);
+    let present = present_chapters(&src);
     let mut cites: Vec<(String, String)> = IMPLICIT
         .iter()
         .map(|(q, c)| (q.to_string(), c.to_string()))
         .filter(|qc| !here.contains(qc))
         .collect();
     cites.extend(cites_of(&src));
+    // A chapter the source already carries is not fetched again. On a root
+    // chapter this changes nothing; on a unit it is what makes resolving
+    // idempotent.
+    cites.retain(|(_, c)| !present.contains(c));
 
     let who = name_of(root);
     walk(&who, &cites, quires, &mut seen, &mut complaints, &mut parts)?;
