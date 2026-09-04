@@ -35,11 +35,11 @@ fn main() -> ExitCode {
         let parsed = parser::parse(&src);
         let mut dg = Desugar::new(&src);
         let ch = dg.chapter(&parsed.tree);
-        if ch.name.is_empty() {
+        if ch.syms.text(ch.name).is_empty() {
             continue;
         }
         refs.push(xref::chapter_refs(&ch, &f.to_string_lossy()));
-        if &ch.name == want {
+        if ch.syms.text(ch.name) == want {
             target = Some((ch, f.clone(), src));
         }
     }
@@ -53,7 +53,7 @@ fn main() -> ExitCode {
     let outside: std::collections::BTreeSet<&str> = ix
         .chapters
         .iter()
-        .filter(|c| c.chapter != ch.name)
+        .filter(|c| c.chapter != ch.syms.text(ch.name))
         .flat_map(|c| c.reads.iter().map(String::as_str))
         .collect();
 
@@ -65,7 +65,7 @@ fn main() -> ExitCode {
 
     let s = seams::analyse(c.def_names.len(), &c.edges, &roots);
 
-    println!("{} ({})", ch.name, path.display());
+    println!("{} ({})", ch.syms.text(ch.name), path.display());
     println!("  {} definitions, {} internal calls", c.def_names.len(), c.edges.len());
     println!("\n  INTERFACE — read by another chapter ({}):", roots.len());
     for line in wrap(&roots.iter().map(|&i| c.def_names[i].as_str()).collect::<Vec<_>>(), 68) {

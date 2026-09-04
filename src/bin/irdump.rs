@@ -147,7 +147,7 @@ fn defs(dir: &Path) -> ExitCode {
         let mut dg = codexc::desugar::Desugar::new(&src);
         let ch = dg.chapter(&parsed.tree);
         let ours: std::collections::HashSet<(String, usize)> =
-            ch.defs.iter().map(|d| (d.name.clone(), d.params.len())).collect();
+            ch.defs.iter().map(|d| (ch.syms.text(d.name).to_string(), d.params.len())).collect();
         let mut file_ok = true;
         for (dn, dp) in gold_defs(&ir) {
             want += 1;
@@ -155,7 +155,7 @@ fn defs(dir: &Path) -> ExitCode {
                 have += 1;
             } else {
                 file_ok = false;
-                let why = if ch.defs.iter().any(|d| d.name == dn) {
+                let why = if ch.defs.iter().any(|d| ch.syms.text(d.name) == dn) {
                     format!("{dn}: parameter count")
                 } else {
                     format!("{dn}: no such definition")

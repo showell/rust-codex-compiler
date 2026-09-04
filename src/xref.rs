@@ -23,6 +23,7 @@
 //! second and much simpler walk that needs no scope -- a type name cannot be
 //! shadowed by a local.
 
+use crate::symbol::SymTab;
 use crate::ast::*;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -90,21 +91,22 @@ thread_local! {
         std::cell::RefCell::new(BTreeSet::new());
 }
 
-fn type_names(t: &TypeExpr, out: &mut BTreeSet<String>) {
+fn type_names(syms: &SymTab, t: &TypeExpr, out: &mut BTreeSet<String>) {
     match t {
         TypeExpr::Named(n, _) => {
+            let n = syms.text(*n);
             if !n.starts_with(|c: char| c.is_lowercase()) {
-                out.insert(n.clone());
+                out.insert(n.to_string());
             }
         }
         TypeExpr::Fun(a, b, _) | TypeExpr::PropEq(a, b, _) => {
-            type_names(a, out);
-            type_names(b, out);
+            type_names(syms, a, out);
+            type_names(syms, b, out);
         }
         TypeExpr::App(c, args, _) => {
-            type_names(c, out);
+            type_names(syms, c, out);
             for a in args {
-                type_names(a, out);
+                type_names(syms, a, out);
             }
         }
         // AN EFFECT ROW NAMES CHAPTERS. `[Console] Nothing` reads `Console`,
@@ -113,29 +115,30 @@ fn type_names(t: &TypeExpr, out: &mut BTreeSet<String>) {
         // and put Display, Microphone and Sensors in `dead`'s delete list.
         TypeExpr::Effect(names, _, _, r, _) => {
             for n in names {
+                let n = syms.text(*n);
                 if !n.starts_with(|c: char| c.is_lowercase()) {
-                    out.insert(n.clone());
-                    EFFECT_SEEN.with(|e| e.borrow_mut().insert(n.clone()));
+                    out.insert(n.to_string());
+                    EFFECT_SEEN.with(|e| e.borrow_mut().insert(n.to_string()));
                 }
             }
-            type_names(r, out)
+            type_names(syms, r, out)
         }
-        TypeExpr::BoundedInt(b, ..) | TypeExpr::Linear(b, _) => type_names(b, out),
-        TypeExpr::Constrained(_, _, b, _) => type_names(b, out),
+        TypeExpr::BoundedInt(b, ..) | TypeExpr::Linear(b, _) => type_names(syms, b, out),
+        TypeExpr::Constrained(_, _, b, _) => type_names(syms, b, out),
         TypeExpr::Forall(_, v, b, _) => {
-            type_names(v, out);
-            type_names(b, out);
+            type_names(syms, v, out);
+            type_names(syms, b, out);
         }
     }
 }
 
 /// Record-literal type names and constructor patterns: the two places a name
 /// is used that the resolver's expression walk deliberately skips.
-fn ctor_and_record_names(e: &Expr, out: &mut BTreeSet<String>) {
+fn ctor_and_record_names(syms: &SymTab, e: &Expr, out: &mut BTreeSet<String>) {
     let mut kids: Vec<&Expr> = Vec::new();
     match e {
         Expr::Record(n, fs, _) => {
-            out.insert(n.clone());
+            out.insert(syms.text(*n).to_string());
             for f in fs {
                 kids.push(&f.value);
             }
@@ -161,7 +164,7 @@ fn ctor_and_record_names(e: &Expr, out: &mut BTreeSet<String>) {
         Expr::Match(scrut, arms, _) | Expr::Induction(scrut, arms, _) => {
             kids.push(scrut);
             for a in arms {
-                pat_names(&a.pattern, out);
+                pat_names(syms, &a.pattern, out);
                 kids.push(&a.guard);
                 kids.push(&a.body);
             }
@@ -192,21 +195,21 @@ fn ctor_and_record_names(e: &Expr, out: &mut BTreeSet<String>) {
         Expr::Lit(..) | Expr::NameRef(..) | Expr::Error(..) => {}
     }
     for k in kids {
-        ctor_and_record_names(k, out);
+        ctor_and_record_names(syms, k, out);
     }
 }
 
-fn pat_names(p: &Pat, out: &mut BTreeSet<String>) {
+fn pat_names(syms: &SymTab, p: &Pat, out: &mut BTreeSet<String>) {
     match p {
         Pat::Ctor(n, subs, _) => {
-            out.insert(n.clone());
+            out.insert(syms.text(*n).to_string());
             for s in subs {
-                pat_names(s, out);
+                pat_names(syms, s, out);
             }
         }
         Pat::Vec_(subs, _) => {
             for s in subs {
-                pat_names(s, out);
+                pat_names(syms, s, out);
             }
         }
         Pat::Var(..) | Pat::Lit(..) | Pat::Wild(_) => {}
@@ -217,11 +220,11 @@ pub fn chapter_refs(ch: &Chapter, path: &str) -> ChapterRefs {
     EFFECT_SEEN.with(|e| e.borrow_mut().clear());
     let mut kinds: BTreeMap<String, &'static str> = BTreeMap::new();
     let mut lines: BTreeMap<String, u32> = BTreeMap::new();
-    let mut defines: BTreeSet<String> = ch.defs.iter().map(|d| d.name.clone()).collect();
+    let mut defines: BTreeSet<String> = ch.defs.iter().map(|d| ch.syms.text(d.name).to_string()).collect();
     let mut claims: BTreeSet<String> = BTreeSet::new();
     for d in &ch.defs {
         kinds.insert(
-            d.name.clone(),
+            ch.syms.text(d.name).to_string(),
             if d.is_claim {
                 "proof"
             } else if d.params.is_empty() {
@@ -230,9 +233,9 @@ pub fn chapter_refs(ch: &Chapter, path: &str) -> ChapterRefs {
                 "function"
             },
         );
-        lines.insert(d.name.clone(), d.span.line);
+        lines.insert(ch.syms.text(d.name).to_string(), d.span.line);
         if d.is_claim {
-            claims.insert(d.name.clone());
+            claims.insert(ch.syms.text(d.name).to_string());
         }
     }
     for t in &ch.type_defs {
@@ -241,27 +244,27 @@ pub fn chapter_refs(ch: &Chapter, path: &str) -> ChapterRefs {
             TypeDef::Unit(n, _, sp) => (n, sp),
             TypeDef::Variant(n, _, _, sp) => (n, sp),
         };
-        kinds.insert(n.clone(), "type");
-        lines.insert(n.clone(), sp.line);
+        kinds.insert(ch.syms.text(*n).to_string(), "type");
+        lines.insert(ch.syms.text(*n).to_string(), sp.line);
         if let TypeDef::Variant(_, _, cs, _) = t {
             for c in cs {
-                kinds.insert(c.name.clone(), "constructor");
-                lines.insert(c.name.clone(), c.span.line);
+                kinds.insert(ch.syms.text(c.name).to_string(), "constructor");
+                lines.insert(ch.syms.text(c.name).to_string(), c.span.line);
             }
         }
     }
     for t in &ch.type_defs {
         match t {
             TypeDef::Record(n, ..) => {
-                defines.insert(n.clone());
+                defines.insert(ch.syms.text(*n).to_string());
             }
             TypeDef::Unit(n, ..) => {
-                defines.insert(n.clone());
+                defines.insert(ch.syms.text(*n).to_string());
             }
             TypeDef::Variant(n, _, cs, _) => {
-                defines.insert(n.clone());
+                defines.insert(ch.syms.text(*n).to_string());
                 for c in cs {
-                    defines.insert(c.name.clone());
+                    defines.insert(ch.syms.text(c.name).to_string());
                 }
             }
         }
@@ -273,32 +276,32 @@ pub fn chapter_refs(ch: &Chapter, path: &str) -> ChapterRefs {
     let mut sig_reads: BTreeSet<String> = BTreeSet::new();
     for e in &ch.effect_defs {
         for o in &e.ops {
-            type_names(&o.type_expr, &mut sig_reads);
+            type_names(&ch.syms, &o.type_expr, &mut sig_reads);
         }
     }
     for c in &ch.class_defs {
         for m in &c.methods {
-            type_names(&m.type_expr, &mut sig_reads);
+            type_names(&ch.syms, &m.type_expr, &mut sig_reads);
         }
     }
     for e in &ch.effect_defs {
-        defines.insert(e.name.clone());
-        kinds.insert(e.name.clone(), "effect");
-        lines.insert(e.name.clone(), e.span.line);
+        defines.insert(ch.syms.text(e.name).to_string());
+        kinds.insert(ch.syms.text(e.name).to_string(), "effect");
+        lines.insert(ch.syms.text(e.name).to_string(), e.span.line);
         for o in &e.ops {
-            defines.insert(o.name.clone());
-            kinds.insert(o.name.clone(), "effect op");
-            lines.insert(o.name.clone(), o.span.line);
+            defines.insert(ch.syms.text(o.name).to_string());
+            kinds.insert(ch.syms.text(o.name).to_string(), "effect op");
+            lines.insert(ch.syms.text(o.name).to_string(), o.span.line);
         }
     }
     for c in &ch.class_defs {
-        defines.insert(c.name.clone());
-        kinds.insert(c.name.clone(), "class");
-        lines.insert(c.name.clone(), c.span.line);
+        defines.insert(ch.syms.text(c.name).to_string());
+        kinds.insert(ch.syms.text(c.name).to_string(), "class");
+        lines.insert(ch.syms.text(c.name).to_string(), c.span.line);
         for m in &c.methods {
-            defines.insert(m.name.clone());
-            kinds.insert(m.name.clone(), "class method");
-            lines.insert(m.name.clone(), m.span.line);
+            defines.insert(ch.syms.text(m.name).to_string());
+            kinds.insert(ch.syms.text(m.name).to_string(), "class method");
+            lines.insert(ch.syms.text(m.name).to_string(), m.span.line);
         }
     }
 
@@ -312,24 +315,24 @@ pub fn chapter_refs(ch: &Chapter, path: &str) -> ChapterRefs {
     for e in &ch.effect_defs {
         for o in &e.ops {
             let mut mine = BTreeSet::new();
-            type_names(&o.type_expr, &mut mine);
+            type_names(&ch.syms, &o.type_expr, &mut mine);
             for n in mine {
-                by_reader.insert((o.name.clone(), n));
+                by_reader.insert((ch.syms.text(o.name).to_string(), n));
             }
         }
     }
     for c in &ch.class_defs {
         for m in &c.methods {
             let mut mine = BTreeSet::new();
-            type_names(&m.type_expr, &mut mine);
+            type_names(&ch.syms, &m.type_expr, &mut mine);
             for n in mine {
-                by_reader.insert((m.name.clone(), n));
+                by_reader.insert((ch.syms.text(m.name).to_string(), n));
             }
         }
     }
     let (_, per_def) = crate::scope::resolve_refs(ch);
     for (i, names) in per_def.into_iter().enumerate() {
-        let reader = ch.defs.get(i).map(|d| d.name.clone()).unwrap_or_default();
+        let reader = ch.defs.get(i).map(|d| ch.syms.text(d.name).to_string()).unwrap_or_default();
         for n in names {
             reads.insert(n.clone());
             by_reader.insert((reader.clone(), n));
@@ -338,12 +341,12 @@ pub fn chapter_refs(ch: &Chapter, path: &str) -> ChapterRefs {
     for d in &ch.defs {
         let mut mine: BTreeSet<String> = BTreeSet::new();
         for t in &d.declared_type {
-            type_names(t, &mut mine);
+            type_names(&ch.syms, t, &mut mine);
         }
-        ctor_and_record_names(&d.body, &mut mine);
+        ctor_and_record_names(&ch.syms, &d.body, &mut mine);
         for n in mine {
             reads.insert(n.clone());
-            by_reader.insert((d.name.clone(), n));
+            by_reader.insert((ch.syms.text(d.name).to_string(), n));
         }
     }
     // A type definition's own field and constructor types are references too:
@@ -354,24 +357,24 @@ pub fn chapter_refs(ch: &Chapter, path: &str) -> ChapterRefs {
         let owner = match t {
             TypeDef::Record(n, _, fs, ..) => {
                 for f in fs {
-                    type_names(&f.type_expr, &mut mine);
+                    type_names(&ch.syms, &f.type_expr, &mut mine);
                 }
-                n.clone()
+                ch.syms.text(*n).to_string()
             }
             TypeDef::Variant(n, _, cs, _) => {
                 for c in cs {
                     for f in &c.fields {
-                        type_names(f, &mut mine);
+                        type_names(&ch.syms, f, &mut mine);
                     }
                     for r in &c.return_type {
-                        type_names(r, &mut mine);
+                        type_names(&ch.syms, r, &mut mine);
                     }
                 }
-                n.clone()
+                ch.syms.text(*n).to_string()
             }
             TypeDef::Unit(n, inner, _) => {
-                type_names(inner, &mut mine);
-                n.clone()
+                type_names(&ch.syms, inner, &mut mine);
+                ch.syms.text(*n).to_string()
             }
         };
         for n in mine {
@@ -390,7 +393,7 @@ pub fn chapter_refs(ch: &Chapter, path: &str) -> ChapterRefs {
         kinds.entry(n.clone()).or_insert("other");
     }
     ChapterRefs {
-        chapter: ch.name.clone(),
+        chapter: ch.syms.text(ch.name).to_string(),
         path: path.to_string(),
         defines,
         reads,

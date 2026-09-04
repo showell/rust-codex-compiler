@@ -109,7 +109,7 @@ fn main() -> ExitCode {
         let parsed = parser::parse(&src);
         let mut dg = Desugar::new(&src);
         let ch = dg.chapter(&parsed.tree);
-        if ch.name.is_empty() {
+        if ch.syms.text(ch.name).is_empty() {
             continue;
         }
         chapters.push(xref::chapter_refs(&ch, &short(f)));
@@ -640,7 +640,7 @@ fn arity_mode(ours: &str, tree: &[String], partial: bool, phases_only: bool) -> 
             let parsed = parser::parse(&src);
             let mut dg = Desugar::new(&src);
             let ch = dg.chapter(&parsed.tree);
-            if ch.name.is_empty() {
+            if ch.syms.text(ch.name).is_empty() {
                 continue;
             }
             out.push((short(&f), ch));
@@ -678,7 +678,7 @@ fn arity_mode(ours: &str, tree: &[String], partial: bool, phases_only: bool) -> 
     // our own definitions against the compiler's arity is how a name collision
     // becomes a false alarm.
     let ours_defines: std::collections::BTreeSet<String> =
-        mine.iter().flat_map(|(_, c)| c.defs.iter().map(|d| d.name.clone())).collect();
+        mine.iter().flat_map(|(_, c)| c.defs.iter().map(|d| c.syms.text(d.name).to_string())).collect();
 
     let (mut short_all, mut over_all, mut skipped) = (Vec::new(), Vec::new(), 0usize);
     let mut per_file: Vec<(String, usize)> = Vec::new();

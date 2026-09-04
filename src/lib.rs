@@ -21,6 +21,7 @@ pub mod parser;
 pub mod preamble;
 pub mod scope;
 pub mod seams;
+pub mod symbol;
 pub mod pattern;
 pub mod token;
 pub mod typedef;

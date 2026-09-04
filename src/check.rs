@@ -40,6 +40,7 @@
 //! against the gold says how far off, every run, instead of nothing until the
 //! end.
 
+use crate::symbol::{Sym, SymTab};
 use crate::ast::Name;
 
 /// Upstream's `CodexType`, `Types/CodexType.codex`. Mirrored constructor for
@@ -107,7 +108,7 @@ pub struct EffectRow {
 /// The name `type-kind` prints for a binding, from the check harness:
 /// `CheckHarness.codex` lines 44-62. These strings are compared against the
 /// gold, so they are not ours to choose.
-pub fn type_kind(t: &Ty) -> String {
+pub fn type_kind(syms: &SymTab, t: &Ty) -> String {
     match t {
         Ty::Integer(..) => "int".into(),
         Ty::Text => "text".into(),
@@ -119,10 +120,10 @@ pub fn type_kind(t: &Ty) -> String {
         Ty::ForAll(..) => "forall".into(),
         Ty::ForAllEff(..) => "foralleff".into(),
         Ty::Var(_) => "tvar".into(),
-        Ty::Sum(n, _) => format!("sum:{n}"),
-        Ty::Record(n, _) => format!("rec:{n}"),
-        Ty::Constructed(n, _) => format!("con:{n}"),
-        Ty::TypeCon(n) => format!("tycon:{n}"),
+        Ty::Sum(n, _) => format!("sum:{}", syms.text(*n)),
+        Ty::Record(n, _) => format!("rec:{}", syms.text(*n)),
+        Ty::Constructed(n, _) => format!("con:{}", syms.text(*n)),
+        Ty::TypeCon(n) => format!("tycon:{}", syms.text(*n)),
         _ => "other".into(),
     }
 }
@@ -130,7 +131,7 @@ pub fn type_kind(t: &Ty) -> String {
 /// One name bound to one type, in the order the checker registered it.
 #[derive(Clone, Debug)]
 pub struct Binding {
-    pub name: String,
+    pub name: Sym,
     pub ty: Ty,
 }
 
@@ -151,7 +152,7 @@ pub struct UnifyState {
     /// Row ids are a SEPARATE counter from type-variable ids. `next-id` in the
     /// gold counts only the latter, so minting a row must not advance it.
     pub next_row_id: u32,
-    pub expr_types: Vec<(String, Ty)>,
+    pub expr_types: Vec<(Sym, Ty)>,
     pub errors: usize,
 }
 
@@ -200,10 +201,10 @@ impl UnifyState {
 /// settle every binding the gold names. What it cannot do is invent a type for
 /// a definition that declares none -- that is inference, and it returns None
 /// here rather than a plausible stand-in.
-pub fn resolve_declared(t: &crate::ast::TypeExpr) -> Option<Ty> {
+pub fn resolve_declared(syms: &SymTab, t: &crate::ast::TypeExpr) -> Option<Ty> {
     use crate::ast::TypeExpr as T;
     Some(match t {
-        T::Named(n, _) => match n.as_str() {
+        T::Named(n, _) => match syms.text(*n) {
             "Integer" => Ty::Integer(i64::MIN, i64::MAX, Overflow::Error),
             "Text" => Ty::Text,
             "Boolean" => Ty::Boolean,
@@ -213,28 +214,28 @@ pub fn resolve_declared(t: &crate::ast::TypeExpr) -> Option<Ty> {
             _ => Ty::TypeCon(n.clone()),
         },
         T::Fun(a, b, _) => Ty::Fun(
-            Box::new(resolve_declared(a)?),
+            Box::new(resolve_declared(syms, a)?),
             EffectRow::default(),
-            Box::new(resolve_declared(b)?),
+            Box::new(resolve_declared(syms, b)?),
         ),
         // `[Console] Nothing` -- the effect row is what makes `opening` print
         // as `eff` rather than as its result type.
         T::Effect(effs, scopes, _, inner, _) => Ty::Effectful(
             effs.clone(),
             scopes.clone(),
-            Box::new(resolve_declared(inner)?),
+            Box::new(resolve_declared(syms, inner)?),
         ),
         T::App(head, args, _) => match (&**head, args.as_slice()) {
-            (T::Named(n, _), [only]) if n == "List" => {
-                Ty::List(Box::new(resolve_declared(only)?))
+            (T::Named(n, _), [only]) if syms.text(*n) == "List" => {
+                Ty::List(Box::new(resolve_declared(syms, only)?))
             }
             (T::Named(n, _), _) => Ty::Constructed(
                 n.clone(),
-                args.iter().filter_map(resolve_declared).collect(),
+                args.iter().filter_map(|t| resolve_declared(syms, t)).collect(),
             ),
             _ => return None,
         },
-        T::Linear(inner, _) => Ty::Linear(Box::new(resolve_declared(inner)?)),
+        T::Linear(inner, _) => Ty::Linear(Box::new(resolve_declared(syms, inner)?)),
         _ => return None,
     })
 }
@@ -248,11 +249,11 @@ pub fn resolve_declared(t: &crate::ast::TypeExpr) -> Option<Ty> {
 pub fn register_defs(ch: &crate::ast::Chapter, st: &mut UnifyState) -> Vec<Binding> {
     let mut out = Vec::new();
     for d in &ch.defs {
-        let ty = match d.declared_type.first().and_then(resolve_declared) {
+        let ty = match d.declared_type.first().and_then(|t| resolve_declared(&ch.syms, t)) {
             Some(t) => t,
             None => st.fresh(),
         };
-        out.push(Binding { name: d.name.clone(), ty });
+        out.push(Binding { name: d.name, ty });
     }
     out
 }
@@ -268,9 +269,9 @@ pub fn check_chapter(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState) {
     let bindings = register_defs(ch, &mut st);
     // Builtins first, then the chapter's own names on top: a chapter that
     // defines `max` shadows the builtin, which the golds show for that name.
-    let mut env = builtin_env();
+    let mut env = builtin_env(&ch.syms);
     for b in &bindings {
-        env.bind(&b.name, b.ty.clone());
+        env.bind(b.name, b.ty.clone());
     }
     for d in &ch.defs {
         // A definition's parameters take their types from its declared arrow
@@ -297,7 +298,7 @@ pub fn check_chapter(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState) {
                 }
             };
             saved.push(p.name.clone());
-            env.bind(&p.name, arg);
+            env.bind(p.name, arg);
         }
         infer(&d.body, &mut env, &mut st);
         for _ in saved {
@@ -309,12 +310,12 @@ pub fn check_chapter(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState) {
 
 /// The `--- check ---` section, in the harness's own format so it can be
 /// diffed against `$CODEX_GOLDS/rungs/check.truth` directly.
-pub fn section(bindings: &[Binding], st: &UnifyState) -> String {
+pub fn section(syms: &SymTab, bindings: &[Binding], st: &UnifyState) -> String {
     let mut s = String::from("--- check ---\n");
     s.push_str(&format!("check-errors {}\n", st.errors));
     s.push_str(&format!("type-bindings {}\n", bindings.len()));
     for b in bindings {
-        s.push_str(&format!("tb {} {}\n", b.name, type_kind(&b.ty)));
+        s.push_str(&format!("tb {} {}\n", syms.text(b.name), type_kind(syms, &b.ty)));
     }
     s.push_str(".\n");
     s.push_str(&format!("substitutions {}\n", st.substitutions.len()));
@@ -336,7 +337,7 @@ pub fn section(bindings: &[Binding], st: &UnifyState) -> String {
 ///
 /// Every expression's type is recorded, because the IR carries one on nearly
 /// every node and `expr-types` counts them.
-pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv, st: &mut UnifyState) -> Ty {
+pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> Ty {
     use crate::ast::Expr as E;
     let t = match e {
         E::Lit(_, crate::ast::LiteralKind::IntLit, _) => {
@@ -353,7 +354,7 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv, st: &mut UnifyState) -> Ty {
             // INSTANTIATING A FORALL MINTS. `show` is
             // `ForAllTy 0 (FunTy (TypeVar 0) empty-row TextTy)`, and opening
             // applies it -- the third of fib's three missing mints.
-            let t = match env.get(n).cloned() {
+            let t = match env.get(*n).cloned() {
                 Some(Ty::ForAll(_, body)) => {
                     let fr = st.fresh();
                     instantiate(&body, &fr)
@@ -361,7 +362,7 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv, st: &mut UnifyState) -> Ty {
                 Some(t) => t,
                 None => Ty::Error,
             };
-            st.expr_types.push((n.clone(), t.clone()));
+            st.expr_types.push((*n, t.clone()));
             return t;
         }
         // A comparison answers Boolean; arithmetic answers its operands'.
@@ -410,7 +411,7 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv, st: &mut UnifyState) -> Ty {
         E::Let(binds, body, _) => {
             for b in binds {
                 let t = infer(&b.value, env, st);
-                env.bind(&b.name, t);
+                env.bind(b.name, t);
             }
             infer(body, env, st)
         }
@@ -434,17 +435,24 @@ fn instantiate(t: &Ty, fresh: &Ty) -> Ty {
 }
 
 /// Names in scope during inference.
-#[derive(Default)]
-pub struct TyEnv {
-    pub scope: Vec<(String, Ty)>,
+pub struct TyEnv<'a> {
+    /// Carried so inference can spell a type's name without every function
+    /// here taking a table.
+    pub syms: &'a SymTab,
+    /// **Symbols, not text.** This is a linear scan on the hot path of
+    /// inference, and it now compares four bytes.
+    pub scope: Vec<(Sym, Ty)>,
 }
 
-impl TyEnv {
-    pub fn get(&self, n: &str) -> Option<&Ty> {
-        self.scope.iter().rev().find(|(k, _)| k == n).map(|(_, v)| v)
+impl<'a> TyEnv<'a> {
+    pub fn new(syms: &'a SymTab) -> TyEnv<'a> {
+        TyEnv { syms, scope: Vec::new() }
     }
-    pub fn bind(&mut self, n: &str, t: Ty) {
-        self.scope.push((n.to_string(), t));
+    pub fn get(&self, n: Sym) -> Option<&Ty> {
+        self.scope.iter().rev().find(|(k, _)| *k == n).map(|(_, v)| v)
+    }
+    pub fn bind(&mut self, n: Sym, t: Ty) {
+        self.scope.push((n, t));
     }
 }
 
@@ -531,12 +539,13 @@ fn build(head: &str, args: &[Ty], words: &[String]) -> Option<Ty> {
 /// Every builtin whose declared type the probe could render, for the checker's
 /// environment. Without these `show` resolves to ErrorTy and instantiating it
 /// mints nothing -- which is one of the eight fresh variables fib expects.
-pub fn builtin_env() -> TyEnv {
-    let mut env = TyEnv::default();
+pub fn builtin_env(syms: &SymTab) -> TyEnv<'_> {
+    let mut env = TyEnv::new(syms);
     for (n, s) in crate::builtins::BUILTIN_TYPES {
-        if let Some(t) = parse_ty(s) {
-            env.bind(n, t);
-        }
+        // A builtin the chapter never names cannot be what any symbol here
+        // means, so it needs no binding.
+        let (Some(sym), Some(t)) = (syms.find(n), parse_ty(s)) else { continue };
+        env.bind(sym, t);
     }
     env
 }

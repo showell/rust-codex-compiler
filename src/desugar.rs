@@ -30,6 +30,8 @@
 //! structural rather than a fold.
 
 use crate::ast::*;
+use crate::symbol::SymTab;
+use std::cell::RefCell;
 use std::rc::Rc;
 use crate::cst::{Node, NodeKind};
 use crate::token::{Kind, Token};
@@ -37,6 +39,12 @@ use crate::token::{Kind, Token};
 pub struct Desugar<'a> {
     src: &'a [u8],
     slug: String,
+    /// **A `RefCell` so the fourteen `&self` methods below keep their
+    /// signatures.** Interning needs `&mut`, and threading mutability through
+    /// a recursive-descent lowering that never mutates anything else would
+    /// have been a worse trade than one borrow flag per name. The table moves
+    /// into the `Chapter` when the walk finishes.
+    syms: RefCell<SymTab>,
 }
 
 fn span_of(t: &Token) -> Span {
@@ -55,25 +63,50 @@ fn head_span(n: &Node) -> Span {
 
 impl<'a> Desugar<'a> {
     pub fn new(src: &'a [u8]) -> Self {
-        Desugar { src, slug: String::new() }
+        Desugar { src, slug: String::new(), syms: RefCell::new(SymTab::default()) }
     }
 
     fn text(&self, t: &Token) -> String {
         String::from_utf8_lossy(t.text(self.src)).into_owned()
     }
 
+    /// A token's text as an interned name. This is the one that runs 6.19
+    /// million times over the corpus; `text` above still serves the places
+    /// that want an owned string, which is literals and chapter metadata.
+    fn sym(&self, t: &Token) -> Name {
+        let raw = t.text(self.src);
+        match std::str::from_utf8(raw) {
+            Ok(s) => self.syms.borrow_mut().intern(s),
+            Err(_) => self.syms.borrow_mut().intern(&String::from_utf8_lossy(raw)),
+        }
+    }
+
+    /// A name the desugarer WRITES rather than reads -- `__seq`, `__rev`,
+    /// `map-list`, `MkTup3`. Nobody typed these, so they are interned like any
+    /// other name and cost nothing after the first.
+    fn sym_str(&self, s: &str) -> Name {
+        self.syms.borrow_mut().intern(s)
+    }
+
+    /// A name back as text, for the few places that carry one as metadata
+    /// rather than as a name: a chapter's own title, a runtime-budget list, an
+    /// error's reason.
+    fn str_of(&self, n: Name) -> String {
+        self.syms.borrow().text(n).to_string()
+    }
+
     /// The first name-shaped token's text.
     fn name_of(&self, n: &Node) -> Name {
         n.tokens()
             .find(|t| matches!(t.kind, Kind::Identifier | Kind::TypeIdentifier))
-            .map(|t| self.text(t))
+            .map(|t| self.sym(t))
             .unwrap_or_default()
     }
 
     /// The first token whatever its kind -- a record field or a constructor
     /// may be named with a keyword.
     fn leading(&self, n: &Node) -> Name {
-        n.tokens().find(|t| !t.kind.is_trivia()).map(|t| self.text(t)).unwrap_or_default()
+        n.tokens().find(|t| !t.kind.is_trivia()).map(|t| self.sym(t)).unwrap_or_default()
     }
 
     // -- expressions ---------------------------------------------------------
@@ -152,7 +185,7 @@ impl<'a> Desugar<'a> {
                     let value = self.expr(stmt);
                     let span = head_span(&kids[0]);
                     Expr::Let(
-                        vec![LetBind { name: "__seq".into(), value, span }],
+                        vec![LetBind { name: self.sym_str("__seq"), value, span }],
                         Rc::new(self.expr(rest)),
                         sp,
                     )
@@ -191,7 +224,7 @@ impl<'a> Desugar<'a> {
                     .own_tokens()
                     .filter(|t| !t.kind.is_trivia() && t.kind != Kind::Dot)
                     .last()
-                    .map(|t| self.text(t))
+                    .map(|t| self.sym(t))
                     .unwrap_or_default();
                 Expr::FieldAccess(
                     Rc::new(kids.first().map_or(Expr::Error(String::new(), sp), |r| self.expr(r))),
@@ -204,7 +237,7 @@ impl<'a> Desugar<'a> {
                     .own_tokens()
                     .filter(|t| !t.kind.is_trivia() && t.kind != Kind::Dot && t.kind != Kind::Equals)
                     .last()
-                    .map(|t| self.text(t))
+                    .map(|t| self.sym(t))
                     .unwrap_or_default();
                 match kids.as_slice() {
                     [rec, val] => Expr::FieldAssign(
@@ -219,7 +252,7 @@ impl<'a> Desugar<'a> {
             NodeKind::Tuple => {
                 // `(a, b)` is `MkTup2 a b`, applied one argument at a time.
                 let elems: Vec<Expr> = kids.iter().map(|k| self.expr(k)).collect();
-                let base = Expr::NameRef(format!("MkTup{}", elems.len()), Span::default());
+                let base = Expr::NameRef(self.sym_str(&format!("MkTup{}", elems.len())), Span::default());
                 elems.into_iter().fold(base, |f, a| Expr::Apply(Rc::new(f), Rc::new(a), sp))
             }
             NodeKind::ForExpr => {
@@ -227,7 +260,7 @@ impl<'a> Desugar<'a> {
                 let var = n
                     .own_tokens()
                     .find(|t| matches!(t.kind, Kind::Identifier | Kind::Underscore) && self.text(t) != "for")
-                    .map(|t| self.text(t))
+                    .map(|t| self.sym(t))
                     .unwrap_or_default();
                 match kids.as_slice() {
                     [list, body] => {
@@ -236,7 +269,7 @@ impl<'a> Desugar<'a> {
                             Rc::new(self.expr(body)),
                             Span::default(),
                         );
-                        let map_fn = Expr::NameRef("map-list".into(), Span::default());
+                        let map_fn = Expr::NameRef(self.sym_str("map-list"), Span::default());
                         Expr::Apply(
                             Rc::new(Expr::Apply(Rc::new(map_fn), Rc::new(lam), Span::default())),
                             Rc::new(self.expr(list)),
@@ -250,7 +283,7 @@ impl<'a> Desugar<'a> {
                 let params: Vec<Name> = n
                     .own_tokens()
                     .filter(|t| matches!(t.kind, Kind::Identifier | Kind::Underscore))
-                    .map(|t| self.text(t))
+                    .map(|t| self.sym(t))
                     .collect();
                 Expr::Lambda(
                     params,
@@ -321,7 +354,7 @@ impl<'a> Desugar<'a> {
                     .children_of(NodeKind::EffectRow)
                     .flat_map(|r| r.tokens())
                     .filter(|t| matches!(t.kind, Kind::Identifier | Kind::TypeIdentifier))
-                    .map(|t| self.text(t))
+                    .map(|t| self.sym(t))
                     .collect();
                 Expr::WithTimeout(Box::new(WithTimeoutExpr {
                     timeout,
@@ -344,7 +377,7 @@ impl<'a> Desugar<'a> {
                 // of field assignments over it.
                 let base =
                     kids.first().map_or(Expr::Error(String::new(), sp), |b| self.expr(b));
-                let mut chain = Expr::NameRef("__rev".into(), Span::default());
+                let mut chain = Expr::NameRef(self.sym_str("__rev"), Span::default());
                 for f in n.descendants(NodeKind::RecordField) {
                     let value = f
                         .child_nodes()
@@ -358,12 +391,12 @@ impl<'a> Desugar<'a> {
                     );
                 }
                 Expr::Let(
-                    vec![LetBind { name: "__rev".into(), value: base, span: Span::default() }],
+                    vec![LetBind { name: self.sym_str("__rev"), value: base, span: Span::default() }],
                     Rc::new(chain),
                     sp,
                 )
             }
-            NodeKind::ErrExpr => Expr::Error(self.leading(n), sp),
+            NodeKind::ErrExpr => Expr::Error(self.str_of(self.leading(n)), sp),
             // A node we do not translate is an error we can NAME, which is
             // better than an empty body that looks understood.
             _ => Expr::Error(format!("{:?}", n.kind), sp),
@@ -478,7 +511,7 @@ impl<'a> Desugar<'a> {
             match child.kind {
                 NodeKind::ChapterHeader => {
                     slug = crate::preamble::header_text(child, self.src);
-                    ch.name = slug.clone();
+                    ch.name = self.sym_str(&slug);
                     ch.chapter_title = slug.clone();
                 }
                 NodeKind::SectionHeader => {
@@ -505,13 +538,13 @@ impl<'a> Desugar<'a> {
                 }),
                 NodeKind::InstanceDef => ch.instance_defs.push(InstanceDef {
                     class_name: self.name_of(child),
-                    type_name: String::new(),
+                    type_name: Name::default(),
                     methods: Vec::new(),
                     span: head_span(child),
                 }),
                 NodeKind::Cites => ch.citations.push(CitesDecl {
                     quire: self.name_of(child),
-                    chapter_name: String::new(),
+                    chapter_name: Name::default(),
                     selected_names: Vec::new(),
                     citing_chapter: slug.clone(),
                     span: head_span(child),
@@ -526,9 +559,10 @@ impl<'a> Desugar<'a> {
         }
         for d in tree.descendants(NodeKind::Def) {
             if d.children_of(NodeKind::Punctual).next().is_some() {
-                ch.rt_names.push(self.def_name(d));
+                ch.rt_names.push(self.str_of(self.def_name(d)));
             }
         }
+        ch.syms = std::mem::take(&mut *self.syms.borrow_mut());
         ch
     }
 
@@ -536,7 +570,7 @@ impl<'a> Desugar<'a> {
         d.children_of(NodeKind::DefEquation)
             .next()
             .map(|e| self.name_of(e))
-            .filter(|n| !n.is_empty())
+            .filter(|n| *n != Name::default())
             .or_else(|| d.children_of(NodeKind::TypeAnnotation).next().map(|a| self.name_of(a)))
             .unwrap_or_default()
     }
@@ -586,7 +620,7 @@ impl<'a> Desugar<'a> {
             .map(|b| self.expr(b))
             .unwrap_or_else(|| Expr::Error("no body".into(), Span::default()));
         Def {
-            name: name_tok.map(|t| self.text(&t)).unwrap_or_default(),
+            name: name_tok.map(|t| self.sym(&t)).unwrap_or_default(),
             params,
             declared_type,
             body,
@@ -607,7 +641,7 @@ impl<'a> Desugar<'a> {
                     .child_nodes()
                     .first()
                     .map(|t| self.type_expr(t))
-                    .unwrap_or(TypeExpr::Named(String::new(), Span::default())),
+                    .unwrap_or(TypeExpr::Named(Name::default(), Span::default())),
                 span: head_span(o),
             })
             .collect()
@@ -620,7 +654,7 @@ impl<'a> Desugar<'a> {
             .children_of(NodeKind::TypeParams)
             .flat_map(|p| p.tokens())
             .filter(|t| matches!(t.kind, Kind::Identifier | Kind::TypeIdentifier))
-            .map(|t| self.text(t))
+            .map(|t| self.sym(t))
             .collect();
         if let Some(rec) = td.children_of(NodeKind::RecordBody).next() {
             let mutable = td.tokens().any(|t| t.kind == Kind::MutableKeyword);
@@ -632,7 +666,7 @@ impl<'a> Desugar<'a> {
                         .child_nodes()
                         .first()
                         .map(|t| self.type_expr(t))
-                        .unwrap_or(TypeExpr::Named(String::new(), Span::default())),
+                        .unwrap_or(TypeExpr::Named(Name::default(), Span::default())),
                     span: head_span(f),
                 })
                 .collect();
@@ -661,11 +695,11 @@ impl<'a> Desugar<'a> {
                 .child_nodes()
                 .first()
                 .map(|t| self.type_expr(t))
-                .unwrap_or(TypeExpr::Named("Integer".into(), sp));
+                .unwrap_or(TypeExpr::Named(self.sym_str("Integer"), sp));
             return Some(TypeDef::Unit(name, base, sp));
         }
         if td.children_of(NodeKind::UnitFamilyBody).next().is_some() {
-            return Some(TypeDef::Unit(name, TypeExpr::Named("Integer".into(), sp), sp));
+            return Some(TypeDef::Unit(name, TypeExpr::Named(self.sym_str("Integer"), sp), sp));
         }
         None
     }
@@ -678,15 +712,17 @@ impl<'a> Desugar<'a> {
         let first = |i: usize| {
             kids.get(i)
                 .map(|k| self.type_expr(k))
-                .unwrap_or(TypeExpr::Named(String::new(), sp))
+                .unwrap_or(TypeExpr::Named(Name::default(), sp))
         };
         match n.kind {
             NodeKind::NamedType => TypeExpr::Named(
-                n.tokens()
-                    .filter(|t| !t.kind.is_trivia())
-                    .map(|t| self.text(t))
-                    .collect::<Vec<_>>()
-                    .concat(),
+                self.sym_str(
+                    &n.tokens()
+                        .filter(|t| !t.kind.is_trivia())
+                        .map(|t| self.text(t))
+                        .collect::<Vec<_>>()
+                        .concat(),
+                ),
                 sp,
             ),
             NodeKind::ParenType => first(0),
@@ -695,13 +731,13 @@ impl<'a> Desugar<'a> {
                 Some((base, args)) => args.iter().fold(self.type_expr(base), |acc, a| {
                     TypeExpr::App(Rc::new(acc), vec![self.type_expr(a)], sp)
                 }),
-                None => TypeExpr::Named(String::new(), sp),
+                None => TypeExpr::Named(Name::default(), sp),
             },
             NodeKind::ArithType => {
                 let op = n
                     .own_tokens()
                     .find(|t| !t.kind.is_trivia())
-                    .map(|t| self.text(t))
+                    .map(|t| self.sym(t))
                     .unwrap_or_default();
                 TypeExpr::App(
                     Rc::new(TypeExpr::Named(op, sp)),
@@ -746,7 +782,7 @@ impl<'a> Desugar<'a> {
                     .own_tokens()
                     .skip_while(|t| t.kind != Kind::LeftParen)
                     .find(|t| matches!(t.kind, Kind::Identifier | Kind::TypeIdentifier))
-                    .map(|t| self.text(t))
+                    .map(|t| self.sym(t))
                     .unwrap_or_default();
                 TypeExpr::Forall(var, Rc::new(first(0)), Rc::new(first(1)), sp)
             }
@@ -754,16 +790,16 @@ impl<'a> Desugar<'a> {
                 let effs: Vec<Name> = n
                     .own_tokens()
                     .filter(|t| matches!(t.kind, Kind::Identifier | Kind::TypeIdentifier))
-                    .map(|t| self.text(t))
+                    .map(|t| self.sym(t))
                     .collect();
                 TypeExpr::Effect(effs, Vec::new(), Vec::new(), Rc::new(first(0)), sp)
             }
             NodeKind::TupleType => {
                 let elems: Vec<TypeExpr> = kids.iter().map(|k| self.type_expr(k)).collect();
-                let base = TypeExpr::Named(format!("Tup{}", elems.len()), sp);
+                let base = TypeExpr::Named(self.sym_str(&format!("Tup{}", elems.len())), sp);
                 elems.into_iter().fold(base, |f, a| TypeExpr::App(Rc::new(f), vec![a], sp))
             }
-            _ => TypeExpr::Named(String::new(), sp),
+            _ => TypeExpr::Named(Name::default(), sp),
         }
     }
 
@@ -788,7 +824,7 @@ impl<'a> Desugar<'a> {
             // A tuple pattern is the tuple constructor's pattern.
             NodeKind::TuplePat => {
                 let subs: Vec<Pat> = n.child_nodes().into_iter().map(|k| self.pat(k)).collect();
-                Pat::Ctor(format!("MkTup{}", subs.len()), subs, sp)
+                Pat::Ctor(self.sym_str(&format!("MkTup{}", subs.len())), subs, sp)
             }
             NodeKind::VecPat => {
                 Pat::Vec_(n.child_nodes().into_iter().map(|k| self.pat(k)).collect(), sp)

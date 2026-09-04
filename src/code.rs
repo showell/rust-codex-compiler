@@ -34,40 +34,9 @@
 
 use crate::ast::*;
 use crate::interp::{literal, FieldBound, Value};
+use crate::symbol::{Sym, SymTab};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-
-/// One shared `Rc<String>` per distinct name, handed out while compiling.
-///
-/// **A record carries its field NAMES, and building one used to copy every one
-/// of them into a fresh `String`** -- 1,585,699 of those in a single safari
-/// unit, about two fifths of everything that run allocated, for a handful of
-/// distinct names written over and over. The names are fixed before the run
-/// starts, so they are shared instead and building a record bumps a refcount
-/// per field.
-///
-/// **`Rc<String>` and not `Rc<str>`, which is the whole reason this is written
-/// down.** `Rc<str>` is a FAT pointer: it took `Value`'s largest variant from
-/// 16 bytes to 24 and `Value` itself from 24 to 32, so every value the
-/// interpreter moved got a third bigger. Measured, that lost 16% -- more than
-/// the 1.59 million allocations it saved were worth. A name is dereferenced
-/// rarely and moved constantly, so the extra indirection is the cheap side of
-/// the trade.
-#[derive(Default)]
-pub struct Interner {
-    seen: HashMap<String, Rc<String>>,
-}
-
-impl Interner {
-    pub fn intern(&mut self, s: &str) -> Rc<String> {
-        if let Some(r) = self.seen.get(s) {
-            return r.clone();
-        }
-        let r = Rc::new(s.to_string());
-        self.seen.insert(s.to_string(), r.clone());
-        r
-    }
-}
 
 /// A lambda's fixed part: arity and compiled body, shared by every closure the
 /// lambda expression makes.
@@ -92,7 +61,7 @@ pub struct Arm {
 
 #[derive(Debug)]
 pub struct RecField {
-    pub name: Rc<String>,
+    pub name: Sym,
     pub value: Code,
     /// The declared bound, read out of the record definition here rather than
     /// looked up under a two-`String` key on every record built.
@@ -116,7 +85,7 @@ pub enum PatCode {
     /// A literal that does not parse. The walker swallowed the error and never
     /// matched; so does this.
     BadLit,
-    Ctor(Name, Vec<PatCode>),
+    Ctor(Sym, Vec<PatCode>),
     Vec_(Vec<PatCode>),
 }
 
@@ -151,10 +120,10 @@ pub enum Code {
     Match(Box<Code>, Rc<Vec<Arm>>),
     List(Vec<Code>),
     /// The type name is shared, not rebuilt per record.
-    Record(Rc<String>, Vec<RecField>),
-    FieldAccess(Box<Code>, Rc<String>, Span),
+    Record(Sym, Vec<RecField>),
+    FieldAccess(Box<Code>, Sym, Span),
     Act(Vec<Stmt>),
-    FieldAssign(Box<Code>, Rc<String>, Box<Code>),
+    FieldAssign(Box<Code>, Sym, Box<Code>),
     Lazy(Box<Code>),
     /// A form the interpreter does not do, with upstream's wording.
     Unsupported(&'static str),
@@ -171,16 +140,16 @@ pub struct Names {
     /// Names defined in more than one chapter of this unit. Almost none are,
     /// and asking only about these is what keeps the chapter question off the
     /// common path.
-    pub colliding: HashSet<String>,
-    pub by_chapter_fun: HashMap<(String, String), u32>,
-    pub by_chapter_const: HashMap<(String, String), u32>,
-    pub funs: HashMap<String, u32>,
-    pub consts: HashMap<String, u32>,
-    pub ctors: HashMap<String, u32>,
-    pub builtin_funs: HashMap<&'static str, u32>,
-    pub builtin_nullary: HashSet<&'static str>,
-    pub builtin_undeclared: HashSet<&'static str>,
-    pub bounds: HashMap<(Rc<String>, Rc<String>), FieldBound>,
+    pub colliding: HashSet<Sym>,
+    pub by_chapter_fun: HashMap<(String, Sym), u32>,
+    pub by_chapter_const: HashMap<(String, Sym), u32>,
+    pub funs: HashMap<Sym, u32>,
+    pub consts: HashMap<Sym, u32>,
+    pub ctors: HashMap<Sym, u32>,
+    pub builtin_funs: HashMap<Sym, u32>,
+    pub builtin_nullary: HashMap<Sym, &'static str>,
+    pub builtin_undeclared: HashMap<Sym, &'static str>,
+    pub bounds: HashMap<(Sym, Sym), FieldBound>,
 }
 
 /// Compiles one definition's body.
@@ -192,32 +161,29 @@ pub struct Names {
 /// whose pattern binds nothing, because the run pushes that one too.
 pub struct Compiler<'a> {
     names: &'a Names,
-    interner: &'a mut Interner,
+    /// Only for the two questions a symbol cannot answer itself: is this name
+    /// capitalised, and what does a builtin call itself.
+    syms: &'a SymTab,
     slug: &'a str,
-    frames: Vec<Vec<&'a str>>,
+    frames: Vec<Vec<Sym>>,
 }
 
 impl<'a> Compiler<'a> {
-    pub fn new(names: &'a Names, interner: &'a mut Interner, slug: &'a str) -> Compiler<'a> {
-        Compiler { names, interner, slug, frames: Vec::new() }
+    pub fn new(names: &'a Names, syms: &'a SymTab, slug: &'a str) -> Compiler<'a> {
+        Compiler { names, syms, slug, frames: Vec::new() }
     }
 
     /// A definition's body, under a frame holding its parameters.
-    pub fn def(names: &'a Names, interner: &'a mut Interner, d: &'a Def) -> Code {
-        let mut c = Compiler::new(names, interner, d.chapter_slug.as_str());
-        c.frames.push(d.params.iter().map(|p| p.name.as_str()).collect());
+    pub fn def(names: &'a Names, syms: &'a SymTab, d: &'a Def) -> Code {
+        let mut c = Compiler::new(names, syms, d.chapter_slug.as_str());
+        c.frames.push(d.params.iter().map(|p| p.name).collect());
         c.expr(&d.body)
     }
 
     /// A body evaluated in the empty environment: a nullary definition, and
     /// `opening` itself.
-    pub fn body(
-        names: &'a Names,
-        interner: &'a mut Interner,
-        slug: &'a str,
-        e: &'a Expr,
-    ) -> Code {
-        Compiler::new(names, interner, slug).expr(e)
+    pub fn body(names: &'a Names, syms: &'a SymTab, slug: &'a str, e: &'a Expr) -> Code {
+        Compiler::new(names, syms, slug).expr(e)
     }
 
     pub fn expr(&mut self, e: &'a Expr) -> Code {
@@ -226,7 +192,7 @@ impl<'a> Compiler<'a> {
                 Ok(v) => Code::Const(v),
                 Err(e) => Code::Fail(e.0),
             },
-            Expr::NameRef(n, _) => self.name(n),
+            Expr::NameRef(n, _) => self.name(*n),
             Expr::Apply(..) => {
                 // Down the left spine to the head, once and for all. Each
                 // argument keeps the span of the application that consumes it,
@@ -261,14 +227,14 @@ impl<'a> Compiler<'a> {
                 let mut vals = Vec::with_capacity(binds.len());
                 for b in binds {
                     vals.push(self.expr(&b.value));
-                    self.frames.push(vec![b.name.as_str()]);
+                    self.frames.push(vec![b.name]);
                 }
                 let body = self.expr(body);
                 self.frames.truncate(self.frames.len() - binds.len());
                 Code::Let(vals, Box::new(body))
             }
             Expr::Lambda(params, body, _) => {
-                self.frames.push(params.iter().map(|p| p.as_str()).collect());
+                self.frames.push(params.iter().copied().collect());
                 let b = self.expr(body);
                 self.frames.pop();
                 Code::Lambda(Rc::new(Lam { arity: params.len(), body: Rc::new(b) }))
@@ -289,20 +255,14 @@ impl<'a> Compiler<'a> {
                 Code::List(out)
             }
             Expr::Record(name, fields, _) => {
-                let ty = self.interner.intern(name);
                 let mut out = Vec::with_capacity(fields.len());
                 for f in fields {
-                    let fname = self.interner.intern(&f.name);
-                    let bound =
-                        self.names.bounds.get(&(ty.clone(), fname.clone())).copied();
-                    out.push(RecField { name: fname, value: self.expr(&f.value), bound });
+                    let bound = self.names.bounds.get(&(*name, f.name)).copied();
+                    out.push(RecField { name: f.name, value: self.expr(&f.value), bound });
                 }
-                Code::Record(ty, out)
+                Code::Record(*name, out)
             }
-            Expr::FieldAccess(o, f, sp) => {
-                let name = self.interner.intern(f);
-                Code::FieldAccess(Box::new(self.expr(o)), name, *sp)
-            }
+            Expr::FieldAccess(o, f, sp) => Code::FieldAccess(Box::new(self.expr(o)), *f, *sp),
             Expr::Act(stmts, _) => {
                 let mut out = Vec::with_capacity(stmts.len());
                 let mut pushed = 0;
@@ -311,7 +271,7 @@ impl<'a> Compiler<'a> {
                         ActStmt::Exec(e, _) => out.push(Stmt::Exec(self.expr(e))),
                         ActStmt::Bind(n, e, _) => {
                             out.push(Stmt::Bind(self.expr(e)));
-                            self.frames.push(vec![n.as_str()]);
+                            self.frames.push(vec![*n]);
                             pushed += 1;
                         }
                     }
@@ -321,7 +281,7 @@ impl<'a> Compiler<'a> {
             }
             Expr::Lazy(i, _) => Code::Lazy(Box::new(self.expr(i))),
             Expr::FieldAssign(r, f, v, _) => {
-                let name = self.interner.intern(f);
+                let name = *f;
                 let base = self.expr(r);
                 let val = self.expr(v);
                 Code::FieldAssign(Box::new(base), name, Box::new(val))
@@ -336,7 +296,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn arm(&mut self, a: &'a MatchArm) -> Arm {
-        let mut vars: Vec<&'a str> = Vec::new();
+        let mut vars: Vec<Sym> = Vec::new();
         let pat = pat_code(&a.pattern, &mut vars);
         let nvars = vars.len();
         self.frames.push(vars);
@@ -348,7 +308,7 @@ impl<'a> Compiler<'a> {
 
     /// A local, innermost frame first. Later bindings shadow earlier ones in
     /// the same frame, which is why this takes the LAST match in a frame.
-    fn local(&self, n: &str) -> Option<Code> {
+    fn local(&self, n: Sym) -> Option<Code> {
         for (hops, f) in self.frames.iter().rev().enumerate() {
             if let Some(slot) = f.iter().rposition(|k| *k == n) {
                 return Some(Code::Local(hops as u32, slot as u32));
@@ -359,18 +319,18 @@ impl<'a> Compiler<'a> {
 
     /// The resolution order is the walker's, case for case. Changing it here
     /// changes which definition a colliding name means.
-    fn name(&mut self, n: &str) -> Code {
+    fn name(&self, n: Sym) -> Code {
         if let Some(c) = self.local(n) {
             return c;
         }
-        let colliding = self.names.colliding.contains(n);
-        let key = || (self.slug.to_string(), n.to_string());
+        let colliding = self.names.colliding.contains(&n);
+        let key = || (self.slug.to_string(), n);
         if colliding {
             if let Some(&g) = self.names.by_chapter_fun.get(&key()) {
                 return Code::Global(g);
             }
         }
-        if let Some(&g) = self.names.funs.get(n) {
+        if let Some(&g) = self.names.funs.get(&n) {
             return Code::Global(g);
         }
         if colliding {
@@ -378,16 +338,16 @@ impl<'a> Compiler<'a> {
                 return Code::ConstDef(c);
             }
         }
-        if let Some(&c) = self.names.consts.get(n) {
+        if let Some(&c) = self.names.consts.get(&n) {
             return Code::ConstDef(c);
         }
-        if let Some(&g) = self.names.ctors.get(n) {
+        if let Some(&g) = self.names.ctors.get(&n) {
             return Code::Global(g);
         }
-        if let Some(&g) = self.names.builtin_funs.get(n) {
+        if let Some(&g) = self.names.builtin_funs.get(&n) {
             return Code::Global(g);
         }
-        if let Some(name) = self.names.builtin_nullary.get(n).copied() {
+        if let Some(name) = self.names.builtin_nullary.get(&n).copied() {
             return Code::NullaryBuiltin(name);
         }
         // A capitalised unknown is a nullary constructor the type definitions
@@ -395,25 +355,25 @@ impl<'a> Compiler<'a> {
         // the undeclared-builtin refusal on purpose: `True`, `False` and
         // `Nothing` are three of the eight that declare no type, and they are
         // constructors rather than anything to call.
-        if n.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
-            return Code::Const(Value::Ctor(self.interner.intern(n), Rc::new(Vec::new())));
+        if self.syms.text(n).chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            return Code::Const(Value::Ctor(n, Rc::new(Vec::new())));
         }
-        if let Some(name) = self.names.builtin_undeclared.get(n).copied() {
+        if let Some(name) = self.names.builtin_undeclared.get(&n).copied() {
             return Code::Fail(format!(
                 "builtin `{name}` declares no type, so its arity is not known"
             ));
         }
-        Code::Fail(format!("undefined name `{n}`"))
+        Code::Fail(format!("undefined name `{}`", self.syms.text(n)))
     }
 }
 
 /// The slots a pattern binds are its `Var`s in walk order, and the matcher
 /// pushes in exactly this order -- which is what makes the slot implicit.
-fn pat_code<'a>(p: &'a Pat, vars: &mut Vec<&'a str>) -> PatCode {
+fn pat_code(p: &Pat, vars: &mut Vec<Sym>) -> PatCode {
     match p {
         Pat::Wild(_) => PatCode::Wild,
         Pat::Var(n, _) => {
-            vars.push(n.as_str());
+            vars.push(*n);
             PatCode::Var
         }
         Pat::Lit(text, kind, _) => match literal(text, *kind) {
@@ -421,7 +381,7 @@ fn pat_code<'a>(p: &'a Pat, vars: &mut Vec<&'a str>) -> PatCode {
             Err(_) => PatCode::BadLit,
         },
         Pat::Ctor(name, subs, _) => {
-            PatCode::Ctor(name.clone(), subs.iter().map(|s| pat_code(s, vars)).collect())
+            PatCode::Ctor(*name, subs.iter().map(|s| pat_code(s, vars)).collect())
         }
         Pat::Vec_(subs, _) => PatCode::Vec_(subs.iter().map(|s| pat_code(s, vars)).collect()),
     }

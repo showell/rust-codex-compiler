@@ -234,7 +234,8 @@ fn section_for(sections: &[(u32, String)], offset: u32) -> String {
 
 pub fn analyse(ch: &Chapter, tree: &Node, src: &[u8]) -> Cohesion {
     let n = ch.defs.len();
-    let def_names: Vec<String> = ch.defs.iter().map(|d| d.name.clone()).collect();
+    let def_names: Vec<String> =
+        ch.defs.iter().map(|d| ch.syms.text(d.name).to_string()).collect();
     let is_fn: Vec<bool> = ch.defs.iter().map(|d| !d.params.is_empty()).collect();
     let data_chapter = !is_fn.iter().any(|&f| f);
 
@@ -324,7 +325,7 @@ pub fn analyse(ch: &Chapter, tree: &Node, src: &[u8]) -> Cohesion {
     let isolated: Vec<usize> = (0..n).filter(|&i| !touched[i]).collect();
 
     Cohesion {
-        chapter: ch.name.clone(),
+        chapter: ch.syms.text(ch.name).to_string(),
         def_names,
         def_section,
         is_fn,

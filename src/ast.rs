@@ -15,9 +15,13 @@
 /// `record { value : Text }`. A name is not a token: the desugarer has already
 /// taken the text, and some names (`__seq`, `__rev`, `MkTup3`) were never
 /// written by anybody.
+use crate::symbol::{Sym, SymTab};
 use std::rc::Rc;
 
-pub type Name = String;
+/// A name is an interned `Sym`, not a `String` -- see `crate::symbol` for why,
+/// and for the one catch: the text is only readable through the `SymTab` that
+/// interned it, which `Chapter` carries.
+pub type Name = Sym;
 
 /// Line, column, offset and length, as `SourceSpan` carries them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -359,6 +363,9 @@ impl Expr {
 
 #[derive(Clone, Debug, Default)]
 pub struct Chapter {
+    /// The table every `Name` in this chapter indexes. It travels with the
+    /// tree because a `Sym` read against the wrong table is a wrong name.
+    pub syms: SymTab,
     pub name: Name,
     pub defs: Vec<Def>,
     pub type_defs: Vec<TypeDef>,
@@ -387,11 +394,12 @@ mod tests {
     /// each of 17,618 match arms. `Handle`, `WithTimeout` and `Try` held 72,
     /// 96 and 96 bytes of payload where nothing else exceeded 64, so three of
     /// the rarest forms in the language set the size of the whole tree. They
-    /// are boxed; this is the guard that keeps them that way.
+    /// are boxed; this is the guard that keeps them that way. 104 bytes then,
+    /// 72 once they were boxed, 56 once a `Name` became a four-byte `Sym`.
     #[test]
     fn expr_does_not_grow() {
         assert!(
-            std::mem::size_of::<Expr>() <= 72,
+            std::mem::size_of::<Expr>() <= 56,
             "Expr is {} bytes; a variant grew",
             std::mem::size_of::<Expr>()
         );

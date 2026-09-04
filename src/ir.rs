@@ -43,6 +43,7 @@
 //! for the whole chapter if any definition in it is out of reach, because a
 //! chapter emitted with half its defs is not comparable to anything.
 
+use crate::symbol::{Sym, SymTab};
 use crate::ast::{BinaryOp, Chapter, Expr, LiteralKind, TypeExpr};
 use crate::builtins::BUILTIN_IR_TYPES;
 use std::collections::BTreeMap;
@@ -64,21 +65,21 @@ fn atom(n: &str) -> Option<&'static str> {
 /// A declared type, in the IR's spelling. `A -> B` is `(fn A B)`; the arrow is
 /// right-associative and stays curried, which is what the golds show:
 /// `char-at` is `(fn text (fn int-default char))`.
-pub fn render_type(t: &TypeExpr) -> Option<String> {
+pub fn render_type(syms: &SymTab, t: &TypeExpr) -> Option<String> {
     match t {
-        TypeExpr::Named(n, _) => atom(n).map(str::to_string),
+        TypeExpr::Named(n, _) => atom(syms.text(*n)).map(str::to_string),
         TypeExpr::Fun(a, b, _) => {
-            Some(format!("(fn {} {})", render_type(a)?, render_type(b)?))
+            Some(format!("(fn {} {})", render_type(syms, a)?, render_type(syms, b)?))
         }
         // `List a` is `(list a)` and `Vector a` is `(vector a)`. The golds
         // carry 228,533 of the first, which makes it the cheapest thing in the
         // language to be unable to spell.
         TypeExpr::App(head, args, _) => match (&**head, args.as_slice()) {
-            (TypeExpr::Named(n, _), [only]) if n == "List" => {
-                Some(format!("(list {})", render_type(only)?))
+            (TypeExpr::Named(n, _), [only]) if syms.text(*n) == "List" => {
+                Some(format!("(list {})", render_type(syms, only)?))
             }
-            (TypeExpr::Named(n, _), [only]) if n == "Vector" => {
-                Some(format!("(vector {})", render_type(only)?))
+            (TypeExpr::Named(n, _), [only]) if syms.text(*n) == "Vector" => {
+                Some(format!("(vector {})", render_type(syms, only)?))
             }
             _ => None,
         },
@@ -89,11 +90,11 @@ pub fn render_type(t: &TypeExpr) -> Option<String> {
 /// The shape of a type we cannot render, for the refusal histogram. A NAMED
 /// type reports its name, because "which named types are missing" and "which
 /// type constructors are missing" are different questions with different fixes.
-pub fn type_kind(t: &TypeExpr) -> String {
+pub fn type_kind(syms: &SymTab, t: &TypeExpr) -> String {
     match t {
-        TypeExpr::Named(n, _) => format!("Named {n}"),
+        TypeExpr::Named(n, _) => format!("Named {}", syms.text(*n)),
         TypeExpr::Fun(a, b, _) => {
-            if render_type(a).is_none() { type_kind(a) } else { type_kind(b) }
+            if render_type(syms, a).is_none() { type_kind(syms, a) } else { type_kind(syms, b) }
         }
         TypeExpr::App(..) => "App (List a, Maybe a, ...)".into(),
         TypeExpr::Effect(..) => "Effect row".into(),
@@ -122,43 +123,51 @@ fn split_fn(ty: &str) -> Option<(&str, &str)> {
 }
 
 /// Names in scope, with the type each one carries at a reference site.
-pub struct Env {
-    types: BTreeMap<String, String>,
-    /// Names bound inside one definition -- its parameters. Consulted FIRST.
-    locals: BTreeMap<String, String>,
+pub struct Env<'a> {
+    /// Carried so the functions below can spell a name without every one of
+    /// them taking a table -- `Env` was already threaded everywhere.
+    syms: &'a SymTab,
+    /// **Keyed by symbol, not by text.** These are lookup-only -- nothing
+    /// iterates them -- so the key can be the four-byte name.
+    types: BTreeMap<Sym, String>,
+    locals: BTreeMap<Sym, String>,
 }
 
-impl Env {
+impl<'a> Env<'a> {
     /// The builtins first, then this chapter's own declared types on top --
     /// a chapter that defines `max` shadows the builtin, and the golds show
     /// both spellings for that name.
-    pub fn new(ch: &Chapter) -> Env {
-        let mut types: BTreeMap<String, String> =
-            BUILTIN_IR_TYPES.iter().map(|(n, t)| (n.to_string(), t.to_string())).collect();
+    pub fn new(ch: &Chapter) -> Env<'_> {
+        // A builtin this chapter never names cannot be what any symbol here
+        // means, so it needs no entry.
+        let mut types: BTreeMap<Sym, String> = BUILTIN_IR_TYPES
+            .iter()
+            .filter_map(|(n, t)| ch.syms.find(n).map(|s| (s, t.to_string())))
+            .collect();
         for d in &ch.defs {
-            if let Some(dt) = d.declared_type.first().and_then(render_type) {
-                types.insert(d.name.clone(), dt);
+            if let Some(dt) = d.declared_type.first().and_then(|t| render_type(&ch.syms, t)) {
+                types.insert(d.name, dt);
             }
         }
-        Env { types, locals: Default::default() }
+        Env { syms: &ch.syms, types, locals: Default::default() }
     }
 
-    fn get(&self, n: &str) -> Option<&str> {
-        self.locals.get(n).or_else(|| self.types.get(n)).map(String::as_str)
+    fn get(&self, n: Sym) -> Option<&str> {
+        self.locals.get(&n).or_else(|| self.types.get(&n)).map(String::as_str)
     }
 
     /// One more name in scope, for a `let` body.
-    fn bind(&self, n: &str, ty: &str) -> Env {
+    fn bind(&self, n: Sym, ty: &str) -> Env<'a> {
         let mut l = self.locals.clone();
-        l.insert(n.to_string(), ty.to_string());
-        Env { types: self.types.clone(), locals: l }
+        l.insert(n, ty.to_string());
+        Env { syms: self.syms, types: self.types.clone(), locals: l }
     }
 
     /// A definition's own parameters, in scope for its body only. They shadow:
     /// a parameter named `max` is the parameter, not the builtin, which is the
     /// same collision the golds show for that name.
-    fn with_locals(&self, locals: BTreeMap<String, String>) -> Env {
-        Env { types: self.types.clone(), locals }
+    fn with_locals(&self, locals: BTreeMap<Sym, String>) -> Env<'a> {
+        Env { syms: self.syms, types: self.types.clone(), locals }
     }
 }
 
@@ -183,12 +192,12 @@ fn expr(e: &Expr, env: &Env) -> Result<(String, String), String> {
             Ok((format!("(bool-lit {v})"), "boolean".into()))
         }
         Expr::Lit(_, k, _) => Err(format!("literal kind {k:?}")),
-        Expr::NameRef(n, _) => match env.get(n) {
+        Expr::NameRef(n, _) => match env.get(*n) {
             Some(t) => {
                 let t = t.to_string();
-                Ok((format!("(name {:?} {})", n, t), t))
+                Ok((format!("(name {:?} {})", env.syms.text(*n), t), t))
             }
-            None => Err(format!("no type for name `{n}`")),
+            None => Err(format!("no type for name `{}`", env.syms.text(*n))),
         },
         Expr::Apply(f, a, _) => {
             let (ft, fty) = expr(f, env)?;
@@ -280,17 +289,17 @@ fn expr(e: &Expr, env: &Env) -> Result<(String, String), String> {
         // let's own type is the BODY's -- a let evaluates to its body. Each
         // binding is in scope for the ones after it and for the body.
         Expr::Let(binds, body, _) => {
-            let mut env2 = env.bind("", "");
+            let mut env2 = env.bind(Sym::default(), "");
             let mut heads = Vec::new();
             for b in binds {
                 let (vt, vty) = expr(&b.value, &env2)?;
                 heads.push((b.name.clone(), vty.clone(), vt));
-                env2 = env2.bind(&b.name, &vty);
+                env2 = env2.bind(b.name, &vty);
             }
             let (bt, bty) = expr(body, &env2)?;
             let mut out = bt;
             for (n, ty, v) in heads.into_iter().rev() {
-                out = format!("(let {:?} {} {} {})", n, ty, v, out);
+                out = format!("(let {:?} {} {} {})", env.syms.text(n), ty, v, out);
             }
             Ok((out, bty))
         }
@@ -360,7 +369,7 @@ pub fn emit_defs(ch: &Chapter) -> Result<String, String> {
 /// library code nothing in the program reaches.
 fn reachable(ch: &Chapter, roots: &[&str]) -> std::collections::BTreeSet<String> {
     let by_name: BTreeMap<&str, &crate::ast::Def> =
-        ch.defs.iter().map(|d| (d.name.as_str(), d)).collect();
+        ch.defs.iter().map(|d| (ch.syms.text(d.name), d)).collect();
     let mut seen = std::collections::BTreeSet::new();
     let mut stack: Vec<String> =
         roots.iter().filter(|r| by_name.contains_key(**r)).map(|r| r.to_string()).collect();
@@ -371,8 +380,8 @@ fn reachable(ch: &Chapter, roots: &[&str]) -> std::collections::BTreeSet<String>
         if let Some(d) = by_name.get(n.as_str()) {
             d.body.walk(&mut |x| {
                 if let Expr::NameRef(m, _) = x {
-                    if by_name.contains_key(m.as_str()) && !seen.contains(m) {
-                        stack.push(m.clone());
+                    if by_name.contains_key(ch.syms.text(*m)) && !seen.contains(ch.syms.text(*m)) {
+                        stack.push(ch.syms.text(*m).to_string());
                     }
                 }
             });
@@ -391,31 +400,41 @@ pub fn emit_defs_from(ch: &Chapter, roots: &[&str]) -> Result<String, String> {
     // definitions. `preamble::emit` ends at `  (defs` because that is where the
     // syntax-only part of a gold stops.
     let mut out = String::new();
-    for d in ch.defs.iter().filter(|d| keep.contains(&d.name)) {
+    for d in ch.defs.iter().filter(|d| keep.contains(ch.syms.text(d.name))) {
         let declared = match d.declared_type.first() {
-            None => return Err(format!("`{}` has no declared type (needs the checker)", d.name)),
-            Some(te) => match render_type(te) {
+            None => {
+                return Err(format!(
+                    "`{}` has no declared type (needs the checker)",
+                    ch.syms.text(d.name)
+                ))
+            }
+            Some(te) => match render_type(&ch.syms, te) {
                 Some(s) => s,
-                None => return Err(format!("type not renderable: {}", type_kind(te))),
+                None => {
+                    return Err(format!("type not renderable: {}", type_kind(&ch.syms, te)))
+                }
             },
         };
         // Parameter types come from walking the declared arrow spine, which is
         // the only place they are written down.
         let mut rest: &str = &declared;
         let mut params = String::new();
-        let mut locals: BTreeMap<String, String> = Default::default();
+        let mut locals: BTreeMap<Sym, String> = Default::default();
         for p in &d.params {
             let (arg, res) = split_fn(rest)
-                .ok_or_else(|| format!("`{}` has more params than its type has arrows", d.name))?;
-            params.push_str(&format!(" (param {:?} {})", p.name, arg));
-            locals.insert(p.name.clone(), arg.to_string());
+                .ok_or_else(|| {
+                format!("`{}` has more params than its type has arrows", ch.syms.text(d.name))
+            })?;
+            params.push_str(&format!(" (param {:?} {})", ch.syms.text(p.name), arg));
+            locals.insert(p.name, arg.to_string());
             rest = res;
         }
         let denv = env.with_locals(locals);
-        let (body, _bty) = expr(&d.body, &denv).map_err(|r| format!("{}: {r}", d.name))?;
+        let (body, _bty) =
+            expr(&d.body, &denv).map_err(|r| format!("{}: {r}", ch.syms.text(d.name)))?;
         out.push_str(&format!(
             "\n  (def {:?} {:?} (params{}) {} {} 0 0)",
-            d.name, d.chapter_slug, params, declared, body
+            ch.syms.text(d.name), d.chapter_slug, params, declared, body
         ));
     }
     Ok(out)
@@ -439,78 +458,80 @@ pub fn emit_defs_from(ch: &Chapter, roots: &[&str]) -> Result<String, String> {
 pub fn lower_section(ch: &Chapter, _roots: &[&str]) -> String {
     let defs: Vec<&crate::ast::Def> = ch.defs.iter().collect();
     let mut s = String::from("--- lower ---\n");
-    s.push_str(&format!("ir-name |{}|\n", ch.name));
+    s.push_str(&format!("ir-name |{}|\n", ch.syms.text(ch.name)));
     s.push_str(&format!("ir-defs {}\n", defs.len()));
     s.push_str("ir-eff-ops 0\n.\n");
     for d in &defs {
         let ty = d
             .declared_type
             .first()
-            .and_then(crate::check::resolve_declared)
-            .map_or_else(|| "other".to_string(), |t| crate::check::type_kind(&t));
+            .and_then(|t| crate::check::resolve_declared(&ch.syms, t))
+            .map_or_else(|| "other".to_string(), |t| crate::check::type_kind(&ch.syms, &t));
         s.push_str(&format!(
             "irdef {} params {} slug {} punctual 0 uparams 0 ty {}\n",
-            d.name,
+            ch.syms.text(d.name),
             d.params.len(),
             d.chapter_slug,
             ty
         ));
-        shape(&d.body, 0, &mut s);
+        shape(&ch.syms, &d.body, 0, &mut s);
     }
     s.push_str(".\n---\n");
     s
 }
 
-fn kind(e: &Expr) -> String {
+fn kind(syms: &SymTab, e: &Expr) -> String {
     match e {
         Expr::Lit(_, LiteralKind::IntLit, _) => "int".into(),
         Expr::Lit(_, LiteralKind::NumLit, _) => "num".into(),
         Expr::Lit(_, LiteralKind::TextLit, _) => "text".into(),
         Expr::Lit(_, LiteralKind::BoolLit, _) => "bool".into(),
         Expr::Lit(_, LiteralKind::CharLit, _) => "char".into(),
-        Expr::NameRef(n, _) => format!("name:{n}"),
+        Expr::NameRef(n, _) => format!("name:{}", syms.text(*n)),
         Expr::Binary(..) => "binary".into(),
         Expr::Unary(..) => "negate".into(),
         Expr::If(..) => "if".into(),
-        Expr::Let(bs, ..) => format!("let:{}", bs.first().map_or("", |b| b.name.as_str())),
+        Expr::Let(bs, ..) => {
+            format!("let:{}", bs.first().map_or("", |b| syms.text(b.name)))
+        }
         Expr::Apply(..) => "apply".into(),
         Expr::Lambda(..) => "lambda".into(),
         Expr::List(..) => "list".into(),
         Expr::Match(..) => "match".into(),
         Expr::Act(..) => "act".into(),
-        Expr::Record(n, ..) => format!("record:{n}"),
-        Expr::FieldAccess(_, f, _) => format!("field:{f}"),
-        Expr::FieldAssign(_, f, _, _) => format!("store:{f}"),
+        Expr::Record(n, ..) => format!("record:{}", syms.text(*n)),
+        Expr::FieldAccess(_, f, _) => format!("field:{}", syms.text(*f)),
+        Expr::FieldAssign(_, f, _, _) => format!("store:{}", syms.text(*f)),
         Expr::Error(..) => "error".into(),
         _ => "other".into(),
     }
 }
 
-fn shape(e: &Expr, d: usize, out: &mut String) {
-    out.push_str(&format!("e{d} {}\n", kind(e)));
+fn shape(syms: &SymTab, e: &Expr, d: usize, out: &mut String) {
+    out.push_str(&format!("e{d} {}\n", kind(syms, e)));
     match e {
         Expr::Binary(l, _, r, _) => {
-            shape(l, d + 1, out);
-            shape(r, d + 1, out);
+            shape(syms, l, d + 1, out);
+            shape(syms, r, d + 1, out);
         }
-        Expr::Unary(x, _) => shape(x, d + 1, out),
+        Expr::Unary(x, _) => shape(syms, x, d + 1, out),
         Expr::If(c, t, e2, _) => {
-            shape(c, d + 1, out);
-            shape(t, d + 1, out);
-            shape(e2, d + 1, out);
+            shape(syms, c, d + 1, out);
+            shape(syms, t, d + 1, out);
+            shape(syms, e2, d + 1, out);
         }
         Expr::Let(bs, body, _) => {
             if let Some(b) = bs.first() {
-                shape(&b.value, d + 1, out);
+                shape(syms, &b.value, d + 1, out);
             }
-            shape(body, d + 1, out);
+            shape(syms, body, d + 1, out);
         }
         Expr::Apply(f, a, _) => {
-            shape(f, d + 1, out);
-            shape(a, d + 1, out);
+            shape(syms, f, d + 1, out);
+            shape(syms, a, d + 1, out);
         }
-        Expr::Lambda(_, b, _) => shape(b, d + 1, out),
-        Expr::FieldAccess(r, _, _) => shape(r, d + 1, out),
+        Expr::Lambda(_, b, _) => shape(syms, b, d + 1, out),
+        Expr::FieldAccess(r, _, _) => shape(syms, r, d + 1, out),
         _ => {}
     }
 }

@@ -76,7 +76,7 @@ fn truth(path: &Path, scope: bool) -> ExitCode {
     let ch = dg.chapter(tree);
     let _ = writeln!(w, "--- desugar ---");
     let _ = writeln!(w, "dr-sat 0");
-    let _ = writeln!(w, "a-name |{}|", ch.name);
+    let _ = writeln!(w, "a-name |{}|", ch.syms.text(ch.name));
     let _ = writeln!(w, "a-chapter-title |{}|", ch.chapter_title);
     let _ = writeln!(w, "a-prose-len {}", ch.prose.len());
     let _ = writeln!(w, "a-defs {}", ch.defs.len());
@@ -84,7 +84,7 @@ fn truth(path: &Path, scope: bool) -> ExitCode {
         let _ = writeln!(
             w,
             "adef {} params {} dtype {} L{}C{} slug {}",
-            d.name,
+            ch.syms.text(d.name),
             d.params.len(),
             d.declared_type.len(),
             d.span.line,

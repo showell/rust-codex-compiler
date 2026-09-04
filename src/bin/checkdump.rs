@@ -40,7 +40,7 @@ fn main() -> ExitCode {
             let ch = dg.chapter(&parsed.tree);
             let (bindings, st) = check::check_chapter(&ch);
             let out = std::io::stdout();
-            let _ = write!(out.lock(), "{}", check::section(&bindings, &st));
+            let _ = write!(out.lock(), "{}", check::section(&ch.syms, &bindings, &st));
             ExitCode::SUCCESS
         }
         _ => {

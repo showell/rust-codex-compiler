@@ -22,7 +22,8 @@
 //! is running.
 
 use crate::ast::*;
-use crate::code::{Arm, Code, Compiler, Interner, Names, PatCode, Stmt};
+use crate::code::{Arm, Code, Compiler, Names, PatCode, Stmt};
+use crate::symbol::{Sym, SymTab};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::rc::Rc;
@@ -35,12 +36,12 @@ pub enum Value {
     Char(char),
     Bool(bool),
     List(Rc<Vec<Value>>),
-    /// A record literal: its type name and its fields. The names are SHARED
-    /// (`crate::code::Interner`), so building a record costs a refcount per
-    /// field rather than a copy of the field's text.
-    Record(Rc<String>, Rc<Vec<(Rc<String>, Value)>>),
+    /// A record literal: its type name and its fields. A name is a four-byte
+    /// `Sym`, so building a record copies nothing and this variant is the
+    /// smallest thing that can carry two.
+    Record(Sym, Rc<Vec<(Sym, Value)>>),
     /// A variant constructor, saturated or not.
-    Ctor(Rc<String>, Rc<Vec<Value>>),
+    Ctor(Sym, Rc<Vec<Value>>),
     Fun(Rc<Closure>),
     /// `Nothing` and friends -- a nullary name we do not otherwise know.
     Unit,
@@ -57,7 +58,7 @@ pub enum Body {
     /// A definition's or a lambda's compiled body.
     Code(Rc<Code>),
     /// A variant constructor: the arguments ARE the value.
-    Ctor(Rc<String>),
+    Ctor(Sym),
     /// A compiler builtin, resolved to its name once.
     Builtin(&'static str),
 }
@@ -158,7 +159,9 @@ pub struct Interp {
     /// time. A record literal names its type, so its bounds are attached at
     /// compile time; a field ASSIGNMENT names only the field, and which record
     /// it lands on is whatever the left-hand side evaluates to.
-    bounds: HashMap<(Rc<String>, Rc<String>), FieldBound>,
+    bounds: HashMap<(Sym, Sym), FieldBound>,
+    /// Spells a name when one has to be printed: an error, or `show`.
+    syms: SymTab,
     /// The empty environment, shared: every top-level closure closes over it.
     root: Env,
     /// Names defined in more than one chapter of a bundled unit.
@@ -196,15 +199,14 @@ impl Interp {
     pub fn new(ch: &Chapter) -> Interp {
         let root = Scope::root();
         let mut names = Names::default();
-        let mut interner = Interner::default();
         let mut globals: Vec<Value> = Vec::new();
 
         // Pass 1: an index for every definition, and who owns each name.
         let mut fun_defs: Vec<(u32, &Def)> = Vec::new();
         let mut const_defs_src: Vec<&Def> = Vec::new();
-        let mut owners: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut owners: HashMap<Sym, Vec<&str>> = HashMap::new();
         for d in &ch.defs {
-            let slugs = owners.entry(d.name.as_str()).or_default();
+            let slugs = owners.entry(d.name).or_default();
             if !slugs.contains(&d.chapter_slug.as_str()) {
                 slugs.push(d.chapter_slug.as_str());
             }
@@ -212,30 +214,34 @@ impl Interp {
             if d.params.is_empty() {
                 let i = const_defs_src.len() as u32;
                 const_defs_src.push(d);
-                names.consts.insert(d.name.clone(), i);
+                names.consts.insert(d.name, i);
                 names.by_chapter_const.insert(key, i);
             } else {
                 let i = globals.len() as u32;
                 globals.push(Value::Unit);
                 fun_defs.push((i, d));
-                names.funs.insert(d.name.clone(), i);
+                names.funs.insert(d.name, i);
                 names.by_chapter_fun.insert(key, i);
             }
         }
-        let mut collisions: Vec<String> =
-            owners.iter().filter(|(_, s)| s.len() > 1).map(|(n, _)| (*n).to_string()).collect();
+        let mut collisions: Vec<String> = owners
+            .iter()
+            .filter(|(_, s)| s.len() > 1)
+            .map(|(n, _)| ch.syms.text(*n).to_string())
+            .collect();
         collisions.sort();
-        names.colliding = collisions.iter().cloned().collect();
+        names.colliding =
+            owners.iter().filter(|(_, s)| s.len() > 1).map(|(n, _)| *n).collect();
 
         // Record field bounds, and a slot for every constructor.
-        let mut ctors: Vec<(u32, String, usize)> = Vec::new();
+        let mut ctors: Vec<(u32, Sym, usize)> = Vec::new();
         for t in &ch.type_defs {
             match t {
                 TypeDef::Record(name, _, fields, ..) => {
                     for f in fields {
                         if let TypeExpr::BoundedInt(_, lo, hi, mode, _) = &f.type_expr {
                             names.bounds.insert(
-                                (interner.intern(name), interner.intern(&f.name)),
+                                (*name, f.name),
                                 FieldBound { lo: *lo, hi: *hi, mode: *mode },
                             );
                         }
@@ -245,8 +251,8 @@ impl Interp {
                     for c in cs {
                         let i = globals.len() as u32;
                         globals.push(Value::Unit);
-                        names.ctors.insert(c.name.clone(), i);
-                        ctors.push((i, c.name.clone(), c.fields.len()));
+                        names.ctors.insert(c.name, i);
+                        ctors.push((i, c.name, c.fields.len()));
                     }
                 }
                 TypeDef::Unit(..) => {}
@@ -267,12 +273,19 @@ impl Interp {
         for (name, arity) in crate::builtins::BUILTINS {
             match arity {
                 None => {
-                    names.builtin_undeclared.insert(name);
+                    if let Some(s) = ch.syms.find(name) {
+                        names.builtin_undeclared.insert(s, name);
+                    }
                 }
                 Some(0) => {
-                    names.builtin_nullary.insert(name);
+                    if let Some(s) = ch.syms.find(name) {
+                        names.builtin_nullary.insert(s, name);
+                    }
                 }
                 Some(arity) => {
+                    // A builtin the chapter never names cannot be what any
+                    // symbol here means, so it needs no slot.
+                    let Some(sym) = ch.syms.find(name) else { continue };
                     let i = globals.len() as u32;
                     globals.push(Value::Fun(Rc::new(Closure {
                         arity,
@@ -280,7 +293,7 @@ impl Interp {
                         env: root.clone(),
                         applied: Vec::new(),
                     })));
-                    names.builtin_funs.insert(name, i);
+                    names.builtin_funs.insert(sym, i);
                 }
             }
         }
@@ -288,7 +301,7 @@ impl Interp {
         // Constructors are FIXED for the run, so their values are built here
         // and every reference clones one refcount.
         for (i, name, arity) in ctors {
-            let rc = interner.intern(&name);
+            let rc = name;
             globals[i as usize] = if arity == 0 {
                 Value::Ctor(rc, Rc::new(Vec::new()))
             } else {
@@ -305,12 +318,12 @@ impl Interp {
         // anything the unit defines regardless of where it sits.
         let mut const_defs: Vec<Rc<Code>> = Vec::with_capacity(const_defs_src.len());
         for d in &const_defs_src {
-            const_defs.push(Rc::new(Compiler::body(&names, &mut interner, &d.chapter_slug, &d.body)));
+            const_defs.push(Rc::new(Compiler::body(&names, &ch.syms, &d.chapter_slug, &d.body)));
         }
         for (i, d) in &fun_defs {
             globals[*i as usize] = Value::Fun(Rc::new(Closure {
                 arity: d.params.len(),
-                body: Body::Code(Rc::new(Compiler::def(&names, &mut interner, d))),
+                body: Body::Code(Rc::new(Compiler::def(&names, &ch.syms, d))),
                 env: root.clone(),
                 applied: Vec::new(),
             }));
@@ -322,14 +335,15 @@ impl Interp {
             .defs
             .iter()
             .rev()
-            .find(|d| d.name == "opening")
-            .map(|d| Rc::new(Compiler::body(&names, &mut interner, &d.chapter_slug, &d.body)));
+            .find(|d| Some(d.name) == ch.syms.find("opening"))
+            .map(|d| Rc::new(Compiler::body(&names, &ch.syms, &d.chapter_slug, &d.body)));
 
         Interp {
             globals,
             const_defs,
             opening,
             bounds: names.bounds,
+            syms: ch.syms.clone(),
             root,
             collisions,
             out: String::new(),
@@ -409,7 +423,7 @@ impl Interp {
                     _ => {}
                 }
                 let b = self.eval(r, env)?;
-                binary(*op, a, b)
+                binary(&self.syms, *op, a, b)
             }
             Code::Unary(x) => match self.eval(x, env)? {
                 Value::Int(i) => Ok(Value::Int(-i)),
@@ -467,16 +481,22 @@ impl Interp {
                     .map(|(_, v)| v.clone())
                     .ok_or_else(|| {
                         Error(format!(
-                            "L{}C{}: `{name}` has no field `{field}` (it has {})",
+                            "L{}C{}: `{}` has no field `{}` (it has {})",
                             sp.line,
                             sp.col,
-                            fs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ")
+                            self.syms.text(name),
+                            self.syms.text(*field),
+                            fs.iter()
+                                .map(|(n, _)| self.syms.text(*n))
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         ))
                     }),
                 v => err(format!(
-                    "L{}C{}: field `{field}` read from {}",
+                    "L{}C{}: field `{}` read from {}",
                     sp.line,
                     sp.col,
+                    self.syms.text(*field),
                     type_name(&v)
                 )),
             },
@@ -501,15 +521,15 @@ impl Interp {
                 let v = self.eval(val, env)?;
                 match base {
                     Value::Record(name, fs) => {
-                        let mut out: Vec<(Rc<String>, Value)> = (*fs).clone();
-                        let bound = self.bounds.get(&(name.clone(), field.clone()));
+                        let mut out: Vec<(Sym, Value)> = (*fs).clone();
+                        let bound = self.bounds.get(&(name, *field));
                         let v = match (&v, bound) {
                             (Value::Int(i), Some(b)) => Value::Int(apply_bound(*i, b)),
                             _ => v,
                         };
                         match out.iter_mut().find(|(n, _)| n == field) {
                             Some(slot) => slot.1 = v,
-                            None => out.push((field.clone(), v)),
+                            None => out.push((*field, v)),
                         }
                         Ok(Value::Record(name, Rc::new(out)))
                     }
@@ -726,16 +746,20 @@ impl Interp {
         match (name, args.as_slice()) {
             // -- console ------------------------------------------------------
             ("print-line-uni" | "print-line", [v]) => {
-                let _ = writeln!(self.out, "{}", show(v));
+                // Spelled BEFORE the write: `show` reads the table and the
+                // write takes the output buffer, and they are the same `self`.
+                let line = show(&self.syms, v);
+                let _ = writeln!(self.out, "{line}");
                 Ok(Unit)
             }
             ("print-uni" | "print", [v]) => {
-                let _ = write!(self.out, "{}", show(v));
+                let part = show(&self.syms, v);
+                let _ = write!(self.out, "{part}");
                 Ok(Unit)
             }
 
             // -- text ---------------------------------------------------------
-            ("show" | "integer-to-text", [v]) => text(show(v)),
+            ("show" | "integer-to-text", [v]) => text(show(&self.syms, v)),
             ("text-length", [Text(t)]) => Ok(Int(t.len() as i64)),
             ("char-at", [Text(t), Int(i)]) => t
                 .as_bytes()
@@ -923,12 +947,13 @@ impl Interp {
             // NAME as text, value.
             ("__record-set", [Record(n, fs), Text(field), v]) => {
                 let mut out = (**fs).clone();
-                // The field is named by a VALUE here rather than by the
-                // source, so this is the one place the name does not come from
-                // the interner -- but a `Text` is already an `Rc<String>`, so
-                // it costs a refcount and not a copy.
-                let key = field.clone();
-                let bound = self.bounds.get(&(n.clone(), key.clone()));
+                // **The field is named by a VALUE here, not by the source**, so
+                // this is the one place a name is not already in the table --
+                // and the one reason the interpreter keeps a mutable one. A
+                // field named by a text nothing else mentions is a new symbol.
+                let n = *n;
+                let key = self.syms.intern(field);
+                let bound = self.bounds.get(&(n, key));
                 let v = match (v, bound) {
                     (Int(i), Some(b)) => Int(apply_bound(*i, b)),
                     _ => v.clone(),
@@ -937,7 +962,7 @@ impl Interp {
                     Some(slot) => slot.1 = v,
                     None => out.push((key, v)),
                 }
-                Ok(Record(n.clone(), Rc::new(out)))
+                Ok(Record(n, Rc::new(out)))
             }
 
             // NOT "is not interpreted yet" -- this arm cannot tell an absent
@@ -1057,7 +1082,7 @@ fn unescape(raw: &str) -> String {
     out
 }
 
-fn binary(op: BinaryOp, a: Value, b: Value) -> R<Value> {
+fn binary(syms: &SymTab, op: BinaryOp, a: Value, b: Value) -> R<Value> {
     use BinaryOp::*;
     use Value::*;
     Ok(match (op, &a, &b) {
@@ -1094,8 +1119,8 @@ fn binary(op: BinaryOp, a: Value, b: Value) -> R<Value> {
         (OpDefEq, _, _) => Bool(equal(&a, &b)),
         // `&` is one operator with four meanings, chosen by what it is given.
         (OpAnd | OpAppend, Text(x), Text(y)) => Text(Rc::new(format!("{x}{y}"))),
-        (OpAnd | OpAppend, Text(x), _) => Text(Rc::new(format!("{x}{}", show(&b)))),
-        (OpAnd | OpAppend, _, Text(y)) => Text(Rc::new(format!("{}{y}", show(&a)))),
+        (OpAnd | OpAppend, Text(x), _) => Text(Rc::new(format!("{x}{}", show(syms, &b)))),
+        (OpAnd | OpAppend, _, Text(y)) => Text(Rc::new(format!("{}{y}", show(syms, &a)))),
         (OpAnd | OpAppend, List(x), List(y)) => {
             let mut out = (**x).clone();
             out.extend(y.iter().cloned());
@@ -1158,13 +1183,13 @@ fn matches_pat(v: &Value, p: &PatCode, vals: &mut Vec<Value>) -> bool {
         PatCode::Lit(l) => equal(v, l),
         PatCode::BadLit => false,
         PatCode::Ctor(name, subs) => match v {
-            Value::Ctor(n, fields) if **n == *name => {
+            Value::Ctor(n, fields) if *n == *name => {
                 subs.len() == fields.len()
                     && subs.iter().zip(fields.iter()).all(|(s, f)| matches_pat(f, s, vals))
             }
             // A one-field constructor pattern over a bare value is how the
             // tuple patterns land after desugaring.
-            Value::Record(n, fields) if **n == *name => {
+            Value::Record(n, fields) if *n == *name => {
                 subs.len() == fields.len()
                     && subs.iter().zip(fields.iter()).all(|(s, f)| matches_pat(&f.1, s, vals))
             }
@@ -1180,7 +1205,7 @@ fn matches_pat(v: &Value, p: &PatCode, vals: &mut Vec<Value>) -> bool {
     }
 }
 
-pub fn show(v: &Value) -> String {
+pub fn show(syms: &SymTab, v: &Value) -> String {
     match v {
         Value::Int(i) => i.to_string(),
         Value::Real(f) => format!("{f}"),
@@ -1189,17 +1214,18 @@ pub fn show(v: &Value) -> String {
         Value::Bool(b) => if *b { "True" } else { "False" }.to_string(),
         Value::Unit => String::new(),
         Value::List(xs) => {
-            let inner: Vec<String> = xs.iter().map(show).collect();
+            let inner: Vec<String> = xs.iter().map(|x| show(syms, x)).collect();
             format!("[{}]", inner.join(", "))
         }
-        Value::Ctor(n, fs) if fs.is_empty() => (**n).clone(),
+        Value::Ctor(n, fs) if fs.is_empty() => syms.text(*n).to_string(),
         Value::Ctor(n, fs) => {
-            let inner: Vec<String> = fs.iter().map(show).collect();
-            format!("{} {}", n, inner.join(" "))
+            let inner: Vec<String> = fs.iter().map(|x| show(syms, x)).collect();
+            format!("{} {}", syms.text(*n), inner.join(" "))
         }
         Value::Record(n, fs) => {
-            let inner: Vec<String> = fs.iter().map(|(k, v)| format!("{k} = {}", show(v))).collect();
-            format!("{} {{ {} }}", n, inner.join(", "))
+            let inner: Vec<String> =
+                fs.iter().map(|(k, v)| format!("{} = {}", syms.text(*k), show(syms, v))).collect();
+            format!("{} {{ {} }}", syms.text(*n), inner.join(", "))
         }
         Value::Fun(_) => "<function>".to_string(),
     }
@@ -1225,13 +1251,17 @@ mod tests {
     use super::*;
 
     /// **A variant that grows `Value` costs more than the allocations it can
-    /// save.** Interning record field names as `Rc<str>` removed 1.59 million
-    /// allocations from one safari unit and ran 16% SLOWER, because `Rc<str>`
-    /// is a fat pointer: it took the largest variant from 16 bytes to 24 and
-    /// this enum from 24 to 32, and every step moves `Value`s. `Rc<String>`
-    /// keeps it thin and won 6% instead. This test is that lesson, enforced.
+    /// save**, and this number is the record of learning that the hard way.
+    ///
+    /// It was 24 bytes when a record's type name was an `Rc<String>`. Interning
+    /// those names as `Rc<str>` removed 1.59 million allocations from one
+    /// safari unit and ran 16% SLOWER, because `Rc<str>` is a FAT pointer: it
+    /// took the largest variant from 16 bytes to 24 and this enum from 24 to
+    /// 32, and every step moves `Value`s. `Rc<String>` kept it thin and won 6%.
+    /// Symbols then took the largest variant -- `Record(Sym, Rc<Vec<..>>)` --
+    /// down to 12, and the enum to 16. Two words.
     #[test]
-    fn value_is_three_words() {
-        assert_eq!(std::mem::size_of::<Value>(), 24);
+    fn value_is_two_words() {
+        assert_eq!(std::mem::size_of::<Value>(), 16);
     }
 }

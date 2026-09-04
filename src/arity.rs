@@ -40,6 +40,7 @@
 //! skipped rather than guessed at, and counted in the summary so the number
 //! skipped is visible rather than silent.
 
+use crate::symbol::{Sym, SymTab};
 use crate::ast::{Chapter, Def, Expr};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -66,13 +67,14 @@ pub fn index(chapters: &[(String, Chapter)]) -> BTreeMap<String, Declared> {
                 path: path.clone(),
                 point_free: d.params.is_empty() && !d.declared_type.is_empty(),
             };
-            match out.get(&d.name) {
+            let dname = ch.syms.text(d.name).to_string();
+            match out.get(&dname) {
                 Some(prev) if prev.params != dec.params => {
-                    ambiguous.insert(d.name.clone());
+                    ambiguous.insert(dname.clone());
                 }
                 Some(_) => {}
                 None => {
-                    out.insert(d.name.clone(), dec);
+                    out.insert(dname, dec);
                 }
             }
         }
@@ -109,17 +111,17 @@ pub fn calls(ch: &Chapter) -> Vec<Call> {
         // LOCAL. A local named as a tree definition is shadowing, and grading
         // its call sites against the tree's arity is how a checker earns a
         // reputation for crying wolf.
-        let mut bound: BTreeSet<String> = d.params.iter().map(|p| p.name.clone()).collect();
+        let mut bound: BTreeSet<Sym> = d.params.iter().map(|p| p.name).collect();
         collect_binders(&d.body, &mut bound);
-        scan(&d.body, &bound, &mut out);
+        scan(&ch.syms, &d.body, &bound, &mut out);
     }
     out
 }
 
-fn collect_binders(e: &Expr, out: &mut BTreeSet<String>) {
+fn collect_binders(e: &Expr, out: &mut BTreeSet<Sym>) {
     e.walk(&mut |x| match x {
-        Expr::Lambda(ns, _, _) => out.extend(ns.iter().cloned()),
-        Expr::Let(bs, _, _) => out.extend(bs.iter().map(|b| b.name.clone())),
+        Expr::Lambda(ns, _, _) => out.extend(ns.iter().copied()),
+        Expr::Let(bs, _, _) => out.extend(bs.iter().map(|b| b.name)),
         _ => {}
     });
 }
@@ -135,7 +137,7 @@ fn addr(e: &Expr) -> usize {
     e as *const Expr as usize
 }
 
-fn scan(body: &Expr, bound: &BTreeSet<String>, out: &mut Vec<Call>) {
+fn scan(syms: &SymTab, body: &Expr, bound: &BTreeSet<Sym>, out: &mut Vec<Call>) {
     let mut interior: BTreeSet<usize> = BTreeSet::new();
     let mut value_pos: BTreeSet<usize> = BTreeSet::new();
     body.walk(&mut |x| match x {
@@ -167,7 +169,7 @@ fn scan(body: &Expr, bound: &BTreeSet<String>, out: &mut Vec<Call>) {
         if let Expr::NameRef(n, sp) = head {
             if !bound.contains(n) {
                 out.push(Call {
-                    name: n.clone(),
+                    name: syms.text(*n).to_string(),
                     applied,
                     line: sp.line,
                     in_arg_position: value_pos.contains(&addr(x)),
