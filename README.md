@@ -26,11 +26,16 @@ that sees MEANING rather than shape: see "Running a program" below, and
    PRs move front-end output, and golds cut against unpatched master would
    encode bugs we reported. Reach them through `$CODEX_GOLDS`.
 4. **Clean by construction.** No generated code in the repo, no `target/`, no
-   vendored golds, no benchmark output. Point `CARGO_TARGET_DIR` at a sandbox.
+   vendored golds, no benchmark output. `CARGO_TARGET_DIR` goes to
+   `~/build/rust-target` -- **a build cache, and deliberately NOT a sandbox.**
+   A sandbox under `~/runs` is a measurement of ONE commit and is deleted when
+   the work is done; a cargo cache spans commits by design, which is the whole
+   point of it. Putting one in `~/runs` makes a directory that looks like a
+   measurement, is not, and survives every cleanup.
 
 ## Building
 
-    export CARGO_TARGET_DIR=~/runs/<sandbox>/rust-target
+    export CARGO_TARGET_DIR=~/build/rust-target
     cargo build --release
     cargo test                    # needs no checkout and no bank
 

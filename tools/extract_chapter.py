@@ -16,9 +16,9 @@ behind a definition that happens to follow it.
 Nothing is written unless every planned name exists exactly once in the source.
 The definitions left behind keep their own sections and prose untouched.
 """
-import subprocess, sys, pathlib, collections
+import os, subprocess, sys, pathlib, collections
 
-BIN = '/home/steve/showell_repos/rust-codex-compiler/target/release/cohesion'
+BIN = os.environ.get('CARGO_TARGET_DIR', os.path.expanduser('~/build/rust-target')) + '/release/cohesion'
 
 def main(src_path, header_path, plan_path, out_path):
     src = pathlib.Path(src_path).read_bytes()

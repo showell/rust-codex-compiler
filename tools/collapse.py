@@ -12,7 +12,7 @@ exactly the ones that straddle any proposed cut. Steve's algorithm, 2026-09-03.
 
 Interface names (read by another chapter) are roots and are never absorbed.
 """
-import collections, subprocess, sys
+import collections, os, subprocess, sys
 
 argv = sys.argv[1:]
 extra_roots = set()
@@ -22,7 +22,7 @@ if '--roots' in argv:
     del argv[i:i + 2]
 chapter, path = argv[0], argv[1]
 dirs = argv[2:]
-BIN = '/home/steve/showell_repos/rust-codex-compiler/target/release'
+BIN = os.environ.get('CARGO_TARGET_DIR', os.path.expanduser('~/build/rust-target')) + '/release'
 
 graph = subprocess.run([BIN + '/cohesion', '--graph', path],
                        capture_output=True, text=True).stdout
