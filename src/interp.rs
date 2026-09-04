@@ -22,7 +22,7 @@
 //! is running.
 
 use crate::ast::*;
-use crate::code::{Arm, Code, Compiler, Names, PatCode, Stmt};
+use crate::code::{Arm, Code, Compiler, Interner, Names, PatCode, Stmt};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::rc::Rc;
@@ -35,8 +35,10 @@ pub enum Value {
     Char(char),
     Bool(bool),
     List(Rc<Vec<Value>>),
-    /// A record literal: its type name and its fields.
-    Record(Rc<String>, Rc<Vec<(String, Value)>>),
+    /// A record literal: its type name and its fields. The names are SHARED
+    /// (`crate::code::Interner`), so building a record costs a refcount per
+    /// field rather than a copy of the field's text.
+    Record(Rc<String>, Rc<Vec<(Rc<String>, Value)>>),
     /// A variant constructor, saturated or not.
     Ctor(Rc<String>, Rc<Vec<Value>>),
     Fun(Rc<Closure>),
@@ -156,7 +158,7 @@ pub struct Interp {
     /// time. A record literal names its type, so its bounds are attached at
     /// compile time; a field ASSIGNMENT names only the field, and which record
     /// it lands on is whatever the left-hand side evaluates to.
-    bounds: HashMap<(String, String), FieldBound>,
+    bounds: HashMap<(Rc<String>, Rc<String>), FieldBound>,
     /// The empty environment, shared: every top-level closure closes over it.
     root: Env,
     /// Names defined in more than one chapter of a bundled unit.
@@ -194,6 +196,7 @@ impl Interp {
     pub fn new(ch: &Chapter) -> Interp {
         let root = Scope::root();
         let mut names = Names::default();
+        let mut interner = Interner::default();
         let mut globals: Vec<Value> = Vec::new();
 
         // Pass 1: an index for every definition, and who owns each name.
@@ -232,7 +235,7 @@ impl Interp {
                     for f in fields {
                         if let TypeExpr::BoundedInt(_, lo, hi, mode, _) = &f.type_expr {
                             names.bounds.insert(
-                                (name.clone(), f.name.clone()),
+                                (interner.intern(name), interner.intern(&f.name)),
                                 FieldBound { lo: *lo, hi: *hi, mode: *mode },
                             );
                         }
@@ -285,7 +288,7 @@ impl Interp {
         // Constructors are FIXED for the run, so their values are built here
         // and every reference clones one refcount.
         for (i, name, arity) in ctors {
-            let rc = Rc::new(name);
+            let rc = interner.intern(&name);
             globals[i as usize] = if arity == 0 {
                 Value::Ctor(rc, Rc::new(Vec::new()))
             } else {
@@ -302,12 +305,12 @@ impl Interp {
         // anything the unit defines regardless of where it sits.
         let mut const_defs: Vec<Rc<Code>> = Vec::with_capacity(const_defs_src.len());
         for d in &const_defs_src {
-            const_defs.push(Rc::new(Compiler::body(&names, &d.chapter_slug, &d.body)));
+            const_defs.push(Rc::new(Compiler::body(&names, &mut interner, &d.chapter_slug, &d.body)));
         }
         for (i, d) in &fun_defs {
             globals[*i as usize] = Value::Fun(Rc::new(Closure {
                 arity: d.params.len(),
-                body: Body::Code(Rc::new(Compiler::def(&names, d))),
+                body: Body::Code(Rc::new(Compiler::def(&names, &mut interner, d))),
                 env: root.clone(),
                 applied: Vec::new(),
             }));
@@ -320,7 +323,7 @@ impl Interp {
             .iter()
             .rev()
             .find(|d| d.name == "opening")
-            .map(|d| Rc::new(Compiler::body(&names, &d.chapter_slug, &d.body)));
+            .map(|d| Rc::new(Compiler::body(&names, &mut interner, &d.chapter_slug, &d.body)));
 
         Interp {
             globals,
@@ -498,8 +501,8 @@ impl Interp {
                 let v = self.eval(val, env)?;
                 match base {
                     Value::Record(name, fs) => {
-                        let mut out: Vec<(String, Value)> = (*fs).clone();
-                        let bound = self.bounds.get(&((*name).clone(), field.clone()));
+                        let mut out: Vec<(Rc<String>, Value)> = (*fs).clone();
+                        let bound = self.bounds.get(&(name.clone(), field.clone()));
                         let v = match (&v, bound) {
                             (Value::Int(i), Some(b)) => Value::Int(apply_bound(*i, b)),
                             _ => v,
@@ -920,14 +923,19 @@ impl Interp {
             // NAME as text, value.
             ("__record-set", [Record(n, fs), Text(field), v]) => {
                 let mut out = (**fs).clone();
-                let bound = self.bounds.get(&((**n).clone(), (**field).clone()));
+                // The field is named by a VALUE here rather than by the
+                // source, so this is the one place the name does not come from
+                // the interner -- but a `Text` is already an `Rc<String>`, so
+                // it costs a refcount and not a copy.
+                let key = field.clone();
+                let bound = self.bounds.get(&(n.clone(), key.clone()));
                 let v = match (v, bound) {
                     (Int(i), Some(b)) => Int(apply_bound(*i, b)),
                     _ => v.clone(),
                 };
-                match out.iter_mut().find(|(k, _)| k == &**field) {
+                match out.iter_mut().find(|(k, _)| *k == key) {
                     Some(slot) => slot.1 = v,
-                    None => out.push(((**field).clone(), v)),
+                    None => out.push((key, v)),
                 }
                 Ok(Record(n.clone(), Rc::new(out)))
             }
@@ -1209,5 +1217,21 @@ fn type_name(v: &Value) -> &'static str {
         Value::Ctor(..) => "a constructor",
         Value::Fun(_) => "a function",
         Value::Unit => "nothing",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **A variant that grows `Value` costs more than the allocations it can
+    /// save.** Interning record field names as `Rc<str>` removed 1.59 million
+    /// allocations from one safari unit and ran 16% SLOWER, because `Rc<str>`
+    /// is a fat pointer: it took the largest variant from 16 bytes to 24 and
+    /// this enum from 24 to 32, and every step moves `Value`s. `Rc<String>`
+    /// keeps it thin and won 6% instead. This test is that lesson, enforced.
+    #[test]
+    fn value_is_three_words() {
+        assert_eq!(std::mem::size_of::<Value>(), 24);
     }
 }

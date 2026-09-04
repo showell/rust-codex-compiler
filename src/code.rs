@@ -37,6 +37,38 @@ use crate::interp::{literal, FieldBound, Value};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+/// One shared `Rc<String>` per distinct name, handed out while compiling.
+///
+/// **A record carries its field NAMES, and building one used to copy every one
+/// of them into a fresh `String`** -- 1,585,699 of those in a single safari
+/// unit, about two fifths of everything that run allocated, for a handful of
+/// distinct names written over and over. The names are fixed before the run
+/// starts, so they are shared instead and building a record bumps a refcount
+/// per field.
+///
+/// **`Rc<String>` and not `Rc<str>`, which is the whole reason this is written
+/// down.** `Rc<str>` is a FAT pointer: it took `Value`'s largest variant from
+/// 16 bytes to 24 and `Value` itself from 24 to 32, so every value the
+/// interpreter moved got a third bigger. Measured, that lost 16% -- more than
+/// the 1.59 million allocations it saved were worth. A name is dereferenced
+/// rarely and moved constantly, so the extra indirection is the cheap side of
+/// the trade.
+#[derive(Default)]
+pub struct Interner {
+    seen: HashMap<String, Rc<String>>,
+}
+
+impl Interner {
+    pub fn intern(&mut self, s: &str) -> Rc<String> {
+        if let Some(r) = self.seen.get(s) {
+            return r.clone();
+        }
+        let r = Rc::new(s.to_string());
+        self.seen.insert(s.to_string(), r.clone());
+        r
+    }
+}
+
 /// A lambda's fixed part: arity and compiled body, shared by every closure the
 /// lambda expression makes.
 #[derive(Debug)]
@@ -60,7 +92,7 @@ pub struct Arm {
 
 #[derive(Debug)]
 pub struct RecField {
-    pub name: Name,
+    pub name: Rc<String>,
     pub value: Code,
     /// The declared bound, read out of the record definition here rather than
     /// looked up under a two-`String` key on every record built.
@@ -120,9 +152,9 @@ pub enum Code {
     List(Vec<Code>),
     /// The type name is shared, not rebuilt per record.
     Record(Rc<String>, Vec<RecField>),
-    FieldAccess(Box<Code>, Name, Span),
+    FieldAccess(Box<Code>, Rc<String>, Span),
     Act(Vec<Stmt>),
-    FieldAssign(Box<Code>, Name, Box<Code>),
+    FieldAssign(Box<Code>, Rc<String>, Box<Code>),
     Lazy(Box<Code>),
     /// A form the interpreter does not do, with upstream's wording.
     Unsupported(&'static str),
@@ -148,7 +180,7 @@ pub struct Names {
     pub builtin_funs: HashMap<&'static str, u32>,
     pub builtin_nullary: HashSet<&'static str>,
     pub builtin_undeclared: HashSet<&'static str>,
-    pub bounds: HashMap<(String, String), FieldBound>,
+    pub bounds: HashMap<(Rc<String>, Rc<String>), FieldBound>,
 }
 
 /// Compiles one definition's body.
@@ -160,26 +192,32 @@ pub struct Names {
 /// whose pattern binds nothing, because the run pushes that one too.
 pub struct Compiler<'a> {
     names: &'a Names,
+    interner: &'a mut Interner,
     slug: &'a str,
     frames: Vec<Vec<&'a str>>,
 }
 
 impl<'a> Compiler<'a> {
-    pub fn new(names: &'a Names, slug: &'a str) -> Compiler<'a> {
-        Compiler { names, slug, frames: Vec::new() }
+    pub fn new(names: &'a Names, interner: &'a mut Interner, slug: &'a str) -> Compiler<'a> {
+        Compiler { names, interner, slug, frames: Vec::new() }
     }
 
     /// A definition's body, under a frame holding its parameters.
-    pub fn def(names: &'a Names, d: &'a Def) -> Code {
-        let mut c = Compiler::new(names, d.chapter_slug.as_str());
+    pub fn def(names: &'a Names, interner: &'a mut Interner, d: &'a Def) -> Code {
+        let mut c = Compiler::new(names, interner, d.chapter_slug.as_str());
         c.frames.push(d.params.iter().map(|p| p.name.as_str()).collect());
         c.expr(&d.body)
     }
 
     /// A body evaluated in the empty environment: a nullary definition, and
     /// `opening` itself.
-    pub fn body(names: &'a Names, slug: &'a str, e: &'a Expr) -> Code {
-        Compiler::new(names, slug).expr(e)
+    pub fn body(
+        names: &'a Names,
+        interner: &'a mut Interner,
+        slug: &'a str,
+        e: &'a Expr,
+    ) -> Code {
+        Compiler::new(names, interner, slug).expr(e)
     }
 
     pub fn expr(&mut self, e: &'a Expr) -> Code {
@@ -251,20 +289,19 @@ impl<'a> Compiler<'a> {
                 Code::List(out)
             }
             Expr::Record(name, fields, _) => {
+                let ty = self.interner.intern(name);
                 let mut out = Vec::with_capacity(fields.len());
                 for f in fields {
+                    let fname = self.interner.intern(&f.name);
                     let bound =
-                        self.names.bounds.get(&(name.clone(), f.name.clone())).copied();
-                    out.push(RecField {
-                        name: f.name.clone(),
-                        value: self.expr(&f.value),
-                        bound,
-                    });
+                        self.names.bounds.get(&(ty.clone(), fname.clone())).copied();
+                    out.push(RecField { name: fname, value: self.expr(&f.value), bound });
                 }
-                Code::Record(Rc::new(name.clone()), out)
+                Code::Record(ty, out)
             }
             Expr::FieldAccess(o, f, sp) => {
-                Code::FieldAccess(Box::new(self.expr(o)), f.clone(), *sp)
+                let name = self.interner.intern(f);
+                Code::FieldAccess(Box::new(self.expr(o)), name, *sp)
             }
             Expr::Act(stmts, _) => {
                 let mut out = Vec::with_capacity(stmts.len());
@@ -284,9 +321,10 @@ impl<'a> Compiler<'a> {
             }
             Expr::Lazy(i, _) => Code::Lazy(Box::new(self.expr(i))),
             Expr::FieldAssign(r, f, v, _) => {
+                let name = self.interner.intern(f);
                 let base = self.expr(r);
                 let val = self.expr(v);
-                Code::FieldAssign(Box::new(base), f.clone(), Box::new(val))
+                Code::FieldAssign(Box::new(base), name, Box::new(val))
             }
             Expr::Error(why, _) => {
                 Code::Fail(format!("the desugarer could not translate {why}"))
@@ -321,7 +359,7 @@ impl<'a> Compiler<'a> {
 
     /// The resolution order is the walker's, case for case. Changing it here
     /// changes which definition a colliding name means.
-    fn name(&self, n: &str) -> Code {
+    fn name(&mut self, n: &str) -> Code {
         if let Some(c) = self.local(n) {
             return c;
         }
@@ -358,7 +396,7 @@ impl<'a> Compiler<'a> {
         // `Nothing` are three of the eight that declare no type, and they are
         // constructors rather than anything to call.
         if n.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
-            return Code::Const(Value::Ctor(Rc::new(n.to_string()), Rc::new(Vec::new())));
+            return Code::Const(Value::Ctor(self.interner.intern(n), Rc::new(Vec::new())));
         }
         if let Some(name) = self.names.builtin_undeclared.get(n).copied() {
             return Code::Fail(format!(
