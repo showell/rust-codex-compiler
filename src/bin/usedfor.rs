@@ -1,8 +1,9 @@
 //! What is DONE with a builtin's answer, across the whole checkout.
 //!
-//!     census <builtin> <dir>...     every call site, grouped by consumer
+//!     usedfor <name> <dir>...     every call site, grouped by what consumes it
 //!
-//! `xref who` answers "which chapters read this name". That is the wrong
+//! The counterpart to `xref who`, which answers "which chapters read this
+//! name". That is the wrong
 //! question for a builtin whose type is `forall a. a -> Integer`: every caller
 //! reads it, and the reads are not alike. `address-of` is compared against zero
 //! in one place to mean ABSENT, ordered against a floor in another to mean
@@ -48,7 +49,7 @@ struct Site {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 {
-        eprintln!("usage: census <builtin> <dir>...");
+        eprintln!("usage: usedfor <name> <dir>...");
         return ExitCode::from(2);
     }
     let target = &args[0];
@@ -81,7 +82,7 @@ fn main() -> ExitCode {
         by_bucket.entry(s.bucket.as_str()).or_default().push(s);
     }
 
-    println!("census of `{target}` over {} chapters", files.len());
+    println!("`{target}` over {} chapters", files.len());
     println!("{} call sites, {} distinct consumers\n", sites.len(), by_bucket.len());
     for (bucket, ss) in &by_bucket {
         println!("{:>4}  {bucket}", ss.len());
