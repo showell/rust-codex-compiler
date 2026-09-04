@@ -27,7 +27,7 @@ BIN="${CODEXRUN:-${CARGO_TARGET_DIR:-$ROOT/target}/release/codexrun}"
 # total was a different measurement than it said it was. A missing subject is
 # now REPORTED.
 SUBJECTS=()
-for u in camera world truck_body cat_draw critter tree drive_main scene_main; do
+for u in camera world truck_draw cat_draw critter tree drive_main scene_main; do
     f="$SAFARI/build/$u-unit.codex"
     if [ -f "$f" ]; then
         SUBJECTS+=("$f")
