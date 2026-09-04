@@ -247,16 +247,17 @@ pub fn check_chapter(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState) {
     for d in &ch.defs {
         // A definition's parameters take their types from its declared arrow
         // spine, walked in order.
-        let mut spine = bindings.iter().find(|b| b.name == d.name).map(|b| b.ty.clone());
+        // A PARAMETER BINDS TO A FRESH VARIABLE, not to the declared type's
+        // argument. `bind-lambda-params` (TypeCheckerInference.codex:567) mints
+        // one per parameter and unification ties it to the declaration
+        // afterwards. Reading the type off the declared spine reaches the same
+        // conclusion and mints nothing, which is how fib's next-id came out 5
+        // instead of 8 -- the two parameters are two of the missing three.
         let mut saved = Vec::new();
         for p in &d.params {
-            let (arg, rest) = match spine {
-                Some(Ty::Fun(a, _, r)) => (*a, Some(*r)),
-                _ => (st.fresh(), None),
-            };
+            let fr = st.fresh();
             saved.push(p.name.clone());
-            env.bind(&p.name, arg);
-            spine = rest;
+            env.bind(&p.name, fr);
         }
         infer(&d.body, &mut env, &mut st);
         for _ in saved {
@@ -309,7 +310,17 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv, st: &mut UnifyState) -> Ty {
         // `double`, 3 in `opening` -- exactly the gold's `expr-types 11`.
         // Recording every expression instead gave 27.
         E::NameRef(n, _) => {
-            let t = env.get(n).cloned().unwrap_or(Ty::Error);
+            // INSTANTIATING A FORALL MINTS. `show` is
+            // `ForAllTy 0 (FunTy (TypeVar 0) empty-row TextTy)`, and opening
+            // applies it -- the third of fib's three missing mints.
+            let t = match env.get(n).cloned() {
+                Some(Ty::ForAll(_, body)) => {
+                    let fr = st.fresh();
+                    instantiate(&body, &fr)
+                }
+                Some(t) => t,
+                None => Ty::Error,
+            };
             st.expr_types.push((n.clone(), t.clone()));
             return t;
         }
@@ -366,6 +377,20 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv, st: &mut UnifyState) -> Ty {
         _ => Ty::Error,
     };
     t
+}
+
+/// Replace the bound variable of a forall with a fresh one.
+fn instantiate(t: &Ty, fresh: &Ty) -> Ty {
+    match t {
+        Ty::Var(_) => fresh.clone(),
+        Ty::Fun(a, r, b) => Ty::Fun(
+            Box::new(instantiate(a, fresh)),
+            r.clone(),
+            Box::new(instantiate(b, fresh)),
+        ),
+        Ty::List(e) => Ty::List(Box::new(instantiate(e, fresh))),
+        other => other.clone(),
+    }
 }
 
 /// Names in scope during inference.
