@@ -289,25 +289,34 @@ impl Node {
     }
 
     /// Every node of `kind` anywhere below here, in source order.
+    ///
+    /// **The filter comes before the sort, and that is the whole cost story.**
+    /// Collecting every node in the subtree and sorting THAT before filtering
+    /// meant asking a chapter for its definitions sorted the entire tree -- and
+    /// the key is not cheap either, since `tokens()` builds a stack to find the
+    /// first one, so the sort allocated per comparison. On a 2.7 MB resolved
+    /// unit this one call was about a sixth of the whole front end.
+    ///
+    /// The sort survives because it is not quite a no-op: the walk is
+    /// pre-order, which IS source order, except that a node holding no tokens
+    /// sorts last rather than staying where the walk found it. Sorting the
+    /// matches alone gives the same answer as sorting everything and then
+    /// filtering -- equal keys keep their walk order either way -- for a sort
+    /// over the handful that matched instead of every node there is.
     pub fn descendants(&self, kind: NodeKind) -> Vec<&Node> {
-        let mut out = Vec::new();
+        let mut out: Vec<&Node> = Vec::new();
         let mut stack: Vec<&Node> = vec![self];
-        // Walk children in order so the result is source order, not reverse.
-        let mut queue: Vec<&Node> = Vec::new();
         while let Some(n) = stack.pop() {
-            queue.push(n);
+            if n.kind == kind {
+                out.push(n);
+            }
             for c in n.children.iter().rev() {
                 if let Child::Node(sub) = c {
                     stack.push(sub);
                 }
             }
         }
-        queue.sort_by_key(|n| n.tokens().next().map(|t| t.offset).unwrap_or(u32::MAX));
-        for n in queue {
-            if n.kind == kind {
-                out.push(n);
-            }
-        }
+        out.sort_by_cached_key(|n| n.tokens().next().map(|t| t.offset).unwrap_or(u32::MAX));
         out
     }
 }
