@@ -139,9 +139,14 @@ pub struct Binding {
 /// `next_id` is NOT `substitutions.len()`, and the gold shows them equal at 8
 /// only by coincidence on this subject. They count different things: how many
 /// fresh variables were minted, and how many of them were resolved.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct UnifyState {
-    pub substitutions: Vec<(u32, Ty)>,
+    /// A SLOT ARRAY INDEXED BY VARIABLE ID, not a list of pairs: upstream's is
+    /// `List CodexType` and slot `i` holds what variable `i` resolved to,
+    /// initialised to `TypeVar i` -- itself. `resolve` (Unifier.codex:101)
+    /// reads `list-at substitutions id`, so the index IS the identity, and a
+    /// pair list would answer the same questions with a different length.
+    pub substitutions: Vec<Ty>,
     pub next_id: u32,
     /// Row ids are a SEPARATE counter from type-variable ids. `next-id` in the
     /// gold counts only the latter, so minting a row must not advance it.
@@ -150,12 +155,33 @@ pub struct UnifyState {
     pub errors: usize,
 }
 
+impl Default for UnifyState {
+    /// `empty-unification-state` (Unifier.codex:41) is NOT empty. It starts
+    /// with two substitution slots and `next-id = 2`, so every id we hand out
+    /// is two higher than a counter starting at zero -- and those ids are
+    /// PRINTED into the IR as `(tvar 41)`, so starting at zero is not a
+    /// harmless offset.
+    fn default() -> UnifyState {
+        UnifyState {
+            substitutions: vec![Ty::Var(0), Ty::Var(1)],
+            next_id: 2,
+            next_row_id: 0,
+            expr_types: Vec::new(),
+            errors: 0,
+        }
+    }
+}
+
 impl UnifyState {
     /// Mint a fresh type variable. ORDER MATTERS: the gold records how many
     /// were minted, so a checker that reaches the same answer by a different
     /// route reports a different number and is wrong here.
     pub fn fresh(&mut self) -> Ty {
+        // `advance-id` pushes a SLOT and advances the id together, so
+        // `substitutions.len()` and `next_id` move in lockstep and the gold
+        // reports both as 8 for the same reason.
         let id = self.next_id;
+        self.substitutions.push(Ty::Var(id));
         self.next_id += 1;
         Ty::Var(id)
     }
@@ -249,17 +275,29 @@ pub fn check_chapter(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState) {
     for d in &ch.defs {
         // A definition's parameters take their types from its declared arrow
         // spine, walked in order.
-        // A PARAMETER BINDS TO A FRESH VARIABLE, not to the declared type's
-        // argument. `bind-lambda-params` (TypeCheckerInference.codex:567) mints
-        // one per parameter and unification ties it to the declaration
-        // afterwards. Reading the type off the declared spine reaches the same
-        // conclusion and mints nothing, which is how fib's next-id came out 5
-        // instead of 8 -- the two parameters are two of the missing three.
+        // A DEFINITION'S PARAMETERS COME FROM ITS DECLARED ARROW, and mint
+        // nothing. `bind-lambda-params` mints one per parameter, but it is for
+        // LAMBDAS; a declared definition already has its parameter types.
+        //
+        // Minting here gave the right TOTAL by cancelling a second error --
+        // starting next-id at 0 where upstream starts at 2 -- and the ids would
+        // have been shifted by two all the way into the IR, where they are
+        // printed as `(tvar N)`. Two wrongs summing to 8.
+        let mut spine = bindings.iter().find(|b| b.name == d.name).map(|b| b.ty.clone());
         let mut saved = Vec::new();
         for p in &d.params {
-            let fr = st.fresh();
+            let arg = match spine {
+                Some(Ty::Fun(a, _, r)) => {
+                    spine = Some(*r);
+                    *a
+                }
+                _ => {
+                    spine = None;
+                    st.fresh()
+                }
+            };
             saved.push(p.name.clone());
-            env.bind(&p.name, fr);
+            env.bind(&p.name, arg);
         }
         infer(&d.body, &mut env, &mut st);
         for _ in saved {
