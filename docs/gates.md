@@ -140,3 +140,28 @@ oracle, and `and` failed to short-circuit under all of them.
 
 The fourth arm built on it -- what it proves, why it needs no gold, and the one
 unit that must DISAGREE -- is `safari/README.md`.
+
+## The bundle gate: two resolvers, one checkout
+
+    bundle diff <units-dir> <roots-dir>
+
+The ladder's `bundle_gate.sh` and safari's `harness/bundle_gate.sh` drive it.
+Today: **1,196 corpus units identical, 35 differing only in line endings, 0
+differing, 0 without a root**; and **35 of 35** safari targets identical.
+
+**What it cannot see.** It compares the two resolvers against each other, so a
+mistake BOTH make is invisible to it -- the same shape as any differential.
+What kills that risk here is that the two share no code and reach the registry
+by different routes; what does not is that both take the registry as truth.
+A quire mapped to the wrong directory would be read identically by both.
+
+**It must resolve the Python units at the same instant.** Against a units
+directory banked days earlier, 33 units differed on the first run and not one
+was a bundler disagreeing -- they were upstream's prose edits in between. The
+script regenerates rather than reusing, and that is not an optimisation to skip.
+
+**The 35 line-ending units are upstream's, filed as issue 124.** Twenty chapters
+carry `\r\r\n` on their `Chapter:` line. Python reads with universal newlines,
+where a lone CR is also a break, so it sees a blank line where reading bytes
+sees two carriage returns on one line. The gate translates both sides the way a
+text-mode reader would before calling a difference real.

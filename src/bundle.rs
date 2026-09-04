@@ -287,8 +287,16 @@ fn name_of(p: &Path) -> String {
 
 /// One chapter's own text is trailed by exactly one newline, as upstream's
 /// bundler does; the parts are then joined by one more.
+///
+/// **THE TRIM TAKES CR AS WELL AS LF, AND THAT IS NOT COSMETIC.** A chapter
+/// committed with CRLF ends `\r\n\r\n`; trimming only `\n` stops at the `\r`
+/// and keeps a blank line that a text-mode reader -- which never sees a `\r` at
+/// all -- has already removed. So the two bundlers differed by a whole line on
+/// every CRLF chapter, and the cause looked like an ordering bug rather than
+/// what it was. Trimming trailing blank lines is a question about blank lines,
+/// and the answer should not depend on which bytes spell one.
 fn tidy(text: &str) -> String {
-    format!("{}\n", text.trim_end_matches('\n'))
+    format!("{}\n", text.trim_end_matches(['\n', '\r']))
 }
 
 fn walk(

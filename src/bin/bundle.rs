@@ -126,32 +126,50 @@ fn diff(units: &Path, roots: &Path) -> ExitCode {
     names.retain(|p| p.extension().is_some_and(|e| e == "codex"));
     names.sort();
 
-    let (mut same, mut differ, mut absent) = (0usize, 0usize, 0usize);
+    // ROOTS ARE FOUND RECURSIVELY AND BY STEM, because that is the population
+    // resolve_corpus.py resolves: every .codex under codex/test except apps/,
+    // keyed by bare stem. Looking only in the top directory found roots for 611
+    // of 1,231 units and called the other 620 "no root here" -- half the corpus
+    // silently outside the gate, which is the failure this gate exists to catch
+    // in other people's tools.
+    let mut index: std::collections::BTreeMap<String, PathBuf> = std::collections::BTreeMap::new();
+    let mut ambiguous: Vec<String> = Vec::new();
+    walk_roots(roots, &mut index, &mut ambiguous);
+    for a in &ambiguous {
+        println!("ambiguous root stem: {a}");
+    }
+
+    let (mut same, mut differ, mut absent, mut eol) = (0usize, 0usize, 0usize, 0usize);
     let mut first: Vec<String> = Vec::new();
     for unit in &names {
-        let stem = unit.file_stem().unwrap_or_default();
-        let root = roots.join(stem).with_extension("codex");
-        if !root.is_file() {
+        let stem = unit.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let Some(root) = index.get(&stem).cloned() else {
             absent += 1;
             continue;
-        }
+        };
         let theirs = std::fs::read_to_string(unit).unwrap_or_default();
         let ours = match bundle::resolve(&root, &qs) {
             Ok(b) => b.text,
             Err(why) => {
                 differ += 1;
                 if first.len() < 10 {
-                    first.push(format!("{}: REFUSED {why}", stem.to_string_lossy()));
+                    first.push(format!("{stem}: REFUSED {why}"));
                 }
                 continue;
             }
         };
         if ours == theirs {
             same += 1;
+        } else if universal(&ours) == universal(&theirs) {
+            // Upstream's malformed line endings, filed as issue 124. Kept
+            // visible and counted, but not a bundler disagreement: the two
+            // resolvers read the same bytes and one of them is a text-mode
+            // reader translating them.
+            eol += 1;
         } else {
             differ += 1;
             if first.len() < 10 {
-                first.push(format!("{}: {}", stem.to_string_lossy(), why_differ(&ours, &theirs)));
+                first.push(format!("{stem}: {}", why_differ(&ours, &theirs)));
             }
         }
     }
@@ -159,7 +177,8 @@ fn diff(units: &Path, roots: &Path) -> ExitCode {
         println!("{line}");
     }
     println!();
-    println!("{same} identical, {differ} differ, {absent} units with no root here");
+    println!("{same} identical, {eol} differ only in line endings (issue 124), \
+{differ} differ, {absent} units with no root here");
     if differ == 0 {
         ExitCode::SUCCESS
     } else {
@@ -167,9 +186,54 @@ fn diff(units: &Path, roots: &Path) -> ExitCode {
     }
 }
 
+/// What a text-mode reader would have seen: CRLF, and a LONE CR, are one break.
+///
+/// **THE LONE CR IS THE WHOLE REASON THIS EXISTS.** Twenty chapters upstream
+/// carry `\r\r\n` on their `Chapter:` line -- a doubled carriage return, one per
+/// file. Python reads with universal newlines, where a lone `\r` is also a line
+/// break, so it sees a blank line there; reading bytes keeps two carriage
+/// returns on one line. Stripping CR is NOT enough to compare the two, because
+/// one side has a line the other does not. Translating the way the text-mode
+/// reader does is.
+fn universal(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Every `.codex` under `roots` except `apps/`, keyed by bare stem.
+fn walk_roots(
+    dir: &Path,
+    index: &mut std::collections::BTreeMap<String, PathBuf>,
+    ambiguous: &mut Vec<String>,
+) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.filter_map(|e| e.ok()) {
+        let p = e.path();
+        if p.is_dir() {
+            if p.file_name().is_some_and(|n| n == "apps") {
+                continue;
+            }
+            walk_roots(&p, index, ambiguous);
+        } else if p.extension().is_some_and(|x| x == "codex") {
+            let stem = p.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+            if let Some(had) = index.insert(stem.clone(), p) {
+                ambiguous.push(format!("{stem} ({} and another)", had.display()));
+            }
+        }
+    }
+}
+
 /// The first line that disagrees, and how long each side is -- enough to say
 /// what KIND of difference it is without printing two whole units.
+///
+/// **CARRIAGE RETURNS GET NAMED RATHER THAN SHOWN.** The known difference
+/// between the two resolvers is that Python's text-mode read drops CR and this
+/// one keeps it, and printing those two lines side by side prints two strings
+/// that look identical -- the least useful true thing a diff can say.
 fn why_differ(ours: &str, theirs: &str) -> String {
+    if ours.replace('\r', "") == theirs.replace('\r', "") {
+        let n = ours.bytes().filter(|b| *b == b'\r').count();
+        return format!("carriage returns only ({n} of them); see issue 124");
+    }
     let mut a = ours.lines();
     let mut b = theirs.lines();
     let mut n = 0usize;
