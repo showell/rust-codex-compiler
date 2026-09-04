@@ -7,6 +7,7 @@ pub mod ast;
 pub mod block;
 pub mod builtins;
 pub mod charcode;
+pub mod check;
 pub mod cohesion;
 pub mod cst;
 pub mod decl;
