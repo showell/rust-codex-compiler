@@ -30,12 +30,26 @@ fn main() -> ExitCode {
             }
             None => ExitCode::from(2),
         },
+        Some("whole") if args.len() == 2 || args.len() == 3 => match whole(Path::new(&args[1]), args.get(2).map(String::as_str)) {
+            Some(text) => {
+                let out = std::io::stdout();
+                let _ = writeln!(out.lock(), "{text}");
+                ExitCode::SUCCESS
+            }
+            None => {
+                eprintln!("REFUSED: a definition in this chapter cannot be typed without the checker");
+                ExitCode::from(2)
+            }
+        },
+        Some("gradewhole") if args.len() == 2 => grade_whole(Path::new(&args[1])),
         Some("grade") if args.len() == 2 => grade(Path::new(&args[1])),
         Some("defs") if args.len() == 2 => defs(Path::new(&args[1])),
         _ => {
             eprintln!("usage: irdump preamble <unit.codex>");
             eprintln!("       irdump grade <units-dir>");
             eprintln!("       irdump defs <units-dir>");
+            eprintln!("       irdump whole <unit.codex>        preamble AND definition bodies");
+            eprintln!("       irdump gradewhole <units-dir>    whole files against $CODEX_GOLDS/ir");
             ExitCode::from(2)
         }
     }
@@ -270,4 +284,64 @@ parameter (`compile-frontend source \"Program\" flags`), not a fact about the so
     } else {
         ExitCode::FAILURE
     }
+}
+
+
+/// Preamble plus definition bodies: a whole gold, or nothing.
+///
+/// The preamble ends at `  (defs`, `ir::emit_defs` contributes the definition
+/// lines, and the two closing parens shut `(defs` and `(chapter`.
+fn whole(path: &Path, chapter: Option<&str>) -> Option<String> {
+    let src = std::fs::read(path).ok()?;
+    let parsed = parser::parse(&src);
+    let head = preamble::emit(&parsed.tree, &src, chapter);
+    let mut dg = codexc::desugar::Desugar::new(&src);
+    let ch = dg.chapter(&parsed.tree);
+    let defs = codexc::ir::emit_defs(&ch)?;
+    Some(format!("{head}{defs}))"))
+}
+
+/// Every unit against its gold, whole. A unit whose body cannot be typed yet is
+/// REFUSED and counted as such, never as a failure and never as a pass -- the
+/// three are different and only one of them is a defect.
+fn grade_whole(dir: &Path) -> ExitCode {
+    let Ok(golds) = std::env::var("CODEX_GOLDS") else {
+        eprintln!("CODEX_GOLDS is not set");
+        return ExitCode::from(2);
+    };
+    let mut files: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if e.path().extension().is_some_and(|x| x == "codex") {
+                files.push(e.path());
+            }
+        }
+    }
+    files.sort();
+    let (mut ok, mut refused, mut differ, mut nogold) = (0, 0, 0, 0);
+    let mut shown = 0;
+    for f in &files {
+        let stem = f.file_stem().unwrap().to_string_lossy().to_string();
+        let gp = Path::new(&golds).join("ir").join(format!("{stem}.ir"));
+        let Ok(gold) = std::fs::read_to_string(&gp) else { nogold += 1; continue };
+        let name = gold_chapter_name(&gold);
+        match whole(f, name) {
+            None => refused += 1,
+            Some(ours) => {
+                if ours.trim_end() == gold.trim_end() {
+                    ok += 1;
+                } else {
+                    differ += 1;
+                    if shown < 3 {
+                        shown += 1;
+                        let (at, g, o) = first_difference(gold.trim_end(), ours.trim_end());
+                        println!("DIFFER {stem} at byte {at}\n  gold {g}\n  ours {o}");
+                    }
+                }
+            }
+        }
+    }
+    println!("{} unit(s): {ok} byte-identical, {differ} differ, {refused} refused (not yet typable), {nogold} without a gold",
+             files.len());
+    if differ == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
