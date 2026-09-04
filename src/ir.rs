@@ -420,3 +420,97 @@ pub fn emit_defs_from(ch: &Chapter, roots: &[&str]) -> Result<String, String> {
     }
     Ok(out)
 }
+
+/// The `--- lower ---` section: a SHAPE dump, not IR text.
+///
+/// `LowerHarness.codex` prints each definition's header and then its expression
+/// tree as depth-prefixed kinds. The walk is PRE-ORDER and descends only into
+/// arms that carry an IRExpr -- a node holding a statement list prints its kind
+/// and stops, because the point is to diff two arms against each other and a
+/// node the walk does not enter is still a node both arms must agree on.
+///
+/// Cheaper to match than the IR text and it grades the same thing: whether the
+/// tree we lowered has the shape upstream lowered.
+/// NOT PRUNED. `ir-prune-unreachable-roots` runs at EMIT time -- the driver
+/// writes `emit-ir-chapter (ir-prune-unreachable-roots lifted-ir
+/// ir-emit-roots)` -- so the IR golds are pruned and this rung is not. `fib`
+/// shows the difference directly: nothing calls `double`, the IR gold drops it,
+/// and lower.truth keeps it.
+pub fn lower_section(ch: &Chapter, _roots: &[&str]) -> String {
+    let defs: Vec<&crate::ast::Def> = ch.defs.iter().collect();
+    let mut s = String::from("--- lower ---\n");
+    s.push_str(&format!("ir-name |{}|\n", ch.name));
+    s.push_str(&format!("ir-defs {}\n", defs.len()));
+    s.push_str("ir-eff-ops 0\n.\n");
+    for d in &defs {
+        let ty = d
+            .declared_type
+            .first()
+            .and_then(crate::check::resolve_declared)
+            .map_or_else(|| "other".to_string(), |t| crate::check::type_kind(&t));
+        s.push_str(&format!(
+            "irdef {} params {} slug {} punctual 0 uparams 0 ty {}\n",
+            d.name,
+            d.params.len(),
+            d.chapter_slug,
+            ty
+        ));
+        shape(&d.body, 0, &mut s);
+    }
+    s.push_str(".\n---\n");
+    s
+}
+
+fn kind(e: &Expr) -> String {
+    match e {
+        Expr::Lit(_, LiteralKind::IntLit, _) => "int".into(),
+        Expr::Lit(_, LiteralKind::NumLit, _) => "num".into(),
+        Expr::Lit(_, LiteralKind::TextLit, _) => "text".into(),
+        Expr::Lit(_, LiteralKind::BoolLit, _) => "bool".into(),
+        Expr::Lit(_, LiteralKind::CharLit, _) => "char".into(),
+        Expr::NameRef(n, _) => format!("name:{n}"),
+        Expr::Binary(..) => "binary".into(),
+        Expr::Unary(..) => "negate".into(),
+        Expr::If(..) => "if".into(),
+        Expr::Let(bs, ..) => format!("let:{}", bs.first().map_or("", |b| b.name.as_str())),
+        Expr::Apply(..) => "apply".into(),
+        Expr::Lambda(..) => "lambda".into(),
+        Expr::List(..) => "list".into(),
+        Expr::Match(..) => "match".into(),
+        Expr::Act(..) => "act".into(),
+        Expr::Record(n, ..) => format!("record:{n}"),
+        Expr::FieldAccess(_, f, _) => format!("field:{f}"),
+        Expr::FieldAssign(_, f, _, _) => format!("store:{f}"),
+        Expr::Error(..) => "error".into(),
+        _ => "other".into(),
+    }
+}
+
+fn shape(e: &Expr, d: usize, out: &mut String) {
+    out.push_str(&format!("e{d} {}\n", kind(e)));
+    match e {
+        Expr::Binary(l, _, r, _) => {
+            shape(l, d + 1, out);
+            shape(r, d + 1, out);
+        }
+        Expr::Unary(x, _) => shape(x, d + 1, out),
+        Expr::If(c, t, e2, _) => {
+            shape(c, d + 1, out);
+            shape(t, d + 1, out);
+            shape(e2, d + 1, out);
+        }
+        Expr::Let(bs, body, _) => {
+            if let Some(b) = bs.first() {
+                shape(&b.value, d + 1, out);
+            }
+            shape(body, d + 1, out);
+        }
+        Expr::Apply(f, a, _) => {
+            shape(f, d + 1, out);
+            shape(a, d + 1, out);
+        }
+        Expr::Lambda(_, b, _) => shape(b, d + 1, out),
+        Expr::FieldAccess(r, _, _) => shape(r, d + 1, out),
+        _ => {}
+    }
+}

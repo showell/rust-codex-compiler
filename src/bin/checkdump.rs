@@ -14,6 +14,22 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("lower") if args.len() == 2 => {
+            let Ok(src) = std::fs::read(Path::new(&args[1])) else {
+                eprintln!("cannot read {}", args[1]);
+                return ExitCode::from(2);
+            };
+            let parsed = parser::parse(&src);
+            let mut dg = Desugar::new(&src);
+            let ch = dg.chapter(&parsed.tree);
+            let out = std::io::stdout();
+            let _ = write!(
+                out.lock(),
+                "{}",
+                codexc::ir::lower_section(&ch, &codexc::ir::IR_EMIT_ROOTS)
+            );
+            ExitCode::SUCCESS
+        }
         Some("check") if args.len() == 2 => {
             let Ok(src) = std::fs::read(Path::new(&args[1])) else {
                 eprintln!("cannot read {}", args[1]);
@@ -29,6 +45,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!("usage: checkdump check <file.codex>");
+            eprintln!("       checkdump lower <file.codex>");
             ExitCode::from(2)
         }
     }
