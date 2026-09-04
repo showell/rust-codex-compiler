@@ -5,9 +5,11 @@ the way Cobblestone is -- lexer, parser, desugarer, scope, check, lower -- and
 stopping at the IR. **The primary goal is compile speed.** Linting and
 bug-hunting come later, on the same front end.
 
-There is also an interpreter (`codexrun`), which is not on that path. It walks
-the desugared AST and exists to be an oracle that sees MEANING rather than
-shape -- see `docs/gates.md`.
+There is also an interpreter (`codexrun`), which is not on that path. It
+compiles the desugared AST to a run form -- names already resolved to frame
+slots, literals already values -- and walks that. It exists to be an oracle
+that sees MEANING rather than shape: see "Running a program" below, and
+`docs/gates.md` for what it cannot see.
 
 ## Four rules this repo is built under
 
@@ -56,6 +58,33 @@ writes; safari's `build/*-unit.codex` already are.
 
 Everything that depends on the safari-codex checkout lives under `safari/` and
 has its own README there. Nothing is vendored; `SAFARI_ROOT` points elsewhere.
+
+## Running a program
+
+    codexrun <unit.codex>                        print what it prints
+    codexrun --check <unit.codex> <expected>     diff against a `.expected`
+    codexrun sweep <units-dir> <codex-test-dir>  every program that has one
+    codexrun bench <unit.codex>...               steps, seconds, steps per second
+
+The input is always a RESOLVED unit: one self-contained file carrying every
+chapter it cites. The ladder's `resolve_corpus.py` writes them for the corpus;
+safari's `build/*-unit.codex` already are.
+
+**A sweep is ONE process and the programs run SERIALLY**, one at a time, in
+sorted order. Each gets a thread that is spawned and joined before the next one
+starts: the thread is there for its 512 MB STACK, not for concurrency.
+Interpreting recursion with recursion makes a deep Codex program a deep Rust
+one, the default 8 MB is not enough for the corpus, and a stack overflow aborts
+the PROCESS -- so without the thread one program takes the whole sweep with it.
+It bounds each program at 60M steps, since one runaway would otherwise own the
+machine; a single run is unbounded. One line per program goes to stderr as it
+finishes and the verdict to stdout, so an interrupted sweep still leaves
+everything it learned.
+
+What a program pays before its first step is the FRONT END -- read, lex, parse,
+desugar, compile -- and a resolved unit carries its whole prelude, so that is
+not free. `bench` times the RUN only; the gap between its total and the wall
+clock is what the front end cost.
 
 ## The gates
 

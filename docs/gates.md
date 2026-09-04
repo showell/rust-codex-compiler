@@ -129,8 +129,9 @@ layer with names resolved, not expressions.
 
 ## The interpreter -- `codexrun`, `safari/run.sh`
 
-`codexrun` walks the desugared AST. No types, no IR, no zig, no guest, which is
-the point: **it shares nothing with the other arms below the text**, so when it
+`codexrun` compiles the desugared AST to a run form -- names resolved to frame
+slots, literals already values -- and walks that. No types, no IR, no zig, no
+guest, which is the point: **it shares nothing with the other arms below the text**, so when it
 disagrees the disagreement is attributable. It is also the first oracle here
 that sees MEANING rather than shape -- five byte-comparison oracles are one
 oracle, and `and` failed to short-circuit under all of them.
