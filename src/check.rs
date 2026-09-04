@@ -240,7 +240,9 @@ pub fn register_defs(ch: &crate::ast::Chapter, st: &mut UnifyState) -> Vec<Bindi
 pub fn check_chapter(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState) {
     let mut st = UnifyState::default();
     let bindings = register_defs(ch, &mut st);
-    let mut env = TyEnv::default();
+    // Builtins first, then the chapter's own names on top: a chapter that
+    // defines `max` shadows the builtin, which the golds show for that name.
+    let mut env = builtin_env();
     for b in &bindings {
         env.bind(&b.name, b.ty.clone());
     }
@@ -406,4 +408,97 @@ impl TyEnv {
     pub fn bind(&mut self, n: &str, t: Ty) {
         self.scope.push((n.to_string(), t));
     }
+}
+
+/// Read a builtin's declared type back out of `BUILTIN_TYPES`.
+///
+/// The table holds a compact s-expression -- `(forall 0 (fn (tvar 0) empty
+/// text))` -- because the IR spelling cannot express a forall and the checker
+/// needs one. Forty lines and testable, where generated Rust constructor calls
+/// would be neither readable in a diff nor checkable.
+pub fn parse_ty(s: &str) -> Option<Ty> {
+    let (t, rest) = parse_one(s.trim())?;
+    if rest.trim().is_empty() { Some(t) } else { None }
+}
+
+fn parse_one(s: &str) -> Option<(Ty, &str)> {
+    let s = s.trim_start();
+    if let Some(inner) = s.strip_prefix('(') {
+        let (head, mut rest) = take_word(inner);
+        let mut args: Vec<Ty> = Vec::new();
+        let mut words: Vec<String> = Vec::new();
+        loop {
+            let r = rest.trim_start();
+            if let Some(after) = r.strip_prefix(')') {
+                return Some((build(head, &args, &words)?, after));
+            }
+            if r.starts_with('(') {
+                let (t, after) = parse_one(r)?;
+                args.push(t);
+                rest = after;
+            } else {
+                let (w, after) = take_word(r);
+                words.push(w.to_string());
+                if let Some(t) = atom(w) {
+                    args.push(t);
+                }
+                rest = after;
+            }
+        }
+    }
+    let (w, rest) = take_word(s);
+    atom(w).map(|t| (t, rest))
+}
+
+fn take_word(s: &str) -> (&str, &str) {
+    let s = s.trim_start();
+    let end = s.find(|c: char| c.is_whitespace() || c == '(' || c == ')').unwrap_or(s.len());
+    (&s[..end], &s[end..])
+}
+
+fn atom(w: &str) -> Option<Ty> {
+    Some(match w {
+        "int" => Ty::Integer(i64::MIN, i64::MAX, Overflow::Error),
+        "text" => Ty::Text,
+        "bool" => Ty::Boolean,
+        "char" => Ty::Char,
+        "nothing" => Ty::Nothing,
+        "void" => Ty::Void,
+        "error" => Ty::Error,
+        "proof" => Ty::Proof,
+        "real" => Ty::Real(RealWidth::F64, RealMode::Trapping),
+        "real-approx" => Ty::Real(RealWidth::F32, RealMode::Approx),
+        _ => return None,
+    })
+}
+
+fn build(head: &str, args: &[Ty], words: &[String]) -> Option<Ty> {
+    Some(match head {
+        // `(fn A ROW B)` -- the row contributes no Ty, so A and B are args 0/1.
+        "fn" => Ty::Fun(
+            Box::new(args.first()?.clone()),
+            EffectRow::default(),
+            Box::new(args.get(1)?.clone()),
+        ),
+        "tvar" => Ty::Var(words.first()?.parse().ok()?),
+        "forall" => Ty::ForAll(words.first()?.parse().ok()?, Box::new(args.first()?.clone())),
+        "foralleff" => Ty::ForAllEff(words.first()?.parse().ok()?, Box::new(args.first()?.clone())),
+        "list" => Ty::List(Box::new(args.first()?.clone())),
+        "eff" => Ty::Effectful(Vec::new(), Vec::new(), Box::new(args.first()?.clone())),
+        "row" | "empty" => return None,
+        _ => return None,
+    })
+}
+
+/// Every builtin whose declared type the probe could render, for the checker's
+/// environment. Without these `show` resolves to ErrorTy and instantiating it
+/// mints nothing -- which is one of the eight fresh variables fib expects.
+pub fn builtin_env() -> TyEnv {
+    let mut env = TyEnv::default();
+    for (n, s) in crate::builtins::BUILTIN_TYPES {
+        if let Some(t) = parse_ty(s) {
+            env.bind(n, t);
+        }
+    }
+    env
 }
