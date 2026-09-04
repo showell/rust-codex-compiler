@@ -22,8 +22,7 @@ fn main() -> ExitCode {
             let parsed = parser::parse(&src);
             let mut dg = Desugar::new(&src);
             let ch = dg.chapter(&parsed.tree);
-            let mut st = check::UnifyState::default();
-            let bindings = check::register_defs(&ch, &mut st);
+            let (bindings, st) = check::check_chapter(&ch);
             let out = std::io::stdout();
             let _ = write!(out.lock(), "{}", check::section(&bindings, &st));
             ExitCode::SUCCESS

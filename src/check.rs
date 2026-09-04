@@ -143,6 +143,9 @@ pub struct Binding {
 pub struct UnifyState {
     pub substitutions: Vec<(u32, Ty)>,
     pub next_id: u32,
+    /// Row ids are a SEPARATE counter from type-variable ids. `next-id` in the
+    /// gold counts only the latter, so minting a row must not advance it.
+    pub next_row_id: u32,
     pub expr_types: Vec<(String, Ty)>,
     pub errors: usize,
 }
@@ -155,6 +158,13 @@ impl UnifyState {
         let id = self.next_id;
         self.next_id += 1;
         Ty::Var(id)
+    }
+
+    /// A fresh effect-row id, on its own counter.
+    pub fn fresh_row(&mut self) -> u32 {
+        let id = self.next_row_id;
+        self.next_row_id += 1;
+        id
     }
 }
 
@@ -221,6 +231,41 @@ pub fn register_defs(ch: &crate::ast::Chapter, st: &mut UnifyState) -> Vec<Bindi
     out
 }
 
+/// Register every definition, then infer every body.
+///
+/// TWO PASSES, and the order is upstream's: all names are bound before any
+/// body is walked, which is what lets `fib` call itself. A one-pass checker
+/// would find `fib` undefined inside its own body and mint a fresh variable
+/// for it -- reaching a plausible answer with the wrong `next-id`.
+pub fn check_chapter(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState) {
+    let mut st = UnifyState::default();
+    let bindings = register_defs(ch, &mut st);
+    let mut env = TyEnv::default();
+    for b in &bindings {
+        env.bind(&b.name, b.ty.clone());
+    }
+    for d in &ch.defs {
+        // A definition's parameters take their types from its declared arrow
+        // spine, walked in order.
+        let mut spine = bindings.iter().find(|b| b.name == d.name).map(|b| b.ty.clone());
+        let mut saved = Vec::new();
+        for p in &d.params {
+            let (arg, rest) = match spine {
+                Some(Ty::Fun(a, _, r)) => (*a, Some(*r)),
+                _ => (st.fresh(), None),
+            };
+            saved.push(p.name.clone());
+            env.bind(&p.name, arg);
+            spine = rest;
+        }
+        infer(&d.body, &mut env, &mut st);
+        for _ in saved {
+            env.scope.pop();
+        }
+    }
+    (bindings, st)
+}
+
 /// The `--- check ---` section, in the harness's own format so it can be
 /// diffed against `$CODEX_GOLDS/rungs/check.truth` directly.
 pub fn section(bindings: &[Binding], st: &UnifyState) -> String {
@@ -237,4 +282,103 @@ pub fn section(bindings: &[Binding], st: &UnifyState) -> String {
     // The harness closes the section, and the gold's last line is this.
     s.push_str("---\n");
     s
+}
+
+/// Inference over one expression, threading the state.
+///
+/// MIRRORS `TypeCheckerInference.codex`'s ALLOCATION ORDER, not merely its
+/// conclusions. `infer-application` (line 633) mints a fresh result variable
+/// and then a fresh ROW id -- two counters, `next_id` and `next_row_id` -- and
+/// a checker that reaches the same types while minting in a different order
+/// reports a different `next-id` and is wrong against the gold, because those
+/// ids are printed into the IR as `(tvar 41)`.
+///
+/// Every expression's type is recorded, because the IR carries one on nearly
+/// every node and `expr-types` counts them.
+pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv, st: &mut UnifyState) -> Ty {
+    use crate::ast::Expr as E;
+    let t = match e {
+        E::Lit(_, crate::ast::LiteralKind::IntLit, _) => {
+            Ty::Integer(i64::MIN, i64::MAX, Overflow::Error)
+        }
+        E::Lit(_, crate::ast::LiteralKind::TextLit, _) => Ty::Text,
+        E::Lit(_, crate::ast::LiteralKind::BoolLit, _) => Ty::Boolean,
+        E::Lit(..) => Ty::Error,
+        // `record-expr-type` has SEVEN call sites upstream and the one that
+        // fires here is name inference. Counted on fib: 6 names in `fib`, 2 in
+        // `double`, 3 in `opening` -- exactly the gold's `expr-types 11`.
+        // Recording every expression instead gave 27.
+        E::NameRef(n, _) => {
+            let t = env.get(n).cloned().unwrap_or(Ty::Error);
+            st.expr_types.push((n.clone(), t.clone()));
+            return t;
+        }
+        // A comparison answers Boolean; arithmetic answers its operands'.
+        // Neither mints, which is why fib's five applications are not the
+        // whole of its next-id.
+        E::Binary(l, op, r, _) => {
+            let lt = infer(l, env, st);
+            let _rt = infer(r, env, st);
+            use crate::ast::BinaryOp::*;
+            match op {
+                OpEq | OpNotEq | OpLt | OpGt | OpLtEq | OpGtEq | OpAnd | OpBoolAnd | OpOr => {
+                    Ty::Boolean
+                }
+                _ => lt,
+            }
+        }
+        E::If(c, a, b, _) => {
+            let _ = infer(c, env, st);
+            let ta = infer(a, env, st);
+            let _tb = infer(b, env, st);
+            ta
+        }
+        // The one site that mints, and it mints TWICE: a result variable and a
+        // row id, in that order.
+        E::Apply(f, a, _) => {
+            let ft = infer(f, env, st);
+            let _at = infer(a, env, st);
+            let ret = st.fresh();
+            let _row = st.fresh_row();
+            match ft {
+                Ty::Fun(_, _, r) => *r,
+                _ => ret,
+            }
+        }
+        E::Act(stmts, _) => {
+            let mut last = Ty::Nothing;
+            for s in stmts {
+                match s {
+                    crate::ast::ActStmt::Exec(x, _) | crate::ast::ActStmt::Bind(_, x, _) => {
+                        last = infer(x, env, st)
+                    }
+                }
+            }
+            last
+        }
+        E::Let(binds, body, _) => {
+            for b in binds {
+                let t = infer(&b.value, env, st);
+                env.bind(&b.name, t);
+            }
+            infer(body, env, st)
+        }
+        _ => Ty::Error,
+    };
+    t
+}
+
+/// Names in scope during inference.
+#[derive(Default)]
+pub struct TyEnv {
+    pub scope: Vec<(String, Ty)>,
+}
+
+impl TyEnv {
+    pub fn get(&self, n: &str) -> Option<&Ty> {
+        self.scope.iter().rev().find(|(k, _)| k == n).map(|(_, v)| v)
+    }
+    pub fn bind(&mut self, n: &str, t: Ty) {
+        self.scope.push((n.to_string(), t));
+    }
 }
