@@ -22,13 +22,28 @@
 //! expressions. The gate is byte-identity against a gold, so a near miss is
 //! worth nothing and a confident near miss is worth less than nothing.
 //!
+//! ## The golds are POST-PIPELINE, and that is a ceiling on this file
+//!
+//! A gold is not the raw lowered IR. It is that IR after
+//! `fold-constants, inline-leaf-calls, inline-single-caller` -- the
+//! `CDX4030 PIPELINE` line every compile log carries. `type-checker-test`
+//! showed it: its gold's `opening` is `add-one (add-one 40)` and the
+//! `apply-twice` it actually calls is GONE, inlined away as a single-caller
+//! function.
+//!
+//! So units match here only where no pass fired on them. That is a real
+//! oracle for those units and a hard ceiling for the rest: matching a gold
+//! whose shape a pass changed needs the passes, not a better emitter. Do not
+//! read a DIFFER on such a unit as an emission bug without checking whether a
+//! pass explains it first.
+//!
 //! What it therefore cannot do yet, and must not pretend to: inferred types
 //! (no annotation), local bindings whose type comes from their value, records,
 //! lists, matches, effects. Those need the checker. `emit_defs` returns None
 //! for the whole chapter if any definition in it is out of reach, because a
 //! chapter emitted with half its defs is not comparable to anything.
 
-use crate::ast::{Chapter, Expr, LiteralKind, TypeExpr};
+use crate::ast::{BinaryOp, Chapter, Expr, LiteralKind, TypeExpr};
 use crate::builtins::BUILTIN_IR_TYPES;
 use std::collections::BTreeMap;
 
@@ -55,7 +70,38 @@ pub fn render_type(t: &TypeExpr) -> Option<String> {
         TypeExpr::Fun(a, b, _) => {
             Some(format!("(fn {} {})", render_type(a)?, render_type(b)?))
         }
+        // `List a` is `(list a)` and `Vector a` is `(vector a)`. The golds
+        // carry 228,533 of the first, which makes it the cheapest thing in the
+        // language to be unable to spell.
+        TypeExpr::App(head, args, _) => match (&**head, args.as_slice()) {
+            (TypeExpr::Named(n, _), [only]) if n == "List" => {
+                Some(format!("(list {})", render_type(only)?))
+            }
+            (TypeExpr::Named(n, _), [only]) if n == "Vector" => {
+                Some(format!("(vector {})", render_type(only)?))
+            }
+            _ => None,
+        },
         _ => None,
+    }
+}
+
+/// The shape of a type we cannot render, for the refusal histogram. A NAMED
+/// type reports its name, because "which named types are missing" and "which
+/// type constructors are missing" are different questions with different fixes.
+pub fn type_kind(t: &TypeExpr) -> String {
+    match t {
+        TypeExpr::Named(n, _) => format!("Named {n}"),
+        TypeExpr::Fun(a, b, _) => {
+            if render_type(a).is_none() { type_kind(a) } else { type_kind(b) }
+        }
+        TypeExpr::App(..) => "App (List a, Maybe a, ...)".into(),
+        TypeExpr::Effect(..) => "Effect row".into(),
+        TypeExpr::BoundedInt(..) => "BoundedInt".into(),
+        TypeExpr::PropEq(..) => "PropEq".into(),
+        TypeExpr::Constrained(..) => "Constrained".into(),
+        TypeExpr::Linear(..) => "Linear".into(),
+        TypeExpr::Forall(..) => "Forall".into(),
     }
 }
 
@@ -78,6 +124,8 @@ fn split_fn(ty: &str) -> Option<(&str, &str)> {
 /// Names in scope, with the type each one carries at a reference site.
 pub struct Env {
     types: BTreeMap<String, String>,
+    /// Names bound inside one definition -- its parameters. Consulted FIRST.
+    locals: BTreeMap<String, String>,
 }
 
 impl Env {
@@ -92,43 +140,137 @@ impl Env {
                 types.insert(d.name.clone(), dt);
             }
         }
-        Env { types }
+        Env { types, locals: Default::default() }
     }
 
     fn get(&self, n: &str) -> Option<&str> {
-        self.types.get(n).map(String::as_str)
+        self.locals.get(n).or_else(|| self.types.get(n)).map(String::as_str)
+    }
+
+    /// A definition's own parameters, in scope for its body only. They shadow:
+    /// a parameter named `max` is the parameter, not the builtin, which is the
+    /// same collision the golds show for that name.
+    fn with_locals(&self, locals: BTreeMap<String, String>) -> Env {
+        Env { types: self.types.clone(), locals }
     }
 }
 
-/// One expression, as `(ir-text, its-type)`. `None` means refused.
-fn expr(e: &Expr, env: &Env) -> Option<(String, String)> {
+/// One expression, as `(ir-text, its-type)`, or the REASON it was refused.
+///
+/// The reason is the whole point of the return type. A bare `None` told us the
+/// corpus refused 1,008 of 1,012 units and nothing about which missing piece
+/// would buy the most, so the next node form got picked by guessing. A reason
+/// turns that into a histogram.
+fn expr(e: &Expr, env: &Env) -> Result<(String, String), String> {
     match e {
         // Literals carry no type of their own in the IR -- `(int-lit 1)`, not
         // `(int-lit 1 int-default)` -- but their type is needed by whatever
         // encloses them, so it is returned alongside.
         Expr::Lit(v, LiteralKind::IntLit, _) => {
-            Some((format!("(int-lit {v})"), "int-default".into()))
+            Ok((format!("(int-lit {v})"), "int-default".into()))
         }
         Expr::Lit(v, LiteralKind::TextLit, _) => {
-            Some((format!("(text-lit {v})"), "text".into()))
+            Ok((format!("(text-lit {v})"), "text".into()))
         }
         Expr::Lit(v, LiteralKind::BoolLit, _) => {
-            Some((format!("(bool-lit {v})"), "boolean".into()))
+            Ok((format!("(bool-lit {v})"), "boolean".into()))
         }
-        Expr::NameRef(n, _) => {
-            let t = env.get(n)?.to_string();
-            Some((format!("(name {:?} {})", n, t), t))
-        }
+        Expr::Lit(_, k, _) => Err(format!("literal kind {k:?}")),
+        Expr::NameRef(n, _) => match env.get(n) {
+            Some(t) => {
+                let t = t.to_string();
+                Ok((format!("(name {:?} {})", n, t), t))
+            }
+            None => Err(format!("no type for name `{n}`")),
+        },
         Expr::Apply(f, a, _) => {
             let (ft, fty) = expr(f, env)?;
             let (at, _aty) = expr(a, env)?;
             // The result of applying one argument is the arrow's right half.
             // A non-arrow here is an over-application, which is a real error
             // and not something to paper over with the same type back.
-            let (_arg, res) = split_fn(&fty)?;
-            Some((format!("(apply {ft} {at} {res})"), res.to_string()))
+            let (_arg, res) = split_fn(&fty)
+                .ok_or_else(|| format!("applying a non-arrow `{fty}`"))?;
+            Ok((format!("(apply {ft} {at} {res})"), res.to_string()))
         }
-        _ => None,
+        // `(binary <op> L R <type>)`. THE OPERATOR NAME DEPENDS ON THE OPERAND
+        // TYPE -- `add-int`, `add-num` and `add-vec` are three names for one
+        // source `+` -- so this needs the operands typed first and refuses
+        // where it cannot tell. A comparison answers `boolean` whatever it
+        // compared; arithmetic answers what it was given.
+        Expr::Binary(l, op, r, _) => {
+            let (lt, lty) = expr(l, env)?;
+            let (rt, rty) = expr(r, env)?;
+            if lty != rty {
+                return Err(format!("binary operands disagree: `{lty}` vs `{rty}`"));
+            }
+            let arith = |stem: &str| -> Result<String, String> {
+                match lty.as_str() {
+                    "int-default" => Ok(format!("{stem}-int")),
+                    "real" => Ok(format!("{stem}-num")),
+                    other => Err(format!("{stem} on `{other}`")),
+                }
+            };
+            let (name, ty) = match op {
+                BinaryOp::OpAdd => (arith("add")?, lty.clone()),
+                BinaryOp::OpSub => (arith("sub")?, lty.clone()),
+                BinaryOp::OpMul => (arith("mul")?, lty.clone()),
+                BinaryOp::OpDiv => (arith("div")?, lty.clone()),
+                BinaryOp::OpEq => ("eq".into(), "boolean".to_string()),
+                BinaryOp::OpNotEq => ("ne".into(), "boolean".to_string()),
+                BinaryOp::OpLt => ("lt".into(), "boolean".to_string()),
+                BinaryOp::OpGt => ("gt".into(), "boolean".to_string()),
+                BinaryOp::OpLtEq => ("le".into(), "boolean".to_string()),
+                BinaryOp::OpGtEq => ("ge".into(), "boolean".to_string()),
+                BinaryOp::OpAnd | BinaryOp::OpBoolAnd => ("and".into(), "boolean".to_string()),
+                BinaryOp::OpOr => ("or".into(), "boolean".to_string()),
+                BinaryOp::OpAppend => match lty.as_str() {
+                    "text" => ("append-text".to_string(), lty.clone()),
+                    s if s.starts_with("(list ") => ("append-list".to_string(), lty.clone()),
+                    other => return Err(format!("append on `{other}`")),
+                },
+                other => return Err(format!("binary op {other:?}")),
+            };
+            Ok((format!("(binary {name} {lt} {rt} {ty})"), ty))
+        }
+        // `(if C T E <type>)`. The type is the BRANCHES', and both must agree
+        // -- if they do not, this is not a place to pick one and move on.
+        Expr::If(c, th, el, _) => {
+            let (ct, _) = expr(c, env)?;
+            let (tt, tty) = expr(th, env)?;
+            let (et, ety) = expr(el, env)?;
+            if tty != ety {
+                return Err(format!("if branches disagree: `{tty}` vs `{ety}`"));
+            }
+            Ok((format!("(if {ct} {tt} {et} {tty})"), tty))
+        }
+        other => Err(node_kind(other).to_string()),
+    }
+}
+
+/// The variant's name, for the refusal histogram.
+fn node_kind(e: &Expr) -> &'static str {
+    match e {
+        Expr::Lit(..) => "Lit",
+        Expr::NameRef(..) => "NameRef",
+        Expr::Apply(..) => "Apply",
+        Expr::Binary(..) => "Binary",
+        Expr::Unary(..) => "Unary",
+        Expr::If(..) => "If",
+        Expr::Let(..) => "Let",
+        Expr::Lambda(..) => "Lambda",
+        Expr::Match(..) => "Match",
+        Expr::List(..) => "List",
+        Expr::Record(..) => "Record",
+        Expr::FieldAccess(..) => "FieldAccess",
+        Expr::Act(..) => "Act",
+        Expr::Handle(..) => "Handle",
+        Expr::WithTimeout(..) => "WithTimeout",
+        Expr::Try(..) => "Try",
+        Expr::FieldAssign(..) => "FieldAssign",
+        Expr::Lazy(..) => "Lazy",
+        Expr::Error(..) => "Error",
+        Expr::Induction(..) => "Induction",
     }
 }
 
@@ -154,7 +296,7 @@ pub const IR_EMIT_ROOTS: [&str; 6] = [
     "fat16-servicer-write",
 ];
 
-pub fn emit_defs(ch: &Chapter) -> Option<String> {
+pub fn emit_defs(ch: &Chapter) -> Result<String, String> {
     emit_defs_from(ch, &IR_EMIT_ROOTS)
 }
 
@@ -189,10 +331,10 @@ fn reachable(ch: &Chapter, roots: &[&str]) -> std::collections::BTreeSet<String>
     seen
 }
 
-pub fn emit_defs_from(ch: &Chapter, roots: &[&str]) -> Option<String> {
+pub fn emit_defs_from(ch: &Chapter, roots: &[&str]) -> Result<String, String> {
     let keep = reachable(ch, roots);
     if keep.is_empty() {
-        return None;
+        return Err("no root reached: the chapter defines none of ir-emit-roots".into());
     }
     let env = Env::new(ch);
     // The OPENER is the preamble's last line, so this contributes only the
@@ -200,21 +342,31 @@ pub fn emit_defs_from(ch: &Chapter, roots: &[&str]) -> Option<String> {
     // syntax-only part of a gold stops.
     let mut out = String::new();
     for d in ch.defs.iter().filter(|d| keep.contains(&d.name)) {
-        let declared = d.declared_type.first().and_then(render_type)?;
+        let declared = match d.declared_type.first() {
+            None => return Err(format!("`{}` has no declared type (needs the checker)", d.name)),
+            Some(te) => match render_type(te) {
+                Some(s) => s,
+                None => return Err(format!("type not renderable: {}", type_kind(te))),
+            },
+        };
         // Parameter types come from walking the declared arrow spine, which is
         // the only place they are written down.
         let mut rest: &str = &declared;
         let mut params = String::new();
+        let mut locals: BTreeMap<String, String> = Default::default();
         for p in &d.params {
-            let (arg, res) = split_fn(rest)?;
+            let (arg, res) = split_fn(rest)
+                .ok_or_else(|| format!("`{}` has more params than its type has arrows", d.name))?;
             params.push_str(&format!(" (param {:?} {})", p.name, arg));
+            locals.insert(p.name.clone(), arg.to_string());
             rest = res;
         }
-        let (body, _bty) = expr(&d.body, &env)?;
+        let denv = env.with_locals(locals);
+        let (body, _bty) = expr(&d.body, &denv).map_err(|r| format!("{}: {r}", d.name))?;
         out.push_str(&format!(
             "\n  (def {:?} {:?} (params{}) {} {} 0 0)",
             d.name, d.chapter_slug, params, declared, body
         ));
     }
-    Some(out)
+    Ok(out)
 }

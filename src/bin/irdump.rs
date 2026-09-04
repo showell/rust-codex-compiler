@@ -31,13 +31,13 @@ fn main() -> ExitCode {
             None => ExitCode::from(2),
         },
         Some("whole") if args.len() == 2 || args.len() == 3 => match whole(Path::new(&args[1]), args.get(2).map(String::as_str)) {
-            Some(text) => {
+            Ok(text) => {
                 let out = std::io::stdout();
                 let _ = writeln!(out.lock(), "{text}");
                 ExitCode::SUCCESS
             }
-            None => {
-                eprintln!("REFUSED: a definition in this chapter cannot be typed without the checker");
+            Err(why) => {
+                eprintln!("REFUSED: {why}");
                 ExitCode::from(2)
             }
         },
@@ -291,14 +291,14 @@ parameter (`compile-frontend source \"Program\" flags`), not a fact about the so
 ///
 /// The preamble ends at `  (defs`, `ir::emit_defs` contributes the definition
 /// lines, and the two closing parens shut `(defs` and `(chapter`.
-fn whole(path: &Path, chapter: Option<&str>) -> Option<String> {
-    let src = std::fs::read(path).ok()?;
+fn whole(path: &Path, chapter: Option<&str>) -> Result<String, String> {
+    let src = std::fs::read(path).map_err(|e| e.to_string())?;
     let parsed = parser::parse(&src);
     let head = preamble::emit(&parsed.tree, &src, chapter);
     let mut dg = codexc::desugar::Desugar::new(&src);
     let ch = dg.chapter(&parsed.tree);
     let defs = codexc::ir::emit_defs(&ch)?;
-    Some(format!("{head}{defs}))"))
+    Ok(format!("{head}{defs}))"))
 }
 
 /// Every unit against its gold, whole. A unit whose body cannot be typed yet is
@@ -320,14 +320,20 @@ fn grade_whole(dir: &Path) -> ExitCode {
     files.sort();
     let (mut ok, mut refused, mut differ, mut nogold) = (0, 0, 0, 0);
     let mut shown = 0;
+    // WHICH missing piece would buy the most. Without this the next node form
+    // gets chosen by guessing, and the guess is worth one build to find out.
+    let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
     for f in &files {
         let stem = f.file_stem().unwrap().to_string_lossy().to_string();
         let gp = Path::new(&golds).join("ir").join(format!("{stem}.ir"));
         let Ok(gold) = std::fs::read_to_string(&gp) else { nogold += 1; continue };
         let name = gold_chapter_name(&gold);
         match whole(f, name) {
-            None => refused += 1,
-            Some(ours) => {
+            Err(why) => {
+                refused += 1;
+                *reasons.entry(first_cause(&why)).or_insert(0usize) += 1;
+            }
+            Ok(ours) => {
                 if ours.trim_end() == gold.trim_end() {
                     ok += 1;
                 } else {
@@ -343,5 +349,27 @@ fn grade_whole(dir: &Path) -> ExitCode {
     }
     println!("{} unit(s): {ok} byte-identical, {differ} differ, {refused} refused (not yet typable), {nogold} without a gold",
              files.len());
+    if !reasons.is_empty() {
+        let mut rs: Vec<_> = reasons.into_iter().collect();
+        rs.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        println!("\nwhat the refusals are waiting on:");
+        for (why, n) in rs.iter().take(14) {
+            println!("  {n:>5}  {why}");
+        }
+    }
     if differ == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+
+/// The refusal reason, stripped of the definition name so it groups.
+fn first_cause(why: &str) -> String {
+    let s = why.split_once(": ").map_or(why, |(_, r)| r);
+    // a name in backticks is per-unit noise; the SHAPE is what groups
+    match s.find('`') {
+        Some(i) => match s[i + 1..].find('`') {
+            Some(j) => format!("{}<name>{}", &s[..i + 1], &s[i + 1 + j..]),
+            None => s.to_string(),
+        },
+        None => s.to_string(),
+    }
 }
