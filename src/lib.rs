@@ -6,6 +6,7 @@ pub mod arity;
 pub mod ast;
 pub mod block;
 pub mod builtins;
+pub mod bundle;
 pub mod charcode;
 pub mod check;
 pub mod cohesion;
