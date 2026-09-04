@@ -156,7 +156,8 @@ fn ctor_and_record_names(e: &Expr, out: &mut BTreeSet<String>) {
             }
             kids.push(body);
         }
-        Expr::Lambda(_, body, _) | Expr::WithTimeout(_, _, _, body, _) => kids.push(body),
+        Expr::Lambda(_, body, _) => kids.push(body),
+        Expr::WithTimeout(wt) => kids.push(&wt.body),
         Expr::Match(scrut, arms, _) | Expr::Induction(scrut, arms, _) => {
             kids.push(scrut);
             for a in arms {
@@ -173,14 +174,14 @@ fn ctor_and_record_names(e: &Expr, out: &mut BTreeSet<String>) {
                 }
             }
         }
-        Expr::Handle(_, body, cs, _) => {
-            kids.push(body);
-            for c in cs {
+        Expr::Handle(h) => {
+            kids.push(&h.body);
+            for c in &h.clauses {
                 kids.push(&c.body);
             }
         }
-        Expr::Try(_, a, b, c, _) => {
-            for region in [a, b, c] {
+        Expr::Try(t) => {
+            for region in [&t.body, &t.fallback, &t.failure] {
                 for s in region {
                     match s {
                         ActStmt::Exec(x, _) | ActStmt::Bind(_, x, _) => kids.push(x),

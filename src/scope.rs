@@ -285,9 +285,9 @@ fn expr(sc: &mut Scope<'_>, e: &Expr, w: &mut Walk) {
             let mut fork = sc.fork();
             act_stmts(&mut fork, ss, w);
         }
-        Expr::Handle(_, body, clauses, _) => {
-            expr(sc, body, w);
-            for c in clauses {
+        Expr::Handle(h) => {
+            expr(sc, &h.body, w);
+            for c in &h.clauses {
                 let mut fork = sc.fork();
                 fork.locals.insert(c.resume_name.clone());
                 let mut seen: HashSet<String> = [c.resume_name.clone()].into_iter().collect();
@@ -303,9 +303,9 @@ fn expr(sc: &mut Scope<'_>, e: &Expr, w: &mut Walk) {
                 expr(&mut fork, &c.body, w);
             }
         }
-        Expr::WithTimeout(_, _, _, body, _) => expr(sc, body, w),
-        Expr::Try(_, a, b, c, _) => {
-            for region in [a, b, c] {
+        Expr::WithTimeout(wt) => expr(sc, &wt.body, w),
+        Expr::Try(t) => {
+            for region in [&t.body, &t.fallback, &t.failure] {
                 let mut fork = sc.fork();
                 act_stmts(&mut fork, region, w);
             }

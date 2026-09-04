@@ -268,13 +268,13 @@ impl<'a> Desugar<'a> {
                 let sect = |k: NodeKind| {
                     n.children_of(k).next().map(|s| self.stmts(s)).unwrap_or_default()
                 };
-                Expr::Try(
+                Expr::Try(Box::new(TryExpr {
                     count,
-                    sect(NodeKind::TryBody),
-                    sect(NodeKind::TryFallback),
-                    sect(NodeKind::TryFailure),
-                    sp,
-                )
+                    body: sect(NodeKind::TryBody),
+                    fallback: sect(NodeKind::TryFallback),
+                    failure: sect(NodeKind::TryFailure),
+                    span: sp,
+                }))
             }
             NodeKind::HandleExpr => {
                 let eff = self.name_of(n);
@@ -304,7 +304,12 @@ impl<'a> Desugar<'a> {
                         }
                     })
                     .collect();
-                Expr::Handle(eff, Rc::new(body), clauses, sp)
+                Expr::Handle(Box::new(HandleExpr {
+                    effect: eff,
+                    body: Rc::new(body),
+                    clauses,
+                    span: sp,
+                }))
             }
             NodeKind::WithTimeout => {
                 let timeout = n
@@ -318,17 +323,17 @@ impl<'a> Desugar<'a> {
                     .filter(|t| matches!(t.kind, Kind::Identifier | Kind::TypeIdentifier))
                     .map(|t| self.text(t))
                     .collect();
-                Expr::WithTimeout(
+                Expr::WithTimeout(Box::new(WithTimeoutExpr {
                     timeout,
-                    effs,
-                    Vec::new(),
-                    Rc::new(
+                    effects: effs,
+                    labels: Vec::new(),
+                    body: Rc::new(
                         kids.iter()
                             .find(|k| k.kind != NodeKind::EffectRow)
                             .map_or(Expr::Error(String::new(), sp), |b| self.expr(b)),
                     ),
-                    sp,
-                )
+                    span: sp,
+                }))
             }
             NodeKind::LazyExpr => Expr::Lazy(
                 Rc::new(kids.first().map_or(Expr::Error(String::new(), sp), |i| self.expr(i))),

@@ -93,6 +93,43 @@ pub enum ActStmt {
     Exec(Expr, Span),
 }
 
+/// The three forms that carry the most and appear the least.
+///
+/// **An enum is as large as its largest variant, and `Expr` is moved by every
+/// pass over 6.58M nodes.** These three held 96, 96 and 72 bytes of payload
+/// where nothing else exceeded 64, so they set the size of every node in the
+/// tree -- including the two `Expr`s inlined in each of 17,618 match arms.
+/// Boxed, they cost one pointer here and one allocation on the rare occasions
+/// they actually appear. The fields are unchanged, so this is still
+/// `AstNodes.codex` variant for variant.
+#[derive(Clone, Debug)]
+pub struct HandleExpr {
+    pub effect: Name,
+    pub body: Rc<Expr>,
+    pub clauses: Vec<HandleClause>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct WithTimeoutExpr {
+    pub timeout: String,
+    pub effects: Vec<Name>,
+    /// Always empty today: nothing constructs it and nothing reads it. Kept
+    /// because the upstream node has it.
+    pub labels: Vec<String>,
+    pub body: Rc<Expr>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct TryExpr {
+    pub count: i64,
+    pub body: Vec<ActStmt>,
+    pub fallback: Vec<ActStmt>,
+    pub failure: Vec<ActStmt>,
+    pub span: Span,
+}
+
 #[derive(Clone, Debug)]
 pub struct HandleClause {
     pub op_name: Name,
@@ -117,9 +154,9 @@ pub enum Expr {
     Record(Name, Vec<FieldExpr>, Span),
     FieldAccess(Rc<Expr>, Name, Span),
     Act(Vec<ActStmt>, Span),
-    Handle(Name, Rc<Expr>, Vec<HandleClause>, Span),
-    WithTimeout(String, Vec<Name>, Vec<String>, Rc<Expr>, Span),
-    Try(i64, Vec<ActStmt>, Vec<ActStmt>, Vec<ActStmt>, Span),
+    Handle(Box<HandleExpr>),
+    WithTimeout(Box<WithTimeoutExpr>),
+    Try(Box<TryExpr>),
     FieldAssign(Rc<Expr>, Name, Rc<Expr>, Span),
     Lazy(Rc<Expr>, Span),
     Error(String, Span),
@@ -304,17 +341,17 @@ impl Expr {
                 }
             }
             Expr::Act(ss, _) => stmts(ss, f),
-            Expr::Handle(_, b, cs, _) => {
-                b.walk(f);
-                for c in cs {
+            Expr::Handle(h) => {
+                h.body.walk(f);
+                for c in &h.clauses {
                     c.body.walk(f);
                 }
             }
-            Expr::WithTimeout(_, _, _, b, _) => b.walk(f),
-            Expr::Try(_, a, b, c, _) => {
-                stmts(a, f);
-                stmts(b, f);
-                stmts(c, f);
+            Expr::WithTimeout(w) => w.body.walk(f),
+            Expr::Try(t) => {
+                stmts(&t.body, f);
+                stmts(&t.fallback, f);
+                stmts(&t.failure, f);
             }
         }
     }
@@ -339,4 +376,24 @@ pub struct Chapter {
     pub rt_budgets: Vec<i64>,
     pub conversions: Vec<String>,
     pub span: Span,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **An enum is as large as its largest variant, and every pass moves
+    /// `Expr`s** -- 6,575,252 of them over the corpus, two of them inlined in
+    /// each of 17,618 match arms. `Handle`, `WithTimeout` and `Try` held 72,
+    /// 96 and 96 bytes of payload where nothing else exceeded 64, so three of
+    /// the rarest forms in the language set the size of the whole tree. They
+    /// are boxed; this is the guard that keeps them that way.
+    #[test]
+    fn expr_does_not_grow() {
+        assert!(
+            std::mem::size_of::<Expr>() <= 72,
+            "Expr is {} bytes; a variant grew",
+            std::mem::size_of::<Expr>()
+        );
+    }
 }
