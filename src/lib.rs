@@ -9,6 +9,7 @@ pub mod builtins;
 pub mod charcode;
 pub mod check;
 pub mod cohesion;
+pub mod code;
 pub mod cst;
 pub mod decl;
 pub mod desugar;

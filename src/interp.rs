@@ -14,8 +14,15 @@
 //!
 //! Anything unimplemented raises an error that NAMES it. A silent wrong answer
 //! would make the whole exercise worthless.
+//!
+//! **What it walks is `Code`, not `Expr`** -- see `crate::code`. The chapter is
+//! compiled once into a form where a local is a frame slot, a global is an
+//! index, a literal is already a value and an application spine is already
+//! flat, so nothing here resolves a name or parses a literal while the program
+//! is running.
 
 use crate::ast::*;
+use crate::code::{Arm, Code, Compiler, Names, PatCode, Stmt};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::rc::Rc;
@@ -45,8 +52,8 @@ pub enum Value {
 /// Naming the three cases allocates nothing.
 #[derive(Clone, Debug)]
 pub enum Body {
-    /// A definition's or a lambda's body.
-    Expr(Rc<Expr>),
+    /// A definition's or a lambda's compiled body.
+    Code(Rc<Code>),
     /// A variant constructor: the arguments ARE the value.
     Ctor(Rc<String>),
     /// A compiler builtin, resolved to its name once.
@@ -55,82 +62,42 @@ pub enum Body {
 
 #[derive(Debug)]
 pub struct Closure {
-    /// SHARED with every partial application of the same function. Cloning a
-    /// `Vec<String>` once per argument applied was the largest single caller
-    /// of `malloc` in the profile.
-    pub params: Rc<Vec<Name>>,
+    /// How many arguments saturate it. The parameters have NAMES in the
+    /// source and none here: `crate::code` turned every reference to one into
+    /// a slot in this call's frame, so the run never asks what they were.
+    pub arity: usize,
     pub body: Body,
     pub env: Env,
     pub applied: Vec<Value>,
-    /// The chapter this closure's body was written in, when it came from a
-    /// top-level definition. A name that COLLIDES across chapters resolves to
-    /// the one in the same chapter as the reference, so a body has to know
-    /// where it lives. INTERNED: a call installs it, and that has to be a
-    /// refcount rather than a copy of the text.
-    pub slug: Option<Rc<str>>,
 }
 
 pub type Env = Rc<Scope>;
 
-/// What one frame binds.
+/// One frame: the values, positionally.
 ///
-/// A CALL binds the closure's whole parameter list at once, and the closure
-/// already owns that list -- so the frame SHARES it and carries the values
-/// beside it, instead of cloning a `String` per parameter per call. A `let`,
-/// an `act` bind and a match arm's captures name themselves and stay pairs.
-#[derive(Debug)]
-enum Frame {
-    Call(Rc<Vec<Name>>, Vec<Value>),
-    Binds(Vec<(Name, Value)>),
-}
-
-/// A frame binds one to three names. A `HashMap` per call spends more on
-/// hashing and on its allocation than a linear scan of a `Vec` ever costs, and
-/// a call is the hottest thing an interpreter does.
+/// A call binds its whole parameter list at once; a `let` binding, an `act`
+/// bind and a match arm's captures each get a frame of their own, in the order
+/// the compiler counted them. A name never appears, so a lookup is `hops`
+/// pointer hops and an index -- no comparison, no hashing, no allocation.
 #[derive(Debug)]
 pub struct Scope {
-    frame: Frame,
+    vals: Vec<Value>,
     parent: Option<Env>,
 }
 
 impl Scope {
     fn root() -> Env {
-        Rc::new(Scope { frame: Frame::Binds(Vec::new()), parent: None })
+        Rc::new(Scope { vals: Vec::new(), parent: None })
     }
-    fn get(&self, n: &str) -> Option<Value> {
+    fn get(&self, hops: u32, slot: u32) -> Option<Value> {
         let mut here = self;
-        loop {
-            // Later bindings shadow earlier ones in the same frame.
-            match &here.frame {
-                Frame::Call(names, vals) => {
-                    if let Some(i) = names.iter().rposition(|k| k == n) {
-                        if let Some(v) = vals.get(i) {
-                            return Some(v.clone());
-                        }
-                    }
-                }
-                Frame::Binds(vars) => {
-                    if let Some((_, v)) = vars.iter().rev().find(|(k, _)| k == n) {
-                        return Some(v.clone());
-                    }
-                }
-            }
-            match &here.parent {
-                Some(p) => here = p,
-                None => return None,
-            }
+        for _ in 0..hops {
+            here = here.parent.as_deref()?;
         }
+        here.vals.get(slot as usize).cloned()
     }
-    fn child(parent: &Env, vars: Vec<(Name, Value)>) -> Env {
-        Rc::new(Scope { frame: Frame::Binds(vars), parent: Some(parent.clone()) })
-    }
-    fn one(parent: &Env, name: Name, v: Value) -> Env {
-        Rc::new(Scope { frame: Frame::Binds(vec![(name, v)]), parent: Some(parent.clone()) })
-    }
-    /// The frame a saturated call runs in: the closure's own parameter list,
-    /// shared, and one value per name.
-    fn call(parent: &Env, names: Rc<Vec<Name>>, vals: Vec<Value>) -> Env {
-        Rc::new(Scope { frame: Frame::Call(names, vals), parent: Some(parent.clone()) })
+    fn push(parent: &Env, vals: Vec<Value>) -> Env {
+        Rc::new(Scope { vals, parent: Some(parent.clone()) })
     }
 }
 
@@ -167,47 +134,37 @@ fn at(e: Error, sp: Span) -> Error {
 }
 
 /// A record field whose declared type carries a bound, and what to do at it.
-struct FieldBound {
-    lo: i64,
-    hi: i64,
-    mode: OverflowMode,
+#[derive(Clone, Copy, Debug)]
+pub struct FieldBound {
+    pub lo: i64,
+    pub hi: i64,
+    pub mode: OverflowMode,
 }
 
 pub struct Interp {
-    /// Top-level definitions by name, and their arity.
-    defs: HashMap<Name, Rc<Def>>,
-    /// `Type.field -> bound`, read from the record definitions.
+    /// Every top-level function, constructor and builtin of one argument or
+    /// more, as a ready value. `Code::Global` indexes this, so a reference is
+    /// an index and a refcount.
+    globals: Vec<Value>,
+    /// The compiled bodies of the definitions that take NO parameters. A
+    /// reference evaluates one; Codex is pure, so that is a cost and not a
+    /// meaning.
+    const_defs: Vec<Rc<Code>>,
+    /// `opening`, compiled in the empty environment.
+    opening: Option<Rc<Code>>,
+    /// `Type.field -> bound`, and the ONE thing resolution cannot do ahead of
+    /// time. A record literal names its type, so its bounds are attached at
+    /// compile time; a field ASSIGNMENT names only the field, and which record
+    /// it lands on is whatever the left-hand side evaluates to.
     bounds: HashMap<(String, String), FieldBound>,
-    /// Which constructors exist, and how many fields each takes.
-    ctors: HashMap<String, usize>,
-    /// Every top-level function as a ready closure, built ONCE. Rebuilding one
-    /// per reference deep-copied the body on every call to every function,
-    /// which is the single most expensive thing an interpreter can do.
-    funs: HashMap<Name, Value>,
-    by_chapter_fun: HashMap<(String, String), Value>,
-    /// Every builtin OF ONE ARGUMENT OR MORE, and every constructor, as a
-    /// ready value built ONCE. A reference used to build a fresh `Vec<String>`
-    /// of parameter names, a `format!`ed marker and two `Rc`s -- every time.
-    builtin_funs: HashMap<&'static str, Value>,
-    /// `Some(0)` in the table: the declared type is NOT AN ARROW, so the
-    /// builtin is a value and a reference to it is already the call.
-    builtin_nullary: std::collections::HashSet<&'static str>,
-    /// `None` in the table: no declared type at all, so nothing here knows the
-    /// arity. Eight names, and guessing one for them is what this fixes.
-    builtin_undeclared: std::collections::HashSet<&'static str>,
-    ctor_funs: HashMap<String, Value>,
     /// The empty environment, shared: every top-level closure closes over it.
     root: Env,
-    /// `(chapter, name) -> definition`, for the names defined in more than one
-    /// chapter of a bundled unit. `drive-unit.codex` has two `bar-quad`s --
-    /// one over `ScreenPt` and one over `RiderPt` -- and keeping only the last
-    /// silently gave the wrong one to every caller of the other.
-    by_chapter: HashMap<(String, String), Rc<Def>>,
-    /// The chapter whose body is currently running.
-    cur_slug: Rc<str>,
+    /// Names defined in more than one chapter of a bundled unit.
+    /// `drive-unit.codex` has two `bar-quad`s -- one over `ScreenPt` and one
+    /// over `RiderPt` -- and keeping only the last silently gave the wrong one
+    /// to every caller of the other. Reported, not used: resolving them is
+    /// `crate::code`'s job and it happens before the run.
     pub collisions: Vec<String>,
-    /// The same set, for the test every lookup makes.
-    colliding: std::collections::HashSet<String>,
     pub out: String,
     /// How much work the run did, which is the only speed number that is not
     /// about this machine on this day.
@@ -229,105 +186,70 @@ const STEP_LIMIT: u64 = u64::MAX;
 const DEPTH_LIMIT: u32 = 20_000;
 
 impl Interp {
+    /// Build the tables, then compile the chapter against them.
+    ///
+    /// **Every index is handed out before any body is compiled**, because a
+    /// body may name a definition that comes after it -- so the globals vector
+    /// is sized and filled in two passes rather than one.
     pub fn new(ch: &Chapter) -> Interp {
         let root = Scope::root();
-        let mut it = Interp {
-            defs: HashMap::new(),
-            bounds: HashMap::new(),
-            ctors: HashMap::new(),
-            funs: HashMap::new(),
-            by_chapter_fun: HashMap::new(),
-            builtin_funs: HashMap::new(),
-            builtin_nullary: Default::default(),
-            builtin_undeclared: Default::default(),
-            ctor_funs: HashMap::new(),
-            root: root.clone(),
-            by_chapter: HashMap::new(),
-            cur_slug: Rc::from(""),
-            collisions: Vec::new(),
-            colliding: Default::default(),
-            out: String::new(),
-            steps: 0,
-            depth: 0,
-            limit: STEP_LIMIT,
-        };
-        let mut owners: HashMap<String, Vec<String>> = HashMap::new();
+        let mut names = Names::default();
+        let mut globals: Vec<Value> = Vec::new();
+
+        // Pass 1: an index for every definition, and who owns each name.
+        let mut fun_defs: Vec<(u32, &Def)> = Vec::new();
+        let mut const_defs_src: Vec<&Def> = Vec::new();
+        let mut owners: HashMap<&str, Vec<&str>> = HashMap::new();
         for d in &ch.defs {
-            let rc = Rc::new(d.clone());
-            it.defs.insert(d.name.clone(), rc.clone());
-            it.by_chapter.insert((d.chapter_slug.clone(), d.name.clone()), rc);
-            let slugs = owners.entry(d.name.clone()).or_default();
-            if !slugs.contains(&d.chapter_slug) {
-                slugs.push(d.chapter_slug.clone());
+            let slugs = owners.entry(d.name.as_str()).or_default();
+            if !slugs.contains(&d.chapter_slug.as_str()) {
+                slugs.push(d.chapter_slug.as_str());
             }
-        }
-        it.collisions = owners
-            .into_iter()
-            .filter(|(_, s)| s.len() > 1)
-            .map(|(n, _)| n)
-            .collect();
-        it.collisions.sort();
-        it.colliding = it.collisions.iter().cloned().collect();
-        // Chapter slugs are interned here, once per chapter rather than once
-        // per closure, because a call installs one.
-        let mut slugs: HashMap<&str, Rc<str>> = HashMap::new();
-        for d in &ch.defs {
+            let key = (d.chapter_slug.clone(), d.name.clone());
             if d.params.is_empty() {
-                continue;
+                let i = const_defs_src.len() as u32;
+                const_defs_src.push(d);
+                names.consts.insert(d.name.clone(), i);
+                names.by_chapter_const.insert(key, i);
+            } else {
+                let i = globals.len() as u32;
+                globals.push(Value::Unit);
+                fun_defs.push((i, d));
+                names.funs.insert(d.name.clone(), i);
+                names.by_chapter_fun.insert(key, i);
             }
-            let slug = slugs
-                .entry(d.chapter_slug.as_str())
-                .or_insert_with(|| Rc::from(d.chapter_slug.as_str()))
-                .clone();
-            let f = Value::Fun(Rc::new(Closure {
-                params: Rc::new(d.params.iter().map(|p| p.name.clone()).collect()),
-                body: Body::Expr(Rc::new(d.body.clone())),
-                env: root.clone(),
-                applied: Vec::new(),
-                slug: Some(slug),
-            }));
-            it.funs.insert(d.name.clone(), f.clone());
-            it.by_chapter_fun.insert((d.chapter_slug.clone(), d.name.clone()), f);
         }
+        let mut collisions: Vec<String> =
+            owners.iter().filter(|(_, s)| s.len() > 1).map(|(n, _)| (*n).to_string()).collect();
+        collisions.sort();
+        names.colliding = collisions.iter().cloned().collect();
+
+        // Record field bounds, and a slot for every constructor.
+        let mut ctors: Vec<(u32, String, usize)> = Vec::new();
         for t in &ch.type_defs {
             match t {
                 TypeDef::Record(name, _, fields, ..) => {
                     for f in fields {
                         if let TypeExpr::BoundedInt(_, lo, hi, mode, _) = &f.type_expr {
-                            it.bounds.insert(
+                            names.bounds.insert(
                                 (name.clone(), f.name.clone()),
                                 FieldBound { lo: *lo, hi: *hi, mode: *mode },
                             );
                         }
                     }
                 }
-                TypeDef::Variant(_, _, ctors, _) => {
-                    for c in ctors {
-                        it.ctors.insert(c.name.clone(), c.fields.len());
+                TypeDef::Variant(_, _, cs, _) => {
+                    for c in cs {
+                        let i = globals.len() as u32;
+                        globals.push(Value::Unit);
+                        names.ctors.insert(c.name.clone(), i);
+                        ctors.push((i, c.name.clone(), c.fields.len()));
                     }
                 }
                 TypeDef::Unit(..) => {}
             }
         }
-        // Constructors and builtins are FIXED for the run, so their closures
-        // are built here and every reference clones a `Value` -- which is one
-        // refcount -- rather than rebuilding one.
-        let ctors: Vec<(String, usize)> = it.ctors.iter().map(|(n, a)| (n.clone(), *a)).collect();
-        for (name, arity) in ctors {
-            let rc = Rc::new(name.clone());
-            let v = if arity == 0 {
-                Value::Ctor(rc, Rc::new(Vec::new()))
-            } else {
-                Value::Fun(Rc::new(Closure {
-                    params: Rc::new((0..arity).map(|i| format!("__f{i}")).collect()),
-                    body: Body::Ctor(rc),
-                    env: root.clone(),
-                    applied: Vec::new(),
-                    slug: None,
-                }))
-            };
-            it.ctor_funs.insert(name, v);
-        }
+
         // The arity comes from the compiler's own table, not from a list here:
         // a builtin applied to the wrong number of arguments would otherwise be
         // a silent partial application rather than a call.
@@ -342,26 +264,76 @@ impl Interp {
         for (name, arity) in crate::builtins::BUILTINS {
             match arity {
                 None => {
-                    it.builtin_undeclared.insert(name);
+                    names.builtin_undeclared.insert(name);
                 }
                 Some(0) => {
-                    it.builtin_nullary.insert(name);
+                    names.builtin_nullary.insert(name);
                 }
                 Some(arity) => {
-                    it.builtin_funs.insert(
-                        name,
-                        Value::Fun(Rc::new(Closure {
-                            params: Rc::new((0..arity).map(|i| format!("__a{i}")).collect()),
-                            body: Body::Builtin(name),
-                            env: root.clone(),
-                            applied: Vec::new(),
-                            slug: None,
-                        })),
-                    );
+                    let i = globals.len() as u32;
+                    globals.push(Value::Fun(Rc::new(Closure {
+                        arity,
+                        body: Body::Builtin(name),
+                        env: root.clone(),
+                        applied: Vec::new(),
+                    })));
+                    names.builtin_funs.insert(name, i);
                 }
             }
         }
-        it
+
+        // Constructors are FIXED for the run, so their values are built here
+        // and every reference clones one refcount.
+        for (i, name, arity) in ctors {
+            let rc = Rc::new(name);
+            globals[i as usize] = if arity == 0 {
+                Value::Ctor(rc, Rc::new(Vec::new()))
+            } else {
+                Value::Fun(Rc::new(Closure {
+                    arity,
+                    body: Body::Ctor(rc),
+                    env: root.clone(),
+                    applied: Vec::new(),
+                }))
+            };
+        }
+
+        // Pass 2: compile. The tables are complete, so a body can name
+        // anything the unit defines regardless of where it sits.
+        let mut const_defs: Vec<Rc<Code>> = Vec::with_capacity(const_defs_src.len());
+        for d in &const_defs_src {
+            const_defs.push(Rc::new(Compiler::body(&names, &d.chapter_slug, &d.body)));
+        }
+        for (i, d) in &fun_defs {
+            globals[*i as usize] = Value::Fun(Rc::new(Closure {
+                arity: d.params.len(),
+                body: Body::Code(Rc::new(Compiler::def(&names, d))),
+                env: root.clone(),
+                applied: Vec::new(),
+            }));
+        }
+        // The entry point runs in the EMPTY environment, whatever it declares,
+        // which is what the walker did. Last definition of the name wins, as
+        // it does everywhere else.
+        let opening = ch
+            .defs
+            .iter()
+            .rev()
+            .find(|d| d.name == "opening")
+            .map(|d| Rc::new(Compiler::body(&names, &d.chapter_slug, &d.body)));
+
+        Interp {
+            globals,
+            const_defs,
+            opening,
+            bounds: names.bounds,
+            root,
+            collisions,
+            out: String::new(),
+            steps: 0,
+            depth: 0,
+            limit: STEP_LIMIT,
+        }
     }
 
     /// Bound this run to a number of steps. The sweep sets one; a single run
@@ -373,16 +345,15 @@ impl Interp {
 
     /// Run `opening`, the entry point every Codex program has.
     pub fn run(&mut self) -> R<()> {
-        let Some(open) = self.defs.get("opening").cloned() else {
+        let Some(open) = self.opening.clone() else {
             return err("no `opening` definition to run");
         };
-        self.cur_slug = Rc::from(open.chapter_slug.as_str());
         let env = self.root.clone();
-        self.eval(&open.body, &env)?;
+        self.eval(&open, &env)?;
         Ok(())
     }
 
-    fn eval(&mut self, e: &Expr, env: &Env) -> R<Value> {
+    fn eval(&mut self, c: &Code, env: &Env) -> R<Value> {
         self.steps += 1;
         if self.steps > self.limit {
             return err("step limit reached; the program did not finish");
@@ -392,20 +363,31 @@ impl Interp {
             self.depth -= 1;
             return err("recursion limit reached");
         }
-        let r = self.eval_inner(e, env);
+        let r = self.eval_inner(c, env);
         self.depth -= 1;
         r
     }
 
-    fn eval_inner(&mut self, e: &Expr, env: &Env) -> R<Value> {
-        match e {
-            Expr::Lit(text, kind, _) => literal(text, *kind),
-            Expr::NameRef(n, _) => self.lookup(n, env),
-            Expr::Apply(..) => match self.apply_spine(e, env, false)? {
+    fn eval_inner(&mut self, c: &Code, env: &Env) -> R<Value> {
+        match c {
+            Code::Const(v) => Ok(v.clone()),
+            Code::Local(hops, slot) => env
+                .get(*hops, *slot)
+                .ok_or_else(|| Error(format!("internal: no local at ({hops}, {slot})"))),
+            Code::Global(i) => Ok(self.globals[*i as usize].clone()),
+            Code::ConstDef(i) => {
+                let body = self.const_defs[*i as usize].clone();
+                let root = self.root.clone();
+                self.eval(&body, &root)
+            }
+            Code::NullaryBuiltin(name) => self.builtin(name, Vec::new()),
+            Code::Fail(msg) => Err(Error(msg.clone())),
+            Code::Unsupported(msg) => err(*msg),
+            Code::Apply(head, args) => match self.apply_spine(head, args, env, false)? {
                 Step::Done(v) => Ok(v),
                 Step::Call(c, applied) => self.call(c, applied),
             },
-            Expr::Binary(l, op, r, _) => {
+            Code::Binary(l, op, r) => {
                 // `and` and `or` SHORT-CIRCUIT, and programs depend on it for
                 // safety rather than speed:
                 //
@@ -426,59 +408,56 @@ impl Interp {
                 let b = self.eval(r, env)?;
                 binary(*op, a, b)
             }
-            Expr::Unary(x, _) => match self.eval(x, env)? {
+            Code::Unary(x) => match self.eval(x, env)? {
                 Value::Int(i) => Ok(Value::Int(-i)),
                 Value::Real(f) => Ok(Value::Real(-f)),
                 v => err(format!("negation of {}", type_name(&v))),
             },
-            Expr::If(c, t, f, _) => match self.eval(c, env)? {
+            Code::If(c, t, f) => match self.eval(c, env)? {
                 Value::Bool(true) => self.eval(t, env),
                 Value::Bool(false) => self.eval(f, env),
                 v => err(format!("`if` on {}", type_name(&v))),
             },
-            Expr::Let(binds, body, _) => {
+            Code::Let(vals, body) => {
                 let mut env = env.clone();
-                for b in binds {
-                    let v = self.eval(&b.value, &env)?;
-                    env = Scope::one(&env, b.name.clone(), v);
+                for v in vals {
+                    let v = self.eval(v, &env)?;
+                    env = Scope::push(&env, vec![v]);
                 }
                 self.eval(body, &env)
             }
             // The body is already shared: a lambda evaluated a million times
             // bumps a refcount rather than copying its tree.
-            Expr::Lambda(params, body, _) => Ok(Value::Fun(Rc::new(Closure {
-                params: Rc::new(params.clone()),
-                body: Body::Expr(body.clone()),
+            Code::Lambda(l) => Ok(Value::Fun(Rc::new(Closure {
+                arity: l.arity,
+                body: Body::Code(l.body.clone()),
                 env: env.clone(),
                 applied: Vec::new(),
-                slug: Some(self.cur_slug.clone()),
             }))),
-            Expr::Match(scrut, arms, _) | Expr::Induction(scrut, arms, _) => {
+            Code::Match(scrut, arms) => {
                 let v = self.eval(scrut, env)?;
                 self.match_arms(&v, arms, env)
             }
-            Expr::List(xs, _) => {
+            Code::List(xs) => {
                 let mut out = Vec::with_capacity(xs.len());
                 for x in xs {
                     out.push(self.eval(x, env)?);
                 }
                 Ok(Value::List(Rc::new(out)))
             }
-            Expr::Record(name, fields, _) => {
+            Code::Record(name, fields) => {
                 let mut out = Vec::with_capacity(fields.len());
                 for f in fields {
                     let mut v = self.eval(&f.value, env)?;
                     // The declared bound is syntax, so it is applied here.
-                    if let (Value::Int(i), Some(b)) =
-                        (&v, self.bounds.get(&(name.clone(), f.name.clone())))
-                    {
+                    if let (Value::Int(i), Some(b)) = (&v, &f.bound) {
                         v = Value::Int(apply_bound(*i, b));
                     }
                     out.push((f.name.clone(), v));
                 }
-                Ok(Value::Record(Rc::new(name.clone()), Rc::new(out)))
+                Ok(Value::Record(name.clone(), Rc::new(out)))
             }
-            Expr::FieldAccess(obj, field, sp) => match self.eval(obj, env)? {
+            Code::FieldAccess(obj, field, sp) => match self.eval(obj, env)? {
                 Value::Record(name, fs) => fs
                     .iter()
                     .find(|(n, _)| n == field)
@@ -498,23 +477,23 @@ impl Interp {
                     type_name(&v)
                 )),
             },
-            Expr::Act(stmts, _) => {
+            Code::Act(stmts) => {
                 let mut env = env.clone();
                 let mut last = Value::Unit;
                 for s in stmts {
                     match s {
-                        ActStmt::Exec(e, _) => last = self.eval(e, &env)?,
-                        ActStmt::Bind(n, e, _) => {
+                        Stmt::Exec(e) => last = self.eval(e, &env)?,
+                        Stmt::Bind(e) => {
                             let v = self.eval(e, &env)?;
-                            env = Scope::one(&env, n.clone(), v);
+                            env = Scope::push(&env, vec![v]);
                             last = Value::Unit;
                         }
                     }
                 }
                 Ok(last)
             }
-            Expr::Lazy(inner, _) => self.eval(inner, env),
-            Expr::FieldAssign(rec, field, val, _) => {
+            Code::Lazy(inner) => self.eval(inner, env),
+            Code::FieldAssign(rec, field, val) => {
                 let base = self.eval(rec, env)?;
                 let v = self.eval(val, env)?;
                 match base {
@@ -534,72 +513,7 @@ impl Interp {
                     v => err(format!("field assignment on {}", type_name(&v))),
                 }
             }
-            Expr::Error(why, _) => err(format!("the desugarer could not translate {why}")),
-            Expr::Handle(..) => err("effect handlers are not interpreted yet"),
-            Expr::WithTimeout(..) => err("with-timeout is not interpreted yet"),
-            Expr::Try(..) => err("trying blocks are not interpreted yet"),
         }
-    }
-
-    fn lookup(&mut self, n: &str, env: &Env) -> R<Value> {
-        if let Some(v) = env.get(n) {
-            return Ok(v);
-        }
-        // The same chapter wins for a name defined in more than one -- but
-        // ASK ONLY WHEN IT COLLIDES. Building the (chapter, name) key
-        // allocated two Strings on every reference to every name, and almost
-        // no name collides.
-        let by_chapter = self.colliding.contains(n).then(|| {
-            let key = (self.cur_slug.to_string(), n.to_string());
-            (self.by_chapter_fun.get(&key).cloned(), self.by_chapter.get(&key).cloned())
-        });
-        if let Some((Some(f), _)) = &by_chapter {
-            return Ok(f.clone());
-        }
-        if let Some(f) = self.funs.get(n) {
-            return Ok(f.clone());
-        }
-        let same_chapter = by_chapter.and_then(|(_, d)| d);
-        if let Some(d) = same_chapter.or_else(|| self.defs.get(n).cloned()) {
-            if d.params.is_empty() {
-                // A constant, evaluated on each reference. Codex is pure, so
-                // this is a cost and not a semantic difference.
-                let root = self.root.clone();
-                return self.eval(&d.body, &root);
-            }
-            return Ok(Value::Fun(Rc::new(Closure {
-                params: Rc::new(d.params.iter().map(|p| p.name.clone()).collect()),
-                body: Body::Expr(Rc::new(d.body.clone())),
-                env: self.root.clone(),
-                applied: Vec::new(),
-                slug: Some(Rc::from(d.chapter_slug.as_str())),
-            })));
-        }
-        if let Some(c) = self.ctor_funs.get(n) {
-            return Ok(c.clone());
-        }
-        if let Some(b) = self.builtin_funs.get(n) {
-            return Ok(b.clone());
-        }
-        // A builtin whose declared type is not an arrow is a VALUE, so the
-        // reference IS the call. There is no closure to hand back.
-        if let Some(name) = self.builtin_nullary.get(n).copied() {
-            return self.builtin(name, Vec::new());
-        }
-        // A capitalised unknown is a nullary constructor the type definitions
-        // did not mention -- `Nothing`, `True` from another chapter. This is
-        // BEFORE the undeclared-builtin refusal on purpose: `True`, `False` and
-        // `Nothing` are three of the eight that declare no type, and they are
-        // constructors rather than anything to call.
-        if n.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
-            return Ok(Value::Ctor(Rc::new(n.to_string()), Rc::new(Vec::new())));
-        }
-        if let Some(name) = self.builtin_undeclared.get(n).copied() {
-            return err(format!(
-                "builtin `{name}` declares no type, so its arity is not known"
-            ));
-        }
-        err(format!("undefined name `{n}`"))
     }
 
     /// Run a saturated closure, looping on every tail call rather than
@@ -613,14 +527,10 @@ impl Interp {
                     let name = *name;
                     return self.builtin(name, applied);
                 }
-                Body::Expr(b) => b.clone(),
+                Body::Code(b) => b.clone(),
             };
-            let env = Scope::call(&c.env, c.params.clone(), applied);
-            let next_slug = c.slug.clone().unwrap_or_else(|| self.cur_slug.clone());
-            let saved = std::mem::replace(&mut self.cur_slug, next_slug);
-            let stepped = self.eval_tail(&body, &env);
-            self.cur_slug = saved;
-            match stepped? {
+            let env = Scope::push(&c.env, applied);
+            match self.eval_tail(&body, &env)? {
                 Step::Done(v) => return Ok(v),
                 Step::Call(next, args) => {
                     c = next;
@@ -635,33 +545,33 @@ impl Interp {
     /// The tail positions are the ones that cannot do any work after the call
     /// returns: both branches of an `if`, the body of a `let`, an arm's body,
     /// and the last statement of an `act`.
-    fn eval_tail(&mut self, e: &Expr, env: &Env) -> R<Step> {
+    fn eval_tail(&mut self, c: &Code, env: &Env) -> R<Step> {
         self.steps += 1;
         if self.steps > self.limit {
             return err("step limit reached; the program did not finish");
         }
-        match e {
-            Expr::If(c, t, f, _) => match self.eval(c, env)? {
+        match c {
+            Code::If(c, t, f) => match self.eval(c, env)? {
                 Value::Bool(true) => self.eval_tail(t, env),
                 Value::Bool(false) => self.eval_tail(f, env),
                 v => err(format!("`if` on {}", type_name(&v))),
             },
-            Expr::Let(binds, body, _) => {
+            Code::Let(vals, body) => {
                 let mut env = env.clone();
-                for b in binds {
-                    let v = self.eval(&b.value, &env)?;
-                    env = Scope::one(&env, b.name.clone(), v);
+                for v in vals {
+                    let v = self.eval(v, &env)?;
+                    env = Scope::push(&env, vec![v]);
                 }
                 self.eval_tail(body, &env)
             }
-            Expr::Match(scrut, arms, _) | Expr::Induction(scrut, arms, _) => {
+            Code::Match(scrut, arms) => {
                 let v = self.eval(scrut, env)?;
-                for a in arms {
-                    let mut vars = Vec::new();
-                    if !matches_pat(&v, &a.pattern, &mut vars) {
+                for a in arms.iter() {
+                    let mut vals = Vec::with_capacity(a.nvars);
+                    if !matches_pat(&v, &a.pat, &mut vals) {
                         continue;
                     }
-                    let arm_env = Scope::child(env, vars);
+                    let arm_env = Scope::push(env, vals);
                     if let Value::Bool(false) = self.eval(&a.guard, &arm_env)? {
                         continue;
                     }
@@ -669,36 +579,38 @@ impl Interp {
                 }
                 err("no match arm applied")
             }
-            Expr::Act(stmts, _) => {
+            Code::Act(stmts) => {
                 let mut env = env.clone();
                 for (i, s) in stmts.iter().enumerate() {
                     let last = i + 1 == stmts.len();
                     match s {
-                        ActStmt::Exec(e, _) if last => return self.eval_tail(e, &env),
-                        ActStmt::Exec(e, _) => {
+                        Stmt::Exec(e) if last => return self.eval_tail(e, &env),
+                        Stmt::Exec(e) => {
                             self.eval(e, &env)?;
                         }
-                        ActStmt::Bind(n, e, _) => {
+                        Stmt::Bind(e) => {
                             let v = self.eval(e, &env)?;
-                            env = Scope::one(&env, n.clone(), v);
+                            env = Scope::push(&env, vec![v]);
                         }
                     }
                 }
                 Ok(Step::Done(Value::Unit))
             }
-            Expr::Apply(..) => self.apply_spine(e, env, true),
-            _ => Ok(Step::Done(self.eval(e, env)?)),
+            Code::Apply(head, args) => self.apply_spine(head, args, env, true),
+            _ => Ok(Step::Done(self.eval(c, env)?)),
         }
     }
 
-    /// Evaluate a whole application SPINE, gathering the arguments for one
-    /// call instead of building a closure per argument.
+    /// Apply a whole spine, gathering the arguments for one call instead of
+    /// building a closure per argument.
     ///
     /// **Application is curried -- `f a b c` is three nested `Apply` nodes --
     /// but the call is not.** Taking them one at a time allocated an
     /// intermediate closure, its argument vector and a clone of every argument
     /// already applied, per argument: `map-list-loop` has five parameters, so
-    /// every one of its calls built four closures it then threw away.
+    /// every one of its calls built four closures it then threw away. The
+    /// spine itself is flattened by `crate::code`, once, rather than re-walked
+    /// into a fresh `Vec` on every application.
     ///
     /// **The ORDER is unchanged, and that is the whole constraint.** Arguments
     /// are still evaluated left to right, and a call that saturates PART WAY
@@ -707,17 +619,13 @@ impl Interp {
     ///
     /// `tail` says whether the caller can loop on the last call rather than
     /// nesting; only `eval_tail` can.
-    fn apply_spine(&mut self, e: &Expr, env: &Env, tail: bool) -> R<Step> {
-        // Down the left spine to the head. Each argument keeps the span of the
-        // application that CONSUMES it, so an error still names the innermost
-        // application rather than the outermost.
-        let mut args: Vec<(&Expr, Span)> = Vec::new();
-        let mut head = e;
-        while let Expr::Apply(f, a, sp) = head {
-            args.push((a, *sp));
-            head = f;
-        }
-        args.reverse();
+    fn apply_spine(
+        &mut self,
+        head: &Code,
+        args: &[(Code, Span)],
+        env: &Env,
+        tail: bool,
+    ) -> R<Step> {
         // The nodes are still there and still evaluated; only the closures in
         // between are gone. Counting them keeps `steps` a measure of the
         // PROGRAM's work rather than of this interpreter's shape, so a rate
@@ -730,29 +638,29 @@ impl Interp {
                 Value::Fun(c) => Some(c.clone()),
                 _ => None,
             };
-            let Some(c) = fun.filter(|c| c.params.len() > c.applied.len()) else {
+            let Some(c) = fun.filter(|c| c.arity > c.applied.len()) else {
                 // A constructor takes its fields one at a time, and anything
                 // else is an error the one-argument path words properly.
-                let (a, sp) = args[i];
+                let (a, sp) = &args[i];
                 let arg = self.eval(a, env)?;
-                f = self.apply(f, arg).map_err(|e| at(e, sp))?;
+                f = self.apply(f, arg).map_err(|e| at(e, *sp))?;
                 i += 1;
                 continue;
             };
-            let take = (c.params.len() - c.applied.len()).min(args.len() - i);
-            let mut applied = c.applied.clone();
+            let take = (c.arity - c.applied.len()).min(args.len() - i);
+            let mut applied = Vec::with_capacity(c.arity);
+            applied.extend_from_slice(&c.applied);
             let sp = args[i + take - 1].1;
             for (a, _) in &args[i..i + take] {
                 applied.push(self.eval(a, env)?);
             }
             i += take;
-            if applied.len() < c.params.len() {
+            if applied.len() < c.arity {
                 f = Value::Fun(Rc::new(Closure {
-                    params: c.params.clone(),
+                    arity: c.arity,
                     body: c.body.clone(),
                     env: c.env.clone(),
                     applied,
-                    slug: c.slug.clone(),
                 }));
             } else if tail && i == args.len() {
                 return Ok(Step::Call(c, applied));
@@ -776,13 +684,12 @@ impl Interp {
         };
         let mut applied = c.applied.clone();
         applied.push(arg);
-        if applied.len() < c.params.len() {
+        if applied.len() < c.arity {
             return Ok(Step::Done(Value::Fun(Rc::new(Closure {
-                params: c.params.clone(),
+                arity: c.arity,
                 body: c.body.clone(),
                 env: c.env.clone(),
                 applied,
-                slug: c.slug.clone(),
             }))));
         }
         Ok(Step::Call(c, applied))
@@ -795,13 +702,13 @@ impl Interp {
         }
     }
 
-    fn match_arms(&mut self, v: &Value, arms: &[MatchArm], env: &Env) -> R<Value> {
+    fn match_arms(&mut self, v: &Value, arms: &[Arm], env: &Env) -> R<Value> {
         for a in arms {
-            let mut vars = Vec::new();
-            if !matches_pat(v, &a.pattern, &mut vars) {
+            let mut vals = Vec::with_capacity(a.nvars);
+            if !matches_pat(v, &a.pat, &mut vals) {
                 continue;
             }
-            let env = Scope::child(env, vars);
+            let env = Scope::push(env, vals);
             match self.eval(&a.guard, &env)? {
                 Value::Bool(false) => continue,
                 _ => return self.eval(&a.body, &env),
@@ -1085,7 +992,7 @@ fn apply_bound(v: i64, b: &FieldBound) -> i64 {
     }
 }
 
-fn literal(text: &str, kind: LiteralKind) -> R<Value> {
+pub(crate) fn literal(text: &str, kind: LiteralKind) -> R<Value> {
     match kind {
         // `#FFFF` is hexadecimal. The lexer scans it as one integer literal,
         // hash and all.
@@ -1229,31 +1136,36 @@ fn equal(a: &Value, b: &Value) -> bool {
     }
 }
 
-fn matches_pat(v: &Value, p: &Pat, vars: &mut Vec<(Name, Value)>) -> bool {
+/// Match, pushing each bound value in the order the compiler counted the
+/// pattern's variables -- which is what makes a slot implicit rather than
+/// named. A failing sub-pattern leaves a partly filled frame behind, and it is
+/// thrown away with the arm.
+fn matches_pat(v: &Value, p: &PatCode, vals: &mut Vec<Value>) -> bool {
     match p {
-        Pat::Wild(_) => true,
-        Pat::Var(n, _) => {
-            vars.push((n.clone(), v.clone()));
+        PatCode::Wild => true,
+        PatCode::Var => {
+            vals.push(v.clone());
             true
         }
-        Pat::Lit(text, kind, _) => literal(text, *kind).map(|l| equal(v, &l)).unwrap_or(false),
-        Pat::Ctor(name, subs, _) => match v {
+        PatCode::Lit(l) => equal(v, l),
+        PatCode::BadLit => false,
+        PatCode::Ctor(name, subs) => match v {
             Value::Ctor(n, fields) if **n == *name => {
                 subs.len() == fields.len()
-                    && subs.iter().zip(fields.iter()).all(|(s, f)| matches_pat(f, s, vars))
+                    && subs.iter().zip(fields.iter()).all(|(s, f)| matches_pat(f, s, vals))
             }
             // A one-field constructor pattern over a bare value is how the
             // tuple patterns land after desugaring.
             Value::Record(n, fields) if **n == *name => {
                 subs.len() == fields.len()
-                    && subs.iter().zip(fields.iter()).all(|(s, f)| matches_pat(&f.1, s, vars))
+                    && subs.iter().zip(fields.iter()).all(|(s, f)| matches_pat(&f.1, s, vals))
             }
             _ => false,
         },
-        Pat::Vec_(subs, _) => match v {
+        PatCode::Vec_(subs) => match v {
             Value::List(xs) => {
                 subs.len() == xs.len()
-                    && subs.iter().zip(xs.iter()).all(|(s, x)| matches_pat(x, s, vars))
+                    && subs.iter().zip(xs.iter()).all(|(s, x)| matches_pat(x, s, vals))
             }
             _ => false,
         },
