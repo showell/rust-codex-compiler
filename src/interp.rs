@@ -153,6 +153,29 @@ pub struct Interp {
     /// reference evaluates one; Codex is pure, so that is a cost and not a
     /// meaning.
     const_defs: Vec<Rc<Code>>,
+    /// The value of each nullary that has already been forced, and whether it
+    /// is one we are allowed to keep.
+    ///
+    /// **A nullary is re-evaluated at every mention, and that is a whole
+    /// complexity class on the tables this compiler is pointed at.** Measured
+    /// on safari's `build-world`: one mention costs about 350,000 steps, two
+    /// cost 700,000, exactly linear. `pose-rest-polys` is 2,198 records rebuilt
+    /// per mention. The game's own port notes record the same shape from the
+    /// other side -- PORTING_NOTES B13, a nullary emits as a FUNCTION in zig
+    /// and allocates per call, per frame.
+    ///
+    /// Codex bindings are pure, so forcing one twice can only cost. THE GUARD
+    /// IS THE EFFECT ROW AND NOTHING ELSE: `opening : [Console] Nothing` is
+    /// also a nullary, and an act performed once is not an act performed twice.
+    /// A definition with no annotation at all is not cached either, because
+    /// what is not declared is not known here -- the checker infers, this pass
+    /// does not.
+    ///
+    /// This is a place the Rust arm deliberately does BETTER than the zig,
+    /// rather than the same. The output is identical because the language is
+    /// pure; only the work differs.
+    const_cache: Vec<Option<Value>>,
+    const_cacheable: Vec<bool>,
     /// `opening`, compiled in the empty environment.
     opening: Option<Rc<Code>>,
     /// `Type.field -> bound`, and the ONE thing resolution cannot do ahead of
@@ -317,8 +340,13 @@ impl Interp {
         // Pass 2: compile. The tables are complete, so a body can name
         // anything the unit defines regardless of where it sits.
         let mut const_defs: Vec<Rc<Code>> = Vec::with_capacity(const_defs_src.len());
+        let mut const_cacheable: Vec<bool> = Vec::with_capacity(const_defs_src.len());
         for d in &const_defs_src {
             const_defs.push(Rc::new(Compiler::body(&names, &ch.syms, &d.chapter_slug, &d.body)));
+            const_cacheable.push(match d.declared_type.first() {
+                Some(t) => !mentions_effect(t),
+                None => false,
+            });
         }
         for (i, d) in &fun_defs {
             globals[*i as usize] = Value::Fun(Rc::new(Closure {
@@ -340,6 +368,8 @@ impl Interp {
 
         Interp {
             globals,
+            const_cache: vec![None; const_defs.len()],
+            const_cacheable,
             const_defs,
             opening,
             bounds: names.bounds,
@@ -393,9 +423,19 @@ impl Interp {
                 .ok_or_else(|| Error(format!("internal: no local at ({hops}, {slot})"))),
             Code::Global(i) => Ok(self.globals[*i as usize].clone()),
             Code::ConstDef(i) => {
-                let body = self.const_defs[*i as usize].clone();
+                let i = *i as usize;
+                if let Some(v) = &self.const_cache[i] {
+                    return Ok(v.clone());
+                }
+                let body = self.const_defs[i].clone();
                 let root = self.root.clone();
-                self.eval(&body, &root)
+                let v = self.eval(&body, &root)?;
+                // Only after it returns: a self-referential nullary must still
+                // recurse to its own error rather than see a half-built answer.
+                if self.const_cacheable[i] {
+                    self.const_cache[i] = Some(v.clone());
+                }
+                Ok(v)
             }
             Code::NullaryBuiltin(name) => self.builtin(name, Vec::new()),
             Code::Fail(msg) => Err(Error(msg.clone())),
@@ -1263,5 +1303,26 @@ mod tests {
     #[test]
     fn value_is_two_words() {
         assert_eq!(std::mem::size_of::<Value>(), 16);
+    }
+}
+
+/// Does this type carry an effect row anywhere inside it?
+///
+/// Recursive rather than a look at the head, because `[Console] Nothing` is the
+/// shape that matters here but an effect can sit under a `Forall` or to the
+/// right of an arrow, and a nullary whose type says it performs anything must
+/// not be cached. Wrong in the safe direction costs a rebuild; wrong in the
+/// other direction silently drops an effect.
+fn mentions_effect(t: &TypeExpr) -> bool {
+    match t {
+        TypeExpr::Effect(..) => true,
+        TypeExpr::Named(..) => false,
+        TypeExpr::Fun(a, b, _) => mentions_effect(a) || mentions_effect(b),
+        TypeExpr::App(h, args, _) => mentions_effect(h) || args.iter().any(mentions_effect),
+        TypeExpr::BoundedInt(a, ..) => mentions_effect(a),
+        TypeExpr::PropEq(a, b, _) => mentions_effect(a) || mentions_effect(b),
+        TypeExpr::Constrained(_, _, a, _) => mentions_effect(a),
+        TypeExpr::Linear(a, _) => mentions_effect(a),
+        TypeExpr::Forall(_, a, b, _) => mentions_effect(a) || mentions_effect(b),
     }
 }
