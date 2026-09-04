@@ -147,6 +147,13 @@ impl Env {
         self.locals.get(n).or_else(|| self.types.get(n)).map(String::as_str)
     }
 
+    /// One more name in scope, for a `let` body.
+    fn bind(&self, n: &str, ty: &str) -> Env {
+        let mut l = self.locals.clone();
+        l.insert(n.to_string(), ty.to_string());
+        Env { types: self.types.clone(), locals: l }
+    }
+
     /// A definition's own parameters, in scope for its body only. They shadow:
     /// a parameter named `max` is the parameter, not the builtin, which is the
     /// same collision the golds show for that name.
@@ -243,6 +250,49 @@ fn expr(e: &Expr, env: &Env) -> Result<(String, String), String> {
                 return Err(format!("if branches disagree: `{tty}` vs `{ety}`"));
             }
             Ok((format!("(if {ct} {tt} {et} {tty})"), tty))
+        }
+        // `(list-expr (elems ...) ELEM)` -- the trailing type is the ELEMENT's,
+        // not the list's, checked against golds carrying text and nested-list
+        // elements rather than assumed from the integer cases. The NODE's type
+        // is `(list ELEM)`.
+        //
+        // An empty list has no element to read a type from and is refused: the
+        // type is in the context, which is the checker's job and not ours.
+        Expr::List(xs, _) => {
+            if xs.is_empty() {
+                return Err("empty list literal (its type is in the context)".into());
+            }
+            let mut parts = Vec::new();
+            let mut elem: Option<String> = None;
+            for x in xs {
+                let (xt, xty) = expr(x, env)?;
+                match &elem {
+                    None => elem = Some(xty),
+                    Some(e) if *e == xty => {}
+                    Some(e) => return Err(format!("list elements disagree: `{e}` vs `{xty}`")),
+                }
+                parts.push(xt);
+            }
+            let e = elem.unwrap();
+            Ok((format!("(list-expr (elems {}) {})", parts.join(" "), e), format!("(list {e})")))
+        }
+        // `(let "n" TYPE VALUE BODY)`, nested one deep per binding, and the
+        // let's own type is the BODY's -- a let evaluates to its body. Each
+        // binding is in scope for the ones after it and for the body.
+        Expr::Let(binds, body, _) => {
+            let mut env2 = env.bind("", "");
+            let mut heads = Vec::new();
+            for b in binds {
+                let (vt, vty) = expr(&b.value, &env2)?;
+                heads.push((b.name.clone(), vty.clone(), vt));
+                env2 = env2.bind(&b.name, &vty);
+            }
+            let (bt, bty) = expr(body, &env2)?;
+            let mut out = bt;
+            for (n, ty, v) in heads.into_iter().rev() {
+                out = format!("(let {:?} {} {} {})", n, ty, v, out);
+            }
+            Ok((out, bty))
         }
         other => Err(node_kind(other).to_string()),
     }
