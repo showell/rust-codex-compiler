@@ -15,6 +15,13 @@
 //! were made from, and reports every byte of disagreement. A difference is a
 //! FINDING until someone shows it is a bug in this arm; it is not a licence to
 //! reach for the other bundler.
+//!
+//! WHAT IT SAYS TODAY, and it wants a same-instant comparison to say it: with
+//! units resolved from the checkout as it stands, 606 are byte-identical and
+//! FIVE differ. All five are the CRLF chapters, and that is the whole of the
+//! disagreement between the two resolvers. Handed a units directory written
+//! against an older checkout, most of the diff is upstream's prose edits rather
+//! than anything either bundler did -- generate the units now.
 
 use codexc::bundle::{self, Quires};
 use std::io::Write;
