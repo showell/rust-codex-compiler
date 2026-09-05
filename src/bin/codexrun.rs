@@ -98,6 +98,9 @@ fn timed(path: &Path, budget: Option<u64>) -> Result<Run, String> {
     let secs = t0.elapsed().as_secs_f64();
     match r {
         Ok(()) => {
+            if it.progress {
+                eprint!("{}", it.profile(20));
+            }
             let (mapped, hwm, hwm_in) = it.memory();
             let hwm_in = format!("{hwm_in} remat={} remat-mb={:.1}",
                                  it.rematerialised,

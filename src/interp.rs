@@ -370,6 +370,21 @@ pub struct Interp {
     started: Option<std::time::Instant>,
     next_report: f64,
     moves: u64,
+    /// **THE SAMPLES, KEPT.** `cur` is already read every `SAMPLE_STEPS` for
+    /// the memory attribution and was then thrown away, one per second
+    /// surviving into the log. Keeping them is a `HashMap` insert on a
+    /// sampling path that already exists, and it turns one sample a second
+    /// into ten thousand -- which is the difference between reading a scrolling
+    /// log by eye and having a profile.
+    ///
+    /// The allocation delta since the previous sample is attributed to the same
+    /// definition, on the same reasoning a sampling profiler attributes time:
+    /// wrong for any single sample, right in aggregate.
+    prof: HashMap<Sym, (u64, u64)>,
+    last_live: usize,
+    /// Which chapter defines each name, so the profile can be bucketed by
+    /// PHASE without anybody guessing from the name afterwards.
+    home: HashMap<Sym, Rc<str>>,
 }
 
 /// One byte-addressed region starting at 0, sparse and paged.
@@ -418,11 +433,31 @@ impl Mem {
     /// `cx_peek_32` uses checked arithmetic and cannot overflow; wasm emits
     /// `i64.load` against `i64.extend_i32_u`. Both plugs, the same split.
     fn load(&self, addr: i64, width: u32) -> i64 {
-        let mut w: u64 = 0;
-        for j in (0..width as i64).rev() {
-            w = (w << 8) | self.byte(addr + j) as u64;
+        // **ONE PAGE LOOKUP, NOT ONE PER BYTE.** A `peek-qword` was eight
+        // hash lookups, and `cons-probe-at` -- the checker's cons table walking
+        // its linear probe with fuel 64 -- does one per probe step. That loop
+        // held 49 to 59 of every 60 samples for the last 458 seconds of a
+        // self-compile. The straddling case is rare and still correct: nothing
+        // aligns a memo slot to a page, so it has its own test.
+        let page = addr.div_euclid(MEM_PAGE);
+        let off = addr.rem_euclid(MEM_PAGE) as usize;
+        let w = width as usize;
+        let mut v: u64 = 0;
+        if off + w <= MEM_PAGE as usize {
+            match self.pages.get(&page) {
+                None => return 0,
+                Some(p) => {
+                    for j in (0..w).rev() {
+                        v = (v << 8) | p[off + j] as u64;
+                    }
+                }
+            }
+        } else {
+            for j in (0..w as i64).rev() {
+                v = (v << 8) | self.byte(addr + j) as u64;
+            }
         }
-        w as i64
+        v as i64
     }
 
     /// How many bytes of pages this region has mapped, and the highest address
@@ -441,9 +476,41 @@ impl Mem {
 
     /// A little-endian store of the low `width` bytes, and no byte beyond.
     fn store(&mut self, addr: i64, width: u32, v: i64) {
-        let w = v as u64;
-        for j in 0..width as i64 {
-            self.set_byte(addr + j, (w >> (8 * j)) as u8);
+        let bits = v as u64;
+        let page = addr.div_euclid(MEM_PAGE);
+        let off = addr.rem_euclid(MEM_PAGE) as usize;
+        let w = width as usize;
+        if off + w <= MEM_PAGE as usize {
+            let p = self
+                .pages
+                .entry(page)
+                .or_insert_with(|| Box::new([0u8; MEM_PAGE as usize]));
+            for j in 0..w {
+                p[off + j] = (bits >> (8 * j)) as u8;
+            }
+        } else {
+            for j in 0..w as i64 {
+                self.set_byte(addr + j, (bits >> (8 * j)) as u8);
+            }
+        }
+    }
+
+    /// Fill `n` bytes, a page at a time rather than a lookup at a time. The
+    /// checker zeroes its cons table this way at every batch open, and those
+    /// tables are megabytes.
+    fn fill(&mut self, addr: i64, n: i64, v: u8) {
+        let mut at = addr;
+        let end = addr + n;
+        while at < end {
+            let page = at.div_euclid(MEM_PAGE);
+            let off = at.rem_euclid(MEM_PAGE) as usize;
+            let take = ((MEM_PAGE as usize - off) as i64).min(end - at) as usize;
+            let p = self
+                .pages
+                .entry(page)
+                .or_insert_with(|| Box::new([0u8; MEM_PAGE as usize]));
+            p[off..off + take].fill(v);
+            at += take as i64;
         }
     }
 }
@@ -482,6 +549,13 @@ impl Interp {
         let root = Scope::root();
         let mut names = Names::default();
         let mut globals: Vec<Value> = Vec::new();
+        // Who defines each name. First definition wins, which is the same rule
+        // the collision report uses; a name in two chapters is reported there
+        // and is not this table's problem to solve.
+        let mut home: HashMap<Sym, Rc<str>> = HashMap::new();
+        for d in &ch.defs {
+            home.entry(d.name).or_insert_with(|| Rc::from(d.chapter_slug.as_str()));
+        }
 
         // Pass 1: an index for every definition, and who owns each name.
         let mut fun_defs: Vec<(u32, &Def)> = Vec::new();
@@ -664,6 +738,9 @@ impl Interp {
             started: None,
             next_report: 1.0,
             moves: 0,
+            prof: HashMap::new(),
+            last_live: 0,
+            home,
         }
     }
 
@@ -694,6 +771,12 @@ impl Interp {
             if live > self.live_hwm {
                 self.live_hwm = live;
                 self.hwm_in = self.cur;
+            }
+            if self.progress {
+                let e = self.prof.entry(self.cur).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += live.saturating_sub(self.last_live) as u64;
+                self.last_live = live;
             }
         }
         if self.progress && self.steps & (PROGRESS_STEPS - 1) == 0 {
@@ -1123,6 +1206,52 @@ impl Interp {
         self.bump.set_cursor(v);
     }
 
+    /// **THE PROFILE, BY CHAPTER AND BY DEFINITION.**
+    ///
+    /// Written out rather than returned, because both self-compile attempts so
+    /// far were KILLED and a profile that only exists at exit is a profile
+    /// nobody gets. This goes to stderr beside the progress lines, so the last
+    /// dump before an interrupt is the answer.
+    ///
+    /// Chapters first: that is the phase breakdown, and the interpreter knows
+    /// which chapter defines each name, so nobody has to infer it from the
+    /// name afterwards.
+    pub fn profile(&self, top: usize) -> String {
+        let total: u64 = self.prof.values().map(|(n, _)| n).sum();
+        if total == 0 {
+            return String::new();
+        }
+        let mut out = format!("\n--- profile: {total} samples\n");
+        let mut by_chapter: HashMap<&str, (u64, u64)> = HashMap::new();
+        for (sym, (n, bytes)) in &self.prof {
+            let ch = self.home.get(sym).map(|c| &**c).unwrap_or("(builtin or lambda)");
+            let e = by_chapter.entry(ch).or_insert((0, 0));
+            e.0 += n;
+            e.1 += bytes;
+        }
+        let mut rows: Vec<_> = by_chapter.into_iter().collect();
+        rows.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+        for (ch, (n, bytes)) in rows.iter().take(top) {
+            out += &format!(
+                "  {:5.1}%  {:>10} allocated  {}\n",
+                100.0 * *n as f64 / total as f64,
+                format!("{:.0} MB", crate::heapwatch::mb(*bytes as usize)),
+                ch
+            );
+        }
+        out += "  --- by definition\n";
+        let mut defs: Vec<_> = self.prof.iter().collect();
+        defs.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+        for (sym, (n, _)) in defs.iter().take(top) {
+            out += &format!(
+                "  {:5.1}%  {}\n",
+                100.0 * *n as f64 / total as f64,
+                self.syms.text(**sym)
+            );
+        }
+        out
+    }
+
     /// Say where this run has got to, at most once a second.
     ///
     /// To stderr, because stdout is the program's own output and a caller is
@@ -1136,6 +1265,11 @@ impl Interp {
             return;
         }
         self.next_report = secs.floor() + 1.0;
+        // Every thirty seconds the whole profile, so an interrupted run still
+        // leaves one behind.
+        if secs as u64 % 30 == 0 {
+            eprint!("{}", self.profile(12));
+        }
         eprintln!(
             "progress secs={secs:.0} steps={} live-mb={:.0} depth={} moves={} in={}",
             self.steps,
@@ -1559,9 +1693,7 @@ impl Interp {
             // `__memset` fills n bytes with the LOW BYTE of its value. The
             // checker opens every batch by zeroing its cons table this way.
             ("__memset", [Int(b), Int(v), Int(n)]) => {
-                for i in 0..*n {
-                    self.mem.set_byte(b + i, *v as u8);
-                }
+                self.mem.fill(*b, *n, *v as u8);
                 Ok(Unit)
             }
 
@@ -2614,6 +2746,67 @@ mod tests {
     fn the_self_type_table_is_empty_in_a_hosted_compiler() {
         let src = mem_body("print-line-uni (show (list-length __self-type-defs))");
         assert_eq!(out(&src).trim(), "0");
+    }
+
+    /// **THE DURABILITY TEST, WHICH IS THE WHOLE REASON A TEXT HAS AN
+    /// ADDRESS.** The compiler asks
+    ///
+    /// ```text
+    /// copy-sx-text (b) (t) = if address-of t < b then t else substring t 0 (text-length t)
+    /// ```
+    ///
+    /// and answers "rebuild it" whenever that is false. With a host pointer it
+    /// was false for every text, always, and the source of a 112 KB subject
+    /// was rebuilt at every keep boundary -- 2.3 GB of a 2.3 GB peak. This
+    /// pins the two halves of the answer: a text made BEFORE a base compares
+    /// below it, and one made AFTER does not.
+    ///
+    /// A LITERAL IS BELOW EVERY BASE, which is the other half. It lives in the
+    /// image band under the heap origin, so it is durable against a base taken
+    /// at any point in the run -- which is what makes sharing it correct
+    /// rather than lucky.
+    #[test]
+    fn a_text_is_durable_against_a_base_taken_after_it() {
+        let src = mem_body(
+            "let lit = \"a literal, which lives in the image\"\n    in let early = \"made\" & \" early\"\n    in let b = __heap-save\n    in let late = \"made\" & \" late\"\n                 in print-line-uni (show (address-of lit < b) & \" \" & show (address-of early < b) & \" \" & show (address-of late < b))",
+        );
+        assert_eq!(out(&src).trim(), "True True False");
+    }
+
+    /// Two texts are two addresses, or every content key in the checker's cons
+    /// table collides -- which is exactly the defect this arm found in the zig
+    /// plug, where `.rodata` answered 0 for all of them.
+    #[test]
+    fn two_texts_have_two_addresses() {
+        let src = mem_body(
+            "let a = \"Console\" & \".Write\"\n    in let b = \"Device\" & \".Mmio\"\n                 in print-line-uni (show (address-of a == address-of b) & \" \" & show (address-of a == 0))",
+        );
+        assert_eq!(out(&src).trim(), "False False");
+    }
+
+    /// **A QWORD MAY STRADDLE A PAGE**, and the flat memory is paged. Nothing
+    /// in the compiler aligns its memo slots to a page -- `table + idx * 16`
+    /// lands wherever the reservation put it -- so an eight-byte load four
+    /// bytes before a boundary is an ordinary case and not an edge one.
+    /// Written before the page lookup was hoisted out of the byte loop,
+    /// because that is exactly the change that would break it.
+    #[test]
+    fn a_load_and_a_store_may_cross_a_page() {
+        let src = mem_body(
+            "let a = __heap-save\n    in let __x = __heap-advance 16384\n    in let __y = poke-qword (a + 4092) 0 (0 - 72057594037927936)\n    in let __z = poke-32 (a + 8190) 0 4294967295\n                 in print-line-uni (show (peek-qword (a + 4092) 0) & \" \" & show (peek-byte (a + 4099) 0) & \" \" & show (peek-32 (a + 8190) 0) & \" \" & show (peek-byte (a + 8194) 0))",
+        );
+        assert_eq!(out(&src).trim(), "-72057594037927936 255 4294967295 0");
+    }
+
+    /// A read of a page nobody wrote answers zero and maps NOTHING. The driver
+    /// opens with `__heap-advance 536870912`; half a gigabyte of pages for a
+    /// region nobody touches would be the whole of the memory this arm has.
+    #[test]
+    fn reading_unmapped_memory_maps_nothing() {
+        let src = mem_body(
+            "let a = __heap-save\n    in let __x = __heap-advance 536870912\n                 in print-line-uni (show (peek-qword (a + 400000000) 0) & \" \" & show (peek-byte (a + 12345678) 0))",
+        );
+        assert_eq!(out(&src).trim(), "0 0");
     }
 
     /// Wrap a body in the smallest chapter that can hold it.
