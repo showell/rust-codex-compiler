@@ -125,6 +125,15 @@ pub enum Code {
     Act(Vec<Stmt>),
     FieldAssign(Box<Code>, Sym, Box<Code>),
     Lazy(Box<Code>),
+    /// `deck-record x`: an EXTENT around the evaluation of `x`.
+    ///
+    /// Its Codex definition is the identity, and that is only true because no
+    /// emitter ever runs it -- `emit-deck-record-wrapper` compiles it to
+    /// `__deck-enter, the body, __deck-exit`. An arm that ran the identity
+    /// instead would never open an extent, and every guarded copy would then
+    /// measure the BIVY against a ceiling the bivy parks on the instant the
+    /// reservation is made.
+    DeckRecord(Box<Code>),
     /// A form the interpreter does not do, with upstream's wording.
     Unsupported(&'static str),
 }
@@ -204,6 +213,14 @@ impl<'a> Compiler<'a> {
                     head = f;
                 }
                 args.reverse();
+                // The one application this compiler does not compile as one.
+                if args.len() == 1 {
+                    if let Expr::NameRef(n, _) = head {
+                        if self.syms.text(*n) == "deck-record" {
+                            return Code::DeckRecord(Box::new(self.expr(args[0].0)));
+                        }
+                    }
+                }
                 let h = self.expr(head);
                 let mut out = Vec::with_capacity(args.len());
                 for (a, sp) in args {

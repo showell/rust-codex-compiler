@@ -69,6 +69,17 @@ pub enum Value {
     /// `Rc<RefCell<..>>` is still one pointer, so `Value` stays 16 bytes -- the
     /// property that made `Rc<str>` cost 16% does not apply here.
     Record(Sym, Rc<RefCell<Vec<(Sym, Value)>>>),
+    /// A LINKED LIST: a mutable handle, which a `List` deliberately is not.
+    ///
+    /// `__linked-list-push` answers the list AND pushes in place, so a caller
+    /// holding its own reference sees the push. The compiler's scoper
+    /// accumulates a chapter's definitions that way; modelled as a fresh
+    /// `List`, its table came out empty and every name in every program was
+    /// undefined, down to a function's own parameter.
+    ///
+    /// It is a separate type upstream too -- `LinkedListTy`, not `list` -- so
+    /// this is not a special case, it is the type.
+    LinkedList(Rc<RefCell<Vec<Value>>>),
     /// A variant constructor, saturated or not.
     Ctor(Sym, Rc<Vec<Value>>),
     Fun(Rc<Closure>),
@@ -252,8 +263,16 @@ pub struct Interp {
     /// here, because nothing here reclaims anything. Agreement between this arm
     /// and bare metal is evidence about the SEMANTICS and silence about the
     /// memory discipline. Do not let a green line be read as covering both.
-    heap_pos: i64,
-    deck_pos: i64,
+    /// The BIVY frontier: where the cursor sits outside an extent.
+    bivy: i64,
+    /// The deck-pos CELL, which `__deck-pos` reads and `__deck-set` writes.
+    deck_cell: i64,
+    /// The cursor while an extent is open. Loaded from the cell on the way in
+    /// and written back on the way out, both only at a zero crossing.
+    deck_cursor: i64,
+    /// How many extents are open. `__deck-enter` and `__deck-exit` are nested,
+    /// and only the outermost pair copies.
+    deck_depth: u32,
     /// Each constructor's position in its own variant declaration, which is
     /// what `variant-tag` answers.
     tags: HashMap<Sym, i64>,
@@ -446,8 +465,10 @@ impl Interp {
             steps: 0,
             depth: 0,
             limit: STEP_LIMIT,
-            heap_pos: 0,
-            deck_pos: 0,
+            bivy: 0,
+            deck_cell: 0,
+            deck_cursor: 0,
+            deck_depth: 0,
             tags,
         }
     }
@@ -627,6 +648,18 @@ impl Interp {
                 Ok(last)
             }
             Code::Lazy(inner) => self.eval(inner, env),
+            Code::DeckRecord(body) => {
+                if self.deck_depth == 0 {
+                    self.deck_cursor = self.deck_cell;
+                }
+                self.deck_depth += 1;
+                let v = self.eval(body, env);
+                self.deck_depth = self.deck_depth.saturating_sub(1);
+                if self.deck_depth == 0 {
+                    self.deck_cell = self.deck_cursor;
+                }
+                v
+            }
             Code::FieldAssign(rec, field, val) => {
                 let base = self.eval(rec, env)?;
                 let v = self.eval(val, env)?;
@@ -857,6 +890,20 @@ impl Interp {
             }
         }
         err("no match arm applied")
+    }
+
+    /// Where the next allocation goes: the deck while an extent is open, the
+    /// bivy otherwise. One cursor with two homes, which is R10 on the metal.
+    fn cursor(&self) -> i64 {
+        if self.deck_depth == 0 { self.bivy } else { self.deck_cursor }
+    }
+
+    fn set_cursor(&mut self, v: i64) {
+        if self.deck_depth == 0 {
+            self.bivy = v;
+        } else {
+            self.deck_cursor = v;
+        }
     }
 
     fn builtin(&mut self, name: &str, args: Vec<Value>) -> R<Value> {
@@ -1116,13 +1163,47 @@ impl Interp {
             // the exit reclaims. Nothing here reclaims anything, so the bracket
             // is a pair of no-ops -- which is exactly why this arm cannot see
             // a value that outlives one.
-            ("__deck-enter", []) | ("__deck-exit", []) => Ok(Unit),
+            ("__deck-enter", []) => {
+                if self.deck_depth == 0 {
+                    self.deck_cursor = self.deck_cell;
+                }
+                self.deck_depth += 1;
+                Ok(Unit)
+            }
+            ("__deck-exit", []) => {
+                self.deck_depth = self.deck_depth.saturating_sub(1);
+                if self.deck_depth == 0 {
+                    self.deck_cell = self.deck_cursor;
+                }
+                Ok(Unit)
+            }
             // A LINKED LIST IS A LIST HERE, and the call sites make that sound:
             // `__linked-list-push` ANSWERS the new list and every caller in the
             // compiler rebinds it -- `__linked-list-push acc (...)` threaded as
             // an accumulator. The mutation is the emitter's optimisation of a
             // functional interface, not the interface.
-            ("__linked-list-empty", [Int(_)]) => Ok(List(Rc::new(Vec::new()))),
+            // The capacity is a hint upstream and there is nothing here to
+            // reserve, exactly as with `__list-with-capacity`.
+            ("__linked-list-empty", [Int(_)]) => Ok(LinkedList(Rc::new(RefCell::new(Vec::new())))),
+            ("__linked-list-push", [LinkedList(xs), v]) => {
+                xs.borrow_mut().push(v.clone());
+                Ok(LinkedList(xs.clone()))
+            }
+            ("__linked-list-to-list", [LinkedList(xs)]) => {
+                Ok(List(Rc::new(xs.borrow().clone())))
+            }
+            // **A LINKED LIST IS SEEDED WITH `[]` AND THAT IS NOT A MISTAKE.**
+            // `ChapterScoper` declares its accumulator `LinkedList ADef` and
+            // passes `[]` for it: the distinction is in the TYPE, and at the
+            // value level an empty list is an empty linked list. So both arms
+            // are real, and they differ in exactly one way -- a `List` handle
+            // is threaded through the return, a `LinkedList` handle is also
+            // visible to whoever else holds it.
+            //
+            // Every call site in the compiler threads the return, so both
+            // behave the same there. Whether anything upstream depends on the
+            // second is NOT established, and the tests above pin only what
+            // `__linked-list-empty` hands back.
             ("__linked-list-push", [List(xs), v]) => {
                 let mut out = (**xs).clone();
                 out.push(v.clone());
@@ -1130,18 +1211,24 @@ impl Interp {
             }
             ("__linked-list-to-list", [List(xs)]) => Ok(List(xs.clone())),
 
-            ("__heap-save", []) => Ok(Int(self.heap_pos)),
-            ("__deck-pos", []) => Ok(Int(self.deck_pos)),
+            // `__heap-save` reads the ACTIVE cursor, which is the whole of
+            // what makes a guarded copy's `__heap-save >= ceiling` mean
+            // anything: inside an extent it asks about the deck, outside it
+            // asks about the bivy.
+            ("__heap-save", []) => Ok(Int(self.cursor())),
             ("__heap-advance", [Int(n)]) => {
-                self.heap_pos += *n;
+                let c = self.cursor() + *n;
+                self.set_cursor(c);
                 Ok(Unit)
             }
             ("__heap-restore", [Int(p)]) => {
-                self.heap_pos = *p;
+                self.set_cursor(*p);
                 Ok(Unit)
             }
+            // The CELL, which is frozen for as long as an extent is open.
+            ("__deck-pos", []) => Ok(Int(self.deck_cell)),
             ("__deck-set", [Int(p)]) => {
-                self.deck_pos = *p;
+                self.deck_cell = *p;
                 Ok(Unit)
             }
             // `__record-set` is how a mutable record is updated: record, field
@@ -1364,6 +1451,10 @@ fn equal(a: &Value, b: &Value) -> bool {
         (Ctor(n, x), Ctor(m, y)) => {
             n == m && x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| equal(p, q))
         }
+        (LinkedList(x), LinkedList(y)) => {
+            let (x, y) = (x.borrow(), y.borrow());
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| equal(p, q))
+        }
         (Record(n, x), Record(m, y)) => {
             let (x, y) = (x.borrow(), y.borrow());
             n == m
@@ -1423,6 +1514,10 @@ pub fn show(syms: &SymTab, v: &Value) -> String {
             let inner: Vec<String> = xs.iter().map(|x| show(syms, x)).collect();
             format!("[{}]", inner.join(", "))
         }
+        Value::LinkedList(xs) => {
+            let inner: Vec<String> = xs.borrow().iter().map(|x| show(syms, x)).collect();
+            format!("[{}]", inner.join(", "))
+        }
         Value::Ctor(n, fs) if fs.is_empty() => syms.text(*n).to_string(),
         Value::Ctor(n, fs) => {
             let inner: Vec<String> = fs.iter().map(|x| show(syms, x)).collect();
@@ -1448,6 +1543,7 @@ fn type_name(v: &Value) -> &'static str {
         Value::Char(_) => "a char",
         Value::Bool(_) => "a boolean",
         Value::List(_) => "a list",
+        Value::LinkedList(_) => "a linked list",
         Value::Record(..) => "a record",
         Value::Ctor(..) => "a constructor",
         Value::Fun(_) => "a function",
@@ -1731,6 +1827,165 @@ mod tests {
                 "in print-line-uni (show one & \" \" & show two & \" \" & show stale)",
             ]),
             "0 1000 True"
+        );
+    }
+
+    /// **A LINKED LIST IS A MUTABLE HANDLE, and a `List` is not.**
+    ///
+    /// `__linked-list-push` answers the list, and every caller in the compiler
+    /// rebinds what it answers -- which is why modelling it as a fresh `List`
+    /// looked right. It is not: upstream pushes IN PLACE and answers the same
+    /// handle, so a caller that keeps its own reference sees the push. The
+    /// scoper does exactly that when it accumulates a chapter's definitions,
+    /// and with a functional push the table came out EMPTY -- every name in
+    /// every program undefined, down to a function's own parameter.
+    ///
+    /// `List` stays immutable, because Codex's is. `LinkedList` is a different
+    /// type over there (`LinkedListTy`, not `list`) and it is a different type
+    /// here.
+    #[test]
+    fn a_linked_list_push_is_seen_through_the_original_handle() {
+        assert_eq!(
+            alloc_out(&[
+                "let ll = __linked-list-empty 0",
+                "in let __a = __linked-list-push ll 1",
+                "in let __b = __linked-list-push ll 2",
+                "in let seen = __linked-list-to-list ll",
+                "in print-line-uni (show (list-length seen) & \" \" & show seen)",
+            ]),
+            "2 [1, 2]"
+        );
+    }
+
+    /// Two empty linked lists are two handles, so a push into one is not a push
+    /// into the other.
+    #[test]
+    fn two_linked_lists_are_two_handles() {
+        assert_eq!(
+            alloc_out(&[
+                "let a = __linked-list-empty 0",
+                "in let b = __linked-list-empty 0",
+                "in let __p = __linked-list-push a 1",
+                "in print-line-uni (show (list-length (__linked-list-to-list a)) & \" \" & show (list-length (__linked-list-to-list b)))",
+            ]),
+            "1 0"
+        );
+    }
+
+    // ---- the extent, and the one cursor --------------------------------
+    //
+    // `PhaseAllocator.codex` describes ONE allocation cursor, R10:
+    //
+    //   "R10 IS THE DECK CURSOR, BUT ONLY INSIDE AN EXTENT. `__deck-enter`
+    //    copies the deck-pos cell into R10 and `__deck-exit` writes it back,
+    //    on the zero crossings of the nesting counter, so within an extent
+    //    every allocation moves R10 down the deck ... Outside an extent R10 is
+    //    the bivy frontier."
+    //
+    // So `__heap-save` does not always answer the same thing, and that is what
+    // makes `copy-sx-defs-guarded`'s `__heap-save >= ceiling` a sensible
+    // question: inside the extent it asks whether the DECK cursor has reached
+    // the reservation's top. Outside, the frontier parks ON that top the
+    // instant `build` reserves, so the same test would be true immediately and
+    // every guarded copy would saturate.
+
+    /// Outside an extent the cursor is the bivy frontier, and advancing moves
+    /// it.
+    #[test]
+    fn outside_an_extent_the_cursor_is_the_bivy() {
+        assert_eq!(
+            alloc_out(&[
+                "let a = __heap-save",
+                "in let __x = __heap-advance 100",
+                "in let b = __heap-save",
+                "in print-line-uni (show a & \" \" & show b)",
+            ]),
+            "0 100"
+        );
+    }
+
+    /// **INSIDE AN EXTENT IT IS THE DECK CURSOR**, loaded from the deck-pos
+    /// cell on the way in. The bivy is left exactly where it was.
+    #[test]
+    fn inside_an_extent_the_cursor_is_the_deck() {
+        assert_eq!(
+            alloc_out(&[
+                "let base = build 1000",
+                "in let outside = __heap-save",
+                "in let __e = __deck-enter",
+                "in let inside = __heap-save",
+                "in let __a = __heap-advance 40",
+                "in let moved = __heap-save",
+                "in let __x = __deck-exit",
+                "in let after = __heap-save",
+                "in print-line-uni (show outside & \" \" & show inside & \" \" & show moved & \" \" & show after)",
+            ]),
+            "1000 0 40 1000"
+        );
+    }
+
+    /// The write-back happens at the exit: the deck-pos cell holds where the
+    /// cursor got to, which is what the phase's usage is measured from.
+    #[test]
+    fn the_exit_writes_the_cursor_back_to_the_cell() {
+        assert_eq!(
+            alloc_out(&[
+                "let base = build 1000",
+                "in let before = __deck-pos",
+                "in let __e = __deck-enter",
+                "in let __a = __heap-advance 40",
+                "in let during = __deck-pos",
+                "in let __x = __deck-exit",
+                "in let after = __deck-pos",
+                "in print-line-uni (show before & \" \" & show during & \" \" & show after)",
+            ]),
+            "0 0 40"
+        );
+    }
+
+    /// **ONLY THE ZERO CROSSINGS COUNT.** A nested extent neither reloads the
+    /// cursor on the way in nor writes it back on the way out, so a phase-wide
+    /// extent keeps the cell frozen at the base however many extents sit inside
+    /// it -- which is exactly why `deck-short-of` asks about the floor's width
+    /// and never about the usage.
+    #[test]
+    fn only_the_outermost_extent_copies_the_cell() {
+        assert_eq!(
+            alloc_out(&[
+                "let base = build 1000",
+                "in let __e1 = __deck-enter",
+                "in let __a1 = __heap-advance 10",
+                "in let __e2 = __deck-enter",
+                "in let __a2 = __heap-advance 10",
+                "in let inner = __deck-pos",
+                "in let __x2 = __deck-exit",
+                "in let mid = __deck-pos",
+                "in let __a3 = __heap-advance 10",
+                "in let __x1 = __deck-exit",
+                "in let outer = __deck-pos",
+                "in print-line-uni (show inner & \" \" & show mid & \" \" & show outer)",
+            ]),
+            "0 0 30"
+        );
+    }
+
+    /// `deck-record` IS the extent. The emitters compile it to
+    /// `__deck-enter, the body, __deck-exit` -- its Codex definition is the
+    /// identity only because the emitter never runs that body. This arm has to
+    /// do the same, or nothing ever opens an extent and every guarded copy
+    /// measures the bivy against a ceiling the bivy is already past.
+    #[test]
+    fn deck_record_opens_an_extent_around_its_argument() {
+        assert_eq!(
+            alloc_out(&[
+                "let base = build 1000",
+                "in let bivy0 = __heap-save",
+                "in let r = deck-record (pitch 40)",
+                "in let bivy1 = __heap-save",
+                "in let cell = __deck-pos",
+                "in print-line-uni (show bivy0 & \" \" & show r & \" \" & show bivy1 & \" \" & show cell)",
+            ]),
+            "1000 0 1000 40"
         );
     }
 
