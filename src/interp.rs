@@ -82,17 +82,6 @@ pub enum Value {
     /// `Rc<RefCell<..>>` is still one pointer, so `Value` stays 16 bytes -- the
     /// property that made `Rc<str>` cost 16% does not apply here.
     Record(Sym, Rc<RefCell<Vec<(Sym, Value)>>>),
-    /// A LINKED LIST: a mutable handle, which a `List` deliberately is not.
-    ///
-    /// `__linked-list-push` answers the list AND pushes in place, so a caller
-    /// holding its own reference sees the push. The compiler's scoper
-    /// accumulates a chapter's definitions that way; modelled as a fresh
-    /// `List`, its table came out empty and every name in every program was
-    /// undefined, down to a function's own parameter.
-    ///
-    /// It is a separate type upstream too -- `LinkedListTy`, not `list` -- so
-    /// this is not a special case, it is the type.
-    LinkedList(Rc<RefCell<Vec<Value>>>),
     /// A variant constructor, saturated or not.
     Ctor(Sym, Rc<Vec<Value>>),
     Fun(Rc<Closure>),
@@ -284,10 +273,17 @@ pub struct Interp {
     ///
     /// **WHAT THIS ARM THEREFORE CANNOT SEE.** Every defect the deck bracket
     /// has produced upstream -- a lifetime error, a value read after the
-    /// bracket reclaimed it, a tag read out of raw memory -- is invisible from
-    /// here, because nothing here reclaims anything. Agreement between this arm
-    /// and bare metal is evidence about the SEMANTICS and silence about the
-    /// memory discipline. Do not let a green line be read as covering both.
+    /// bracket reclaimed it -- is invisible from here, because nothing here
+    /// reclaims anything. Agreement between this arm and bare metal is
+    /// evidence about the SEMANTICS and silence about the memory DISCIPLINE.
+    /// Do not let a green line be read as covering both.
+    ///
+    /// The line is not where it looks, though, and `Mem` is the reason. The
+    /// type checker's memo and cons tables are raw memory -- reserved off
+    /// `__heap-save`, zeroed with `__memset`, probed with `peek-32` over
+    /// `table + idx * 8` -- so the addresses these counters hand out are read
+    /// back as data by the program under test. What is missing is reclamation,
+    /// not addressing.
     /// The BIVY frontier: where the cursor sits outside an extent.
     bivy: i64,
     /// The deck-pos CELL, which `__deck-pos` reads and `__deck-set` writes.
@@ -301,6 +297,70 @@ pub struct Interp {
     /// Each constructor's position in its own variant declaration, which is
     /// what `variant-tag` answers.
     tags: HashMap<Sym, i64>,
+    /// THE FLAT MEMORY THE ALLOCATOR HANDS OUT ADDRESSES INTO.
+    mem: Mem,
+}
+
+/// One byte-addressed region starting at 0, sparse and paged.
+///
+/// **THE TYPE CHECKER IS A RAW-MEMORY PROGRAM and there is no interpreting it
+/// without this.** `check-batch-open` reserves two hash tables off
+/// `__heap-save`, zeroes them with `__memset`, and then `memo-probe-at` and
+/// `cons-probe-at` walk them with `peek-32` and `peek-qword` over
+/// `table + idx * 8`. Those are addresses, not handles: the memo layer
+/// deduplicates types BY ADDRESS, so the identity the checker computes with is
+/// the one this region defines.
+///
+/// Paged because the reservations are dense and the space between them is not:
+/// the driver opens with `__heap-advance 536870912`, half a gigabyte nobody
+/// writes a byte of. 4 KB pages, allocated on first WRITE -- a read of an
+/// unmapped page answers zero and maps nothing, which is what `cx_buf_want`
+/// growing a zeroed region does.
+#[derive(Default)]
+struct Mem {
+    pages: HashMap<i64, Box<[u8; MEM_PAGE as usize]>>,
+}
+
+const MEM_PAGE: i64 = 4096;
+
+impl Mem {
+    fn byte(&self, addr: i64) -> u8 {
+        self.pages
+            .get(&addr.div_euclid(MEM_PAGE))
+            .map_or(0, |p| p[addr.rem_euclid(MEM_PAGE) as usize])
+    }
+
+    fn set_byte(&mut self, addr: i64, v: u8) {
+        let page = self
+            .pages
+            .entry(addr.div_euclid(MEM_PAGE))
+            .or_insert_with(|| Box::new([0u8; MEM_PAGE as usize]));
+        page[addr.rem_euclid(MEM_PAGE) as usize] = v;
+    }
+
+    /// A little-endian load of `width` bytes.
+    ///
+    /// The result is the bit pattern: at eight bytes that is a signed i64 and
+    /// may be negative, and below eight it is zero-extended and cannot be.
+    /// That split is not a choice made here -- `cx_peek_qword` rebuilds its
+    /// value with WRAPPING arithmetic and says why in its own comment, while
+    /// `cx_peek_32` uses checked arithmetic and cannot overflow; wasm emits
+    /// `i64.load` against `i64.extend_i32_u`. Both plugs, the same split.
+    fn load(&self, addr: i64, width: u32) -> i64 {
+        let mut w: u64 = 0;
+        for j in (0..width as i64).rev() {
+            w = (w << 8) | self.byte(addr + j) as u64;
+        }
+        w as i64
+    }
+
+    /// A little-endian store of the low `width` bytes, and no byte beyond.
+    fn store(&mut self, addr: i64, width: u32, v: i64) {
+        let w = v as u64;
+        for j in 0..width as i64 {
+            self.set_byte(addr + j, (w >> (8 * j)) as u8);
+        }
+    }
 }
 
 /// The default budget for ONE program: effectively none.
@@ -497,6 +557,7 @@ impl Interp {
             deck_cursor: 0,
             deck_depth: 0,
             tags,
+            mem: Mem::default(),
         }
     }
 
@@ -1029,19 +1090,29 @@ impl Interp {
                 }),
             // `list-snoc` and `list-push` are ONE operation: the zig emitter
             // gives both the same `cx_ll_push(l, v)`, an append at the end.
+            //
+            // **AND IT APPENDS IN PLACE.** `cx_ll_push` is
+            // `l.items.append(gpa, v); return l;` -- always the same handle,
+            // never a copy. The compiler depends on it:
+            // `tail-resolve-binding-chunk` fills a `__list-with-capacity`
+            // chunk, DISCARDS every push's result, answers only a count, and
+            // its caller then reads `chunk` positions 0..n. A copying push
+            // hands that caller an empty list and `list-at 0` of it.
             ("list-push" | "list-snoc", [List(xs), v]) => {
-                let mut out = xs.borrow().clone();
-                out.push(v.clone());
-                Ok(list(out))
+                xs.borrow_mut().push(v.clone());
+                Ok(List(xs.clone()))
             }
+            // `cx_ll_insert_at` is `l.items.insert(gpa, i, v); return l;`, so
+            // this writes through for the same reason `list-push` does.
             ("list-insert-at", [List(xs), Int(i), v]) => {
-                let mut out = xs.borrow().clone();
+                let mut out = xs.borrow_mut();
                 let i = *i;
                 if i < 0 || i as usize > out.len() {
                     return err(format!("list-insert-at {i} of a {}-element list", out.len()));
                 }
                 out.insert(i as usize, v.clone());
-                Ok(list(out))
+                drop(out);
+                Ok(List(xs.clone()))
             }
             // The capacity is an allocation hint upstream -- `cx_ll_empty` then
             // `ensureTotalCapacityPrecise` -- and the LIST IS EMPTY. It is
@@ -1209,37 +1280,65 @@ impl Interp {
                 }
                 Ok(Unit)
             }
-            // A LINKED LIST IS A LIST HERE, and the call sites make that sound:
-            // `__linked-list-push` ANSWERS the new list and every caller in the
-            // compiler rebinds it -- `__linked-list-push acc (...)` threaded as
-            // an accumulator. The mutation is the emitter's optimisation of a
-            // functional interface, not the interface.
+            // **A LINKED LIST IS A LIST, and there is no second variant.**
+            //
+            // There WAS one, for the eleven days a `List` was immutable: a
+            // separate mutable handle so `ChapterScoper`'s accumulator could be
+            // pushed into. `cx_ll_push` is the emitter for BOTH -- it is the
+            // same function, `l.items.append(gpa, v); return l;` -- and once
+            // `list-push` writes through, the two variants held the same value
+            // and behaved the same way. The distinction is real upstream and it
+            // is in the TYPE (`LinkedListTy`, not `list`); it was never in the
+            // representation, and `ChapterScoper` seeds its `LinkedList ADef`
+            // with `[]` because at the value level there is nothing to seed it
+            // with but an empty list.
+            //
             // The capacity is a hint upstream and there is nothing here to
             // reserve, exactly as with `__list-with-capacity`.
-            ("__linked-list-empty", [Int(_)]) => Ok(LinkedList(Rc::new(RefCell::new(Vec::new())))),
-            ("__linked-list-push", [LinkedList(xs), v]) => {
-                xs.borrow_mut().push(v.clone());
-                Ok(LinkedList(xs.clone()))
-            }
-            ("__linked-list-to-list", [LinkedList(xs)]) => Ok(list(xs.borrow().clone())),
-            // **A LINKED LIST IS SEEDED WITH `[]` AND THAT IS NOT A MISTAKE.**
-            // `ChapterScoper` declares its accumulator `LinkedList ADef` and
-            // passes `[]` for it: the distinction is in the TYPE, and at the
-            // value level an empty list is an empty linked list. So both arms
-            // are real, and they differ in exactly one way -- a `List` handle
-            // is threaded through the return, a `LinkedList` handle is also
-            // visible to whoever else holds it.
-            //
-            // Every call site in the compiler threads the return, so both
-            // behave the same there. Whether anything upstream depends on the
-            // second is NOT established, and the tests above pin only what
-            // `__linked-list-empty` hands back.
+            ("__linked-list-empty", [Int(_)]) => Ok(list(Vec::new())),
             ("__linked-list-push", [List(xs), v]) => {
-                let mut out = xs.borrow().clone();
-                out.push(v.clone());
-                Ok(list(out))
+                xs.borrow_mut().push(v.clone());
+                Ok(List(xs.clone()))
             }
             ("__linked-list-to-list", [List(xs)]) => Ok(List(xs.clone())),
+
+            // -- the flat memory ---------------------------------------------
+            // Every one of these takes a BASE and an OFFSET and adds them, so
+            // `peek-32 slot 0` is the shape a caller who already did the
+            // arithmetic writes. A poke answers 0; `__memset` answers nothing.
+            ("peek-byte", [Int(b), Int(o)]) => Ok(Int(self.mem.load(b + o, 1))),
+            ("peek-16", [Int(b), Int(o)]) => Ok(Int(self.mem.load(b + o, 2))),
+            ("peek-32", [Int(b), Int(o)]) => Ok(Int(self.mem.load(b + o, 4))),
+            ("peek-qword", [Int(b), Int(o)]) => Ok(Int(self.mem.load(b + o, 8))),
+            ("poke-byte", [Int(b), Int(o), Int(v)]) => {
+                self.mem.store(b + o, 1, *v);
+                Ok(Int(0))
+            }
+            ("poke-16", [Int(b), Int(o), Int(v)]) => {
+                self.mem.store(b + o, 2, *v);
+                Ok(Int(0))
+            }
+            ("poke-32", [Int(b), Int(o), Int(v)]) => {
+                self.mem.store(b + o, 4, *v);
+                Ok(Int(0))
+            }
+            ("poke-qword", [Int(b), Int(o), Int(v)]) => {
+                self.mem.store(b + o, 8, *v);
+                Ok(Int(0))
+            }
+            // **A HOSTED PROCESS HAS NO I/O PORTS**, and the zig plug's
+            // `cx_port_out_byte` answers 0 without writing. An MMIO poke is
+            // the same question: it takes its arguments so a caller's own
+            // side effects still happen, and writes nothing.
+            ("poke-mmio" | "poke-mmio-32", [Int(_), Int(_), Int(_)]) => Ok(Int(0)),
+            // `__memset` fills n bytes with the LOW BYTE of its value. The
+            // checker opens every batch by zeroing its cons table this way.
+            ("__memset", [Int(b), Int(v), Int(n)]) => {
+                for i in 0..*n {
+                    self.mem.set_byte(b + i, *v as u8);
+                }
+                Ok(Unit)
+            }
 
             // `__heap-save` reads the ACTIVE cursor, which is the whole of
             // what makes a guarded copy's `__heap-save >= ceiling` mean
@@ -1485,10 +1584,6 @@ fn equal(a: &Value, b: &Value) -> bool {
         (Ctor(n, x), Ctor(m, y)) => {
             n == m && x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| equal(p, q))
         }
-        (LinkedList(x), LinkedList(y)) => {
-            let (x, y) = (x.borrow(), y.borrow());
-            x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| equal(p, q))
-        }
         (Record(n, x), Record(m, y)) => {
             let (x, y) = (x.borrow(), y.borrow());
             n == m
@@ -1549,10 +1644,6 @@ pub fn show(syms: &SymTab, v: &Value) -> String {
             let inner: Vec<String> = xs.borrow().iter().map(|x| show(syms, x)).collect();
             format!("[{}]", inner.join(", "))
         }
-        Value::LinkedList(xs) => {
-            let inner: Vec<String> = xs.borrow().iter().map(|x| show(syms, x)).collect();
-            format!("[{}]", inner.join(", "))
-        }
         Value::Ctor(n, fs) if fs.is_empty() => syms.text(*n).to_string(),
         Value::Ctor(n, fs) => {
             let inner: Vec<String> = fs.iter().map(|x| show(syms, x)).collect();
@@ -1578,7 +1669,6 @@ fn type_name(v: &Value) -> &'static str {
         Value::Char(_) => "a char",
         Value::Bool(_) => "a boolean",
         Value::List(_) => "a list",
-        Value::LinkedList(_) => "a linked list",
         Value::Record(..) => "a record",
         Value::Ctor(..) => "a constructor",
         Value::Fun(_) => "a function",
@@ -1867,7 +1957,7 @@ mod tests {
 
     /// **A LINKED LIST IS A MUTABLE HANDLE, and a `List` is not.**
     ///
-    /// `__linked-list-push` answers the list, and every caller in the compiler
+    /// `__linked-list-push` is `list-push`, and every caller in the compiler
     /// rebinds what it answers -- which is why modelling it as a fresh `List`
     /// looked right. It is not: upstream pushes IN PLACE and answers the same
     /// handle, so a caller that keeps its own reference sees the push. The
@@ -2072,21 +2162,159 @@ mod tests {
         assert_eq!(out(src).trim(), "1 7 7 | 7 7 7");
     }
 
-    /// **`list-push` and `&` ALLOCATE here**, which is the other half of the
-    /// contract: only `list-set-at` writes through.
+    /// **`list-push` WRITES THROUGH TOO, and `&` allocates.** The two halves
+    /// are not a symmetry and each is somebody's prelude, read rather than
+    /// reasoned about:
     ///
-    /// Upstream leaves itself more room than this. The wasm plug's
-    /// `$list_push` has an in-place path that extends the frontier when the
-    /// list already ends at the allocator position, so a push there MAY answer
-    /// the same block -- `plugs-backlog.md` describes the two frontier-extend
-    /// tests and the view case that had to be excluded from them. Correct
-    /// Codex threads the return either way, and nothing in the compiler may
-    /// depend on which it got. So this pins OUR side of a question upstream
-    /// deliberately leaves open, and a disagreement here is not a defect.
+    /// ```text
+    /// fn cx_ll_push(l: anytype, v: anytype) @TypeOf(l) {
+    ///     l.items.append(cx_gpa, v) catch @panic("oom");
+    ///     return l;
+    /// }
+    /// fn cx_ll_concat(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+    ///     const c = cx_new(...);  // a FRESH list, both sides copied in
+    /// ```
+    ///
+    /// `cx_ll_cons` allocates like concat, `cx_ll_insert_at` writes through
+    /// like push. The wasm plug reaches the same place from the other side: a
+    /// push is in place when the capacity is there and copies when it is not,
+    /// which is exactly why `__list-with-capacity` exists and why its capacity
+    /// is documented upstream as load-bearing rather than a hint.
+    ///
+    /// **This was pinned the WRONG WAY ROUND first** -- push allocating, on
+    /// the reasoning that an aliasing accumulator is a footgun -- and the
+    /// compiler said otherwise within the hour. `tail-resolve-binding-chunk`
+    /// pushes into a `__list-with-capacity` chunk, DISCARDS every result, and
+    /// answers a count its caller uses to read the chunk back.
     #[test]
-    fn appending_allocates_and_the_original_is_untouched() {
-        let src = "Chapter: T\n\nSection: S\n\n  show-list : List Integer, Integer, Text -> Text\n  show-list (xs) (i) (acc) =\n    if i >= list-length xs then acc\n    else show-list xs (i + 1) (acc & \" \" & show (list-at xs i))\n\nSection: E\n\n  opening : [Console] Nothing = act\n                 let a = [1, 2]\n    in let b = list-push a 3\n    in let c = a & [9]\n    in let __x = list-set-at b 0 50\n                 in print-line-uni (show-list a 0 \"\" & \" |\" & show-list b 0 \"\" & \" |\" & show-list c 0 \"\")\n  end\n";
-        assert_eq!(out(src).trim(), "1 2 | 50 2 3 | 1 2 9");
+    fn a_push_writes_through_and_an_append_allocates() {
+        let src = "Chapter: T\n\nSection: S\n\n  show-list : List Integer, Integer, Text -> Text\n  show-list (xs) (i) (acc) =\n    if i >= list-length xs then acc\n    else show-list xs (i + 1) (acc & \" \" & show (list-at xs i))\n\nSection: E\n\n  opening : [Console] Nothing = act\n                 let a = [1, 2]\n    in let c = a & [9]\n    in let __p = list-push a 3\n    in let __q = list-push c 8\n                 in print-line-uni (show-list a 0 \"\" & \" |\" & show-list c 0 \"\")\n  end\n";
+        assert_eq!(out(src).trim(), "1 2 3 | 1 2 9 8");
+    }
+
+    /// **THE CHUNK PATTERN, which is the shape that found it.** A caller fills
+    /// a capacity list, throws away what every push answered, and reports how
+    /// many it did; the caller then reads the list it passed IN. Reduced from
+    /// `tail-resolve-binding-chunk` and `tail-copy-binding-chunk`, which is
+    /// how the type checker resolves bindings in budget-sized batches.
+    #[test]
+    fn a_discarded_push_is_visible_to_the_caller_that_passed_the_list() {
+        let src = "Chapter: T\n\nSection: S\n\n  fill : List Integer, Integer, Integer -> Integer\n  fill (chunk) (i) (n) =\n    if i >= n then n\n    else let discarded = list-push chunk (i * 10)\n    in fill chunk (i + 1) n\n\n  show-list : List Integer, Integer, Text -> Text\n  show-list (xs) (i) (acc) =\n    if i >= list-length xs then acc\n    else show-list xs (i + 1) (acc & \" \" & show (list-at xs i))\n\nSection: E\n\n  opening : [Console] Nothing = act\n                 let chunk = __list-with-capacity 4\n    in let n = fill chunk 0 3\n                 in print-line-uni (show n & \" |\" & show-list chunk 0 \"\")\n  end\n";
+        assert_eq!(out(src).trim(), "3 | 0 10 20");
+    }
+
+    // -- the flat memory ---------------------------------------------------
+    //
+    // The contract is the zig plug's prelude, which is a fixed point against
+    // bare metal: one byte-addressed region starting at 0, little-endian
+    // throughout, unsigned loads below 8 bytes and a raw bit pattern at 8,
+    // truncating stores, and a `poke-*` that answers 0. See
+    // `ZigEmitter.codex:4150`ff and `WasmEmitter.codex:1873`ff, which agree.
+
+    /// A byte comes back as it went in, and memory that was never written
+    /// reads as zero rather than as an error -- `cx_buf_want` grows the region
+    /// and the growth is zeroed.
+    #[test]
+    fn a_written_byte_reads_back_and_the_rest_is_zero() {
+        let src = mem_body(
+            "let a = __heap-save\n    in let __x = __heap-advance 64\n    in let __y = poke-byte a 3 200\n                 in print-line-uni (show (peek-byte a 3) & \" \" & show (peek-byte a 4) & \" \" & show (peek-byte a 0))",
+        );
+        assert_eq!(out(&src).trim(), "200 0 0");
+    }
+
+    /// **THE OFFSET IS PART OF THE ADDRESS.** Every one of these takes a base
+    /// and an offset and adds them, which is why `memo-probe-at` can say
+    /// `peek-32 slot 0` with the arithmetic already done.
+    #[test]
+    fn the_offset_and_the_base_are_added() {
+        let src = mem_body(
+            "let a = __heap-save\n    in let __x = __heap-advance 64\n    in let __y = poke-byte a 7 42\n                 in print-line-uni (show (peek-byte (a + 7) 0) & \" \" & show (peek-byte (a + 3) 4))",
+        );
+        assert_eq!(out(&src).trim(), "42 42");
+    }
+
+    /// **LITTLE-ENDIAN, and a 32-bit load CLEARS THE TOP HALF.** `cx_peek_32`
+    /// rebuilds the value from byte 3 down with checked arithmetic, so it
+    /// cannot answer anything negative; `memo-slot-key`'s `bit-and ... 
+    /// 4294967295` is belt and braces over a load that is already unsigned.
+    #[test]
+    fn a_32_bit_load_is_little_endian_and_unsigned() {
+        let src = mem_body(
+            "let a = __heap-save\n    in let __x = __heap-advance 64\n    in let __1 = poke-byte a 0 1\n    in let __2 = poke-byte a 1 2\n    in let __3 = poke-byte a 2 3\n    in let __4 = poke-byte a 3 4\n    in let __f = poke-32 (a + 8) 0 4294967295\n                 in print-line-uni (show (peek-32 a 0) & \" \" & show (peek-32 (a + 8) 0))",
+        );
+        assert_eq!(out(&src).trim(), "67305985 4294967295");
+    }
+
+    /// **A QWORD LOAD IS THE RAW BIT PATTERN AND MAY BE NEGATIVE**, which is
+    /// why `cx_peek_qword` rebuilds it with WRAPPING `*%` and `+%` where
+    /// `cx_peek_32` uses checked arithmetic. This number is not derived here:
+    /// it is the measurement in that function's own comment, taken on bare
+    /// metal on 2026-08-21 with `findings/probe-peek-qword.codex`, for the
+    /// bytes `00 00 00 00 00 00 00 FF`.
+    #[test]
+    fn a_qword_load_carries_the_sign_bit() {
+        let src = mem_body(
+            "let a = __heap-save\n    in let __x = __heap-advance 64\n    in let __y = poke-byte a 7 255\n                 in print-line-uni (show (peek-qword a 0))",
+        );
+        assert_eq!(out(&src).trim(), "-72057594037927936");
+    }
+
+    /// A store keeps the low bytes and drops the rest, and it touches no byte
+    /// beyond its width.
+    #[test]
+    fn a_store_truncates_and_stays_inside_its_width() {
+        let src = mem_body(
+            "let a = __heap-save\n    in let __x = __heap-advance 64\n    in let __y = poke-32 a 0 (4294967296 + 305419896)\n                 in print-line-uni (show (peek-32 a 0) & \" \" & show (peek-byte a 4) & \" \" & show (peek-qword a 0))",
+        );
+        assert_eq!(out(&src).trim(), "305419896 0 305419896");
+    }
+
+    /// **A POKE ANSWERS 0**, in every plug, so a `let` that binds one is
+    /// binding a constant and the write is the whole of what it did.
+    #[test]
+    fn a_poke_answers_zero() {
+        let src = mem_body(
+            "let a = __heap-save\n    in let __x = __heap-advance 64\n                 in print-line-uni (show (poke-byte a 0 7) & \" \" & show (poke-32 a 8 7) & \" \" & show (poke-qword a 16 7))",
+        );
+        assert_eq!(out(&src).trim(), "0 0 0");
+    }
+
+    /// `__memset` fills exactly n bytes and answers nothing. The checker opens
+    /// every batch by zeroing its cons table this way -- `check-batch-open`
+    /// does it twice -- so a memset that ran short would leave a probe reading
+    /// a key from the last compile.
+    #[test]
+    fn a_memset_fills_exactly_its_range() {
+        let src = mem_body(
+            "let a = __heap-save\n    in let __x = __heap-advance 64\n    in let __1 = poke-byte a 0 9\n    in let __2 = poke-byte a 3 9\n    in let __3 = poke-byte a 4 9\n    in let __z = __memset a 0 4\n                 in print-line-uni (show (peek-byte a 0) & \" \" & show (peek-byte a 3) & \" \" & show (peek-byte a 4))",
+        );
+        assert_eq!(out(&src).trim(), "0 0 9");
+    }
+
+    /// A memset writes the LOW BYTE of its value, not the value.
+    #[test]
+    fn a_memset_writes_one_byte_of_its_argument() {
+        let src = mem_body(
+            "let a = __heap-save\n    in let __x = __heap-advance 64\n    in let __z = __memset a 513 2\n                 in print-line-uni (show (peek-byte a 0) & \" \" & show (peek-byte a 1) & \" \" & show (peek-byte a 2))",
+        );
+        assert_eq!(out(&src).trim(), "1 1 0");
+    }
+
+    /// **THE ALLOCATOR AND THE MEMORY ARE THE SAME ADDRESSES.** This is the
+    /// join that makes the whole thing a model rather than two: the checker
+    /// takes its memo table's base from `__heap-save`, advances past it, and
+    /// pokes into what it reserved. Two reservations must not overlap.
+    #[test]
+    fn two_reservations_do_not_overlap() {
+        let src = mem_body(
+            "let a = __heap-save\n    in let __x = __heap-advance 16\n    in let b = __heap-save\n    in let __y = __heap-advance 16\n    in let __1 = poke-qword a 0 111\n    in let __2 = poke-qword b 0 222\n                 in print-line-uni (show (b - a) & \" \" & show (peek-qword a 0) & \" \" & show (peek-qword b 0))",
+        );
+        assert_eq!(out(&src).trim(), "16 111 222");
+    }
+
+    /// Wrap a body in the smallest chapter that can hold it.
+    fn mem_body(body: &str) -> String {
+        format!("Chapter: T\n\nSection: E\n\n  opening : [Console] Nothing = act\n                 {body}\n  end\n")
     }
 
     /// **A NULLARY THAT ANSWERS A LIST CANNOT BE CACHED once anything in the
@@ -2174,7 +2402,7 @@ fn frozen(v: &Value) -> bool {
         | Value::Bool(_)
         | Value::Unit => true,
         Value::Ctor(_, fs) => fs.iter().all(frozen),
-        Value::List(_) | Value::Record(..) | Value::LinkedList(_) | Value::Fun(_) => false,
+        Value::List(_) | Value::Record(..) | Value::Fun(_) => false,
     }
 }
 
@@ -2193,6 +2421,21 @@ const IMPURE_BUILTINS: &[&str] = &[
     "__deck-enter",
     "__deck-exit",
     "__record-set",
+    // The flat memory, both ways. A poke is obviously a write; a PEEK has to
+    // be here too, because a cached nullary that reads memory keeps whatever
+    // the region held the first time anybody asked. Upstream says the same
+    // thing in its own table -- every one of these carries `bs-varies = True`.
+    "peek-byte",
+    "peek-16",
+    "peek-32",
+    "peek-qword",
+    "poke-byte",
+    "poke-16",
+    "poke-32",
+    "poke-qword",
+    "poke-mmio",
+    "poke-mmio-32",
+    "__memset",
 ];
 
 /// Every definition that can touch mutable state, directly or through a call.
