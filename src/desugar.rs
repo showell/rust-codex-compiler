@@ -73,6 +73,36 @@ impl<'a> Desugar<'a> {
     /// A token's text as an interned name. This is the one that runs 6.19
     /// million times over the corpus; `text` above still serves the places
     /// that want an owned string, which is literals and chapter metadata.
+    /// The field named by a `.field` access or a `.field = v` assignment: the
+    /// first non-trivia token AFTER the dot.
+    ///
+    /// **THIS WAS `.last()` OF THE NON-DOT TOKENS AND IT WAS WRONG, silently.**
+    /// A newline is NOT trivia in Codex -- it is significant outside brackets,
+    /// which is CDX1070's whole cause -- so a field assignment at the end of a
+    /// line owned the tokens `[Dot, Identifier, Spaces, Equals, Newline,
+    /// Newline]` and `.last()` took a NEWLINE as the field's name. The record
+    /// then grew a second field whose name was "\n", and the real field kept
+    /// its old value.
+    ///
+    /// Nothing caught it for a long time because almost nothing outside the
+    /// compiler assigns to a field: 49 sites in the whole checkout, 47 of them
+    /// in `codex/compiler`. Interpreting Cobblestone's own lexer is what found
+    /// it -- `scan-ident-rest` ends by assigning `st.offset` and returning
+    /// `st`, so the scanner never advanced and a two-character identifier
+    /// looped forever.
+    ///
+    /// Taking the token after the dot is unambiguous: the parser bumps the dot
+    /// and the name adjacently, and a chained access wraps each level in its
+    /// own node, so there is exactly one dot per node.
+    fn field_after_dot(&self, n: &Node) -> Name {
+        let mut toks = n.own_tokens().skip_while(|t| t.kind != Kind::Dot);
+        toks.next();
+        toks.filter(|t| !t.kind.is_trivia())
+            .map(|t| self.sym(t))
+            .next()
+            .unwrap_or_default()
+    }
+
     fn sym(&self, t: &Token) -> Name {
         let raw = t.text(self.src);
         match std::str::from_utf8(raw) {
@@ -220,12 +250,7 @@ impl<'a> Desugar<'a> {
                 sp,
             ),
             NodeKind::FieldAccess => {
-                let field = n
-                    .own_tokens()
-                    .filter(|t| !t.kind.is_trivia() && t.kind != Kind::Dot)
-                    .last()
-                    .map(|t| self.sym(t))
-                    .unwrap_or_default();
+                let field = self.field_after_dot(n);
                 Expr::FieldAccess(
                     Rc::new(kids.first().map_or(Expr::Error(String::new(), sp), |r| self.expr(r))),
                     field,
@@ -233,12 +258,7 @@ impl<'a> Desugar<'a> {
                 )
             }
             NodeKind::FieldAssign => {
-                let field = n
-                    .own_tokens()
-                    .filter(|t| !t.kind.is_trivia() && t.kind != Kind::Dot && t.kind != Kind::Equals)
-                    .last()
-                    .map(|t| self.sym(t))
-                    .unwrap_or_default();
+                let field = self.field_after_dot(n);
                 match kids.as_slice() {
                     [rec, val] => Expr::FieldAssign(
                         Rc::new(self.expr(rec)),

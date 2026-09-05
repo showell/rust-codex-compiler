@@ -26,6 +26,7 @@ use crate::code::{Arm, Code, Compiler, Names, PatCode, Stmt};
 use crate::symbol::{Sym, SymTab};
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::cell::RefCell;
 use std::rc::Rc;
 
 #[derive(Clone, Debug)]
@@ -39,7 +40,33 @@ pub enum Value {
     /// A record literal: its type name and its fields. A name is a four-byte
     /// `Sym`, so building a record copies nothing and this variant is the
     /// smallest thing that can carry two.
-    Record(Sym, Rc<Vec<(Sym, Value)>>),
+    /// A RECORD IS SHARED AND MUTABLE, because Codex's is.
+    ///
+    /// `st.offset = stop` is a field ASSIGNMENT and it writes through: the
+    /// compiler's lexer ends `scan-ident-rest` with
+    ///
+    ///     in let __seq = st.offset = stop
+    ///     in let __seq = st.column = new-col
+    ///     in st
+    ///
+    /// and returns the same `st` it was handed, expecting the two assignments
+    /// to be visible in it. This arm used to build a NEW record and return it,
+    /// so the sequence threw the update away and the scanner re-read the same
+    /// character forever -- `"x"` lexed in 692 steps and `"xy"` never finished.
+    ///
+    /// The alternative was to rebind the assigned NAME for the rest of the
+    /// sequence, which is cheaper and covers all 49 sites in the checkout,
+    /// every one of which assigns through a plain local. It was rejected
+    /// because it cannot be made to FAIL LOUDLY when a second binding aliases
+    /// the same record: at the moment of assignment the record is already held
+    /// by the environment and by the evaluator, so a reference count cannot
+    /// separate an innocent alias from a live one. An interpreter whose answer
+    /// depends on how a program NAMES a value, silently, is worse than a slower
+    /// one.
+    ///
+    /// `Rc<RefCell<..>>` is still one pointer, so `Value` stays 16 bytes -- the
+    /// property that made `Rc<str>` cost 16% does not apply here.
+    Record(Sym, Rc<RefCell<Vec<(Sym, Value)>>>),
     /// A variant constructor, saturated or not.
     Ctor(Sym, Rc<Vec<Value>>),
     Fun(Rc<Closure>),
@@ -225,6 +252,9 @@ pub struct Interp {
     /// memory discipline. Do not let a green line be read as covering both.
     heap_pos: i64,
     deck_pos: i64,
+    /// Each constructor's position in its own variant declaration, which is
+    /// what `variant-tag` answers.
+    tags: HashMap<Sym, i64>,
 }
 
 /// The default budget for ONE program: effectively none.
@@ -284,6 +314,7 @@ impl Interp {
 
         // Record field bounds, and a slot for every constructor.
         let mut ctors: Vec<(u32, Sym, usize)> = Vec::new();
+        let mut tags: HashMap<Sym, i64> = HashMap::new();
         for t in &ch.type_defs {
             match t {
                 TypeDef::Record(name, _, fields, ..) => {
@@ -297,10 +328,16 @@ impl Interp {
                     }
                 }
                 TypeDef::Variant(_, _, cs, _) => {
-                    for c in cs {
+                    for (tag, c) in cs.iter().enumerate() {
                         let i = globals.len() as u32;
                         globals.push(Value::Unit);
                         names.ctors.insert(c.name, i);
+                        // THE TAG IS THE CONSTRUCTOR'S POSITION IN ITS OWN
+                        // DECLARATION, which is what `variant-tag` answers and
+                        // what the unifier compares. It is only correct if this
+                        // walk keeps the declared order, so it reads the order
+                        // rather than sorting or hashing.
+                        tags.insert(c.name, tag as i64);
                         ctors.push((i, c.name, c.fields.len()));
                     }
                 }
@@ -408,6 +445,7 @@ impl Interp {
             limit: STEP_LIMIT,
             heap_pos: 0,
             deck_pos: 0,
+            tags,
         }
     }
 
@@ -540,10 +578,11 @@ impl Interp {
                     }
                     out.push((f.name.clone(), v));
                 }
-                Ok(Value::Record(name.clone(), Rc::new(out)))
+                Ok(Value::Record(name.clone(), Rc::new(RefCell::new(out))))
             }
             Code::FieldAccess(obj, field, sp) => match self.eval(obj, env)? {
                 Value::Record(name, fs) => fs
+                    .borrow()
                     .iter()
                     .find(|(n, _)| n == field)
                     .map(|(_, v)| v.clone())
@@ -554,7 +593,8 @@ impl Interp {
                             sp.col,
                             self.syms.text(name),
                             self.syms.text(*field),
-                            fs.iter()
+                            fs.borrow()
+                                .iter()
                                 .map(|(n, _)| self.syms.text(*n))
                                 .collect::<Vec<_>>()
                                 .join(", ")
@@ -589,17 +629,25 @@ impl Interp {
                 let v = self.eval(val, env)?;
                 match base {
                     Value::Record(name, fs) => {
-                        let mut out: Vec<(Sym, Value)> = (*fs).clone();
                         let bound = self.bounds.get(&(name, *field));
                         let v = match (&v, bound) {
                             (Value::Int(i), Some(b)) => Value::Int(apply_bound(*i, b)),
                             _ => v,
                         };
-                        match out.iter_mut().find(|(n, _)| n == field) {
-                            Some(slot) => slot.1 = v,
-                            None => out.push((*field, v)),
+                        {
+                            // The borrow is scoped so that nothing re-enters
+                            // the evaluator while it is held -- `v` is already
+                            // a value and the bound is already applied.
+                            let mut out = fs.borrow_mut();
+                            match out.iter_mut().find(|(n, _)| n == field) {
+                                Some(slot) => slot.1 = v,
+                                None => out.push((*field, v)),
+                            }
                         }
-                        Ok(Value::Record(name, Rc::new(out)))
+                        // THE SAME RECORD, not a copy of it. Every other
+                        // binding that reaches this one sees the assignment,
+                        // which is what the compiler's `in ... in st` relies on.
+                        Ok(Value::Record(name, fs))
                     }
                     v => err(format!("field assignment on {}", type_name(&v))),
                 }
@@ -1023,6 +1071,44 @@ impl Interp {
             // the memory work a hosted target has no business doing -- the
             // check compact above all. A tree walker is as hosted as it gets.
             ("hosted-kind", []) => Ok(Int(1)),
+            // AN IDENTITY FOR A VALUE THAT HAS NO ADDRESS.
+            //
+            // Upstream emits `address-of` as the identity -- the value with no
+            // load -- so an Integer answers itself, and measured on real x86 a
+            // payload-free constructor is BOXED and answers its own heap
+            // pointer, 24 bytes from its neighbour. The compiler uses it for
+            // ABSENCE: `address-of x == 0` is how ten tests in `Types/Unifier`
+            // ask whether there is a value at all.
+            //
+            // So an integer answers itself and everything else answers a
+            // stable non-zero id. The pointer inside the `Rc` is exactly that,
+            // and now that records are shared it has the right property too:
+            // two names for one record answer the same id, as they do on bare
+            // metal. What it is NOT is bare metal's number, and nothing may
+            // compare it across arms or embed it in output.
+            ("address-of", [Int(i)]) => Ok(Int(*i)),
+            ("address-of", [Record(_, fs)]) => Ok(Int(Rc::as_ptr(fs) as i64)),
+            ("address-of", [List(xs)]) => Ok(Int(Rc::as_ptr(xs) as *const u8 as i64)),
+            ("address-of", [Ctor(_, fs)]) => Ok(Int(Rc::as_ptr(fs) as *const u8 as i64)),
+            ("address-of", [Text(t)]) => Ok(Int(Rc::as_ptr(t) as *const u8 as i64)),
+            ("address-of", [Unit]) => Ok(Int(0)),
+            // The tag the unifier reads. Upstream's `mcopy-type` read this out
+            // of raw memory and took a payload word for it, which was the root
+            // of issue 126; here it is the declaration order and cannot be
+            // anything else.
+            ("variant-tag", [Ctor(n, _)]) => Ok(Int(*self.tags.get(n).unwrap_or(&0))),
+            ("variant-tag", [Int(i)]) => Ok(Int(*i)),
+            ("tag-equal", [Ctor(a, _), Ctor(b, _)]) => Ok(Bool(a == b)),
+            ("text-concat-list", [List(xs)]) => {
+                let mut out = String::new();
+                for x in xs.iter() {
+                    match x {
+                        Text(t) => out.push_str(t),
+                        other => return err(format!("text-concat-list over {}", type_name(other))),
+                    }
+                }
+                Ok(Text(Rc::new(out)))
+            }
             // The deck bracket: everything allocated between them is scratch
             // the exit reclaims. Nothing here reclaims anything, so the bracket
             // is a pair of no-ops -- which is exactly why this arm cannot see
@@ -1058,7 +1144,9 @@ impl Interp {
             // `__record-set` is how a mutable record is updated: record, field
             // NAME as text, value.
             ("__record-set", [Record(n, fs), Text(field), v]) => {
-                let mut out = (**fs).clone();
+                // Same mutation as `Code::FieldAssign`, with the field named
+                // by a VALUE rather than by the source.
+                let mut out = fs.borrow_mut();
                 // **The field is named by a VALUE here, not by the source**, so
                 // this is the one place a name is not already in the table --
                 // and the one reason the interpreter keeps a mutable one. A
@@ -1074,7 +1162,8 @@ impl Interp {
                     Some(slot) => slot.1 = v,
                     None => out.push((key, v)),
                 }
-                Ok(Record(n, Rc::new(out)))
+                drop(out);
+                Ok(Record(n, fs.clone()))
             }
 
             // NOT "is not interpreted yet" -- this arm cannot tell an absent
@@ -1273,6 +1362,7 @@ fn equal(a: &Value, b: &Value) -> bool {
             n == m && x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| equal(p, q))
         }
         (Record(n, x), Record(m, y)) => {
+            let (x, y) = (x.borrow(), y.borrow());
             n == m
                 && x.len() == y.len()
                 && x.iter().zip(y.iter()).all(|(p, q)| p.0 == q.0 && equal(&p.1, &q.1))
@@ -1302,6 +1392,7 @@ fn matches_pat(v: &Value, p: &PatCode, vals: &mut Vec<Value>) -> bool {
             // A one-field constructor pattern over a bare value is how the
             // tuple patterns land after desugaring.
             Value::Record(n, fields) if *n == *name => {
+                let fields = fields.borrow();
                 subs.len() == fields.len()
                     && subs.iter().zip(fields.iter()).all(|(s, f)| matches_pat(&f.1, s, vals))
             }
@@ -1335,8 +1426,11 @@ pub fn show(syms: &SymTab, v: &Value) -> String {
             format!("{} {}", syms.text(*n), inner.join(" "))
         }
         Value::Record(n, fs) => {
-            let inner: Vec<String> =
-                fs.iter().map(|(k, v)| format!("{} = {}", syms.text(*k), show(syms, v))).collect();
+            let inner: Vec<String> = fs
+                .borrow()
+                .iter()
+                .map(|(k, v)| format!("{} = {}", syms.text(*k), show(syms, v)))
+                .collect();
             format!("{} {{ {} }}", syms.text(*n), inner.join(", "))
         }
         Value::Fun(_) => "<function>".to_string(),
@@ -1375,6 +1469,90 @@ mod tests {
     #[test]
     fn value_is_two_words() {
         assert_eq!(std::mem::size_of::<Value>(), 16);
+    }
+
+    /// Run a whole chapter and answer what it printed.
+    ///
+    /// The tests below are all about ONE construct -- assignment to a record
+    /// field -- because it is the one the compiler's own lexer is built out of
+    /// and the one nothing else in this ecosystem uses. safari's port, judge
+    /// and specs contain ZERO field assignments across 54 chapters, which is
+    /// why 2,351 graded values on three arms never touched this path.
+    fn out(src: &str) -> String {
+        let src = src.as_bytes().to_vec();
+        let parsed = crate::parser::parse(&src);
+        let mut dg = crate::desugar::Desugar::new(&src);
+        let ch = dg.chapter(&parsed.tree);
+        let mut it = Interp::new(&ch);
+        it.run().unwrap_or_else(|e| panic!("{}", e.0));
+        it.out
+    }
+
+    const BOX: &str = "Chapter: T\n\nSection: S\n\n  Box = record {\n    n : Integer,\n    m : Integer\n  }\n\n";
+
+    /// **The bug that interpreting Cobblestone's lexer found.** A field
+    /// assignment writes THROUGH: the record the caller holds sees it, because
+    /// `scan-ident-rest` assigns `st.offset` and then returns the same `st`.
+    #[test]
+    fn a_field_assignment_is_visible_in_the_caller() {
+        let src = format!(
+            "{BOX}  bump : Box -> Box\n  bump (b) =\n    let __seq = b.n = 99\n    in b\n\n\
+             Section: E\n\n  opening : [Console] Nothing = act\n                 let a = Box {{ n = 1, m = 2 }}\n    in let r = bump a\n                 in print-line-uni (show (r.n) & \" \" & show (a.n) & \" \" & show (a.m))\n  end\n"
+        );
+        assert_eq!(out(&src).trim(), "99 99 2");
+    }
+
+    /// The field name is the token AFTER the dot, and a trailing newline is not
+    /// it. Taking the last non-trivia token gave the assignment a field named
+    /// "\n" -- the record grew a second, nameless field and the real one kept
+    /// its value. Two fields here so a mis-named write cannot land on the right
+    /// one by luck.
+    #[test]
+    fn the_assigned_field_is_the_one_after_the_dot() {
+        let src = format!(
+            "{BOX}Section: E\n\n  opening : [Console] Nothing = act\n                 let a = Box {{ n = 1, m = 2 }}\n    in let __seq = a.m = 7\n                 in print-line-uni (show a)\n  end\n"
+        );
+        assert_eq!(out(&src).trim(), "Box { n = 1, m = 7 }");
+    }
+
+    /// Records are SHARED, so two names for one record both see the write.
+    /// This is the property the rebind-the-name alternative could not give and
+    /// could not fail loudly about.
+    #[test]
+    fn two_names_for_one_record_see_the_same_write() {
+        let src = format!(
+            "{BOX}Section: E\n\n  opening : [Console] Nothing = act\n                 let a = Box {{ n = 1, m = 2 }}\n    in let b = a\n                 in let __seq = a.n = 5\n                 in print-line-uni (show (b.n))\n  end\n"
+        );
+        assert_eq!(out(&src).trim(), "5");
+    }
+
+    /// A record LITERAL is a fresh record every time, so sharing is not
+    /// accidental: two literals with the same fields are two records.
+    #[test]
+    fn two_literals_are_two_records() {
+        let src = format!(
+            "{BOX}Section: E\n\n  opening : [Console] Nothing = act\n                 let a = Box {{ n = 1, m = 2 }}\n    in let b = Box {{ n = 1, m = 2 }}\n                 in let __seq = a.n = 5\n                 in print-line-uni (show (b.n))\n  end\n"
+        );
+        assert_eq!(out(&src).trim(), "1");
+    }
+
+    /// `scan-ident-rest` in miniature: a tail-recursive scanner that advances
+    /// by assigning a field and returning the record it was handed. Before the
+    /// fix this did not terminate.
+    #[test]
+    fn a_scanner_that_advances_by_assignment_terminates() {
+        let src = format!(
+            "{BOX}  step : Box -> Box\n  step (b) =\n                 if b.n >= b.m then b\n                 else let __seq = b.n = b.n + 1\n    in step b\n\n             Section: E\n\n  opening : [Console] Nothing = act\n                 let a = Box {{ n = 0, m = 40 }}\n    in print-line-uni (show ((step a).n))\n  end\n"
+        );
+        assert_eq!(out(&src).trim(), "40");
+    }
+
+    /// The allocator is arithmetic here: advance moves the position, restore
+    /// puts it back, and `deck-short-of`'s two operands answer accordingly.
+    #[test]
+    fn the_heap_position_moves_and_comes_back() {
+        let src = "Chapter: T\n\nSection: E\n\n  opening : [Console] Nothing = act\n                 let a = __heap-save\n    in let __x = __heap-advance 1000\n                 in let b = __heap-save\n    in let __y = __heap-restore a\n                 in let c = __heap-save\n                 in print-line-uni (show a & \" \" & show b & \" \" & show c)\n  end\n";
+        assert_eq!(out(src).trim(), "0 1000 0");
     }
 }
 
