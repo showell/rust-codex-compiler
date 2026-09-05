@@ -31,9 +31,46 @@ pub fn aligned(n: i64) -> i64 {
     (n + ALIGN - 1) / ALIGN * ALIGN
 }
 
+/// **THE HEAP DOES NOT START AT ZERO, and neither does anybody else's.** The
+/// zig plug opens its cursor at 6,291,456 and everything under it belongs to
+/// the deck; bare metal's heap sits above the loaded image. Two things here
+/// need that gap. A text LITERAL lives in the image, below the heap, which is
+/// why it is durable and shared rather than copied -- so literals are handed
+/// addresses from the band below this origin. And zero has to stay available
+/// as "not an address at all", which it cannot be if it is also the first
+/// thing allocated.
+pub const HEAP_ORIGIN: i64 = 16 << 20;
+
+/// Where literal addresses start. Above zero because zero means "no address",
+/// and below `HEAP_ORIGIN` because a literal is durable against every base the
+/// compiler can compute.
+pub const IMAGE_ORIGIN: i64 = 8;
+
+/// **A LITERAL IS INTERNED, NOT ALLOCATED**, and it is done here rather than
+/// on a `Bump` because literals are built when a chapter is COMPILED and the
+/// interpreter that will run it does not exist yet. That is faithful rather
+/// than convenient: a literal lives in the loaded image on bare metal, one
+/// region for the whole program, never reclaimed and below every heap address
+/// -- which is precisely why `copy-sx-text` shares one instead of rebuilding
+/// it.
+///
+/// Process-wide, so two interpreters in one process draw from one image, which
+/// is what a process has. Distinctness is what the address is for and that
+/// survives sharing; the band holds two million literals before the assert
+/// fires, against roughly fifty thousand in the compiler's own bundle.
+pub fn intern_literal(n: i64) -> i64 {
+    use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
+    static NEXT: AtomicI64 = AtomicI64::new(IMAGE_ORIGIN);
+    let at = NEXT.fetch_add(aligned(n).max(ALIGN), Relaxed);
+    debug_assert!(at < HEAP_ORIGIN, "the image band ran into the heap");
+    at
+}
+
 /// The two cursors and the extent depth between them.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Bump {
+    /// The image cursor: literals, which never move and are never reclaimed.
+    image: i64,
     /// Where the cursor sits outside an extent.
     bivy: i64,
     /// The deck-pos CELL, which `__deck-pos` reads and `__deck-set` writes.
@@ -47,7 +84,22 @@ pub struct Bump {
     pub hwm: i64,
 }
 
+impl Default for Bump {
+    fn default() -> Bump {
+        Bump { image: IMAGE_ORIGIN, bivy: HEAP_ORIGIN, cell: HEAP_ORIGIN, deck: HEAP_ORIGIN, depth: 0, hwm: HEAP_ORIGIN }
+    }
+}
+
 impl Bump {
+    /// A literal's address, from the band below the heap. It is not reclaimed
+    /// and it is durable against every base, which is what a literal is.
+    pub fn intern(&mut self, n: i64) -> i64 {
+        let at = self.image;
+        self.image += aligned(n).max(ALIGN);
+        debug_assert!(self.image < HEAP_ORIGIN, "the image band ran into the heap");
+        at
+    }
+
     /// The ACTIVE cursor: inside an extent the deck, outside it the bivy.
     ///
     /// This is the whole of what makes a guarded copy's
@@ -131,10 +183,10 @@ mod tests {
     #[test]
     fn an_allocation_answers_where_it_starts_and_moves_the_cursor_past_it() {
         let mut b = Bump::default();
-        assert_eq!(b.alloc(24), 0);
-        assert_eq!(b.cursor(), 24);
-        assert_eq!(b.alloc(1), 24);
-        assert_eq!(b.cursor(), 32, "one byte still costs a word");
+        assert_eq!(b.alloc(24), HEAP_ORIGIN);
+        assert_eq!(b.cursor(), HEAP_ORIGIN + 24);
+        assert_eq!(b.alloc(1), HEAP_ORIGIN + 24);
+        assert_eq!(b.cursor(), HEAP_ORIGIN + 32, "one byte still costs a word");
     }
 
     /// The ordering the compiler's durability test is asking about.
@@ -198,14 +250,40 @@ mod tests {
         assert_eq!(first, second, "the scratch was reused, exactly as upstream reuses it");
     }
 
+    /// **A LITERAL IS BELOW THE HEAP AND THEREFORE DURABLE**, which is the
+    /// property `copy-sx-text` reads to decide whether to share a text or
+    /// rebuild it. Distinct, non-zero, and under every base the compiler can
+    /// compute, because every base comes off a cursor that starts at the
+    /// heap origin.
+    #[test]
+    fn a_literal_is_below_every_heap_address() {
+        let mut b = Bump::default();
+        let (one, two) = (b.intern(13), b.intern(13));
+        let allocated = b.alloc(8);
+        assert_ne!(one, two, "two literals are two addresses");
+        assert!(one > 0 && two > 0, "and neither is the not-an-address sentinel");
+        assert!(two < allocated, "both below anything the heap hands out");
+        assert!(two < b.cursor() && one < HEAP_ORIGIN);
+    }
+
+    /// Nothing is ever allocated at zero, so zero can go on meaning what the
+    /// compiler reads it as: not an address.
+    #[test]
+    fn zero_is_never_a_live_address() {
+        let mut b = Bump::default();
+        assert_ne!(b.intern(1), 0);
+        assert_ne!(b.alloc(1), 0);
+        assert_eq!(b.cursor() > HEAP_ORIGIN, true);
+    }
+
     /// The high-water mark survives a restore, because it is about how much
     /// was ever needed and not about how much is held.
     #[test]
     fn the_high_water_mark_remembers_what_a_restore_gave_back() {
         let mut b = Bump::default();
         b.alloc(4096);
-        b.set_cursor(0);
-        assert_eq!(b.cursor(), 0);
-        assert_eq!(b.hwm, 4096);
+        b.set_cursor(HEAP_ORIGIN);
+        assert_eq!(b.cursor(), HEAP_ORIGIN);
+        assert_eq!(b.hwm, HEAP_ORIGIN + 4096);
     }
 }

@@ -33,7 +33,7 @@ use std::rc::Rc;
 pub enum Value {
     Int(i64),
     Real(f64),
-    Text(Rc<String>),
+    Text(Rc<Str>),
     Char(char),
     Bool(bool),
     /// A LIST IS SHARED AND ITS SLOTS ARE WRITABLE, because Codex's is.
@@ -121,6 +121,52 @@ pub struct Closure {
     pub body: Body,
     pub env: Env,
     pub applied: Vec<Value>,
+}
+
+/// A TEXT, AND WHERE IT LIVES.
+///
+/// The address is not decoration and it is not for debugging: the compiler
+/// asks `address-of t < b` to decide whether a text is durable enough to share
+/// or has to be rebuilt, and a raw host pointer cannot answer that question
+/// against an allocator offset. It is stamped once, at the moment the text is
+/// made, from the same cursor `__heap-save` reads -- so it is below every base
+/// computed after it and at or above every one before, which is the whole of
+/// what the test wants to know.
+///
+/// Behind the `Rc` rather than beside it in the variant, because `Value` is
+/// two words and that is load-bearing: it was 24 bytes once and 16% slower.
+#[derive(Debug)]
+pub struct Str {
+    pub addr: i64,
+    s: String,
+}
+
+impl Str {
+    pub fn as_str(&self) -> &str {
+        &self.s
+    }
+}
+
+/// **TWO TEXTS ARE EQUAL WHEN THEY READ THE SAME**, whatever their addresses.
+/// Codex compares texts by content and always has; the address answers a
+/// different question and `address-of` is where it is asked.
+impl PartialEq for Str {
+    fn eq(&self, other: &Str) -> bool {
+        self.s == other.s
+    }
+}
+
+impl std::ops::Deref for Str {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.s
+    }
+}
+
+impl std::fmt::Display for Str {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.s)
+    }
 }
 
 pub type Env = Rc<Scope>;
@@ -689,7 +735,10 @@ impl Interp {
                     _ => {}
                 }
                 let b = self.eval(r, env)?;
-                binary(&self.syms, *op, a, b)
+                {
+                    let Interp { syms, bump, .. } = self;
+                    binary(syms, bump, *op, a, b)
+                }
             }
             Code::Unary(x) => match self.eval(x, env)? {
                 Value::Int(i) => Ok(Value::Int(-i)),
@@ -1055,9 +1104,21 @@ impl Interp {
         (self.mem.mapped(), self.bump.hwm, self.syms.text(self.hwm_in).to_string())
     }
 
+    /// **MAKING A TEXT ALLOCATES**, which is the whole change: the address is
+    /// stamped from the same cursor `__heap-save` reads, so a text made before
+    /// a base is below it and one made after is not.
+    ///
+    /// The size is the byte length, word-aligned, which is what a text
+    /// occupies upstream -- `cx_concat` allocates `b.len` and bare metal bumps
+    /// r10 by the same.
+    fn text(&mut self, s: String) -> R<Value> {
+        let addr = self.bump.alloc(s.len() as i64);
+        Ok(Value::Text(Rc::new(Str { addr, s })))
+    }
+
     fn builtin(&mut self, name: &str, args: Vec<Value>) -> R<Value> {
         use Value::*;
-        let text = |s: String| Ok(Text(Rc::new(s)));
+
         match (name, args.as_slice()) {
             // -- console ------------------------------------------------------
             ("print-line-uni" | "print-line", [v]) => {
@@ -1074,7 +1135,10 @@ impl Interp {
             }
 
             // -- text ---------------------------------------------------------
-            ("show" | "integer-to-text", [v]) => text(show(&self.syms, v)),
+            ("show" | "integer-to-text", [v]) => {
+                let t = show(&self.syms, v);
+                self.text(t)
+            }
             ("text-length", [Text(t)]) => Ok(Int(t.len() as i64)),
             ("char-at", [Text(t), Int(i)]) => t
                 .as_bytes()
@@ -1090,7 +1154,10 @@ impl Interp {
                 .unwrap_or(0))),
             ("char-code", [Char(c)]) => Ok(Int(char_code(*c as u8))),
             ("code-to-char", [Int(c)]) => Ok(Char(code_to_char(*c))),
-            ("char-to-text" | "char-encode", [Char(c)]) => text(c.to_string()),
+            ("char-to-text" | "char-encode", [Char(c)]) => {
+                let t = c.to_string();
+                self.text(t)
+            }
             ("substring", [Text(t), Int(start), Int(len)]) => {
                 let b = t.as_bytes();
                 let s = (*start).clamp(0, b.len() as i64) as usize;
@@ -1106,12 +1173,16 @@ impl Interp {
                     self.rematerialised += 1;
                     self.rematerialised_bytes += e as u64;
                 }
-                text(String::from_utf8_lossy(&b[s..e]).into_owned())
+                let t = String::from_utf8_lossy(&b[s..e]).into_owned();
+                self.text(t)
             }
-            ("text-contains", [Text(a), Text(b)]) => Ok(Bool(a.contains(&**b))),
-            ("text-starts-with", [Text(a), Text(b)]) => Ok(Bool(a.starts_with(&**b))),
-            ("text-ends-with", [Text(a), Text(b)]) => Ok(Bool(a.ends_with(&**b))),
-            ("text-replace", [Text(a), Text(b), Text(c)]) => text(a.replace(&**b, c)),
+            ("text-contains", [Text(a), Text(b)]) => Ok(Bool(a.contains(b.as_str()))),
+            ("text-starts-with", [Text(a), Text(b)]) => Ok(Bool(a.starts_with(b.as_str()))),
+            ("text-ends-with", [Text(a), Text(b)]) => Ok(Bool(a.ends_with(b.as_str()))),
+            ("text-replace", [Text(a), Text(b), Text(c)]) => {
+                let r = a.replace(b.as_str(), c.as_str());
+                self.text(r)
+            }
             ("text-to-integer", [Text(t)]) => Ok(Int(t.trim().parse().unwrap_or(0))),
             // `text-compare` is over CCE bytes, which is char-code order and
             // not ASCII order.
@@ -1149,7 +1220,8 @@ impl Interp {
             ("raw-bytes-to-text", [List(xs)]) => {
                 let bytes: Vec<u8> =
                     xs.borrow().iter().map(|v| if let Int(i) = v { *i as u8 } else { 0 }).collect();
-                text(String::from_utf8_lossy(&bytes).into_owned())
+                let t = String::from_utf8_lossy(&bytes).into_owned();
+                self.text(t)
             }
 
             // -- lists --------------------------------------------------------
@@ -1229,7 +1301,13 @@ impl Interp {
                 if sep.is_empty() {
                     vec![Text(t.clone())]
                 } else {
-                    t.split(&**sep).map(|p| Text(Rc::new(p.to_string()))).collect()
+                    let parts: Vec<String> =
+                        t.split(sep.as_str()).map(|p| p.to_string()).collect();
+                    let mut out = Vec::with_capacity(parts.len());
+                    for part in parts {
+                        out.push(self.text(part)?);
+                    }
+                    return Ok(list(out));
                 },
             )),
 
@@ -1315,7 +1393,14 @@ impl Interp {
             ("address-of", [Record(_, fs)]) => Ok(Int(Rc::as_ptr(fs) as i64)),
             ("address-of", [List(xs)]) => Ok(Int(Rc::as_ptr(xs) as *const u8 as i64)),
             ("address-of", [Ctor(_, fs)]) => Ok(Int(Rc::as_ptr(fs) as *const u8 as i64)),
-            ("address-of", [Text(t)]) => Ok(Int(Rc::as_ptr(t) as *const u8 as i64)),
+            // **A TEXT ANSWERS WHERE IT WAS ALLOCATED**, from the same cursor
+            // `__heap-save` reads. This was the host pointer, and the host
+            // pointer is on a scale five orders of magnitude above every base
+            // the compiler computes -- so `copy-sx-text`'s durability test was
+            // false for every text, always, and the source was rebuilt at
+            // every keep boundary. That was the whole of a 2.3 GB peak on a
+            // 112 KB subject.
+            ("address-of", [Text(t)]) => Ok(Int(t.addr)),
             ("address-of", [Unit]) => Ok(Int(0)),
             // The tag the unifier reads. Upstream's `mcopy-type` read this out
             // of raw memory and took a payload word for it, which was the root
@@ -1332,7 +1417,7 @@ impl Interp {
                         other => return err(format!("text-concat-list over {}", type_name(other))),
                     }
                 }
-                Ok(Text(Rc::new(out)))
+                self.text(out)
             }
             // The deck bracket: everything allocated between them is scratch
             // the exit reclaims. Nothing here reclaims anything, so the bracket
@@ -1565,7 +1650,11 @@ pub(crate) fn literal(text: &str, kind: LiteralKind) -> R<Value> {
             .map(Value::Real)
             .map_err(|_| Error(format!("bad number literal `{text}`"))),
         LiteralKind::BoolLit => Ok(Value::Bool(text == "True")),
-        LiteralKind::TextLit => Ok(Value::Text(Rc::new(unescape(text)))),
+        LiteralKind::TextLit => {
+            let s = unescape(text);
+            let addr = crate::bump::intern_literal(s.len() as i64);
+            Ok(Value::Text(Rc::new(Str { addr, s })))
+        }
         LiteralKind::CharLit => Ok(Value::Char(unescape(text).chars().next().unwrap_or('\0'))),
     }
 }
@@ -1594,7 +1683,20 @@ fn unescape(raw: &str) -> String {
     out
 }
 
-fn binary(syms: &SymTab, op: BinaryOp, a: Value, b: Value) -> R<Value> {
+/// **CONCATENATION ALLOCATES, so this needs the allocator.** `&` on two texts
+/// is a fresh block at the cursor upstream -- bare metal's two str-concat
+/// emitters both bump r10 unconditionally, and the zig plug documents why it
+/// does not short-circuit an empty right operand: an aliased return inside a
+/// deck extent yields a value that looks decked and is not.
+///
+/// The borrow is split rather than the table cloned: `syms` and `bump` are
+/// disjoint fields, and Rust will let both be borrowed at once when it can see
+/// that.
+fn binary(syms: &SymTab, bump: &mut crate::bump::Bump, op: BinaryOp, a: Value, b: Value) -> R<Value> {
+    let mut cat = |s: String| {
+        let addr = bump.alloc(s.len() as i64);
+        Text(Rc::new(Str { addr, s }))
+    };
     use BinaryOp::*;
     use Value::*;
     Ok(match (op, &a, &b) {
@@ -1630,9 +1732,9 @@ fn binary(syms: &SymTab, op: BinaryOp, a: Value, b: Value) -> R<Value> {
         (OpNotEq, _, _) => Bool(!equal(&a, &b)),
         (OpDefEq, _, _) => Bool(equal(&a, &b)),
         // `&` is one operator with four meanings, chosen by what it is given.
-        (OpAnd | OpAppend, Text(x), Text(y)) => Text(Rc::new(format!("{x}{y}"))),
-        (OpAnd | OpAppend, Text(x), _) => Text(Rc::new(format!("{x}{}", show(syms, &b)))),
-        (OpAnd | OpAppend, _, Text(y)) => Text(Rc::new(format!("{}{y}", show(syms, &a)))),
+        (OpAnd | OpAppend, Text(x), Text(y)) => cat(format!("{x}{y}")),
+        (OpAnd | OpAppend, Text(x), _) => cat(format!("{x}{}", show(syms, &b))),
+        (OpAnd | OpAppend, _, Text(y)) => cat(format!("{}{y}", show(syms, &a))),
         (OpAnd | OpAppend, List(x), List(y)) => {
             let mut out = x.borrow().clone();
             out.extend(y.borrow().iter().cloned());
@@ -1662,7 +1764,7 @@ fn equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Int(x), Int(y)) => x == y,
         (Real(x), Real(y)) => x == y,
-        (Text(x), Text(y)) => x == y,
+        (Text(x), Text(y)) => x.as_str() == y.as_str(),
         (Char(x), Char(y)) => x == y,
         (Bool(x), Bool(y)) => x == y,
         (Unit, Unit) => true,
@@ -1728,7 +1830,7 @@ pub fn show(syms: &SymTab, v: &Value) -> String {
     match v {
         Value::Int(i) => i.to_string(),
         Value::Real(f) => format!("{f}"),
-        Value::Text(t) => (**t).clone(),
+        Value::Text(t) => t.as_str().to_string(),
         Value::Char(c) => c.to_string(),
         Value::Bool(b) => if *b { "True" } else { "False" }.to_string(),
         Value::Unit => String::new(),
@@ -1910,6 +2012,28 @@ mod tests {
         "",
     ];
 
+    /// **POSITIONS ARE REPORTED FROM THE HEAP ORIGIN**, because the origin is
+    /// a constant of the model and not of the behaviour under test.
+    ///
+    /// The heap does not start at zero -- it starts at `bump::HEAP_ORIGIN`, so
+    /// that the band below it can hold text literals, which are durable and
+    /// must compare below every base. These tests are about how far the cursor
+    /// MOVES, and writing that constant into eleven expected strings would
+    /// have made them a record of where the heap happens to begin rather than
+    /// of what the allocator does.
+    ///
+    /// Every integer in the output is a position; anything that does not parse
+    /// as one is left alone, which is how `True` survives.
+    fn from_origin(out: String) -> String {
+        out.split_whitespace()
+            .map(|w| match w.parse::<i64>() {
+                Ok(n) => (n - crate::bump::HEAP_ORIGIN).to_string(),
+                Err(_) => w.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// Run `body` as the entry point, with the allocator primitives in scope.
     fn alloc_out(body: &[&str]) -> String {
         let mut lines: Vec<String> =
@@ -1923,12 +2047,21 @@ mod tests {
         out(&lines.join("\n")).trim().to_string()
     }
 
+    /// `alloc_out`, for a body whose output is POSITIONS. Kept separate
+    /// because `alloc_out` is also the scaffolding for tests that print list
+    /// lengths, and subtracting an origin from a count of two gives
+    /// -16777214 -- which is what happened when this normalisation was
+    /// applied to every caller instead of the ones that meant it.
+    fn alloc_pos(body: &[&str]) -> String {
+        from_origin(alloc_out(body))
+    }
+
     /// `pitch` answers where the bivy was and leaves it `size` higher; `strike`
     /// puts it back exactly.
     #[test]
     fn pitch_answers_the_old_frontier_and_strike_restores_it() {
         assert_eq!(
-            alloc_out(&[
+            alloc_pos(&[
                 "let a = pitch 100",
                 "in let b = pitch 50",
                 "in let c = __heap-save",
@@ -1946,7 +2079,7 @@ mod tests {
     #[test]
     fn build_plants_the_deck_at_the_base_and_advances_the_bivy_over_it() {
         assert_eq!(
-            alloc_out(&[
+            alloc_pos(&[
                 "let base = build 1000",
                 "in let top = __heap-save",
                 "in let deck = __deck-pos",
@@ -1961,7 +2094,7 @@ mod tests {
     #[test]
     fn phase_compact_drops_the_bivy_to_the_deck() {
         assert_eq!(
-            alloc_out(&[
+            alloc_pos(&[
                 "let base = build 1000",
                 "in let __a = pitch 400",
                 "in let grown = __heap-save",
@@ -2017,7 +2150,7 @@ mod tests {
     #[test]
     fn a_build_after_a_compact_reuses_the_same_base() {
         assert_eq!(
-            alloc_out(&[
+            alloc_pos(&[
                 "let one = build 1000",
                 "in let __a = pitch 200",
                 "in let __b = phase-compact",
@@ -2037,7 +2170,7 @@ mod tests {
     #[test]
     fn a_build_without_a_compact_climbs_and_the_first_ceiling_goes_stale() {
         assert_eq!(
-            alloc_out(&[
+            alloc_pos(&[
                 "let one = build 1000",
                 "in let two = build 1000",
                 "in let stale = deck-short-of (one + 1000) 8",
@@ -2111,7 +2244,7 @@ mod tests {
     #[test]
     fn outside_an_extent_the_cursor_is_the_bivy() {
         assert_eq!(
-            alloc_out(&[
+            alloc_pos(&[
                 "let a = __heap-save",
                 "in let __x = __heap-advance 100",
                 "in let b = __heap-save",
@@ -2126,7 +2259,7 @@ mod tests {
     #[test]
     fn inside_an_extent_the_cursor_is_the_deck() {
         assert_eq!(
-            alloc_out(&[
+            alloc_pos(&[
                 "let base = build 1000",
                 "in let outside = __heap-save",
                 "in let __e = __deck-enter",
@@ -2146,7 +2279,7 @@ mod tests {
     #[test]
     fn the_exit_writes_the_cursor_back_to_the_cell() {
         assert_eq!(
-            alloc_out(&[
+            alloc_pos(&[
                 "let base = build 1000",
                 "in let before = __deck-pos",
                 "in let __e = __deck-enter",
@@ -2168,7 +2301,7 @@ mod tests {
     #[test]
     fn only_the_outermost_extent_copies_the_cell() {
         assert_eq!(
-            alloc_out(&[
+            alloc_pos(&[
                 "let base = build 1000",
                 "in let __e1 = __deck-enter",
                 "in let __a1 = __heap-advance 10",
@@ -2194,7 +2327,7 @@ mod tests {
     #[test]
     fn deck_record_opens_an_extent_around_its_argument() {
         assert_eq!(
-            alloc_out(&[
+            alloc_pos(&[
                 "let base = build 1000",
                 "in let bivy0 = __heap-save",
                 "in let r = deck-record (pitch 40)",
@@ -2211,7 +2344,7 @@ mod tests {
     #[test]
     fn the_heap_position_moves_and_comes_back() {
         let src = "Chapter: T\n\nSection: E\n\n  opening : [Console] Nothing = act\n                 let a = __heap-save\n    in let __x = __heap-advance 1000\n                 in let b = __heap-save\n    in let __y = __heap-restore a\n                 in let c = __heap-save\n                 in print-line-uni (show a & \" \" & show b & \" \" & show c)\n  end\n";
-        assert_eq!(out(src).trim(), "0 1000 0");
+        assert_eq!(from_origin(out(src).trim().to_string()), "0 1000 0");
     }
 
     /// **`list-set-at` MUTATES IN PLACE**, and this is the upstream regression
