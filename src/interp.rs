@@ -45,9 +45,11 @@ pub enum Value {
     /// `st.offset = stop` is a field ASSIGNMENT and it writes through: the
     /// compiler's lexer ends `scan-ident-rest` with
     ///
-    ///     in let __seq = st.offset = stop
-    ///     in let __seq = st.column = new-col
-    ///     in st
+    /// ```text
+    /// in let __seq = st.offset = stop
+    /// in let __seq = st.column = new-col
+    /// in st
+    /// ```
     ///
     /// and returns the same `st` it was handed, expecting the two assignments
     /// to be visible in it. This arm used to build a NEW record and return it,
