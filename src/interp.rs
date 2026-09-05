@@ -199,6 +199,32 @@ pub struct Interp {
     pub steps: u64,
     depth: u32,
     limit: u64,
+    /// THE ALLOCATOR'S BOOKKEEPING, AND NOTHING IS ALLOCATED.
+    ///
+    /// The compiler manages its own memory: a bump heap with a deck growing
+    /// under it, `__heap-advance` to reserve, `__heap-restore` to give back,
+    /// and `phase-compact` -- which is exactly `__heap-restore (__deck-pos)` --
+    /// between phases. On bare metal and in the plugs that is real. Here the
+    /// host allocator does the job, so these two counters carry the ARITHMETIC
+    /// and none of the memory.
+    ///
+    /// They are not zero and they are not constant, because the compiler asks
+    /// them questions. `deck-short-of ceiling band` is
+    /// `__deck-pos + band >= ceiling`, and `heap-short-of` the same over
+    /// `__heap-save`, so a position frozen at zero would answer those two the
+    /// way a machine with no memory left does, or the way one with infinite
+    /// memory does, depending on the ceiling -- and neither is the answer a
+    /// real run gives. Moving them the way a bump allocator moves them is the
+    /// cheapest model that gets those two predicates right.
+    ///
+    /// **WHAT THIS ARM THEREFORE CANNOT SEE.** Every defect the deck bracket
+    /// has produced upstream -- a lifetime error, a value read after the
+    /// bracket reclaimed it, a tag read out of raw memory -- is invisible from
+    /// here, because nothing here reclaims anything. Agreement between this arm
+    /// and bare metal is evidence about the SEMANTICS and silence about the
+    /// memory discipline. Do not let a green line be read as covering both.
+    heap_pos: i64,
+    deck_pos: i64,
 }
 
 /// The default budget for ONE program: effectively none.
@@ -380,6 +406,8 @@ impl Interp {
             steps: 0,
             depth: 0,
             limit: STEP_LIMIT,
+            heap_pos: 0,
+            deck_pos: 0,
         }
     }
 
@@ -983,6 +1011,50 @@ impl Interp {
             // `__narrow` is a codegen hint: it tells the emitter a value fits
             // a narrower machine type. At the value level it is the identity.
             ("__narrow", [v]) => Ok(v.clone()),
+
+            // -- the allocator, as arithmetic ---------------------------------
+            // See `heap_pos` on the struct for why these move rather than
+            // answering a constant, and for what this arm consequently cannot
+            // see. `__heap-advance` and `__heap-restore` are declared to answer
+            // Nothing and the compiler binds their results only to sequence
+            // them, so Unit is the whole of it.
+            // THE HOST IS A HOSTED ONE. `hosted-kind` is 1 in the zig, wasm and
+            // C# plugs and 0 in the bare-metal code generators, and it guards
+            // the memory work a hosted target has no business doing -- the
+            // check compact above all. A tree walker is as hosted as it gets.
+            ("hosted-kind", []) => Ok(Int(1)),
+            // The deck bracket: everything allocated between them is scratch
+            // the exit reclaims. Nothing here reclaims anything, so the bracket
+            // is a pair of no-ops -- which is exactly why this arm cannot see
+            // a value that outlives one.
+            ("__deck-enter", []) | ("__deck-exit", []) => Ok(Unit),
+            // A LINKED LIST IS A LIST HERE, and the call sites make that sound:
+            // `__linked-list-push` ANSWERS the new list and every caller in the
+            // compiler rebinds it -- `__linked-list-push acc (...)` threaded as
+            // an accumulator. The mutation is the emitter's optimisation of a
+            // functional interface, not the interface.
+            ("__linked-list-empty", [Int(_)]) => Ok(List(Rc::new(Vec::new()))),
+            ("__linked-list-push", [List(xs), v]) => {
+                let mut out = (**xs).clone();
+                out.push(v.clone());
+                Ok(List(Rc::new(out)))
+            }
+            ("__linked-list-to-list", [List(xs)]) => Ok(List(xs.clone())),
+
+            ("__heap-save", []) => Ok(Int(self.heap_pos)),
+            ("__deck-pos", []) => Ok(Int(self.deck_pos)),
+            ("__heap-advance", [Int(n)]) => {
+                self.heap_pos += *n;
+                Ok(Unit)
+            }
+            ("__heap-restore", [Int(p)]) => {
+                self.heap_pos = *p;
+                Ok(Unit)
+            }
+            ("__deck-set", [Int(p)]) => {
+                self.deck_pos = *p;
+                Ok(Unit)
+            }
             // `__record-set` is how a mutable record is updated: record, field
             // NAME as text, value.
             ("__record-set", [Record(n, fs), Text(field), v]) => {
