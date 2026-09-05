@@ -402,12 +402,13 @@ impl Interp {
 
         // Pass 2: compile. The tables are complete, so a body can name
         // anything the unit defines regardless of where it sits.
+        let impure = impure_names(&ch.syms, &const_defs_src, &fun_defs);
         let mut const_defs: Vec<Rc<Code>> = Vec::with_capacity(const_defs_src.len());
         let mut const_cacheable: Vec<bool> = Vec::with_capacity(const_defs_src.len());
         for d in &const_defs_src {
             const_defs.push(Rc::new(Compiler::body(&names, &ch.syms, &d.chapter_slug, &d.body)));
             const_cacheable.push(match d.declared_type.first() {
-                Some(t) => !mentions_effect(t),
+                Some(t) => !mentions_effect(t) && !impure.contains(&d.name),
                 None => false,
             });
         }
@@ -1547,12 +1548,278 @@ mod tests {
         assert_eq!(out(&src).trim(), "40");
     }
 
+    // ---- the allocator's arithmetic ------------------------------------
+    //
+    // `codex/compiler/Core/PhaseAllocator.codex` IS the specification and these
+    // transcribe it. A test failing here means this arm's counters do not obey
+    // the contract the compiler is written against -- not that the contract is
+    // unclear.
+    //
+    // The compiler manages its own memory with a BIVY that bumps upward and a
+    // DECK reserved out of it in one advance. This arm allocates nothing, so
+    // what has to be right is the arithmetic the compiler's own guards read.
+
+    /// The allocator chapter's primitives, transcribed, for the tests to call.
+    const ALLOC: &[&str] = &[
+        "  pitch : Integer -> Integer",
+        "  pitch (size) =",
+        "   let p = __heap-save",
+        "   in let advanced = __heap-advance size",
+        "   in p",
+        "",
+        "  strike : Integer -> Nothing",
+        "  strike (start) = __heap-restore start",
+        "",
+        "  build : Integer -> Integer",
+        "  build (size) =",
+        "   let p = __heap-save",
+        "   in let deck-init = __deck-set p",
+        "   in let advanced = __heap-advance size",
+        "   in p",
+        "",
+        "  init-phase-allocator : Integer",
+        "  init-phase-allocator =",
+        "   let base = __heap-save",
+        "   in let deck-init = __deck-set base",
+        "   in base",
+        "",
+        "  phase-compact : Nothing = __heap-restore (__deck-pos)",
+        "",
+        "  deck-short-of : Integer, Integer -> Boolean",
+        "  deck-short-of (ceiling) (band) =",
+        "   if ceiling > 0 & __deck-pos + band >= ceiling then True else False",
+        "",
+        "  deck-bound-short-of : Integer, Integer -> Boolean",
+        "  deck-bound-short-of (ceiling) (band) =",
+        "   if ceiling > 0 & __heap-save + band >= ceiling then True else False",
+        "",
+    ];
+
+    /// Run `body` as the entry point, with the allocator primitives in scope.
+    fn alloc_out(body: &[&str]) -> String {
+        let mut lines: Vec<String> =
+            vec!["Chapter: A".into(), "".into(), "Section: S".into(), "".into()];
+        lines.extend(ALLOC.iter().map(|l| (*l).to_string()));
+        lines.push("Section: E".into());
+        lines.push("".into());
+        lines.push("  opening : [Console] Nothing = act".into());
+        lines.extend(body.iter().map(|l| format!("    {l}")));
+        lines.push("  end".into());
+        out(&lines.join("\n")).trim().to_string()
+    }
+
+    /// `pitch` answers where the bivy was and leaves it `size` higher; `strike`
+    /// puts it back exactly.
+    #[test]
+    fn pitch_answers_the_old_frontier_and_strike_restores_it() {
+        assert_eq!(
+            alloc_out(&[
+                "let a = pitch 100",
+                "in let b = pitch 50",
+                "in let c = __heap-save",
+                "in let __x = strike a",
+                "in let d = __heap-save",
+                "in print-line-uni (show a & \" \" & show b & \" \" & show c & \" \" & show d)",
+            ]),
+            "0 100 150 0"
+        );
+    }
+
+    /// `build` reserves the whole deck in ONE advance -- the reason the guard
+    /// page cannot catch it, and the reason that chapter checks it instead --
+    /// and it plants the deck cursor at the reservation's base.
+    #[test]
+    fn build_plants_the_deck_at_the_base_and_advances_the_bivy_over_it() {
+        assert_eq!(
+            alloc_out(&[
+                "let base = build 1000",
+                "in let top = __heap-save",
+                "in let deck = __deck-pos",
+                "in print-line-uni (show base & \" \" & show top & \" \" & show deck)",
+            ]),
+            "0 1000 0"
+        );
+    }
+
+    /// `phase-compact` is `__heap-restore (__deck-pos)`: it drops the bivy back
+    /// to the deck's base, which is what makes a phase's scratch free.
+    #[test]
+    fn phase_compact_drops_the_bivy_to_the_deck() {
+        assert_eq!(
+            alloc_out(&[
+                "let base = build 1000",
+                "in let __a = pitch 400",
+                "in let grown = __heap-save",
+                "in let __b = phase-compact",
+                "in let after = __heap-save",
+                "in print-line-uni (show grown & \" \" & show after & \" \" & show base)",
+            ]),
+            "1400 0 0"
+        );
+    }
+
+    /// **THE GUARD ASKS ABOUT THE FLOOR'S WIDTH, NOT ABOUT USAGE**, and the
+    /// chapter says so outright: inside a phase-wide extent the deck-pos cell is
+    /// FROZEN at the base, so `deck-short-of` reduces to
+    /// `base + band >= base + height` -- "true only when the floor is narrower
+    /// than the band".
+    ///
+    /// This is the assertion the model turns on. The parse phase reserves a
+    /// 392 MB floor against an 8 MB band, so it must answer False.
+    #[test]
+    fn deck_short_of_is_false_while_the_floor_is_wider_than_the_band() {
+        assert_eq!(
+            alloc_out(&[
+                "let base = build 411041792",
+                "in let wide = deck-short-of (base + 411041792) 8388608",
+                "in let narrow = deck-short-of (base + 4194304) 8388608",
+                "in let unarmed = deck-short-of 0 8388608",
+                "in print-line-uni (show wide & \" \" & show narrow & \" \" & show unarmed)",
+            ]),
+            "False True False"
+        );
+    }
+
+    /// `deck-bound-short-of` asks the same shape of the BIVY frontier, and the
+    /// two answer differently on purpose: the bivy has moved over the whole
+    /// reservation and the deck has not moved at all.
+    #[test]
+    fn the_bivy_bound_and_the_deck_bound_are_different_questions() {
+        assert_eq!(
+            alloc_out(&[
+                "let base = build 1000",
+                "in let deck = deck-short-of (base + 1000) 100",
+                "in let bivy = deck-bound-short-of (base + 1000) 100",
+                "in print-line-uni (show deck & \" \" & show bivy)",
+            ]),
+            "False True"
+        );
+    }
+
+    /// Thirteen builds per compile, each after a compact, must all land on the
+    /// SAME base -- otherwise a later phase's deck sits above an earlier
+    /// phase's ceiling and the guard fires on arithmetic alone.
+    #[test]
+    fn a_build_after_a_compact_reuses_the_same_base() {
+        assert_eq!(
+            alloc_out(&[
+                "let one = build 1000",
+                "in let __a = pitch 200",
+                "in let __b = phase-compact",
+                "in let two = build 2000",
+                "in let __c = phase-compact",
+                "in let three = build 500",
+                "in print-line-uni (show one & \" \" & show two & \" \" & show three)",
+            ]),
+            "0 0 0"
+        );
+    }
+
+    /// WITHOUT the compact they do not, and that is the failure mode worth
+    /// naming: the second reservation starts where the first ended, so a
+    /// ceiling computed from the first is already behind the cursor and the
+    /// guard fires on arithmetic rather than on usage.
+    #[test]
+    fn a_build_without_a_compact_climbs_and_the_first_ceiling_goes_stale() {
+        assert_eq!(
+            alloc_out(&[
+                "let one = build 1000",
+                "in let two = build 1000",
+                "in let stale = deck-short-of (one + 1000) 8",
+                "in print-line-uni (show one & \" \" & show two & \" \" & show stale)",
+            ]),
+            "0 1000 True"
+        );
+    }
+
     /// The allocator is arithmetic here: advance moves the position, restore
     /// puts it back, and `deck-short-of`'s two operands answer accordingly.
     #[test]
     fn the_heap_position_moves_and_comes_back() {
         let src = "Chapter: T\n\nSection: E\n\n  opening : [Console] Nothing = act\n                 let a = __heap-save\n    in let __x = __heap-advance 1000\n                 in let b = __heap-save\n    in let __y = __heap-restore a\n                 in let c = __heap-save\n                 in print-line-uni (show a & \" \" & show b & \" \" & show c)\n  end\n";
         assert_eq!(out(src).trim(), "0 1000 0");
+    }
+}
+
+/// The builtins that READ OR WRITE the allocator's two positions, plus the one
+/// that mutates a record.
+///
+/// Nothing in a type says these are impure -- their declared rows are `empty`,
+/// because upstream's effect system is about capabilities and not about the
+/// bump allocator underneath everything.
+const IMPURE_BUILTINS: &[&str] = &[
+    "__heap-save",
+    "__heap-restore",
+    "__heap-advance",
+    "__deck-pos",
+    "__deck-set",
+    "__deck-enter",
+    "__deck-exit",
+    "__record-set",
+];
+
+/// Every definition that can touch mutable state, directly or through a call.
+///
+/// **THE EFFECT ROW IS NOT ENOUGH TO DECIDE WHAT MAY BE CACHED, and a test
+/// found it.** `phase-compact : Nothing = __heap-restore (__deck-pos)` is a
+/// NULLARY whose declared type carries no effect, so the cache kept its first
+/// answer and every later mention did nothing at all. The compiler calls it
+/// between phases to drop the bivy back to the deck; cached, the second phase's
+/// reservation started where the first ended, and a ceiling computed from the
+/// first was already behind the cursor -- CDX9002, deck overflow, on
+/// arithmetic rather than on usage.
+///
+/// So this is a fixpoint over the call graph rather than a look at one body: a
+/// definition is impure if it mentions an impure builtin, or a field
+/// assignment, or the name of anything already known to be impure. It runs once
+/// at startup and it only ever REMOVES definitions from the cache, so being
+/// wrong in this direction costs a rebuild and being wrong in the other loses
+/// an update.
+///
+/// Names, not chapter-qualified keys, so two definitions sharing a name are
+/// both marked. Over-approximating is the safe side here.
+fn impure_names(
+    syms: &SymTab,
+    consts: &[&crate::ast::Def],
+    funs: &[(u32, &crate::ast::Def)],
+) -> std::collections::HashSet<Sym> {
+    use std::collections::{HashMap, HashSet};
+    let mut impure: HashSet<Sym> = HashSet::new();
+    for b in IMPURE_BUILTINS {
+        if let Some(s) = syms.find(b) {
+            impure.insert(s);
+        }
+    }
+    // What each definition mentions, and whether it assigns to a field itself.
+    let mut mentions: HashMap<Sym, HashSet<Sym>> = HashMap::new();
+    let mut seeds: Vec<Sym> = Vec::new();
+    let all = consts.iter().copied().chain(funs.iter().map(|(_, d)| *d));
+    for d in all {
+        let e = mentions.entry(d.name).or_default();
+        d.body.walk(&mut |x| match x {
+            crate::ast::Expr::NameRef(n, _) => {
+                e.insert(*n);
+            }
+            crate::ast::Expr::FieldAssign(..) => seeds.push(d.name),
+            _ => {}
+        });
+    }
+    impure.extend(seeds);
+    // Fixpoint. The graph is small and shallow; this settles in a few passes.
+    loop {
+        let mut grew = false;
+        for (name, refs) in &mentions {
+            if impure.contains(name) {
+                continue;
+            }
+            if refs.iter().any(|r| impure.contains(r)) {
+                impure.insert(*name);
+                grew = true;
+            }
+        }
+        if !grew {
+            return impure;
+        }
     }
 }
 
