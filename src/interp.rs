@@ -381,6 +381,15 @@ pub struct Interp {
     /// definition, on the same reasoning a sampling profiler attributes time:
     /// wrong for any single sample, right in aggregate.
     prof: HashMap<Sym, (u64, u64)>,
+    /// How many builtin calls, and how many frames pushed. Exact rather than
+    /// sampled, because the sampler cannot see them: a builtin returns before
+    /// the next sample is due, so `cur` is almost never inside one. Two
+    /// increments on paths that already exist, and they answer the two
+    /// questions an optimiser would otherwise guess at -- whether the string
+    /// match over two hundred builtin arms is worth replacing with an index,
+    /// and whether one `Rc<Scope>` per call is worth pooling.
+    pub builtin_calls: u64,
+    pub frames: u64,
     last_live: usize,
     /// Which chapter defines each name, so the profile can be bucketed by
     /// PHASE without anybody guessing from the name afterwards.
@@ -739,6 +748,8 @@ impl Interp {
             next_report: 1.0,
             moves: 0,
             prof: HashMap::new(),
+            builtin_calls: 0,
+            frames: 0,
             last_live: 0,
             home,
         }
@@ -1006,6 +1017,7 @@ impl Interp {
                 }
                 Body::Code(b) => b.clone(),
             };
+            self.frames += 1;
             let env = Scope::push(&c.env, applied);
             match self.eval_tail(&body, &env)? {
                 Step::Done(v) => return Ok(v),
@@ -1221,7 +1233,13 @@ impl Interp {
         if total == 0 {
             return String::new();
         }
-        let mut out = format!("\n--- profile: {total} samples\n");
+        let mut out = format!(
+            "\n--- profile: {total} samples, {} steps, {} builtin calls ({:.0}% of steps), {} frames\n",
+            self.steps,
+            self.builtin_calls,
+            100.0 * self.builtin_calls as f64 / self.steps.max(1) as f64,
+            self.frames,
+        );
         let mut by_chapter: HashMap<&str, (u64, u64)> = HashMap::new();
         for (sym, (n, bytes)) in &self.prof {
             let ch = self.home.get(sym).map(|c| &**c).unwrap_or("(builtin or lambda)");
@@ -1300,6 +1318,7 @@ impl Interp {
 
     fn builtin(&mut self, name: &str, args: Vec<Value>) -> R<Value> {
         use Value::*;
+        self.builtin_calls += 1;
 
         match (name, args.as_slice()) {
             // -- console ------------------------------------------------------
