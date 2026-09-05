@@ -319,6 +319,10 @@ pub struct Interp {
     /// The name is the innermost definition entered, which is the one worth
     /// having -- an allocation made three frames down is attributed to the
     /// frame that made it.
+    /// Full-length `substring` calls and their bytes: what the keep phase
+    /// rebuilt because nothing could be recognised as already durable.
+    pub rematerialised: u64,
+    pub rematerialised_bytes: u64,
     live_hwm: usize,
     hwm_in: Sym,
     cur: Sym,
@@ -604,6 +608,8 @@ impl Interp {
             tags,
             mem: Mem::default(),
             bivy_hwm: 0,
+            rematerialised: 0,
+            rematerialised_bytes: 0,
             live_hwm: 0,
             hwm_in: Sym::default(),
             cur: Sym::default(),
@@ -1116,6 +1122,17 @@ impl Interp {
                 let b = t.as_bytes();
                 let s = (*start).clamp(0, b.len() as i64) as usize;
                 let e = (s + (*len).max(0) as usize).min(b.len());
+                // **A FULL-LENGTH SUBSTRING IS NOT A SUBSTRING, IT IS A COPY.**
+                // `substring t 0 (text-length t)` is the compiler's idiom for
+                // rematerialising a text it has decided is not durable --
+                // `copy-sx-text` and `mcopy-text-content` are both written that
+                // way. Counting exactly that shape measures the bytes this arm
+                // copies BECAUSE its durability test cannot answer, and no
+                // ordinary substring is caught by it.
+                if s == 0 && e == b.len() {
+                    self.rematerialised += 1;
+                    self.rematerialised_bytes += e as u64;
+                }
                 text(String::from_utf8_lossy(&b[s..e]).into_owned())
             }
             ("text-contains", [Text(a), Text(b)]) => Ok(Bool(a.contains(&**b))),

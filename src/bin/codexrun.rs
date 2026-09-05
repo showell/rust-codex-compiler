@@ -97,6 +97,9 @@ fn timed(path: &Path, budget: Option<u64>) -> Result<Run, String> {
     match r {
         Ok(()) => {
             let (mapped, hwm, hwm_in) = it.memory();
+            let hwm_in = format!("{hwm_in} remat={} remat-mb={:.1}",
+                                 it.rematerialised,
+                                 heapwatch::mb(it.rematerialised_bytes as usize));
             Ok((std::mem::take(&mut it.out), it.steps, secs, mapped, hwm, hwm_in))
         }
         // The partial output comes back with the error: seeing which line it
