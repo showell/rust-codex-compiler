@@ -88,6 +88,8 @@ fn timed(path: &Path, budget: Option<u64>) -> Result<Run, String> {
     let mut dg = Desugar::new(&src);
     let ch = dg.chapter(&parsed.tree);
     let mut it = Interp::new(&ch);
+    // A run long enough to worry about is a run that should say where it is.
+    it.progress = std::env::var_os("CODEXRUN_PROGRESS").is_some();
     if let Some(b) = budget {
         it = it.with_budget(b);
     }

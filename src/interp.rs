@@ -362,6 +362,14 @@ pub struct Interp {
     live_hwm: usize,
     hwm_in: Sym,
     cur: Sym,
+    /// Set to have a long run report where it has got to. `moves` counts
+    /// entries into a different definition than the last one, which is the
+    /// signal that separates "slow" from "stuck": a run making progress moves
+    /// between definitions constantly, and one going round a loop does not.
+    pub progress: bool,
+    started: Option<std::time::Instant>,
+    next_report: f64,
+    moves: u64,
 }
 
 /// One byte-addressed region starting at 0, sparse and paged.
@@ -451,6 +459,13 @@ const STEP_LIMIT: u64 = u64::MAX;
 /// program has to be caught by a counter rather than by the operating system:
 /// a stack overflow aborts the process and takes the whole sweep with it.
 const DEPTH_LIMIT: u32 = 20_000;
+
+/// **HOW OFTEN A LONG RUN SAYS WHERE IT IS.** A compile that takes minutes and
+/// prints nothing is indistinguishable from one that is stuck, and the
+/// difference matters most exactly when the wait is longest. Every second,
+/// checked on a step mask so the clock is read about ten times a second rather
+/// than forty million.
+const PROGRESS_STEPS: u64 = 1 << 22;
 
 /// How often the memory high-water mark is attributed to a running definition.
 /// A power of two, so the test is a mask rather than a division; 4,096 steps
@@ -645,6 +660,10 @@ impl Interp {
             live_hwm: 0,
             hwm_in: Sym::default(),
             cur: Sym::default(),
+            progress: false,
+            started: None,
+            next_report: 1.0,
+            moves: 0,
         }
     }
 
@@ -676,6 +695,9 @@ impl Interp {
                 self.live_hwm = live;
                 self.hwm_in = self.cur;
             }
+        }
+        if self.progress && self.steps & (PROGRESS_STEPS - 1) == 0 {
+            self.report_progress();
         }
         self.depth += 1;
         if self.depth > DEPTH_LIMIT {
@@ -889,7 +911,10 @@ impl Interp {
         loop {
             let c = cell.clone();
             let applied = std::mem::take(args);
-            self.cur = c.name;
+            if self.cur != c.name {
+                self.moves += 1;
+                self.cur = c.name;
+            }
             let body = match &c.body {
                 Body::Ctor(name) => return Ok(Value::Ctor(name.clone(), Rc::new(applied))),
                 Body::Builtin(name) => {
@@ -1096,6 +1121,29 @@ impl Interp {
 
     fn set_cursor(&mut self, v: i64) {
         self.bump.set_cursor(v);
+    }
+
+    /// Say where this run has got to, at most once a second.
+    ///
+    /// To stderr, because stdout is the program's own output and a caller is
+    /// diffing it. `moves` is cumulative rather than per-report so two lines
+    /// can be subtracted; a run whose `moves` stops rising while `steps` keeps
+    /// rising is going round something.
+    fn report_progress(&mut self) {
+        let t0 = *self.started.get_or_insert_with(std::time::Instant::now);
+        let secs = t0.elapsed().as_secs_f64();
+        if secs < self.next_report {
+            return;
+        }
+        self.next_report = secs.floor() + 1.0;
+        eprintln!(
+            "progress secs={secs:.0} steps={} live-mb={:.0} depth={} moves={} in={}",
+            self.steps,
+            crate::heapwatch::mb(crate::heapwatch::live()),
+            self.depth,
+            self.moves,
+            self.syms.text(self.cur),
+        );
     }
 
     /// Bytes of flat memory mapped, the furthest the allocator's cursor ever
