@@ -10,10 +10,16 @@
 //! The input must be a RESOLVED unit, the same as everything else here.
 
 use codexc::desugar::Desugar;
+use codexc::heapwatch;
 use codexc::interp::Interp;
 use codexc::parser;
 use std::path::Path;
 use std::process::ExitCode;
+
+/// **THE ALLOCATOR COUNTS**, so `bench` can say what a program needed and not
+/// only what it did. See `codexc::heapwatch` for why this is not peak RSS.
+#[global_allocator]
+static ALLOC: heapwatch::Counting = heapwatch::Counting;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -102,22 +108,30 @@ fn timed(path: &Path, budget: Option<u64>) -> Result<(String, u64, f64), String>
 ///
 ///     codexrun bench $SAFARI_ROOT/build/camera-unit.codex ...
 fn bench(paths: &[String]) -> ExitCode {
-    println!("{:<22} {:>12} {:>9} {:>12}", "program", "steps", "seconds", "steps/sec");
-    let (mut total_steps, mut total_secs) = (0u64, 0f64);
+    println!("{:<22} {:>12} {:>9} {:>12} {:>9}",
+             "program", "steps", "seconds", "steps/sec", "peak MB");
+    let (mut total_steps, mut total_secs, mut worst) = (0u64, 0f64, 0usize);
     for p in paths {
         let path = Path::new(p);
         let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        // Per program, not cumulative: the mark drops to what is live before
+        // each one, so the column is what THIS program needed on top of what
+        // was already held.
+        heapwatch::reset();
         match run_timed_in_thread(path) {
             Ok((_, steps, secs)) => {
+                let peak = heapwatch::peak();
                 total_steps += steps;
                 total_secs += secs;
-                println!("{name:<22} {steps:>12} {secs:>9.3} {:>12.0}", steps as f64 / secs.max(1e-9));
+                worst = worst.max(peak);
+                println!("{name:<22} {steps:>12} {secs:>9.3} {:>12.0} {:>9.1}",
+                         steps as f64 / secs.max(1e-9), heapwatch::mb(peak));
             }
             Err(e) => println!("{name:<22} {:>12}", e.lines().next().unwrap_or("failed")),
         }
     }
-    println!("{:<22} {total_steps:>12} {total_secs:>9.3} {:>12.0}", "TOTAL",
-             total_steps as f64 / total_secs.max(1e-9));
+    println!("{:<22} {total_steps:>12} {total_secs:>9.3} {:>12.0} {:>9.1}", "TOTAL",
+             total_steps as f64 / total_secs.max(1e-9), heapwatch::mb(worst));
     ExitCode::SUCCESS
 }
 

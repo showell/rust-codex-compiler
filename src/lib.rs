@@ -15,6 +15,7 @@ pub mod cst;
 pub mod decl;
 pub mod desugar;
 pub mod expr;
+pub mod heapwatch;
 pub mod interp;
 pub mod ir;
 pub mod lexer;
