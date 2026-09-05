@@ -107,6 +107,13 @@ pub enum Body {
 
 #[derive(Debug)]
 pub struct Closure {
+    /// **WHOSE BODY THIS IS**, which the run does not need and an instrument
+    /// does. It is the only way to answer "where did the memory go" with a
+    /// name instead of a number: the peak is sampled against whatever is
+    /// executing, and without this every answer is "somewhere in the
+    /// compiler". A `Sym` is four bytes on a heap-allocated Closure, so it
+    /// costs nothing that shows up.
+    pub name: Sym,
     /// How many arguments saturate it. The parameters have NAMES in the
     /// source and none here: `crate::code` turned every reference to one into
     /// a slot in this call's frame, so the run never asks what they were.
@@ -299,6 +306,22 @@ pub struct Interp {
     tags: HashMap<Sym, i64>,
     /// THE FLAT MEMORY THE ALLOCATOR HANDS OUT ADDRESSES INTO.
     mem: Mem,
+    /// The highest cursor the allocator ever reached, and how far the deck
+    /// travelled. Reported beside the flat memory because the two answer
+    /// different halves of "where did the bytes go".
+    pub bivy_hwm: i64,
+    /// WHAT WAS RUNNING WHEN THE MEMORY WAS HIGHEST.
+    ///
+    /// Sampled rather than exact, every `SAMPLE_STEPS` steps, because the
+    /// allocator counter is a global and the interpreter cannot be called back
+    /// from it. A peak reached and released entirely between two samples is
+    /// missed; one that stands for even a fraction of a millisecond is not.
+    /// The name is the innermost definition entered, which is the one worth
+    /// having -- an allocation made three frames down is attributed to the
+    /// frame that made it.
+    live_hwm: usize,
+    hwm_in: Sym,
+    cur: Sym,
 }
 
 /// One byte-addressed region starting at 0, sparse and paged.
@@ -354,6 +377,20 @@ impl Mem {
         w as i64
     }
 
+    /// How many bytes of pages this region has mapped, and the highest address
+    /// ever written.
+    ///
+    /// **THE FLAT MEMORY IS NOT RECLAIMED AND THE ALLOCATOR MODEL DOES NOT
+    /// KNOW THAT.** `__heap-restore` moves a counter back; the pages a program
+    /// wrote before the restore stay mapped. On bare metal the same restore
+    /// makes those bytes available again, so a checker that reserves a memo
+    /// table per batch reuses ONE region there and accumulates regions here --
+    /// if the reservations climb rather than repeat. Which of those is
+    /// happening is a measurement, and this is the instrument for it.
+    fn mapped(&self) -> usize {
+        self.pages.len() * MEM_PAGE as usize
+    }
+
     /// A little-endian store of the low `width` bytes, and no byte beyond.
     fn store(&mut self, addr: i64, width: u32, v: i64) {
         let w = v as u64;
@@ -374,6 +411,11 @@ const STEP_LIMIT: u64 = u64::MAX;
 /// program has to be caught by a counter rather than by the operating system:
 /// a stack overflow aborts the process and takes the whole sweep with it.
 const DEPTH_LIMIT: u32 = 20_000;
+
+/// How often the memory high-water mark is attributed to a running definition.
+/// A power of two, so the test is a mask rather than a division; 4,096 steps
+/// is about a ten-thousandth of a second at the rate this runs.
+const SAMPLE_STEPS: u64 = 4096;
 
 impl Interp {
     /// Build the tables, then compile the chapter against them.
@@ -480,6 +522,7 @@ impl Interp {
                     let Some(sym) = ch.syms.find(name) else { continue };
                     let i = globals.len() as u32;
                     globals.push(Value::Fun(Rc::new(Closure {
+                        name: sym,
                         arity,
                         body: Body::Builtin(name),
                         env: root.clone(),
@@ -498,6 +541,7 @@ impl Interp {
                 Value::Ctor(rc, Rc::new(Vec::new()))
             } else {
                 Value::Fun(Rc::new(Closure {
+                    name: rc,
                     arity,
                     body: Body::Ctor(rc),
                     env: root.clone(),
@@ -521,6 +565,7 @@ impl Interp {
         }
         for (i, d) in &fun_defs {
             globals[*i as usize] = Value::Fun(Rc::new(Closure {
+                name: d.name,
                 arity: d.params.len(),
                 body: Body::Code(Rc::new(Compiler::def(&names, &ch.syms, d))),
                 env: root.clone(),
@@ -558,6 +603,10 @@ impl Interp {
             deck_depth: 0,
             tags,
             mem: Mem::default(),
+            bivy_hwm: 0,
+            live_hwm: 0,
+            hwm_in: Sym::default(),
+            cur: Sym::default(),
         }
     }
 
@@ -582,6 +631,13 @@ impl Interp {
         self.steps += 1;
         if self.steps > self.limit {
             return err("step limit reached; the program did not finish");
+        }
+        if self.steps & (SAMPLE_STEPS - 1) == 0 {
+            let live = crate::heapwatch::live();
+            if live > self.live_hwm {
+                self.live_hwm = live;
+                self.hwm_in = self.cur;
+            }
         }
         self.depth += 1;
         if self.depth > DEPTH_LIMIT {
@@ -664,6 +720,9 @@ impl Interp {
             // The body is already shared: a lambda evaluated a million times
             // bumps a refcount rather than copying its tree.
             Code::Lambda(l) => Ok(Value::Fun(Rc::new(Closure {
+                // A lambda has no name of its own; it is attributed to
+                // whatever definition it was written inside.
+                name: self.cur,
                 arity: l.arity,
                 body: Body::Code(l.body.clone()),
                 env: env.clone(),
@@ -783,7 +842,19 @@ impl Interp {
     /// recursing. Non-tail calls still nest, which is what a call stack is
     /// for; this is only about the ones that do not need to.
     fn call(&mut self, mut c: Rc<Closure>, mut applied: Vec<Value>) -> R<Value> {
+        // The caller is restored on the way out, so `cur` names the frame that
+        // is running rather than the deepest one ever entered.
+        let caller = self.cur;
+        let r = self.call_frames(&mut c, &mut applied);
+        self.cur = caller;
+        r
+    }
+
+    fn call_frames(&mut self, cell: &mut Rc<Closure>, args: &mut Vec<Value>) -> R<Value> {
         loop {
+            let c = cell.clone();
+            let applied = std::mem::take(args);
+            self.cur = c.name;
             let body = match &c.body {
                 Body::Ctor(name) => return Ok(Value::Ctor(name.clone(), Rc::new(applied))),
                 Body::Builtin(name) => {
@@ -795,9 +866,9 @@ impl Interp {
             let env = Scope::push(&c.env, applied);
             match self.eval_tail(&body, &env)? {
                 Step::Done(v) => return Ok(v),
-                Step::Call(next, args) => {
-                    c = next;
-                    applied = args;
+                Step::Call(next, next_args) => {
+                    *cell = next;
+                    *args = next_args;
                 }
             }
         }
@@ -920,6 +991,7 @@ impl Interp {
             i += take;
             if applied.len() < c.arity {
                 f = Value::Fun(Rc::new(Closure {
+                    name: c.name,
                     arity: c.arity,
                     body: c.body.clone(),
                     env: c.env.clone(),
@@ -949,6 +1021,7 @@ impl Interp {
         applied.push(arg);
         if applied.len() < c.arity {
             return Ok(Step::Done(Value::Fun(Rc::new(Closure {
+                name: c.name,
                 arity: c.arity,
                 body: c.body.clone(),
                 env: c.env.clone(),
@@ -987,11 +1060,20 @@ impl Interp {
     }
 
     fn set_cursor(&mut self, v: i64) {
+        if v > self.bivy_hwm {
+            self.bivy_hwm = v;
+        }
         if self.deck_depth == 0 {
             self.bivy = v;
         } else {
             self.deck_cursor = v;
         }
+    }
+
+    /// Bytes of flat memory mapped, the furthest the allocator's cursor ever
+    /// got, and the definition that was running when the most was held.
+    pub fn memory(&self) -> (usize, i64, String) {
+        (self.mem.mapped(), self.bivy_hwm, self.syms.text(self.hwm_in).to_string())
     }
 
     fn builtin(&mut self, name: &str, args: Vec<Value>) -> R<Value> {

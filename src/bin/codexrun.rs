@@ -27,6 +27,7 @@ fn main() -> ExitCode {
         Some("--check") if args.len() == 3 => check(Path::new(&args[1]), Path::new(&args[2])),
         Some("sweep") if args.len() == 3 => sweep(Path::new(&args[1]), Path::new(&args[2])),
         Some("bench") if args.len() >= 2 => bench(&args[1..]),
+        Some("ramp") if args.len() == 2 => ramp(Path::new(&args[1])),
         Some(p) if args.len() == 1 => match run(Path::new(p)) {
             Ok(out) => {
                 print!("{out}");
@@ -42,6 +43,7 @@ fn main() -> ExitCode {
             eprintln!("       codexrun --check <unit.codex> <expected>");
             eprintln!("       codexrun sweep <units-dir> <codex-test-dir>");
             eprintln!("       codexrun bench <unit.codex>...");
+            eprintln!("       codexrun ramp <unit.codex>");
             ExitCode::from(2)
         }
     }
@@ -73,11 +75,11 @@ fn run_in_thread(path: &Path, budget: Option<u64>) -> Result<String, String> {
 const SWEEP_BUDGET: u64 = 60_000_000;
 
 fn run_bounded(path: &Path, budget: Option<u64>) -> Result<String, String> {
-    timed(path, budget).map(|(out, _, _)| out)
+    timed(path, budget).map(|(out, ..)| out)
 }
 
 /// Run, and report the work done and the wall time it took.
-fn timed(path: &Path, budget: Option<u64>) -> Result<(String, u64, f64), String> {
+fn timed(path: &Path, budget: Option<u64>) -> Result<Run, String> {
     // RESOLVING CITES IS A COMPILER PHASE, not another tool's job. Handed a root
     // chapter this pulls in what it cites; handed a unit that already carries
     // its chapters, every cite is satisfied by presence and this is a line scan.
@@ -93,10 +95,45 @@ fn timed(path: &Path, budget: Option<u64>) -> Result<(String, u64, f64), String>
     let r = it.run();
     let secs = t0.elapsed().as_secs_f64();
     match r {
-        Ok(()) => Ok((std::mem::take(&mut it.out), it.steps, secs)),
+        Ok(()) => {
+            let (mapped, hwm, hwm_in) = it.memory();
+            Ok((std::mem::take(&mut it.out), it.steps, secs, mapped, hwm, hwm_in))
+        }
         // The partial output comes back with the error: seeing which line it
         // reached is most of the diagnosis.
         Err(e) => Err(format!("{}\n--- output before the error ---\n{}", e.0, it.out)),
+    }
+}
+
+/// One program, and BOTH what it printed and what it cost.
+///
+/// `bench` discards the output and `run` discards the cost, and a ramp needs
+/// the two together: the whole question is how steps and memory grow as the
+/// subject grows, and whether the answer is still RIGHT at each size. Reading
+/// them from one run rather than two matters when a run is minutes long.
+///
+/// The program's output goes to stdout untouched, so it can be diffed against
+/// another arm. The cost goes to stderr as one line, which is also where the
+/// error goes if there is one -- a caller that reads stderr for a verdict gets
+/// either the line or the failure, never both.
+fn ramp(path: &Path) -> ExitCode {
+    let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    heapwatch::reset();
+    match run_timed_in_thread(path) {
+        Ok((out, steps, secs, mapped, hwm, hwm_in)) => {
+            print!("{out}");
+            eprintln!(
+                "ramp {name} steps={steps} secs={secs:.3} peak-mb={:.1} flat-mb={:.1} cursor-mb={:.1} peak-in={hwm_in}",
+                heapwatch::mb(heapwatch::peak()),
+                heapwatch::mb(mapped),
+                heapwatch::mb(hwm.max(0) as usize)
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{}: {e}", path.display());
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -119,7 +156,7 @@ fn bench(paths: &[String]) -> ExitCode {
         // was already held.
         heapwatch::reset();
         match run_timed_in_thread(path) {
-            Ok((_, steps, secs)) => {
+            Ok((_, steps, secs, ..)) => {
                 let peak = heapwatch::peak();
                 total_steps += steps;
                 total_secs += secs;
@@ -135,7 +172,11 @@ fn bench(paths: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_timed_in_thread(path: &Path) -> Result<(String, u64, f64), String> {
+/// What one run cost: output, steps, seconds, flat-memory bytes mapped, and
+/// the furthest the allocator's cursor reached.
+type Run = (String, u64, f64, usize, i64, String);
+
+fn run_timed_in_thread(path: &Path) -> Result<Run, String> {
     let p = path.to_path_buf();
     std::thread::Builder::new()
         .stack_size(512 * 1024 * 1024)
