@@ -1302,6 +1302,32 @@ impl Interp {
             }
             ("__linked-list-to-list", [List(xs)]) => Ok(List(xs.clone())),
 
+            // **A DECIMAL LITERAL TO THE DOUBLE NEAREST IT.** Rust's `parse`
+            // is correctly rounded and upstream's `text-to-double-bits` is
+            // not: issue 125 has it right to fifteen significant digits and
+            // wrong above 2^53, where the routine's own accumulation loses a
+            // bit before the rounding step ever runs. So this arm is EXPECTED
+            // to disagree with the bank on any program carrying such a
+            // literal, and the disagreement is the better answer. Three safari
+            // specs already carry the same gap against the zig arm, filed in
+            // `spec/arm-gaps.tsv`.
+            //
+            // A literal the parse refuses is not a hosting gap: the lexer only
+            // reaches here with text it has already accepted as a Real.
+            ("text-to-double-bits", [Text(t)]) => match t.trim().parse::<f64>() {
+                Ok(f) => Ok(Int(f.to_bits() as i64)),
+                Err(_) => err(format!("text-to-double-bits on {t:?}, which is not a Real")),
+            },
+
+            // **A HOSTED COMPILER HAS NO SELF TYPE TABLE, and answers the
+            // EMPTY list.** Bare metal fills this from the type definitions it
+            // was itself built with, which is how `pmap-selftest` resolves a
+            // root type by name. Both plugs decline the same way and say so in
+            // their name tables -- zig maps it to `cx_ll_empty(TypeBinding)`
+            // and wasm to `list_with_capacity 0` -- so the empty answer is the
+            // fixed point rather than a gap here.
+            ("__self-type-defs", []) => Ok(list(Vec::new())),
+
             // -- the flat memory ---------------------------------------------
             // Every one of these takes a BASE and an OFFSET and adds them, so
             // `peek-32 slot 0` is the shape a caller who already did the
@@ -2310,6 +2336,37 @@ mod tests {
             "let a = __heap-save\n    in let __x = __heap-advance 16\n    in let b = __heap-save\n    in let __y = __heap-advance 16\n    in let __1 = poke-qword a 0 111\n    in let __2 = poke-qword b 0 222\n                 in print-line-uni (show (b - a) & \" \" & show (peek-qword a 0) & \" \" & show (peek-qword b 0))",
         );
         assert_eq!(out(&src).trim(), "16 111 222");
+    }
+
+    /// **A DECIMAL LITERAL IS CORRECTLY ROUNDED HERE AND IS NOT UPSTREAM.**
+    /// 0.1 and 1e300 are inside the fifteen significant digits upstream gets
+    /// right, so those two agree with every arm. `9007199254740993` is 2^53+1
+    /// and is the shape issue 125 is about; what is pinned is the CORRECT
+    /// answer, which is 2^53 as a double, and a disagreement with the bank
+    /// there is this arm being right.
+    #[test]
+    fn a_real_literal_is_correctly_rounded() {
+        let src = mem_body(
+            "print-line-uni (show (text-to-double-bits \"0.1\") & \" \" & show (text-to-double-bits \"1e300\") & \" \" & show (text-to-double-bits \"9007199254740993.0\"))",
+        );
+        assert_eq!(
+            out(&src).trim(),
+            format!(
+                "{} {} {}",
+                0.1f64.to_bits() as i64,
+                1e300f64.to_bits() as i64,
+                9007199254740992.0f64.to_bits() as i64
+            )
+        );
+    }
+
+    /// **`__self-type-defs` IS EMPTY**, which is what both plugs answer and
+    /// therefore what this arm must. It is not zero-arity by accident either:
+    /// the arity table had to know, or the call reads as one argument short.
+    #[test]
+    fn the_self_type_table_is_empty_in_a_hosted_compiler() {
+        let src = mem_body("print-line-uni (show (list-length __self-type-defs))");
+        assert_eq!(out(&src).trim(), "0");
     }
 
     /// Wrap a body in the smallest chapter that can hold it.

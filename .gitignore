@@ -3,3 +3,4 @@
 # target/ should never appear here at all -- this line is a backstop, not a plan.
 target/
 Cargo.lock
+ladder/__pycache__/
