@@ -77,6 +77,15 @@ pub enum Complaint {
     /// same is a bundler that quietly rewrites its input, and which of those
     /// two behaviours is wanted is not this module's call to make silently.
     CarriageReturns { chapter: String, path: PathBuf },
+    /// The project's own quire file re-uses a name the checkout also registers.
+    ///
+    /// Upstream took safari's `port/` in as `apps/safari/port` at Update 55 and
+    /// registered it under the same name the project has always used. The
+    /// project's file wins -- it is the more specific statement, and a chapter
+    /// cited from inside safari-codex means safari-codex's copy -- but a name
+    /// resolving somewhere other than where the checkout says is not something
+    /// to decide in silence.
+    ShadowedQuire { quire: String, local: PathBuf, upstream: PathBuf },
 }
 
 impl fmt::Display for Complaint {
@@ -100,6 +109,9 @@ impl fmt::Display for Complaint {
             Complaint::CarriageReturns { chapter, path } => {
                 write!(f, "CRLF: chapter {chapter} is {} -- kept as written; the Python resolver drops these silently", path.display())
             }
+            Complaint::ShadowedQuire { quire, local, upstream } => {
+                write!(f, "SHADOWED: quire {quire} is this project's {}, not the checkout's {}", local.display(), upstream.display())
+            }
         }
     }
 }
@@ -107,16 +119,27 @@ impl fmt::Display for Complaint {
 /// The quire registry: a name, and the directory its chapters live in.
 pub struct Quires {
     entries: Vec<(String, PathBuf)>,
+    shadowed: Vec<Complaint>,
 }
 
 impl Quires {
     /// Read upstream's registry, plus any local one the project supplies.
     ///
     /// The local file is how a project that is not the depot names its own
-    /// quires -- safari's `Safari`, `Judge` and `Gold` are its own directories
-    /// and upstream has never heard of them. One `name<TAB>relative/dir` per
-    /// line, `#` to end of line is a comment. It is a FILE rather than a flag
-    /// because the answer belongs to the project, not to the invocation.
+    /// quires -- safari's `Safari`, `Judge` and `Gold` are its own directories.
+    /// One `name<TAB>relative/dir` per line, `#` to end of line is a comment.
+    /// It is a FILE rather than a flag because the answer belongs to the
+    /// project, not to the invocation.
+    ///
+    /// **THE LOCAL FILE WINS, and upstream having never heard of these names is
+    /// not something to rely on.** It stopped being true at Update 55, which
+    /// took safari's `port/` into the checkout as `apps/safari/port` under the
+    /// name `Safari`. Appending the local entries and taking the first match
+    /// silently resolved every safari cite to upstream's snapshot instead: the
+    /// Python resolver assigns into a dict and had always given the project the
+    /// last word, so the two bundlers disagreed on 34 of 35 targets the day the
+    /// pin moved. A shadowed name is removed here rather than merely outranked,
+    /// so that spelling it in a different case cannot reach the loser either.
     pub fn read(codex: &Path, local: Option<&Path>) -> Result<Self, String> {
         let mut entries = Vec::new();
         let map = codex.join("build").join("quire-map.ps1");
@@ -128,10 +151,12 @@ impl Quires {
         if entries.is_empty() {
             return Err(format!("{} has no $QuireDirs table", map.display()));
         }
+        let mut shadowed = Vec::new();
         if let Some(path) = local {
             let text = std::fs::read_to_string(path)
                 .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
             let base = path.parent().unwrap_or(Path::new("."));
+            let mut mine: Vec<(String, PathBuf)> = Vec::new();
             for (n, line) in text.lines().enumerate() {
                 let line = line.split('#').next().unwrap_or("").trim();
                 if line.is_empty() {
@@ -139,12 +164,23 @@ impl Quires {
                 }
                 let mut it = line.split_whitespace();
                 match (it.next(), it.next(), it.next()) {
-                    (Some(q), Some(d), None) => entries.push((q.to_string(), base.join(d))),
+                    (Some(q), Some(d), None) => mine.push((q.to_string(), base.join(d))),
                     _ => return Err(format!("{}:{}: want `Quire<space>dir`", path.display(), n + 1)),
                 }
             }
+            for (q, d) in &mine {
+                for (uq, ud) in entries.iter().filter(|(n, _)| n.eq_ignore_ascii_case(q)) {
+                    shadowed.push(Complaint::ShadowedQuire {
+                        quire: uq.clone(),
+                        local: d.clone(),
+                        upstream: ud.clone(),
+                    });
+                }
+            }
+            entries.retain(|(n, _)| !mine.iter().any(|(q, _)| q.eq_ignore_ascii_case(n)));
+            entries.extend(mine);
         }
-        Ok(Quires { entries })
+        Ok(Quires { entries, shadowed })
     }
 
     /// -> (directory, the registered spelling) for a cited quire.
@@ -161,14 +197,18 @@ impl Quires {
             .map(|(n, d)| (d.as_path(), n.as_str()))
     }
 
-    /// Registered directories that are not there. Checked once, up front,
-    /// because a registry nobody validates is a registry that rots.
-    pub fn dead(&self) -> Vec<Complaint> {
-        self.entries
-            .iter()
-            .filter(|(_, d)| !d.is_dir())
-            .map(|(q, d)| Complaint::DeadQuireDir { quire: q.clone(), dir: d.clone() })
-            .collect()
+    /// What is wrong with the registry itself: directories that are not there,
+    /// and names the project took over from the checkout. Checked once, up
+    /// front, because a registry nobody validates is a registry that rots.
+    pub fn registry_complaints(&self) -> Vec<Complaint> {
+        let mut out = self.shadowed.clone();
+        out.extend(
+            self.entries
+                .iter()
+                .filter(|(_, d)| !d.is_dir())
+                .map(|(q, d)| Complaint::DeadQuireDir { quire: q.clone(), dir: d.clone() }),
+        );
+        out
     }
 }
 
@@ -346,7 +386,7 @@ pub fn resolve(root: &Path, quires: &Quires) -> Result<Bundle, String> {
     let src = std::fs::read(root).map_err(|e| format!("cannot read {}: {e}", root.display()))?;
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
     seen.insert(root.to_path_buf());
-    let mut complaints = quires.dead();
+    let mut complaints = quires.registry_complaints();
     let mut parts: Vec<String> = Vec::new();
 
     let here = embedded(&src);
@@ -451,6 +491,37 @@ mod tests {
                 ("OS".into(), "codex/os/core".into()),
             ]
         );
+    }
+
+    /// Update 55 took safari's `port/` into the checkout under the name the
+    /// project already used, and appending the local entries meant every safari
+    /// cite resolved to upstream's snapshot instead. The Python resolver
+    /// assigns into a dict, so it had always given the project the last word;
+    /// the two bundlers disagreed on 34 of 35 targets the day the pin moved.
+    #[test]
+    fn the_projects_own_quire_file_beats_the_checkouts_and_says_so() {
+        let dir = std::env::temp_dir().join(format!("codexc-quires-{}", std::process::id()));
+        let build = dir.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(
+            build.join("quire-map.ps1"),
+            "$QuireDirs = @{\n    'Safari' = 'apps\\safari\\port'\n    'OS' = 'codex\\os'\n}",
+        )
+        .unwrap();
+        let local = dir.join("quires.tsv");
+        // Spelled in a different case on purpose: shadowing removes the loser
+        // rather than outranking it, so no spelling can reach the checkout's.
+        std::fs::write(&local, "safari port\n").unwrap();
+
+        let q = Quires::read(&dir, Some(&local)).unwrap();
+        assert_eq!(q.dir("Safari").unwrap().0, dir.join("port"));
+        assert_eq!(q.dir("safari").unwrap().0, dir.join("port"));
+        assert_eq!(q.dir("OS").unwrap().0, dir.join("codex/os"));
+        assert!(q
+            .registry_complaints()
+            .iter()
+            .any(|c| matches!(c, Complaint::ShadowedQuire { quire, .. } if quire == "Safari")));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
