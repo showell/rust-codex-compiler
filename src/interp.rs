@@ -36,7 +36,20 @@ pub enum Value {
     Text(Rc<String>),
     Char(char),
     Bool(bool),
-    List(Rc<Vec<Value>>),
+    /// A LIST IS SHARED AND ITS SLOTS ARE WRITABLE, because Codex's is.
+    ///
+    /// `list-set-at` is an in-place mutator upstream and the compiler's skip
+    /// list links its nodes by nothing else -- `splice-new-node` discards both
+    /// results and returns the list it was given. A copying `list-set-at`
+    /// leaves every insert structurally invisible while `size` still advances,
+    /// which is how a 266-name scope ends up unsearchable and a function's own
+    /// parameter comes back `CDX3002 Undefined name`.
+    ///
+    /// The wasm plug shipped the copy first and row 8 of `plugs-backlog.md`
+    /// records the same symptom, so this is a transcribed defect and not a
+    /// guess. `list-set-at` is the ONLY writer; `list-push`, `&` and `::` all
+    /// allocate.
+    List(Rc<RefCell<Vec<Value>>>),
     /// A record literal: its type name and its fields. A name is a four-byte
     /// `Sym`, so building a record copies nothing and this variant is the
     /// smallest thing that can carry two.
@@ -166,6 +179,13 @@ fn err<T>(msg: impl Into<String>) -> R<T> {
     Err(Error(msg.into()))
 }
 
+/// A FRESH list. Every construction goes through here, because a shared
+/// backing that was meant to be new is the way `list-set-at`'s write-through
+/// turns into a leak between two lists that were never the same one.
+fn list(cells: Vec<Value>) -> Value {
+    Value::List(Rc::new(RefCell::new(cells)))
+}
+
 /// Stamp a location on an error that does not have one. The innermost frame
 /// wins, which is the one a reader wants.
 fn at(e: Error, sp: Span) -> Error {
@@ -216,6 +236,11 @@ pub struct Interp {
     /// pure; only the work differs.
     const_cache: Vec<Option<Value>>,
     const_cacheable: Vec<bool>,
+    /// Does this program contain a WRITER at all -- a `list-set-at`, a
+    /// `__record-set`, or a field assignment? If it does not, nothing can
+    /// reach into a cached value and every nullary may hand out one object.
+    /// See `frozen`.
+    writes: bool,
     /// `opening`, compiled in the empty environment.
     opening: Option<Rc<Code>>,
     /// `Type.field -> bound`, and the ONE thing resolution cannot do ahead of
@@ -424,6 +449,7 @@ impl Interp {
         // Pass 2: compile. The tables are complete, so a body can name
         // anything the unit defines regardless of where it sits.
         let impure = impure_names(&ch.syms, &const_defs_src, &fun_defs);
+        let writes = program_writes(&ch.syms, &const_defs_src, &fun_defs);
         let mut const_defs: Vec<Rc<Code>> = Vec::with_capacity(const_defs_src.len());
         let mut const_cacheable: Vec<bool> = Vec::with_capacity(const_defs_src.len());
         for d in &const_defs_src {
@@ -455,6 +481,7 @@ impl Interp {
             globals,
             const_cache: vec![None; const_defs.len()],
             const_cacheable,
+            writes,
             const_defs,
             opening,
             bounds: names.bounds,
@@ -522,7 +549,7 @@ impl Interp {
                 let v = self.eval(&body, &root)?;
                 // Only after it returns: a self-referential nullary must still
                 // recurse to its own error rather than see a half-built answer.
-                if self.const_cacheable[i] {
+                if self.const_cacheable[i] && (!self.writes || frozen(&v)) {
                     self.const_cache[i] = Some(v.clone());
                 }
                 Ok(v)
@@ -590,7 +617,7 @@ impl Interp {
                 for x in xs {
                     out.push(self.eval(x, env)?);
                 }
-                Ok(Value::List(Rc::new(out)))
+                Ok(list(out))
             }
             Code::Record(name, fields) => {
                 let mut out = Vec::with_capacity(fields.len());
@@ -988,46 +1015,51 @@ impl Interp {
             // `List Integer -> Text`, the bytes as written.
             ("raw-bytes-to-text", [List(xs)]) => {
                 let bytes: Vec<u8> =
-                    xs.iter().map(|v| if let Int(i) = v { *i as u8 } else { 0 }).collect();
+                    xs.borrow().iter().map(|v| if let Int(i) = v { *i as u8 } else { 0 }).collect();
                 text(String::from_utf8_lossy(&bytes).into_owned())
             }
 
             // -- lists --------------------------------------------------------
-            ("list-length", [List(xs)]) => Ok(Int(xs.len() as i64)),
+            ("list-length", [List(xs)]) => Ok(Int(xs.borrow().len() as i64)),
             ("list-at", [List(xs), Int(i)]) => (*i >= 0)
-                .then(|| xs.get(*i as usize).cloned())
+                .then(|| xs.borrow().get(*i as usize).cloned())
                 .flatten()
-                .ok_or_else(|| Error(format!("list-at {i} of a {}-element list", xs.len()))),
+                .ok_or_else(|| {
+                    Error(format!("list-at {i} of a {}-element list", xs.borrow().len()))
+                }),
             // `list-snoc` and `list-push` are ONE operation: the zig emitter
             // gives both the same `cx_ll_push(l, v)`, an append at the end.
             ("list-push" | "list-snoc", [List(xs), v]) => {
-                let mut out = (**xs).clone();
+                let mut out = xs.borrow().clone();
                 out.push(v.clone());
-                Ok(List(Rc::new(out)))
+                Ok(list(out))
             }
             ("list-insert-at", [List(xs), Int(i), v]) => {
-                let mut out = (**xs).clone();
+                let mut out = xs.borrow().clone();
                 let i = *i;
                 if i < 0 || i as usize > out.len() {
                     return err(format!("list-insert-at {i} of a {}-element list", out.len()));
                 }
                 out.insert(i as usize, v.clone());
-                Ok(List(Rc::new(out)))
+                Ok(list(out))
             }
             // The capacity is an allocation hint upstream -- `cx_ll_empty` then
             // `ensureTotalCapacityPrecise` -- and the LIST IS EMPTY. It is
             // load-bearing over there for a reason that cannot exist here: a
             // reallocation inside emit-all-defs' save/restore bracket lands in
             // scratch the bracket reclaims. Nothing here reclaims anything.
-            ("__list-with-capacity", [Int(_)]) => Ok(List(Rc::new(Vec::new()))),
+            ("__list-with-capacity", [Int(_)]) => Ok(list(Vec::new())),
+            // **THE ONE WRITER.** It answers the list it was handed, which is
+            // the same list the caller still holds -- see `Value::List`.
             ("list-set-at", [List(xs), Int(i), v]) => {
-                let mut out = (**xs).clone();
                 let i = *i as usize;
-                if i >= out.len() {
+                let mut cells = xs.borrow_mut();
+                if i >= cells.len() {
                     return err(format!("list-set-at {i} past the end"));
                 }
-                out[i] = v.clone();
-                Ok(List(Rc::new(out)))
+                cells[i] = v.clone();
+                drop(cells);
+                Ok(List(xs.clone()))
             }
 
             // -- arithmetic ---------------------------------------------------
@@ -1050,13 +1082,13 @@ impl Interp {
             ("bit-shr" | "bit-shru", [Int(a), Int(b)]) => {
                 Ok(Int(((*a as u64) >> (*b as u32 & 63)) as i64))
             }
-            ("text-split", [Text(t), Text(sep)]) => Ok(List(Rc::new(
+            ("text-split", [Text(t), Text(sep)]) => Ok(list(
                 if sep.is_empty() {
                     vec![Text(t.clone())]
                 } else {
                     t.split(&**sep).map(|p| Text(Rc::new(p.to_string()))).collect()
                 },
-            ))),
+            )),
 
             // -- reals --------------------------------------------------------
             // ONE ARM FOR EIGHT NAMES WAS WRONG ABOUT FIVE OF THEM. Only the
@@ -1151,7 +1183,7 @@ impl Interp {
             ("tag-equal", [Ctor(a, _), Ctor(b, _)]) => Ok(Bool(a == b)),
             ("text-concat-list", [List(xs)]) => {
                 let mut out = String::new();
-                for x in xs.iter() {
+                for x in xs.borrow().iter() {
                     match x {
                         Text(t) => out.push_str(t),
                         other => return err(format!("text-concat-list over {}", type_name(other))),
@@ -1189,9 +1221,7 @@ impl Interp {
                 xs.borrow_mut().push(v.clone());
                 Ok(LinkedList(xs.clone()))
             }
-            ("__linked-list-to-list", [LinkedList(xs)]) => {
-                Ok(List(Rc::new(xs.borrow().clone())))
-            }
+            ("__linked-list-to-list", [LinkedList(xs)]) => Ok(list(xs.borrow().clone())),
             // **A LINKED LIST IS SEEDED WITH `[]` AND THAT IS NOT A MISTAKE.**
             // `ChapterScoper` declares its accumulator `LinkedList ADef` and
             // passes `[]` for it: the distinction is in the TYPE, and at the
@@ -1205,9 +1235,9 @@ impl Interp {
             // second is NOT established, and the tests above pin only what
             // `__linked-list-empty` hands back.
             ("__linked-list-push", [List(xs), v]) => {
-                let mut out = (**xs).clone();
+                let mut out = xs.borrow().clone();
                 out.push(v.clone());
-                Ok(List(Rc::new(out)))
+                Ok(list(out))
             }
             ("__linked-list-to-list", [List(xs)]) => Ok(List(xs.clone())),
 
@@ -1413,17 +1443,17 @@ fn binary(syms: &SymTab, op: BinaryOp, a: Value, b: Value) -> R<Value> {
         (OpAnd | OpAppend, Text(x), _) => Text(Rc::new(format!("{x}{}", show(syms, &b)))),
         (OpAnd | OpAppend, _, Text(y)) => Text(Rc::new(format!("{}{y}", show(syms, &a)))),
         (OpAnd | OpAppend, List(x), List(y)) => {
-            let mut out = (**x).clone();
-            out.extend(y.iter().cloned());
-            List(Rc::new(out))
+            let mut out = x.borrow().clone();
+            out.extend(y.borrow().iter().cloned());
+            list(out)
         }
         (OpAnd, Bool(x), Bool(y)) => Bool(*x && *y),
         (OpAnd, Int(x), Int(y)) => Int(x & y),
         (OpOr, Int(x), Int(y)) => Int(x | y),
         (OpCons, _, List(y)) => {
             let mut out = vec![a.clone()];
-            out.extend(y.iter().cloned());
-            List(Rc::new(out))
+            out.extend(y.borrow().iter().cloned());
+            list(out)
         }
         _ => {
             return err(format!(
@@ -1446,6 +1476,10 @@ fn equal(a: &Value, b: &Value) -> bool {
         (Bool(x), Bool(y)) => x == y,
         (Unit, Unit) => true,
         (List(x), List(y)) => {
+            if Rc::ptr_eq(x, y) {
+                return true;
+            }
+            let (x, y) = (x.borrow(), y.borrow());
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| equal(p, q))
         }
         (Ctor(n, x), Ctor(m, y)) => {
@@ -1494,6 +1528,7 @@ fn matches_pat(v: &Value, p: &PatCode, vals: &mut Vec<Value>) -> bool {
         },
         PatCode::Vec_(subs) => match v {
             Value::List(xs) => {
+                let xs = xs.borrow();
                 subs.len() == xs.len()
                     && subs.iter().zip(xs.iter()).all(|(s, x)| matches_pat(x, s, vals))
             }
@@ -1511,7 +1546,7 @@ pub fn show(syms: &SymTab, v: &Value) -> String {
         Value::Bool(b) => if *b { "True" } else { "False" }.to_string(),
         Value::Unit => String::new(),
         Value::List(xs) => {
-            let inner: Vec<String> = xs.iter().map(|x| show(syms, x)).collect();
+            let inner: Vec<String> = xs.borrow().iter().map(|x| show(syms, x)).collect();
             format!("[{}]", inner.join(", "))
         }
         Value::LinkedList(xs) => {
@@ -1995,6 +2030,151 @@ mod tests {
     fn the_heap_position_moves_and_comes_back() {
         let src = "Chapter: T\n\nSection: E\n\n  opening : [Console] Nothing = act\n                 let a = __heap-save\n    in let __x = __heap-advance 1000\n                 in let b = __heap-save\n    in let __y = __heap-restore a\n                 in let c = __heap-save\n                 in print-line-uni (show a & \" \" & show b & \" \" & show c)\n  end\n";
         assert_eq!(out(src).trim(), "0 1000 0");
+    }
+
+    /// **`list-set-at` MUTATES IN PLACE**, and this is the upstream regression
+    /// test `codex/plugs/wasm/test/list-set-at-rt.codex` transcribed. The wasm
+    /// plug emitted it as a copy and row 8 of the plugs backlog records what
+    /// that cost: every skip-list insert bumped `size` and linked nothing, so
+    /// name resolution searched a 266-name scope that had no links in it.
+    ///
+    /// The compiler's `splice-new-node` DISCARDS both results:
+    ///
+    /// ```text
+    /// in let dummy1 = list-set-at (pred.forward) i new-node
+    /// in let dummy2 = list-set-at (pred.spans) i (new-pos - pred-rank)
+    /// in splice-new-node s path new-node height new-pos (i + 1)
+    /// ```
+    ///
+    /// so the links ARE the side effect and there is nothing else.
+    #[test]
+    fn a_discarded_list_set_at_is_still_visible() {
+        let src = "Chapter: T\n\nSection: S\n\n  clobber : List Integer -> Integer\n  clobber (xs) =\n    let ignored = list-set-at xs 1 99\n    in 0\n\n  show-list : List Integer, Integer, Text -> Text\n  show-list (xs) (i) (acc) =\n    if i >= list-length xs then acc\n    else show-list xs (i + 1) (acc & \" \" & show (list-at xs i))\n\nSection: E\n\n  opening : [Console] Nothing = act\n                 let xs = [10, 20, 30]\n    in let d1 = clobber xs\n    in let ret = list-set-at xs 0 5\n                 in print-line-uni (show-list xs 0 \"\" & \" |\" & show-list ret 0 \"\")\n  end\n";
+        assert_eq!(out(src).trim(), "5 99 30 | 5 99 30");
+    }
+
+    /// A list reached THROUGH A FIELD is the same list, so a write through the
+    /// field is visible from the record. The skip list only ever reaches its
+    /// backing that way -- `pred.forward`, `s.head.spans` -- so a `List` that
+    /// copied on the way out of a field would defeat the fix above.
+    #[test]
+    fn a_write_through_a_field_reaches_the_records_list() {
+        let src = "Chapter: T\n\nSection: S\n\n  Holder = record {\n    cells : List Integer\n  }\n\n  clobber-field : Holder -> Integer\n  clobber-field (h) =\n    let ignored = list-set-at (h.cells) 2 77\n    in 0\n\n  show-list : List Integer, Integer, Text -> Text\n  show-list (xs) (i) (acc) =\n    if i >= list-length xs then acc\n    else show-list xs (i + 1) (acc & \" \" & show (list-at xs i))\n\nSection: E\n\n  opening : [Console] Nothing = act\n                 let h = Holder { cells = [1, 2, 3] }\n    in let d2 = clobber-field h\n                 in print-line-uni (show-list (h.cells) 0 \"\")\n  end\n";
+        assert_eq!(out(src).trim(), "1 2 77");
+    }
+
+    /// **A list LITERAL is a fresh list every time it is evaluated**, or the
+    /// mutation above would leak between calls. `make-end-node`'s `forward =
+    /// []` and `replicate-node`'s accumulator are both literals inside loops.
+    #[test]
+    fn a_list_literal_is_fresh_on_every_evaluation() {
+        let src = "Chapter: T\n\nSection: S\n\n  fresh : Integer -> List Integer\n  fresh (n) = [n, n, n]\n\n  show-list : List Integer, Integer, Text -> Text\n  show-list (xs) (i) (acc) =\n    if i >= list-length xs then acc\n    else show-list xs (i + 1) (acc & \" \" & show (list-at xs i))\n\nSection: E\n\n  opening : [Console] Nothing = act\n                 let a = fresh 7\n    in let __x = list-set-at a 0 1\n    in let b = fresh 7\n                 in print-line-uni (show-list a 0 \"\" & \" |\" & show-list b 0 \"\")\n  end\n";
+        assert_eq!(out(src).trim(), "1 7 7 | 7 7 7");
+    }
+
+    /// **`list-push` and `&` ALLOCATE here**, which is the other half of the
+    /// contract: only `list-set-at` writes through.
+    ///
+    /// Upstream leaves itself more room than this. The wasm plug's
+    /// `$list_push` has an in-place path that extends the frontier when the
+    /// list already ends at the allocator position, so a push there MAY answer
+    /// the same block -- `plugs-backlog.md` describes the two frontier-extend
+    /// tests and the view case that had to be excluded from them. Correct
+    /// Codex threads the return either way, and nothing in the compiler may
+    /// depend on which it got. So this pins OUR side of a question upstream
+    /// deliberately leaves open, and a disagreement here is not a defect.
+    #[test]
+    fn appending_allocates_and_the_original_is_untouched() {
+        let src = "Chapter: T\n\nSection: S\n\n  show-list : List Integer, Integer, Text -> Text\n  show-list (xs) (i) (acc) =\n    if i >= list-length xs then acc\n    else show-list xs (i + 1) (acc & \" \" & show (list-at xs i))\n\nSection: E\n\n  opening : [Console] Nothing = act\n                 let a = [1, 2]\n    in let b = list-push a 3\n    in let c = a & [9]\n    in let __x = list-set-at b 0 50\n                 in print-line-uni (show-list a 0 \"\" & \" |\" & show-list b 0 \"\" & \" |\" & show-list c 0 \"\")\n  end\n";
+        assert_eq!(out(src).trim(), "1 2 | 50 2 3 | 1 2 9");
+    }
+
+    /// **A NULLARY THAT ANSWERS A LIST CANNOT BE CACHED once anything in the
+    /// program writes**, and `skip-list-text-empty` is the definition that
+    /// proved it. It mentions no impure builtin and calls nothing impure, so
+    /// the call-graph fixpoint leaves it cacheable -- and every
+    /// `skip-list-text-insert` splices into the head node's `forward` list it
+    /// handed out. Two skip lists then share one accumulator: the second
+    /// insert of `b` went missing and `x` was unfindable in a list of size 1.
+    #[test]
+    fn a_list_valued_nullary_is_rebuilt_when_the_program_writes() {
+        let src = "Chapter: T\n\nSection: S\n\n  seed : List Integer\n  seed = [1, 2, 3]\n\n  show-list : List Integer, Integer, Text -> Text\n  show-list (xs) (i) (acc) =\n    if i >= list-length xs then acc\n    else show-list xs (i + 1) (acc & \" \" & show (list-at xs i))\n\nSection: E\n\n  opening : [Console] Nothing = act\n                 let a = seed\n    in let __x = list-set-at a 0 99\n                 in print-line-uni (show-list a 0 \"\" & \" |\" & show-list seed 0 \"\")\n  end\n";
+        assert_eq!(out(src).trim(), "99 2 3 | 1 2 3");
+    }
+
+    /// **And it IS still cached when nothing writes**, which is what keeps
+    /// safari's route tables off the rebuild path. The same shape without a
+    /// `list-set-at` anywhere hands out one object, so `address-of` agrees
+    /// with itself across two mentions.
+    #[test]
+    fn a_list_valued_nullary_is_shared_when_nothing_writes() {
+        let src = "Chapter: T\n\nSection: S\n\n  seed : List Integer\n  seed = [1, 2, 3]\n\nSection: E\n\n  opening : [Console] Nothing = act\n                 print-line-uni (show (address-of seed == address-of seed))\n  end\n";
+        assert_eq!(out(src).trim(), "True");
+    }
+
+    /// **The skip list is the thing this was found in**, so it is the thing
+    /// pinned: an insert must be FINDABLE, not merely counted. This is
+    /// `skip-list-text`'s shape reduced to what carries the defect -- a node
+    /// whose forward pointer is written through a discarded `list-set-at`.
+    #[test]
+    fn a_spliced_node_is_reachable_from_its_predecessor() {
+        let src = "Chapter: T\n\nSection: S\n\n  Node = record {\n    value : Text,\n    forward : List Node\n  }\n\n  end-node : Node\n  end-node = Node { value = \"\", forward = [] }\n\n  splice : Node, Node -> Integer\n  splice (pred) (fresh) =\n    let dummy = list-set-at (pred.forward) 0 fresh\n    in 0\n\nSection: E\n\n  opening : [Console] Nothing = act\n                 let head = Node { value = \"h\", forward = [end-node] }\n    in let n = Node { value = \"x\", forward = [end-node] }\n    in let d = splice head n\n                 in print-line-uni ((list-at (head.forward) 0).value)\n  end\n";
+        assert_eq!(out(src).trim(), "x");
+    }
+}
+
+/// Does anything in this program WRITE?
+///
+/// The gate in front of `frozen`, and the reason safari does not pay for the
+/// compiler's problem: 54 spec chapters contain no `list-set-at`, no
+/// `__record-set` and no field assignment between them, so no cached value
+/// there can be reached by a writer and all of them may be shared. Narrowing
+/// the cache unconditionally cost that suite 1.7x for a hazard it does not
+/// have.
+///
+/// Wrong in the safe direction costs a rebuild; wrong in the other loses an
+/// update. So this looks for the writers by name and takes any mention as a
+/// write, without asking what is written.
+fn program_writes(
+    syms: &SymTab,
+    consts: &[&crate::ast::Def],
+    funs: &[(u32, &crate::ast::Def)],
+) -> bool {
+    let writers: Vec<Sym> =
+        ["list-set-at", "__record-set"].iter().filter_map(|n| syms.find(n)).collect();
+    let mut found = false;
+    for d in consts.iter().copied().chain(funs.iter().map(|(_, d)| *d)) {
+        d.body.walk(&mut |x| match x {
+            crate::ast::Expr::NameRef(n, _) => found |= writers.contains(n),
+            crate::ast::Expr::FieldAssign(..) => found = true,
+            _ => {}
+        });
+    }
+    found
+}
+
+/// **A CACHED NULLARY HANDS OUT ONE OBJECT, so it may only hold values nobody
+/// can write to.** `skip-list-text-empty` is the definition that proves it: it
+/// mentions no impure builtin and calls nothing impure, so the call-graph
+/// fixpoint below leaves it cacheable -- and it answers a record whose head
+/// node's `forward` list every later `skip-list-text-insert` splices into. One
+/// shared empty list is then the accumulator for every skip list in the
+/// program.
+///
+/// This is a look at the VALUE and not at the body, because the body is not
+/// where the aliasing is: the writer is somebody else's code, reached through
+/// a handle this definition gave away. A `List` or a `Record` is writable, a
+/// scalar is not, and a constructor is exactly as writable as its fields.
+fn frozen(v: &Value) -> bool {
+    match v {
+        Value::Int(_)
+        | Value::Real(_)
+        | Value::Text(_)
+        | Value::Char(_)
+        | Value::Bool(_)
+        | Value::Unit => true,
+        Value::Ctor(_, fs) => fs.iter().all(frozen),
+        Value::List(_) | Value::Record(..) | Value::LinkedList(_) | Value::Fun(_) => false,
     }
 }
 
