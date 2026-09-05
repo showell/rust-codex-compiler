@@ -291,25 +291,15 @@ pub struct Interp {
     /// `table + idx * 8` -- so the addresses these counters hand out are read
     /// back as data by the program under test. What is missing is reclamation,
     /// not addressing.
-    /// The BIVY frontier: where the cursor sits outside an extent.
-    bivy: i64,
-    /// The deck-pos CELL, which `__deck-pos` reads and `__deck-set` writes.
-    deck_cell: i64,
-    /// The cursor while an extent is open. Loaded from the cell on the way in
-    /// and written back on the way out, both only at a zero crossing.
-    deck_cursor: i64,
-    /// How many extents are open. `__deck-enter` and `__deck-exit` are nested,
-    /// and only the outermost pair copies.
-    deck_depth: u32,
+    /// The two cursors and the extent depth between them. `crate::bump` owns
+    /// the arithmetic, and owns it separately so it can be tested without a
+    /// program to run.
+    bump: crate::bump::Bump,
     /// Each constructor's position in its own variant declaration, which is
     /// what `variant-tag` answers.
     tags: HashMap<Sym, i64>,
     /// THE FLAT MEMORY THE ALLOCATOR HANDS OUT ADDRESSES INTO.
     mem: Mem,
-    /// The highest cursor the allocator ever reached, and how far the deck
-    /// travelled. Reported beside the flat memory because the two answer
-    /// different halves of "where did the bytes go".
-    pub bivy_hwm: i64,
     /// WHAT WAS RUNNING WHEN THE MEMORY WAS HIGHEST.
     ///
     /// Sampled rather than exact, every `SAMPLE_STEPS` steps, because the
@@ -601,13 +591,9 @@ impl Interp {
             steps: 0,
             depth: 0,
             limit: STEP_LIMIT,
-            bivy: 0,
-            deck_cell: 0,
-            deck_cursor: 0,
-            deck_depth: 0,
+            bump: crate::bump::Bump::default(),
             tags,
             mem: Mem::default(),
-            bivy_hwm: 0,
             rematerialised: 0,
             rematerialised_bytes: 0,
             live_hwm: 0,
@@ -802,15 +788,9 @@ impl Interp {
             }
             Code::Lazy(inner) => self.eval(inner, env),
             Code::DeckRecord(body) => {
-                if self.deck_depth == 0 {
-                    self.deck_cursor = self.deck_cell;
-                }
-                self.deck_depth += 1;
+                self.bump.enter();
                 let v = self.eval(body, env);
-                self.deck_depth = self.deck_depth.saturating_sub(1);
-                if self.deck_depth == 0 {
-                    self.deck_cell = self.deck_cursor;
-                }
+                self.bump.exit();
                 v
             }
             Code::FieldAssign(rec, field, val) => {
@@ -1062,24 +1042,17 @@ impl Interp {
     /// Where the next allocation goes: the deck while an extent is open, the
     /// bivy otherwise. One cursor with two homes, which is R10 on the metal.
     fn cursor(&self) -> i64 {
-        if self.deck_depth == 0 { self.bivy } else { self.deck_cursor }
+        self.bump.cursor()
     }
 
     fn set_cursor(&mut self, v: i64) {
-        if v > self.bivy_hwm {
-            self.bivy_hwm = v;
-        }
-        if self.deck_depth == 0 {
-            self.bivy = v;
-        } else {
-            self.deck_cursor = v;
-        }
+        self.bump.set_cursor(v);
     }
 
     /// Bytes of flat memory mapped, the furthest the allocator's cursor ever
     /// got, and the definition that was running when the most was held.
     pub fn memory(&self) -> (usize, i64, String) {
-        (self.mem.mapped(), self.bivy_hwm, self.syms.text(self.hwm_in).to_string())
+        (self.mem.mapped(), self.bump.hwm, self.syms.text(self.hwm_in).to_string())
     }
 
     fn builtin(&mut self, name: &str, args: Vec<Value>) -> R<Value> {
@@ -1366,17 +1339,11 @@ impl Interp {
             // is a pair of no-ops -- which is exactly why this arm cannot see
             // a value that outlives one.
             ("__deck-enter", []) => {
-                if self.deck_depth == 0 {
-                    self.deck_cursor = self.deck_cell;
-                }
-                self.deck_depth += 1;
+                self.bump.enter();
                 Ok(Unit)
             }
             ("__deck-exit", []) => {
-                self.deck_depth = self.deck_depth.saturating_sub(1);
-                if self.deck_depth == 0 {
-                    self.deck_cell = self.deck_cursor;
-                }
+                self.bump.exit();
                 Ok(Unit)
             }
             // **A LINKED LIST IS A LIST, and there is no second variant.**
@@ -1480,9 +1447,9 @@ impl Interp {
                 Ok(Unit)
             }
             // The CELL, which is frozen for as long as an extent is open.
-            ("__deck-pos", []) => Ok(Int(self.deck_cell)),
+            ("__deck-pos", []) => Ok(Int(self.bump.deck_pos())),
             ("__deck-set", [Int(p)]) => {
-                self.deck_cell = *p;
+                self.bump.deck_set(*p);
                 Ok(Unit)
             }
             // `__record-set` is how a mutable record is updated: record, field
