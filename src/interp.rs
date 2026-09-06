@@ -138,6 +138,10 @@ pub struct Closure {
 #[derive(Debug)]
 pub struct Cell<T> {
     pub addr: i64,
+    /// **THIS OBJECT IS HELD BY THE NULLARY CACHE**, so a mutator must not
+    /// write through it -- see `cow` and `mark_cached`. Behind the `Rc` with
+    /// everything else, so `Value` is still two words.
+    pub cached: std::cell::Cell<bool>,
     /// Public only so `crate::code` can fold a payload-free constructor at
     /// compile time. Everything else builds one through `Interp::list`,
     /// `record` or `ctor`, which is where the address comes from.
@@ -801,7 +805,7 @@ impl Interp {
                 // Built once, before there is an interpreter, and never freed.
                 // That is a literal's lifetime, so it gets a literal's address.
                 let addr = crate::bump::intern_literal(words(0));
-                Value::Ctor(rc, Rc::new(Cell { addr, v: Vec::new() }))
+                Value::Ctor(rc, Rc::new(Cell { addr, cached: std::cell::Cell::new(false), v: Vec::new() }))
             } else {
                 Value::Fun(Rc::new(Closure {
                     name: rc,
@@ -946,6 +950,11 @@ impl Interp {
                 // Only after it returns: a self-referential nullary must still
                 // recurse to its own error rather than see a half-built answer.
                 if self.const_cacheable[i] && (!self.writes || frozen(&v)) {
+                    // **EVERYTHING REACHABLE IS NOW SHARED**, so mark it: a
+                    // mutator that would write through one of these copies it
+                    // first, which is what upstream's re-evaluation would have
+                    // given the caller anyway. See `cow`.
+                    mark_cached(&v);
                     self.const_cache[i] = Some(v.clone());
                 }
                 Ok(v)
@@ -1441,14 +1450,31 @@ impl Interp {
     /// shared backing that was meant to be new is how `list-set-at`'s
     /// write-through leaks between two lists that were never the same one,
     /// and a shared ADDRESS is how the cons table adopts the wrong type.
+    /// The same list, or a FRESH COPY of it if the nullary cache holds it.
+    ///
+    /// A copy gets its own allocator address, because an address here is
+    /// allocator-relative and the compiler computes with it -- two live lists
+    /// answering one address is a different bug.
+    ///
+    /// The copy is shallow: only the spine this push appends to is at risk, and
+    /// its elements stay marked, so a push onto one of THEM copies in turn.
+    fn cow(&mut self, xs: &Rc<Cell<RefCell<Vec<Value>>>>) -> Rc<Cell<RefCell<Vec<Value>>>> {
+        if !xs.cached.get() {
+            return xs.clone();
+        }
+        let cells = xs.borrow().clone();
+        let addr = self.bump.alloc(words(cells.len()));
+        Rc::new(Cell { addr, cached: std::cell::Cell::new(false), v: RefCell::new(cells) })
+    }
+
     fn list(&mut self, cells: Vec<Value>) -> Value {
         let addr = self.bump.alloc(words(cells.len()));
-        Value::List(Rc::new(Cell { addr, v: RefCell::new(cells) }))
+        Value::List(Rc::new(Cell { addr, cached: std::cell::Cell::new(false), v: RefCell::new(cells) }))
     }
 
     fn record(&mut self, name: Sym, fields: Vec<(Sym, Value)>) -> Value {
         let addr = self.bump.alloc(words(fields.len()));
-        Value::Record(name, Rc::new(Cell { addr, v: RefCell::new(fields) }))
+        Value::Record(name, Rc::new(Cell { addr, cached: std::cell::Cell::new(false), v: RefCell::new(fields) }))
     }
 
     /// **A PAYLOAD-FREE CONSTRUCTOR IS BOXED**, so it gets an address like
@@ -1458,7 +1484,7 @@ impl Interp {
     /// in a program one object as far as the memo layer is concerned.
     fn ctor(&mut self, name: Sym, fields: Vec<Value>) -> Value {
         let addr = self.bump.alloc(words(fields.len()));
-        Value::Ctor(name, Rc::new(Cell { addr, v: fields }))
+        Value::Ctor(name, Rc::new(Cell { addr, cached: std::cell::Cell::new(false), v: fields }))
     }
 
     fn text(&mut self, s: String) -> R<Value> {
@@ -1592,13 +1618,27 @@ impl Interp {
             // chunk, DISCARDS every push's result, answers only a count, and
             // its caller then reads `chunk` positions 0..n. A copying push
             // hands that caller an empty list and `list-at 0` of it.
+            //
+            // **UNLESS THE LIST IS THE NULLARY CACHE'S**, in which case this
+            // pushes onto a COPY. Upstream re-evaluates a nullary at every
+            // mention, so each mention owns its list and no push can be seen by
+            // another; caching one object here and writing through it made the
+            // second mention see the first's entries. `signal-queue-empty` is
+            // that shape, and `signal-bus-test` is where it surfaced.
+            //
+            // Only the mutators that RETURN the list can do this. `list-set-at`
+            // and a field assignment exist FOR the write-through -- the lexer
+            // ends `scan-ident-rest` relying on it -- so those stay guarded by
+            // `program_writes` and `frozen` instead.
             ("list-push" | "list-snoc", [List(xs), v]) => {
+                let xs = self.cow(xs);
                 xs.borrow_mut().push(v.clone());
-                Ok(List(xs.clone()))
+                Ok(List(xs))
             }
             // `cx_ll_insert_at` is `l.items.insert(gpa, i, v); return l;`, so
             // this writes through for the same reason `list-push` does.
             ("list-insert-at", [List(xs), Int(i), v]) => {
+                let xs = self.cow(xs);
                 let mut out = xs.borrow_mut();
                 let i = *i;
                 if i < 0 || i as usize > out.len() {
@@ -1606,7 +1646,7 @@ impl Interp {
                 }
                 out.insert(i as usize, v.clone());
                 drop(out);
-                Ok(List(xs.clone()))
+                Ok(List(xs))
             }
             // The capacity is an allocation hint upstream -- `cx_ll_empty` then
             // `ensureTotalCapacityPrecise` -- and the LIST IS EMPTY. It is
@@ -1797,8 +1837,9 @@ impl Interp {
             // reserve, exactly as with `__list-with-capacity`.
             ("__linked-list-empty", [Int(_)]) => Ok(self.list(Vec::new())),
             ("__linked-list-push", [List(xs), v]) => {
+                let xs = self.cow(xs);
                 xs.borrow_mut().push(v.clone());
-                Ok(List(xs.clone()))
+                Ok(List(xs))
             }
             ("__linked-list-to-list", [List(xs)]) => Ok(List(xs.clone())),
 
@@ -2085,7 +2126,7 @@ fn binary(syms: &SymTab, bump: &mut crate::bump::Bump, op: BinaryOp, a: Value, b
     }
     fn mklist(bump: &mut crate::bump::Bump, cells: Vec<Value>) -> Value {
         let addr = bump.alloc(words(cells.len()));
-        List(Rc::new(Cell { addr, v: RefCell::new(cells) }))
+        List(Rc::new(Cell { addr, cached: std::cell::Cell::new(false), v: RefCell::new(cells) }))
     }
     use BinaryOp::*;
     use Value::*;
@@ -2747,12 +2788,11 @@ mod tests {
     ///
     /// ```text
     /// in let dummy1 = list-set-at (pred.forward) i new-node
-    /// **A NULLARY THAT ANSWERS A LIST IS NOT CACHEABLE IF ANYTHING PUSHES.**
+    /// **A CACHED NULLARY'S LIST IS COPIED BEFORE IT IS PUSHED ONTO.**
     /// `list-push` writes through and hands back the same list, so a cached
-    /// nullary gives every mention one list and the second use sees the first
-    /// one's entries. The `writes` guard listed only `list-set-at` and
-    /// `__record-set`, so a program whose only mutator was a push kept the
-    /// cache and shared the list.
+    /// nullary would give every mention one list and the second use would see
+    /// the first one's entries. `cow` copies it instead, which is what
+    /// upstream's re-evaluation gives each mention anyway.
     ///
     /// Measured against upstream on `signal-bus-test`, whose `signal-queue-empty`
     /// is exactly this shape. The failure surfaced three tests later as a count
@@ -3242,13 +3282,11 @@ fn program_writes(
     // list to two independent uses. The second saw the first's entries -- and
     // the failure surfaced three tests later, as a count that was too LOW,
     // because the loop bounds itself by a `count` field that had not moved.
-    let writers: Vec<Sym> = [
-        "list-set-at", "__record-set", "list-push", "list-snoc",
-        "list-insert-at", "__linked-list-push",
-    ]
-    .iter()
-    .filter_map(|n| syms.find(n))
-    .collect();
+    // Only the mutators that write THROUGH a handle. The pushes protect
+    // themselves by copying (see `cow`), so a program that only pushes keeps
+    // its nullary cache -- which is worth 1.8x on safari's tables.
+    let writers: Vec<Sym> =
+        ["list-set-at", "__record-set"].iter().filter_map(|n| syms.find(n)).collect();
     let mut found = false;
     for d in consts.iter().copied().chain(funs.iter().map(|(_, d)| *d)) {
         d.body.walk(&mut |x| match x {
@@ -3272,6 +3310,40 @@ fn program_writes(
 /// where the aliasing is: the writer is somebody else's code, reached through
 /// a handle this definition gave away. A `List` or a `Record` is writable, a
 /// scalar is not, and a constructor is exactly as writable as its fields.
+/// Mark a value and everything under it as held by the nullary cache.
+///
+/// Deep, because the hazard is not the value the cache holds -- it is the list
+/// two records down that somebody pushes onto.
+fn mark_cached(v: &Value) {
+    match v {
+        Value::List(c) => {
+            if c.cached.replace(true) {
+                return;                       // already marked; and cycles end
+            }
+            for x in c.borrow().iter() {
+                mark_cached(x);
+            }
+        }
+        Value::Record(_, c) => {
+            if c.cached.replace(true) {
+                return;
+            }
+            for (_, x) in c.borrow().iter() {
+                mark_cached(x);
+            }
+        }
+        Value::Ctor(_, c) => {
+            if c.cached.replace(true) {
+                return;
+            }
+            for x in c.v.iter() {
+                mark_cached(x);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn frozen(v: &Value) -> bool {
     match v {
         Value::Int(_)

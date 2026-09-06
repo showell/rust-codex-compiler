@@ -378,7 +378,7 @@ impl<'a> Compiler<'a> {
             // literal's address rather than one off a heap that does not
             // exist yet.
             let addr = crate::bump::intern_literal(8);
-            return Code::Const(Value::Ctor(n, Rc::new(crate::interp::Cell { addr, v: Vec::new() })));
+            return Code::Const(Value::Ctor(n, Rc::new(crate::interp::Cell { addr, cached: std::cell::Cell::new(false), v: Vec::new() })));
         }
         if let Some(name) = self.names.builtin_undeclared.get(&n).copied() {
             return Code::Fail(format!(
