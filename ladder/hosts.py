@@ -52,9 +52,23 @@ MEM_LIMIT = 1 << 30
 RUN_TIMEOUT = 180
 ORACLE_TIMEOUT = 120
 
-HARNESS = '''
+HARNESS = r'''
 
 Chapter: Parsmi--Hosts
+
+Section: Halt
+
+ **`cir-halted` FROM `CodexIrHarness`, WORD FOR WORD.** A refusal has to read
+ the same on both arms or the comparison needs a special case, and a special
+ case is where a real disagreement hides. Printing every error instead of the
+ count and the first one made four mutual refusals -- identical diagnostics,
+ identical order -- read as four disagreements.
+
+  hosts-halted : List Diagnostic -> Text
+  hosts-halted (es) =
+   let n = list-length es
+   in let e0 = list-at es 0
+   in "CODEGEN-HALTED: " & show n & " error(s); no IR emitted; first CDX" & show (e0.code) & " " & (e0.message) & "\n"
 
 Section: Entry
 
@@ -65,32 +79,15 @@ Section: Entry
     in let ds = __deck-set db
     in let da = __heap-advance 536870912
     in let fe = compile-frontend-ir src "Program" compile-flags-default
-    in act
-      print-codegen-error-header (bag-errors (fe.bag))
-      if bag-has-errors (fe.bag) then print-line-uni "CODEGEN-HALTED: errors in bag; no IR emitted"
-      else let lifted-ir = lift-ir-for-emit (fe.ir) compile-flags-default
-       in print-uni (emit-ir-chapter (ir-prune-unreachable-roots lifted-ir ir-emit-roots) (fe.text-meta) (fe.type-defs))
-    end
+    in if bag-has-errors (fe.bag) then print-uni (hosts-halted (bag-errors (fe.bag)))
+    else let lifted-ir = lift-ir-for-emit (fe.ir) compile-flags-default
+    in print-uni (emit-ir-chapter (ir-prune-unreachable-roots lifted-ir ir-emit-roots) (fe.text-meta) (fe.type-defs))
   end
 '''
 
 
 def _cap_memory():
     resource.setrlimit(resource.RLIMIT_AS, (MEM_LIMIT, MEM_LIMIT))
-
-
-def halted(text):
-    """Both harnesses refuse in their own words, so a refusal compares by CODE.
-
-    `codexir` says `CODEGEN-HALTED: 3 error(s); ... first CDX2001 ...` and this
-    one prints every error then a bare CODEGEN-HALTED line. Same verdict, same
-    compiler, different wording -- so when both refuse, what is compared is the
-    set of CDX codes each reported. Comparing the prose instead reported every
-    mutual refusal as a disagreement.
-    """
-    if "CODEGEN-HALTED" not in text:
-        return None
-    return sorted({w[:7] for w in text.split() if w.startswith("CDX")})
 
 
 def main():
@@ -134,17 +131,19 @@ def main():
                                    timeout=ORACLE_TIMEOUT)
             oracle = o.stderr.decode("utf-8", "replace")
             os.unlink(src_path)
-            ours_codes, oracle_codes = halted(ours), halted(oracle)
+            # Raw bytes, both ways. Both harnesses pass the chapter literal
+            # "Program" and both refuse in `cir-halted`'s words, so there is
+            # nothing left for a normalising pass to be wrong about.
             if why:
                 verdict, detail = "REFUSED", why
             elif ours == oracle:
-                verdict, detail = "agree", f"{len(ours)} bytes"
-            elif ours_codes is not None and ours_codes == oracle_codes:
-                verdict, detail = "agree", f"both halt: {' '.join(ours_codes)}"
+                kind = "halt" if ours.startswith("CODEGEN-HALTED") else "bytes"
+                verdict, detail = "agree", f"{len(ours)} {kind}"
             else:
                 verdict = "DIFFERS"
                 detail = f"{len(ours)} vs codexir {len(oracle)}"
-                if (ours_codes is None) != (oracle_codes is None):
+                halts = (ours.startswith("CODEGEN-HALTED"), oracle.startswith("CODEGEN-HALTED"))
+                if halts[0] != halts[1]:
                     detail += "  (one halted, one did not)"
         tally[verdict] = tally.get(verdict, 0) + 1
         print(f"{name:34} {verdict:11} {secs if not missing else 0:6.2f}s  {detail}",
