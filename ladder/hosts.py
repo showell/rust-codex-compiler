@@ -147,7 +147,17 @@ def main():
                                    preexec_fn=_cap_memory, timeout=RUN_TIMEOUT)
                 ours, why = r.stdout.lstrip("\n"), None
                 if r.returncode != 0:
-                    why = r.stderr.strip().splitlines()[-1][:70] if r.stderr.strip() else "nonzero"
+                    # **THE FIRST LINE, NOT THE LAST.** The last line of a Rust
+                    # failure is boilerplate -- `note: run with RUST_BACKTRACE=1`
+                    # grounds nothing -- and reporting it made an ordinary
+                    # exhaustion of MEM_LIMIT read as an interpreter panic.
+                    # `browser-pane-fit` is that program: it aborts on
+                    # `memory allocation of 64 bytes failed` under the cap and
+                    # completes without one.
+                    lines = r.stderr.strip().splitlines()
+                    why = lines[0][:70] if lines else "nonzero"
+                    if "memory allocation of" in r.stderr:
+                        why = f"over MEM_LIMIT ({MEM_LIMIT >> 20} MB)"
             except subprocess.TimeoutExpired:
                 ours, why = "", f"timed out at {RUN_TIMEOUT}s"
             secs = time.time() - t0

@@ -562,7 +562,25 @@ pub fn check_chapter(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState) {
             saved.push(p.name.clone());
             env.bind(p.name, arg);
         }
-        infer(&d.body, &mut env, &mut st);
+        let body_ty = infer(&d.body, &mut env, &mut st);
+        // **THE BODY MEETS THE DECLARED RESULT.** Without this a definition's
+        // own signature decides nothing about what it computes, and an
+        // inferred variable never learns what it is: `f : Integer -> List
+        // Integer` with body `[]` left the element as `(tvar 2)` where the
+        // oracle spells `int-default`. Nothing is minted here -- unification
+        // binds, it does not allocate.
+        //
+        // An effectful result is peeled first: `opening : [Console] Nothing`
+        // computes a `Nothing`, and the row is the caller's business.
+        let want = match spine {
+            Some(Ty::Effectful(_, _, inner)) => Some(*inner),
+            other => other,
+        };
+        if let Some(w) = want {
+            if !st.unify(&body_ty, &w) {
+                st.unify_gaps += 1;
+            }
+        }
         for _ in saved {
             env.scope.pop();
         }
@@ -585,6 +603,10 @@ pub fn section(syms: &SymTab, bindings: &[Binding], st: &UnifyState) -> String {
     s.push_str(".\n");
     s.push_str(&format!("substitutions {}\n", st.substitutions.len()));
     s.push_str(&format!("next-id {}\n", st.next_id));
+    // `CheckHarness.codex` prints this and `$CODEX_GOLDS/rungs/check.truth`
+    // does not: the bank predates the row counter. `codexcheck` is the control
+    // now, so the section is shaped to IT.
+    s.push_str(&format!("next-row-id {}\n", st.next_row_id));
     s.push_str(&format!("expr-types {}\n", st.expr_types.len()));
     // The harness closes the section, and the gold's last line is this.
     s.push_str("---\n");
@@ -717,9 +739,136 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
             }
             infer(body, env, st)
         }
-        _ => Ty::Error,
+        // **EVERY REMAINING FORM IS WALKED, EVEN WHERE THE TYPE IS NOT KNOWN.**
+        // A `_ => Ty::Error` arm that did not recurse skipped whole subtrees in
+        // silence: no name inside a lambda, a match arm, a record literal or a
+        // list literal was ever visited, so none of them minted and none of
+        // them was recorded. On `encode-hex`'s unit that was 98 fresh
+        // variables, 18 rows and 22 expression types missing against
+        // `codexcheck`, and the shortfall reached the wire as a row id 18 low
+        // on the ONE definition the IR keeps.
+        //
+        // Answering the type is a separate question from making the walk. What
+        // each of these mints has to be measured form by form the way the
+        // application rule was; until then they recurse and mint nothing of
+        // their own, which is a number that can be checked rather than a
+        // subtree that cannot.
+        E::Unary(x, _) => infer(x, env, st),
+        E::Lazy(x, _) => infer(x, env, st),
+        // **AN EMPTY LIST MINTS ONE VARIABLE AND RECORDS IT; A NON-EMPTY ONE
+        // MINTS NOTHING.** `[]` has no element to read a type from, so the
+        // element type is a fresh variable that unification decides from the
+        // context -- and lowering reads it back at this span to spell
+        // `(list-expr (elems) int-default)`. Measured on `codexcheck`:
+        // `f (x) = []` is next-id 3 and expr-types 1 where `f (x) = [x]` is 2
+        // and 1, on a body with no names in it at all.
+        E::List(xs, sp) => {
+            if xs.is_empty() {
+                let e = st.fresh();
+                st.record_expr_type(*sp, e.clone());
+                return Ty::List(Box::new(e));
+            }
+            let mut elem = Ty::Error;
+            for x in xs {
+                elem = infer(x, env, st);
+            }
+            Ty::List(Box::new(elem))
+        }
+        // `bind-lambda-params` mints one variable per parameter -- a lambda,
+        // unlike a declared definition, has nowhere else to get them from.
+        E::Lambda(params, body, sp) => {
+            let mut arg = Ty::Error;
+            for p in params {
+                arg = st.fresh();
+                env.bind(*p, arg.clone());
+            }
+            let ret = infer(body, env, st);
+            for _ in params {
+                env.scope.pop();
+            }
+            let t = Ty::Fun(Box::new(arg), EffectRow::default(), Box::new(ret));
+            st.record_expr_type(*sp, t.clone());
+            return t;
+        }
+        E::Match(scrut, arms, _) | E::Induction(scrut, arms, _) => {
+            let _ = infer(scrut, env, st);
+            let mut last = Ty::Error;
+            for a in arms {
+                let bound = bind_pattern(&a.pattern, env, st);
+                let _ = infer(&a.guard, env, st);
+                last = infer(&a.body, env, st);
+                for _ in 0..bound {
+                    env.scope.pop();
+                }
+            }
+            last
+        }
+        // A record literal is the other site `record-expr-type` is populated
+        // from (Unifier.codex:131).
+        E::Record(n, fields, sp) => {
+            for f in fields {
+                let _ = infer(&f.value, env, st);
+            }
+            let t = Ty::Record(*n, Vec::new());
+            st.record_expr_type(*sp, t.clone());
+            return t;
+        }
+        // The field's type is in the chapter's type definitions, which this
+        // does not read yet. The RECORD is still walked.
+        E::FieldAccess(r, _, _) => {
+            let _ = infer(r, env, st);
+            Ty::Error
+        }
+        E::FieldAssign(r, _, v, _) => {
+            let _ = infer(r, env, st);
+            let _ = infer(v, env, st);
+            Ty::Nothing
+        }
+        E::Handle(h) => {
+            let t = infer(&h.body, env, st);
+            for c in &h.clauses {
+                let _ = infer(&c.body, env, st);
+            }
+            t
+        }
+        E::WithTimeout(w) => infer(&w.body, env, st),
+        // Three statement lists, all of them walked: the body, the retry
+        // fallback and the failure arm are all program the checker sees.
+        E::Try(t) => {
+            let mut last = Ty::Nothing;
+            for stmts in [&t.body, &t.fallback, &t.failure] {
+                for stmt in stmts {
+                    match stmt {
+                        crate::ast::ActStmt::Exec(x, _) => last = infer(x, env, st),
+                        crate::ast::ActStmt::Bind(n, x, _) => {
+                            last = infer(x, env, st);
+                            env.bind(*n, last.clone());
+                        }
+                    }
+                }
+            }
+            last
+        }
+        E::Error(..) => Ty::Error,
     };
     t
+}
+
+/// A pattern's variables, bound to fresh variables for the arm's body. Returns
+/// how many were pushed so the caller can pop exactly those.
+fn bind_pattern(p: &crate::ast::Pat, env: &mut TyEnv<'_>, st: &mut UnifyState) -> usize {
+    use crate::ast::Pat as P;
+    match p {
+        P::Var(n, _) => {
+            let t = st.fresh();
+            env.bind(*n, t);
+            1
+        }
+        P::Ctor(_, subs, _) | P::Vec_(subs, _) => {
+            subs.iter().map(|s| bind_pattern(s, env, st)).sum()
+        }
+        P::Lit(..) | P::Wild(_) => 0,
+    }
 }
 
 /// Names in scope during inference.

@@ -300,9 +300,17 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
         //
         // An empty list has no element to read a type from and is refused: the
         // type is in the context, which the checker decides and this does not.
-        Expr::List(xs, _) => {
+        Expr::List(xs, sp) => {
+            // An empty list's element type is the variable the checker minted
+            // for it, resolved through the substitutions -- so `[]` in a call
+            // to `list-length` spells `(list-expr (elems) int-default)`.
             if xs.is_empty() {
-                return Err("empty list literal (its type is in the context)".into());
+                let e = cx.at(*sp).ok_or("empty list literal with no recorded element type")?;
+                let rendered = render_ty(cx.syms, &e);
+                return Ok((
+                    format!("(list-expr (elems) {rendered})"),
+                    Ty::List(Box::new(e)),
+                ));
             }
             let mut parts = Vec::new();
             let mut elem: Option<Ty> = None;
@@ -775,6 +783,19 @@ mod tests {
             ),
             "got: {}",
             def_line(scoped, "opening")
+        );
+    }
+
+    /// **AN EMPTY LIST'S ELEMENT TYPE COMES FROM THE CONTEXT**, which is a
+    /// variable the checker minted and unification decided. `codexir`'s bytes
+    /// at `u56-candidate-sunday`, with `f` called twice so the single-caller
+    /// pass leaves it standing.
+    #[test]
+    fn an_empty_list_carries_the_element_type_the_checker_decided() {
+        let src = "Chapter: T\n\nSection: S\n  f : Integer -> List Integer\n  f (x) = []\n\nSection: E\n  opening : [Console] Nothing = act\n   print-line-uni (show (list-length (f 1)))\n   print-line-uni (show (list-length (f 2)))\n  end\n";
+        assert_eq!(
+            def_line(src, "f"),
+            r#"(def "f" "T" (params (param "x" int-default)) (fn int-default (list int-default)) (list-expr (elems) int-default) 0 0)"#
         );
     }
 
