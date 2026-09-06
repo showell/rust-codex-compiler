@@ -1460,12 +1460,40 @@ pub fn infer_row(
         E::Record(n, fields, sp) => {
             let raw = env.get(*n).cloned().unwrap_or(Ty::Error);
             let inst = st.instantiate(&raw);
+            // **THE EXPECTED FIELD TYPES ARE THE INSTANTIATED CONSTRUCTOR'S
+            // ARGUMENTS, NOT THE DECLARED TABLE'S.** A record with a type
+            // parameter has a different field type at every use, and the
+            // constructor is the only place that difference exists: its arrow
+            // chain was just instantiated, `TypeDefs` still holds `a`.
+            // Argument i of the chain is field i of the DECLARATION, which is
+            // what `field_index` answers -- the expression may name them in any
+            // order.
+            let mut declared = Vec::new();
             let mut result = inst;
-            while let Ty::Fun(_, _, r) = result {
+            while let Ty::Fun(a, _, r) = result {
+                declared.push(*a);
                 result = *r;
             }
+            let rec_name = match &result {
+                Ty::Record(rn, _) | Ty::Constructed(rn, _) | Ty::Sum(rn, _) => *rn,
+                _ => *n,
+            };
             for f in fields {
-                let (_, frow) = infer_row(&f.value, env, st);
+                let (ft, frow) = infer_row(&f.value, env, st);
+                // **AND THIS IS WHERE AN EMPTY LIST LEARNS ITS ELEMENT TYPE.**
+                // `infer-and-unify-record-fields` (line 1996) unifies each value
+                // against its field's type. Without it `R { tags = [] }` reaches
+                // the IR as `(list-expr (elems) (tvar 352))` where upstream
+                // spells `text`: the fresh variable the empty list minted is
+                // never told what it is.
+                if let Some(want) =
+                    env.type_defs.field_index(rec_name, f.name).and_then(|i| declared.get(i))
+                {
+                    let want = want.clone();
+                    if !st.unify(&ft, &want) {
+                        st.unify_gaps += 1;
+                    }
+                }
                 row = st.row_union(&row, &frow);
             }
             st.record_expr_type(*sp, result.clone());
