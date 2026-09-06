@@ -162,6 +162,7 @@ fn bench(paths: &[String]) -> ExitCode {
         // Per program, not cumulative: the mark drops to what is live before
         // each one, so the column is what THIS program needed on top of what
         // was already held.
+        heapwatch::enable();
         heapwatch::reset();
         match run_timed_in_thread(path) {
             Ok((_, steps, secs, ..)) => {

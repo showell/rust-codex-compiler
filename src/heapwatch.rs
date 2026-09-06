@@ -10,8 +10,17 @@
 //!
 //! So this is a global allocator that counts. Two relaxed atomics, one add per
 //! allocation and one subtract per free, and a peak that only moves on the way
-//! up. Measured on the whole safari suite -- 54 chapters, 2,351 graded values
-//! -- the cost is in the noise against the same suite without it.
+//! up.
+//!
+//! **AND IT IS OFF UNLESS SOMEONE IS ASKING.** On the safari suite the cost was
+//! in the noise, which is what the note here used to say without qualification.
+//! On an allocation-heavy compile it is not: `shell-build-keep`'s ShellTypes
+//! chapter runs 19.7s with the counters and 17.0s without, a 14 per cent tax on
+//! every sweep, paid for a number no sweep reads. Three locked
+//! read-modify-writes per allocation is not free at fifty million of them.
+//!
+//! `enable()` turns it on, and `bench` is the only caller. Disabled, the cost
+//! is one relaxed load and a predictable branch.
 //!
 //! RELAXED IS THE RIGHT ORDERING and not a shortcut. Nothing synchronises on
 //! these counters: no thread reads one to decide whether another thread's
@@ -26,6 +35,15 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+/// Whether to count at all. A sweep never reads the number and should not pay
+/// for it; `bench` turns it on before the run it measures.
+static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Start counting. Anything allocated before this is not counted, which is
+/// what `reset` already implies: the figure is per-program, not per-process.
+pub fn enable() {
+    ON.store(true, Relaxed);
+}
 
 pub struct Counting;
 
@@ -40,14 +58,16 @@ impl Counting {
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         let p = unsafe { System.alloc(l) };
-        if !p.is_null() {
+        if !p.is_null() && ON.load(Relaxed) {
             Self::grew(l.size());
         }
         p
     }
 
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        LIVE.fetch_sub(l.size(), Relaxed);
+        if ON.load(Relaxed) {
+            LIVE.fetch_sub(l.size(), Relaxed);
+        }
         unsafe { System.dealloc(p, l) }
     }
 
@@ -59,7 +79,7 @@ unsafe impl GlobalAlloc for Counting {
     /// down by the old.
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
         let q = unsafe { System.realloc(p, l, new) };
-        if !q.is_null() {
+        if !q.is_null() && ON.load(Relaxed) {
             Self::grew(new);
             LIVE.fetch_sub(l.size(), Relaxed);
         }
@@ -68,7 +88,7 @@ unsafe impl GlobalAlloc for Counting {
 
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
         let p = unsafe { System.alloc_zeroed(l) };
-        if !p.is_null() {
+        if !p.is_null() && ON.load(Relaxed) {
             Self::grew(l.size());
         }
         p
