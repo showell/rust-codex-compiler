@@ -29,7 +29,9 @@ fn starts_a_type_arg(k: Kind) -> bool {
 }
 
 pub(crate) fn parse_type(p: &mut Parser<'_>) {
-    parse_type_inner(p, true)
+    p.type_depth += 1;
+    parse_type_inner(p, true);
+    p.type_depth -= 1;
 }
 
 /// Inside a tuple, a comma SEPARATES elements; everywhere else it introduces
@@ -358,6 +360,57 @@ mod tests {
     fn errors_for(annotation: &str) -> Vec<String> {
         let src = format!("Chapter: T\n\nSection: S\n  f : {annotation}\n  f (x) = x\n");
         parse(src.as_bytes()).errors.into_iter().map(|e| e.msg).collect()
+    }
+
+    /// Errors for a whole unit, so a probe can put the byte anywhere.
+    fn errors_in(src: &str) -> Vec<String> {
+        parse(src.as_bytes()).errors.into_iter().map(|e| e.msg).collect()
+    }
+
+    #[test]
+    fn an_unmapped_byte_in_a_type_is_refused() {
+        // **MEASURED AGAINST `codexir`, NOT INFERRED FROM THE BANK.** Every
+        // byte the frequency alphabet does not map -- carriage return, tab,
+        // vertical tab, form feed, SOH -- halts the real compiler with CDX1000
+        // when it lands inside a type, and is skipped as trivia everywhere
+        // else. The five probes below were run through `codexir` at
+        // u56-candidate-sunday one at a time; the compiler refused exactly
+        // these and compiled the same bytes in an expression.
+        //
+        // The bank cannot settle this and reading it as though it could is how
+        // the opposite rule got written down: `cite_resolve.py` reads with
+        // `read_text()`, so Python's universal newlines stripped every CR
+        // before bare metal ever saw one, and no gold in the set contains the
+        // byte whose handling it was cited as proving.
+        for byte in ["\r", "\t", "\x0b", "\x0c", "\x01"] {
+            let probe = format!("Integer{byte} -> Integer");
+            assert!(
+                !errors_for(&probe).is_empty(),
+                "an unmapped byte in a type must be refused: {probe:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unmapped_byte_outside_a_type_is_trivia() {
+        // The other half of the same measurement, and the reason this is not
+        // simply "reject the byte": `codexir` compiles all of these. A rule
+        // that refused them everywhere would diverge from the compiler in the
+        // opposite direction, which is no better for an oracle.
+        for byte in ["\r", "\t", "\x0b", "\x0c"] {
+            let src = format!(
+                "Chapter: T\n\nSection: S\n  f : Integer -> Integer\n  f (x) = x +{byte} 1\n"
+            );
+            assert!(
+                errors_in(&src).is_empty(),
+                "an unmapped byte outside a type is trivia: {byte:?} -> {:?}",
+                errors_in(&src)
+            );
+        }
+        // And on the lines around a definition, which is where CRLF actually
+        // puts them: chapter, section, blank and body lines all compile.
+        let crlf_edges = "Chapter: T\r\n\r\nSection: S\r\n\r\n  f : Integer -> Integer\n  f (x) = x + 1\r\n";
+        assert!(errors_in(crlf_edges).is_empty(), "{:?}", errors_in(crlf_edges));
     }
 
     #[test]

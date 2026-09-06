@@ -85,6 +85,23 @@ fn one(root: &str, out: Option<&String>) -> ExitCode {
     for c in &b.complaints {
         eprintln!("{c}");
     }
+    // **A UNIT WITH A CARRIAGE RETURN IN IT CANNOT BE COMPILED, so it is not
+    // written.** The bytes are kept as they were read -- this bundler does not
+    // quietly rewrite its input -- which leaves refusing as the only honest
+    // answer: `codexir` halts with CDX1000 on an unmapped byte inside a type,
+    // and a `Chapter:` line ending in CRLF carries the return into the chapter
+    // NAME, so a cite for `FFT` cannot match the `FFT\r` that is present.
+    // Emitting the unit anyway produced a file whose failure looked like a
+    // missing chapter and was a line ending.
+    //
+    // The caller normalises. `cite_resolve.py` gets this for free by reading in
+    // text mode, which is also how the IR bank came to be cut from source no
+    // compiler could have read as it sits on disk.
+    if b.text.contains('\r') {
+        eprintln!("REFUSED: the unit carries a carriage return and cannot be compiled; \
+                   normalise the source before bundling");
+        return ExitCode::from(2);
+    }
     match out {
         Some(p) => {
             if let Err(e) = std::fs::write(p, &b.text) {

@@ -402,13 +402,19 @@ pub fn tokenize_into(src: &[u8], prose_mode: bool) -> Lexed {
         // the alphabet does not map, so the arm is live and it skips every one
         // of them -- a carriage return above all.
         //
-        // Reading `cc-cr = -1` as "a value no byte can equal" and letting the
-        // byte fall through to scan-operator gave it an ErrorToken, and the
-        // gold IR says otherwise: 15 files in the checkout have CRLF endings,
-        // and `foreword/ai/DiffusionScheduler.codex` -- whose `record {` line
-        // ends `\r\n` -- is in the bank with `NoiseSchedule` carrying all its
-        // fields. An ErrorToken sitting between the brace and the first field
-        // would have left that record empty and the chapter uncompilable.
+        // **THE BANK CANNOT SETTLE THIS AND WAS ONCE CITED AS THOUGH IT
+        // COULD.** This comment used to argue from the gold IR: 15 files in
+        // the checkout have CRLF endings, `foreword/ai/DiffusionScheduler.codex`
+        // is one of them, and its `NoiseSchedule` record is in the bank with
+        // every field, so the byte must be trivia. But the bank was cut through
+        // `cite_resolve.py`, which reads in text mode, and Python's universal
+        // newlines removed every carriage return before bare metal saw one. No
+        // gold in the set contains the byte the argument turned on.
+        //
+        // Measured directly against `codexir` instead, one probe per position:
+        // the byte IS skipped here, in an expression and on the lines around a
+        // definition -- and is REFUSED inside a type, which the parser enforces
+        // rather than the lexer. See `parser::Parser::type_depth`.
         //
         // The byte is TRIVIA, not nothing: dropping it would break
         // `concat(tokens) == source`, which is the one property no oracle is

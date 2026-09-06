@@ -66,6 +66,12 @@ pub(crate) struct Parser<'a> {
     /// is upstream's `paren-depth` and it is the whole reason a multi-line
     /// application is an error at the top level and fine inside parentheses.
     pub(crate) paren_depth: u32,
+    /// How many type expressions are open. **A type is the one place an
+    /// unmapped byte is not trivia**, measured against `codexir`: a carriage
+    /// return, tab, vertical tab or form feed inside a type halts the compiler
+    /// with CDX1000, and the same byte in an expression or on the lines around
+    /// a definition compiles. Types nest, so this counts rather than flags.
+    pub(crate) type_depth: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -102,16 +108,33 @@ impl<'a> Parser<'a> {
 
     /// Eat trivia into whatever node is open, then eat one real token.
     pub(crate) fn bump(&mut self) -> Option<Token> {
-        while self.toks.get(self.at()).is_some_and(|t| t.kind.is_trivia()) {
-            self.b.eat();
-        }
+        self.eat_trivia();
         self.b.eat()
     }
 
     /// Eat trivia only, so it attaches to the enclosing node rather than to
     /// the construct about to start.
     pub(crate) fn drift(&mut self) {
-        while self.toks.get(self.at()).is_some_and(|t| t.kind.is_trivia()) {
+        self.eat_trivia();
+    }
+
+    /// Trivia goes into the tree in order -- `concat(tokens) == source` is the
+    /// one property that needs no oracle -- but inside a type an unmapped byte
+    /// is reported on the way past.
+    fn eat_trivia(&mut self) {
+        while let Some(t) = self.toks.get(self.at()).copied() {
+            if !t.kind.is_trivia() {
+                break;
+            }
+            if t.kind == Kind::Unmapped && self.type_depth > 0 {
+                let byte = t.text(self.src).first().copied().unwrap_or(0);
+                let (line, col) = (t.line, t.col);
+                self.errors.push(ParseError {
+                    msg: format!("Expected token kind mismatch, got byte 0x{byte:02x}"),
+                    line,
+                    col,
+                });
+            }
             self.b.eat();
         }
     }
@@ -184,6 +207,7 @@ pub fn parse(src: &[u8]) -> Parsed {
         unclosed_blocks: 0,
         resynced_lines: 0,
         paren_depth: 0,
+        type_depth: 0,
     };
 
     while !p.done() {

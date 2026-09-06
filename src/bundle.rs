@@ -72,10 +72,16 @@ pub enum Complaint {
     /// chapters -- all of them in `foreword`, which is to say in the library
     /// every program reaches transitively.
     ///
-    /// Reported and not corrected. The lexer treats a carriage return as
-    /// trivia, so the compiled program is the same either way; what is not the
-    /// same is a bundler that quietly rewrites its input, and which of those
-    /// two behaviours is wanted is not this module's call to make silently.
+    /// **REPORTED AND FATAL, because the compiled program is NOT the same
+    /// either way.** This comment used to say that it was -- that a carriage
+    /// return is trivia and only the bytes differ -- and that was measured
+    /// wrong: `codexir` halts with CDX1000 when an unmapped byte lands inside
+    /// a TYPE, and a `Chapter:` line ending in CRLF puts the return inside the
+    /// chapter name, where it defeats the cite that names the chapter without
+    /// one. Both failures read as something else entirely.
+    ///
+    /// The bytes are still kept as they were read. What changed is that the
+    /// bundler will not WRITE a unit it knows cannot compile.
     CarriageReturns { chapter: String, path: PathBuf },
     /// The project's own quire file re-uses a name the checkout also registers.
     ///
