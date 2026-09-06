@@ -763,11 +763,9 @@ mod tests {
     #[test]
     fn an_effect_row_keeps_dotted_names_and_their_scopes() {
         let dotted = "Chapter: BlockIdentify\n\nSection: Body\n  opening : [Device.Block] Integer = block-sector-count\n";
-        assert!(
-            def_line(dotted, "opening")
-                .contains(r#"(effectful (effs "Device.Block") (scopes "") int-default)"#),
-            "got: {}",
-            def_line(dotted, "opening")
+        assert_eq!(
+            def_line(dotted, "opening"),
+            r#"(def "opening" "BlockIdentify" (params) (effectful (effs "Device.Block") (scopes "") int-default) (name "block-sector-count" int-default) 0 0)"#
         );
 
         let scoped = "Chapter: Sc\n\nSection: S\n  opening : [Console \"stdout\", FileSystem.Read \"/config/\"] Nothing = act\n   print-line-uni \"a\"\n  end\n";

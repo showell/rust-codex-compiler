@@ -750,8 +750,8 @@ impl<'a> TyEnv<'a> {
 /// text))` -- because the IR spelling cannot express a forall and the checker
 /// needs one. Forty lines and testable, where generated Rust constructor calls
 /// would be neither readable in a diff nor checkable.
-pub fn parse_ty(s: &str) -> Option<Ty> {
-    let (t, rest) = parse_one(s.trim())?;
+pub fn parse_ty(syms: &SymTab, s: &str) -> Option<Ty> {
+    let (t, rest) = parse_one(syms, s.trim())?;
     if rest.trim().is_empty() { Some(t) } else { None }
 }
 
@@ -784,20 +784,29 @@ fn take_group(s: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// `(row Console.Write)` and `(row)` as the wire's own record. `empty` is the
-/// row with no labels, which is what a pure builtin declares.
+/// `(row Console.Write)`, `(rowvar 0)` and `empty` as the wire's own record.
+///
+/// **`empty` AND `(rowvar N)` ARE NOT THE SAME ROW.** An empty row has no tail
+/// and `open-spine-rows` mints one for it at every reference; a row variable
+/// already carries the id its `foralleff` binds, and minting over it would put
+/// a number on the wire that nothing else in the program agrees with.
 fn parse_row(inner: &str) -> EffectRow {
     let mut it = inner.split_whitespace();
     let head = it.next().unwrap_or("");
-    let labels = if head == "row" {
-        it.map(|w| (w.to_string(), String::new())).collect()
-    } else {
-        Vec::new()
-    };
-    EffectRow { labels, ..Default::default() }
+    match head {
+        "row" => EffectRow {
+            labels: it.map(|w| (w.to_string(), String::new())).collect(),
+            ..Default::default()
+        },
+        "rowvar" => EffectRow {
+            id: it.next().and_then(|w| w.parse().ok()).unwrap_or(-1),
+            ..Default::default()
+        },
+        _ => EffectRow::default(),
+    }
 }
 
-fn parse_one(s: &str) -> Option<(Ty, &str)> {
+fn parse_one<'a>(syms: &SymTab, s: &'a str) -> Option<(Ty, &'a str)> {
     let s = s.trim_start();
     if let Some(inner) = s.strip_prefix('(') {
         let (head, mut rest) = take_word(inner);
@@ -807,7 +816,7 @@ fn parse_one(s: &str) -> Option<(Ty, &str)> {
         loop {
             let r = rest.trim_start();
             if let Some(after) = r.strip_prefix(')') {
-                return Some((build(head, &args, &words, &rows)?, after));
+                return Some((build(syms, head, &args, &words, &rows)?, after));
             }
             if r.starts_with('(') {
                 // A row group is consumed whole and contributes a row, not a
@@ -815,7 +824,7 @@ fn parse_one(s: &str) -> Option<(Ty, &str)> {
                 let is_row = take_group(r)
                     .map(|(inner, _)| {
                         let w = inner.split_whitespace().next().unwrap_or("");
-                        w == "row" || w == "empty"
+                        w == "row" || w == "empty" || w == "rowvar"
                     })
                     .unwrap_or(false);
                 if is_row {
@@ -824,7 +833,7 @@ fn parse_one(s: &str) -> Option<(Ty, &str)> {
                     rest = after;
                     continue;
                 }
-                let (t, after) = parse_one(r)?;
+                let (t, after) = parse_one(syms, r)?;
                 args.push(t);
                 rest = after;
             } else {
@@ -860,12 +869,16 @@ fn atom(w: &str) -> Option<Ty> {
         "error" => Ty::Error,
         "proof" => Ty::Proof,
         "real" => Ty::Real(RealWidth::F64, RealMode::Default),
+        "real-trapping" => Ty::Real(RealWidth::F64, RealMode::Trapping),
+        "real-saturating" => Ty::Real(RealWidth::F64, RealMode::Saturating),
         "real-approx" => Ty::Real(RealWidth::F32, RealMode::Default),
+        "real-approx-trapping" => Ty::Real(RealWidth::F32, RealMode::Trapping),
+        "real-approx-saturating" => Ty::Real(RealWidth::F32, RealMode::Saturating),
         _ => return None,
     })
 }
 
-fn build(head: &str, args: &[Ty], words: &[String], rows: &[EffectRow]) -> Option<Ty> {
+fn build(syms: &SymTab, head: &str, args: &[Ty], words: &[String], rows: &[EffectRow]) -> Option<Ty> {
     Some(match head {
         // `(fn A ROW B)` -- the row contributes no Ty, so A and B are args 0/1,
         // and the row itself is CARRIED rather than defaulted away: its labels
@@ -880,6 +893,27 @@ fn build(head: &str, args: &[Ty], words: &[String], rows: &[EffectRow]) -> Optio
         "forall" => Ty::ForAll(words.first()?.parse().ok()?, Box::new(args.first()?.clone())),
         "foralleff" => Ty::ForAllEff(words.first()?.parse().ok()?, Box::new(args.first()?.clone())),
         "list" => Ty::List(Box::new(args.first()?.clone())),
+        "llist" => Ty::LinkedList(Box::new(args.first()?.clone())),
+        "vec" => Ty::Vector(words.first()?.parse().ok()?, Box::new(args.first()?.clone())),
+        "vec-mask" => Ty::VectorMask(words.first()?.parse().ok()?),
+        "propeq" => Ty::PropEq(
+            Box::new(args.first()?.clone()),
+            Box::new(args.get(1)?.clone()),
+        ),
+        "tyapply" => Ty::TypeApply(
+            Box::new(args.first()?.clone()),
+            Box::new(args.get(1)?.clone()),
+        ),
+        // **A CONSTRUCTOR THIS CHAPTER NEVER SPELLS IS REFUSED, NOT DEFAULTED.**
+        // The name is a `Sym` and interning one here would need a mutable
+        // table the checker does not hold; `Sym::default()` would print some
+        // other chapter's first name into a graded `tb` line. So a chapter
+        // that calls `read-line` without ever naming `Maybe` loses the builtin
+        // rather than gaining a wrong one, and the gap is visible.
+        "ctd" => Ty::Constructed(syms.find(words.first()?)?, args.to_vec()),
+        // The effect NAMES a builtin declares are not carried: `infer-name`
+        // answers the inner type and hands the row to its caller, so they
+        // never reach this wire through a reference. See the probe.
         "eff" => Ty::Effectful(Vec::new(), Vec::new(), Box::new(args.first()?.clone())),
         _ => return None,
     })
@@ -893,7 +927,7 @@ pub fn builtin_env(syms: &SymTab) -> TyEnv<'_> {
     for (n, s) in crate::builtins::BUILTIN_TYPES {
         // A builtin the chapter never names cannot be what any symbol here
         // means, so it needs no binding.
-        let (Some(sym), Some(t)) = (syms.find(n), parse_ty(s)) else { continue };
+        let (Some(sym), Some(t)) = (syms.find(n), parse_ty(syms, s)) else { continue };
         env.bind(sym, t);
     }
     env

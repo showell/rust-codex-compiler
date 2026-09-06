@@ -76,6 +76,14 @@ def main():
             why[reason] += 1
         elif r.stdout == oracle:
             verdict, detail = "agree", f"{len(r.stdout)} bytes"
+        elif not oracle.startswith("(chapter"):
+            # **THE ORACLE REFUSED THE PROGRAM AND WE DID NOT.** Counted apart
+            # because it is not a lowering diff: these are the corpus's
+            # NEGATIVE tests, and we emit IR for them because there is no
+            # diagnostics layer here yet to reject one. Folding them into
+            # DIFFERS made the smallest sixty programs read as 41 disagreements
+            # when four were about lowering at all.
+            verdict, detail = "no-diagnosis", oracle.strip().split(";")[0][:60]
         else:
             verdict = "DIFFERS"
             detail = f"{len(r.stdout)} vs codexir {len(oracle)}"
