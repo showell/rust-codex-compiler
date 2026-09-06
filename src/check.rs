@@ -790,14 +790,43 @@ fn register_ctors(ch: &crate::ast::Chapter, tds: &TypeDefs, st: &mut UnifyState)
     for td in &ch.type_defs {
         let (name, params, ctors) = match td {
             TypeDef::Variant(n, ps, cs, _) => (n, ps, cs),
-            TypeDef::Record(n, ps, ..) => {
-                let ty = Ty::Record(*n, ps.iter().map(|p| Ty::TypeCon(*p)).collect());
+            // **A RECORD'S NAME IS BOUND TO ITS CONSTRUCTOR ARROW**, not to
+            // the record type: `build-record-ctor-type` folds the fields into
+            // `f1 -> f2 -> ... -> R`, and `ARecordExpr` instantiates that to
+            // get the field types. Binding the RecordTy itself reads back as
+            // `rec:R` where the oracle says `fn`.
+            TypeDef::Record(n, ps, fields, ..) => {
+                let result = Ty::Record(*n, ps.iter().map(|p| Ty::TypeCon(*p)).collect());
+                let ty = fields.iter().rev().fold(result, |acc, f| {
+                    match resolve_declared(&ch.syms, tds, &f.type_expr) {
+                        Some(a) => Ty::Fun(Box::new(a), EffectRow::default(), Box::new(acc)),
+                        None => acc,
+                    }
+                });
                 out.push(Binding { name: *n, ty: parameterize(&ty, &ch.syms, st) });
                 continue;
             }
             TypeDef::Unit(..) => continue,
         };
-        let result = Ty::Constructed(*name, params.iter().map(|p| Ty::TypeCon(*p)).collect());
+        // **A VARIANT WITH NO TYPE PARAMETERS ANSWERS THE SUM ITSELF.**
+        // `register-one-type-def`: `result-ty = if list-length type-params == 0
+        // then sum-ty else ConstructedTy name (params)`. It is why a nullary
+        // constructor of `CharClass` binds as `sum:CharClass` and not
+        // `con:CharClass`.
+        let args: Vec<Ty> = params.iter().map(|p| Ty::TypeCon(*p)).collect();
+        // **THE TYPE NAME IS BOUND TO THE SUM, ALWAYS**, and is NOT
+        // parameterised -- `Box (a) = | MkBox (a)` costs one variable, not two.
+        out.push(Binding { name: *name, ty: Ty::Sum(*name, args.clone()) });
+        // **WHAT A CONSTRUCTOR ANSWERS IS CONDITIONAL, AND THAT IS SEPARATE.**
+        // `register-one-type-def`: `result-ty = if list-length type-params == 0
+        // then sum-ty else ConstructedTy name (params)`. It is why a nullary
+        // constructor of `CharClass` binds as `sum:CharClass` and a
+        // constructor of `Maybe (a)` as `con:Maybe`.
+        let result = if params.is_empty() {
+            Ty::Sum(*name, Vec::new())
+        } else {
+            Ty::Constructed(*name, args)
+        };
         for c in ctors {
             // Right to left: the spine is built inside out, so the first field
             // ends up the outermost argument.
@@ -1259,13 +1288,26 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
         }
         // A record literal is the other site `record-expr-type` is populated
         // from (Unifier.codex:131).
+        //
+        // **IT INSTANTIATES THE RECORD'S OWN CONSTRUCTOR BEFORE IT LOOKS AT A
+        // FIELD.** `ARecordExpr` (TypeCheckerInference.codex:1678) reads the
+        // name out of the environment, instantiates it, and only then infers
+        // the field values -- so a record carrying a type parameter costs one
+        // fresh variable at every USE, not just at its declaration. What is
+        // recorded at the span is the RESULT type, the constructor's arrows
+        // peeled off.
         E::Record(n, fields, sp) => {
+            let raw = env.get(*n).cloned().unwrap_or(Ty::Error);
+            let inst = st.instantiate(&raw);
+            let mut result = inst;
+            while let Ty::Fun(_, _, r) = result {
+                result = *r;
+            }
             for f in fields {
                 let _ = infer(&f.value, env, st);
             }
-            let t = Ty::Record(*n, Vec::new());
-            st.record_expr_type(*sp, t.clone());
-            return t;
+            st.record_expr_type(*sp, result.clone());
+            return result;
         }
         // **A FIELD ACCESS ON A TYPE THAT IS NOT A RECORD MINTS A FRESH
         // VARIABLE**, which is most of them here: the field's type comes from

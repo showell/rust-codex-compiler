@@ -612,7 +612,7 @@ impl<'a> Desugar<'a> {
                 c.fields.iter().any(|f| type_names(f, *name))
             });
             if names_itself {
-                out.push(self.eq_def(*name, ctors, &ch.syms));
+                out.push(self.eq_def(*name, ctors));
             }
         }
         ch.defs.extend(out);
@@ -626,8 +626,13 @@ impl<'a> Desugar<'a> {
     /// skips a synthetic span, so none of these names reaches `expr-types`.
     /// That is why `expr-types` already matched on units whose `next-id` did
     /// not -- the missing definitions mint variables and record nothing.
-    fn eq_def(&self, tname: Name, ctors: &[VariantCtorDef], syms: &SymTab) -> Def {
+    fn eq_def(&self, tname: Name, ctors: &[VariantCtorDef]) -> Def {
         let sp = Span::default();
+        // **THE LIVE TABLE, NOT THE CHAPTER'S.** `ch.syms` is filled by the
+        // `take` on the line after this runs, so reading a name out of it here
+        // answers `<not this table>` -- which is what every derived definition
+        // was called, and would have collided them all onto one name.
+        let eq_name = format!("__eq_{}", self.syms.borrow().text(tname));
         let (xn, yn) = (self.sym_str("__ex"), self.sym_str("__ey"));
         let tref = TypeExpr::Named(tname, sp);
         let boolean = TypeExpr::Named(self.sym_str("Boolean"), sp);
@@ -676,7 +681,7 @@ impl<'a> Desugar<'a> {
             })
             .collect();
         Def {
-            name: self.sym_str(&format!("__eq_{}", syms.text(tname))),
+            name: self.sym_str(&eq_name),
             params: vec![Param { name: xn, span: sp }, Param { name: yn, span: sp }],
             declared_type: vec![TypeExpr::Fun(
                 Rc::new(tref.clone()),
