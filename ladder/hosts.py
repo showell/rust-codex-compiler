@@ -90,6 +90,31 @@ def _cap_memory():
     resource.setrlimit(resource.RLIMIT_AS, (MEM_LIMIT, MEM_LIMIT))
 
 
+def refuse_a_stale_binary(*bins):
+    """**A BINARY OLDER THAN ITS SOURCE IS NOT THE PROGRAM YOU THINK.**
+
+    `CARGO_TARGET_DIR` is not set in a plain shell, so `cargo build --release`
+    writes to `./target/release` while this script reads
+    `~/build/rust-target/release`. Both exist. Nothing warns. A whole
+    verification -- twelve programs, several minutes -- was run against a
+    codexrun eleven hours older than the fix it was meant to test, and reported
+    that the fix changed nothing.
+
+    Compares against the newest file under `src/`, which is what `cargo` itself
+    would rebuild from.
+    """
+    src = pathlib.Path(__file__).resolve().parent.parent / "src"
+    if not src.is_dir():
+        return
+    newest = max((p.stat().st_mtime for p in src.rglob("*.rs")), default=0)
+    for b in bins:
+        if b.is_file() and b.stat().st_mtime < newest:
+            raise SystemExit(
+                f"REFUSED: {b} is older than src/. Build with\n"
+                f"    CARGO_TARGET_DIR={b.parent.parent} cargo build --release"
+            )
+
+
 def main():
     if len(sys.argv) < 3:
         raise SystemExit(__doc__)
@@ -99,6 +124,7 @@ def main():
     for b in (BIN, CODEXIR):
         if not b.is_file():
             raise SystemExit(f"no {b.name} at {b}")
+    refuse_a_stale_binary(BIN)
 
     tally = {}
     for arg in sys.argv[2:]:

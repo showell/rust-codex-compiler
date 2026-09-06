@@ -167,11 +167,80 @@ impl<T> std::ops::Deref for Cell<T> {
 pub struct Str {
     pub addr: i64,
     s: String,
+    /// **The byte offset of every CCE unit, and `None` when they are the
+    /// byte offsets.**
+    ///
+    /// A Codex `Text` is a sequence of CCE units, one per character, so
+    /// `text-length "café!"` is 5 where the UTF-8 is six bytes. On ASCII the
+    /// two indices coincide and this stays `None`, which is the case that
+    /// matters: the compiler's own source is ASCII and the lexer indexes it
+    /// constantly.
+    ///
+    /// **IT IS AN INDEX AND NOT A FLAG BECAUSE ONE CHARACTER POISONS A WHOLE
+    /// TEXT.** A single Cyrillic letter in one section title makes the entire
+    /// 3.4 MB unit non-ASCII, and walking `char_indices()` per lookup made
+    /// every `substring` O(n) against it: `gopfish-scene` went from 35 seconds
+    /// to 179, and it is the SOURCE being scanned, not the section title.
+    /// Built once per non-ASCII text, four bytes a unit, and every lookup
+    /// after it is a subscript.
+    units: Option<Box<[u32]>>,
 }
 
 impl Str {
+    /// The one place the index is decided, so it cannot disagree with `s`.
+    pub fn new(addr: i64, s: String) -> Str {
+        let units = if s.is_ascii() {
+            None
+        } else {
+            Some(s.char_indices().map(|(i, _)| i as u32).collect::<Vec<_>>().into_boxed_slice())
+        };
+        Str { addr, s, units }
+    }
+
     pub fn as_str(&self) -> &str {
         &self.s
+    }
+
+    /// The length in CCE units: characters, not bytes.
+    pub fn units(&self) -> usize {
+        match &self.units {
+            None => self.s.len(),
+            Some(ix) => ix.len(),
+        }
+    }
+
+    /// The byte range of `len` units from `start`, clamped as upstream clamps.
+    fn byte_range(&self, start: i64, len: i64) -> (usize, usize) {
+        let n = self.units();
+        let a = start.clamp(0, n as i64) as usize;
+        let z = (a + len.max(0) as usize).min(n);
+        match &self.units {
+            None => (a, z),
+            Some(ix) => (
+                ix.get(a).copied().unwrap_or(self.s.len() as u32) as usize,
+                ix.get(z).copied().unwrap_or(self.s.len() as u32) as usize,
+            ),
+        }
+    }
+
+    /// The character at a unit index.
+    pub fn unit_at(&self, i: i64) -> Option<char> {
+        if i < 0 || i as usize >= self.units() {
+            return None;
+        }
+        match &self.units {
+            None => Some(self.s.as_bytes()[i as usize] as char),
+            Some(ix) => self.s[ix[i as usize] as usize..].chars().next(),
+        }
+    }
+
+    /// `len` units from `start`. **Slicing on unit boundaries is the point**:
+    /// the byte-indexed version cut multi-byte sequences in half and re-encoded
+    /// the halves through `from_utf8_lossy`, so a one-unit slice of `café`
+    /// came back three bytes long as U+FFFD.
+    pub fn unit_slice(&self, start: i64, len: i64) -> &str {
+        let (a, z) = self.byte_range(start, len);
+        &self.s[a..z]
     }
 }
 
@@ -1377,7 +1446,7 @@ impl Interp {
 
     fn text(&mut self, s: String) -> R<Value> {
         let addr = self.bump.alloc(s.len() as i64);
-        Ok(Value::Text(Rc::new(Str { addr, s })))
+        Ok(Value::Text(Rc::new(Str::new(addr, s))))
     }
 
     fn builtin(&mut self, name: &str, args: Vec<Value>) -> R<Value> {
@@ -1404,19 +1473,20 @@ impl Interp {
                 let t = show(&self.syms, v);
                 self.text(t)
             }
-            ("text-length", [Text(t)]) => Ok(Int(t.len() as i64)),
+            ("text-length", [Text(t)]) => Ok(Int(t.units() as i64)),
             ("char-at", [Text(t), Int(i)]) => t
-                .as_bytes()
-                .get(*i as usize)
-                .map(|b| Char(*b as char))
+                .unit_at(*i)
+                .map(Char)
                 .ok_or_else(|| Error(format!("char-at {i} past the end"))),
-            // `char-code-at` indexes BYTES, and `char-code` is the private
-            // frequency alphabet -- not ASCII. `char-code 'A'` is 41.
-            ("char-code-at", [Text(t), Int(i)]) => Ok(Int(t
-                .as_bytes()
-                .get(*i as usize)
-                .map(|b| char_code(*b as char))
-                .unwrap_or(0))),
+            // `char-code-at` indexes CCE UNITS -- characters -- and `char-code`
+            // is the private frequency alphabet, not ASCII: `char-code 'A'` is
+            // 41 and `char-code 'é'` is 97. Indexing BYTES here answered 0
+            // twice for every non-ASCII character, and `code-to-char 0` is NUL,
+            // which is what put a run of NULs where ten corpus programs' IR
+            // should carry the section title `Cyrillic (CCE 113-127 -> а о е)`.
+            ("char-code-at", [Text(t), Int(i)]) => {
+                Ok(Int(t.unit_at(*i).map(char_code).unwrap_or(0)))
+            }
             ("char-code", [Char(c)]) => Ok(Int(char_code(*c))),
             ("code-to-char", [Int(c)]) => Ok(Char(code_to_char(*c))),
             ("char-to-text" | "char-encode", [Char(c)]) => {
@@ -1424,9 +1494,7 @@ impl Interp {
                 self.text(t)
             }
             ("substring", [Text(t), Int(start), Int(len)]) => {
-                let b = t.as_bytes();
-                let s = (*start).clamp(0, b.len() as i64) as usize;
-                let e = (s + (*len).max(0) as usize).min(b.len());
+                let piece = t.unit_slice(*start, *len);
                 // **A FULL-LENGTH SUBSTRING IS NOT A SUBSTRING, IT IS A COPY.**
                 // `substring t 0 (text-length t)` is the compiler's idiom for
                 // rematerialising a text it has decided is not durable --
@@ -1434,12 +1502,12 @@ impl Interp {
                 // way. Counting exactly that shape measures the bytes this arm
                 // copies BECAUSE its durability test cannot answer, and no
                 // ordinary substring is caught by it.
-                if s == 0 && e == b.len() {
+                if piece.len() == t.as_str().len() {
                     self.rematerialised += 1;
-                    self.rematerialised_bytes += e as u64;
+                    self.rematerialised_bytes += piece.len() as u64;
                 }
-                let t = String::from_utf8_lossy(&b[s..e]).into_owned();
-                self.text(t)
+                let owned = piece.to_string();
+                self.text(owned)
             }
             ("text-contains", [Text(a), Text(b)]) => Ok(Bool(a.contains(b.as_str()))),
             ("text-starts-with", [Text(a), Text(b)]) => Ok(Bool(a.starts_with(b.as_str()))),
@@ -1953,7 +2021,7 @@ pub(crate) fn literal(text: &str, kind: LiteralKind) -> R<Value> {
         LiteralKind::TextLit => {
             let s = unescape(text);
             let addr = crate::bump::intern_literal(s.len() as i64);
-            Ok(Value::Text(Rc::new(Str { addr, s })))
+            Ok(Value::Text(Rc::new(Str::new(addr, s))))
         }
         LiteralKind::CharLit => Ok(Value::Char(unescape(text).chars().next().unwrap_or('\0'))),
     }
@@ -1996,7 +2064,7 @@ fn binary(syms: &SymTab, bump: &mut crate::bump::Bump, op: BinaryOp, a: Value, b
     // Nested fns rather than closures: two closures cannot both hold the bump.
     fn cat(bump: &mut crate::bump::Bump, s: String) -> Value {
         let addr = bump.alloc(s.len() as i64);
-        Text(Rc::new(Str { addr, s }))
+        Text(Rc::new(Str::new(addr, s)))
     }
     fn mklist(bump: &mut crate::bump::Bump, cells: Vec<Value>) -> Value {
         let addr = bump.alloc(words(cells.len()));
@@ -2991,6 +3059,48 @@ mod tests {
     }
 
     /// Wrap a body in the smallest chapter that can hold it.
+    /// **A CODEX `Text` IS A SEQUENCE OF CCE UNITS, ONE PER CHARACTER.**
+    ///
+    /// Every number below was read off a native binary: `probe.codex`
+    /// transpiled with `codexzig` and run, at u56-candidate-sunday. On
+    /// `"café!"` -- six UTF-8 bytes, five characters -- it answers
+    ///
+    ///     len=5  sub31len=1  cca3=97  cca4=67  head3=caf  roundtrip=café!
+    ///
+    /// We answered 6, 3, 0 and 0: byte indexing, and `substring` re-encoding a
+    /// cut multi-byte sequence through `from_utf8_lossy`, so a one-unit slice
+    /// came back three bytes long as U+FFFD.
+    ///
+    /// This is what put NULs in ten corpus programs' IR. A cited chapter
+    /// carries the section title `Cyrillic (CCE 113-127 -> а о е ...)`, and
+    /// each of those characters read as two bytes that are each outside the
+    /// alphabet, so `char-code-at` answered 0 twice and `code-to-char 0` is
+    /// NUL. All ten differed from the oracle by exactly 61.
+    #[test]
+    fn a_text_is_indexed_by_character_not_by_byte() {
+        let probe = |expr: &str| {
+            out(&mem_body(&format!("print-line-uni (show ({expr}))"))).trim().to_string()
+        };
+        assert_eq!(probe(r#"text-length "café!""#), "5");
+        assert_eq!(probe(r#"text-length (substring "café!" 3 1)"#), "1");
+        assert_eq!(probe(r#"char-code-at "café!" 3"#), "97", "é is CCE 97");
+        assert_eq!(probe(r#"char-code-at "café!" 4"#), "67", "! is CCE 67");
+        assert_eq!(probe(r#"char-code-at (substring "café!" 3 1) 0"#), "97");
+        assert_eq!(probe(r#"text-length (substring "café!" 3 2)"#), "2");
+
+        // The text itself, not a count: a slice must round-trip through
+        // printing, which is where CCE becomes UTF-8 again.
+        let says = |expr: &str| out(&mem_body(&format!("print-line-uni ({expr})"))).trim().to_string();
+        assert_eq!(says(r#"substring "café!" 0 3"#), "caf");
+        assert_eq!(says(r#"substring "café!" 3 2"#), "é!");
+        assert_eq!(says(r#"substring "café!" 0 3 & substring "café!" 3 2"#), "café!");
+
+        // Cyrillic is the other half of the alphabet and behaves the same way.
+        assert_eq!(probe(r#"text-length "аое""#), "3");
+        assert_eq!(probe(r#"char-code-at "аое" 0"#), "113");
+        assert_eq!(says(r#"substring "аое" 1 2"#), "ое");
+    }
+
     fn mem_body(body: &str) -> String {
         format!("Chapter: T\n\nSection: E\n\n  opening : [Console] Nothing = act\n                 {body}\n  end\n")
     }
