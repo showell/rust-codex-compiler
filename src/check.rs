@@ -1178,9 +1178,16 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
                 st.record_expr_type(*sp, resolved);
             }
             match op {
-                OpEq | OpNotEq | OpLt | OpGt | OpLtEq | OpGtEq | OpAnd | OpBoolAnd | OpOr => {
-                    Ty::Boolean
-                }
+                // **`&` ANSWERS ITS LEFT OPERAND, BECAUSE IT IS TWO OPERATORS.**
+                // `infer-and` (TypeCheckerInference.codex:414) resolves the left
+                // type and dispatches: Boolean is a logical AND, anything else
+                // is an append. Answering Boolean unconditionally made
+                // `a & b & "!"` see a Boolean meeting a Text at the second `&`,
+                // which is a disagreement that is not in the program.
+                //
+                // `and` the KEYWORD is only ever logical, and so is `or`.
+                OpAnd => st.resolve(&lt),
+                OpEq | OpNotEq | OpLt | OpGt | OpLtEq | OpGtEq | OpBoolAnd | OpOr => Ty::Boolean,
                 _ => lt,
             }
         }

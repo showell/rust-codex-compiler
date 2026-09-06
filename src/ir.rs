@@ -216,7 +216,13 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
             Ok((format!("(int-lit {v})"), Ty::Integer(i64::MIN, i64::MAX, Overflow::Error)))
         }
         Expr::Lit(v, LiteralKind::TextLit, _) => Ok((format!("(text-lit {v})"), Ty::Text)),
-        Expr::Lit(v, LiteralKind::BoolLit, _) => Ok((format!("(bool-lit {v})"), Ty::Boolean)),
+        // **`true`, NOT `True`.** The source spells the constructor and the
+        // wire spells the VALUE, lowercase. Every program carrying a boolean
+        // literal differed by those two bytes.
+        Expr::Lit(v, LiteralKind::BoolLit, _) => Ok((
+            format!("(bool-lit {})", if v == "True" { "true" } else { "false" }),
+            Ty::Boolean,
+        )),
         Expr::Lit(_, k, _) => Err(format!("literal kind {k:?}")),
         // `(negate X TYPE)`, and the type is the OPERAND's -- negating does
         // not change it. `-n` is this; `0 - n` is a `binary sub-int` and the
@@ -296,15 +302,20 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
                 BinaryOp::OpGt => ("gt".into(), Ty::Boolean),
                 BinaryOp::OpLtEq => ("le".into(), Ty::Boolean),
                 BinaryOp::OpGtEq => ("ge".into(), Ty::Boolean),
-                BinaryOp::OpAnd | BinaryOp::OpBoolAnd => ("and".into(), Ty::Boolean),
-                BinaryOp::OpOr => ("or".into(), Ty::Boolean),
-                BinaryOp::OpAppend => match &lty {
+                // **ONE TOKEN, THREE ATOMS.** `&` is `and` over Booleans,
+                // `append-text` over Text and `append-list` over a List, and
+                // the OPERAND type is what picks. `and` the keyword is only
+                // ever logical.
+                BinaryOp::OpAnd | BinaryOp::OpAppend => match &lty {
+                    Ty::Boolean => ("and".to_string(), Ty::Boolean),
                     Ty::Text => ("append-text".to_string(), lty.clone()),
                     Ty::List(_) => ("append-list".to_string(), lty.clone()),
                     other => {
-                        return Err(format!("append on `{}`", render_ty(cx.syms, other)))
+                        return Err(format!("`&` on `{}`", render_ty(cx.syms, other)))
                     }
                 },
+                BinaryOp::OpBoolAnd => ("and".into(), Ty::Boolean),
+                BinaryOp::OpOr => ("or".into(), Ty::Boolean),
                 other => return Err(format!("binary op {other:?}")),
             };
             let rendered = render_ty(cx.syms, &ty);
@@ -474,7 +485,89 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
                 fty,
             ))
         }
+        // `(match SC (branches (branch PAT BODY GUARD) ...) TYPE)`. Every arm
+        // carries a guard -- an unguarded one carries `(bool-lit true)`, which
+        // the desugarer put there -- and the arms have already been unified
+        // into one type, so the first body's is the match's.
+        Expr::Match(scrut, arms, _) => {
+            let (st_, sty) = expr(scrut, cx)?;
+            let mut parts = String::new();
+            let mut ty: Option<Ty> = None;
+            for a in arms {
+                let pat = pattern(&a.pattern, &sty, cx)?;
+                let (body, bty) = expr(&a.body, cx)?;
+                let (guard, _) = expr(&a.guard, cx)?;
+                parts.push_str(&format!(" (branch {pat} {body} {guard})"));
+                ty.get_or_insert(bty);
+            }
+            let ty = ty.ok_or("a match with no arms")?;
+            let rendered = render_ty(cx.syms, &ty);
+            Ok((format!("(match {st_} (branches{parts}) {rendered})"), ty))
+        }
         other => Err(node_kind(other).to_string()),
+    }
+}
+
+/// One pattern. **A CONSTRUCTOR PATTERN CARRIES THE SCRUTINEE'S TYPE**, not its
+/// own result type, and its sub-patterns carry the FIELD types -- which come
+/// from the constructor's binding, peeled arrow by arrow.
+///
+/// A wildcard is the bare atom `wild-pat`, with no parentheses and no type.
+fn pattern(p: &crate::ast::Pat, scrut: &Ty, cx: &Lower) -> Result<String, String> {
+    use crate::ast::Pat as P;
+    match p {
+        P::Wild(_) => Ok("wild-pat".into()),
+        P::Var(n, _) => Ok(format!(
+            "(var-pat {:?} {})",
+            cx.syms.text(*n),
+            render_ty(cx.syms, scrut)
+        )),
+        P::Lit(v, _, _) => {
+            Ok(format!("(lit-pat {:?} {})", v, render_ty(cx.syms, scrut)))
+        }
+        P::Ctor(name, subs, _) => {
+            let bound = cx
+                .bindings
+                .get(name)
+                .ok_or_else(|| format!("no constructor `{}`", cx.syms.text(*name)))?;
+            // **A POLYMORPHIC CONSTRUCTOR IS REFUSED, NOT GUESSED AT.** Its
+            // field types are quantified, and instantiating one here would
+            // mint -- which lowering must not do. Substituting the scrutinee's
+            // arguments through the quantifier is the way in, and it needs its
+            // own measurement rather than an assumption.
+            let mut spine = match bound {
+                Ty::ForAll(..) | Ty::ForAllEff(..) => {
+                    return Err(format!(
+                        "polymorphic constructor `{}` in a pattern",
+                        cx.syms.text(*name)
+                    ))
+                }
+                other => other.clone(),
+            };
+            let mut out = String::new();
+            for sub in subs {
+                let field = match spine {
+                    Ty::Fun(a, _, r) => {
+                        spine = *r;
+                        cx.st.deep_resolve(&a)
+                    }
+                    _ => {
+                        return Err(format!(
+                            "`{}` takes fewer fields than the pattern binds",
+                            cx.syms.text(*name)
+                        ))
+                    }
+                };
+                out.push_str(&format!(" {}", pattern(sub, &field, cx)?));
+            }
+            Ok(format!(
+                "(ctor-pat {:?} (subs{}) {})",
+                cx.syms.text(*name),
+                out,
+                render_ty(cx.syms, scrut)
+            ))
+        }
+        P::Vec_(..) => Err("vector pattern".into()),
     }
 }
 
@@ -984,6 +1077,57 @@ mod tests {
             "got: {}",
             def_line(&left, "w")
         );
+    }
+
+    /// **A CONSTRUCTOR PATTERN CARRIES THE SCRUTINEE'S TYPE, A WILDCARD IS A
+    /// BARE ATOM, AND EVERY BRANCH HAS A GUARD.** An unguarded arm carries
+    /// `(bool-lit true)`, which the desugarer put there -- and note the
+    /// lowercase: the source spells the constructor `True`, the wire spells the
+    /// value.
+    #[test]
+    fn a_match_spells_its_patterns_against_the_scrutinee() {
+        let decl = "Chapter: T\n\nSection: S\n  M =\n    | Some (Integer)\n    | Nowt\n\n";
+        let calls = "\nSection: E\n  opening : [Console] Nothing = act\n   print-line-uni (show (unwrap (Some 1)))\n   print-line-uni (show (unwrap Nowt))\n  end\n";
+        let src = format!(
+            "{decl}  unwrap : M -> Integer\n  unwrap (m) = when m\n    is Some (x) -> x\n    is Nowt -> 0\n{calls}"
+        );
+        assert_eq!(
+            def_line(&src, "unwrap"),
+            r#"(def "unwrap" "T" (params (param "m" (sum "M" (args)))) (fn (sum "M" (args)) int-default) (match (name "m" (sum "M" (args))) (branches (branch (ctor-pat "Some" (subs (var-pat "x" int-default)) (sum "M" (args))) (name "x" int-default) (bool-lit true)) (branch (ctor-pat "Nowt" (subs) (sum "M" (args))) (int-lit 0) (bool-lit true))) int-default) 0 0)"#
+        );
+
+        let wild = format!(
+            "{decl}  unwrap : M -> Integer\n  unwrap (m) = when m\n    is Some (x) -> x\n    is otherwise -> 7\n{calls}"
+        );
+        assert!(
+            def_line(&wild, "unwrap").contains("(branch wild-pat (int-lit 7) (bool-lit true))"),
+            "got: {}",
+            def_line(&wild, "unwrap")
+        );
+    }
+
+    /// `True` in source is `true` on the wire -- the source names the
+    /// constructor, the wire carries the value.
+    #[test]
+    fn a_boolean_literal_is_lowercase_on_the_wire() {
+        let src = "Chapter: T\n\nSection: S\n  yes : Integer -> Boolean\n  yes (n) = True\n\nSection: E\n  opening : [Console] Nothing = act\n   print-line-uni (show (yes 1))\n   print-line-uni (show (yes 2))\n  end\n";
+        assert_eq!(
+            def_line(src, "yes"),
+            r#"(def "yes" "T" (params (param "n" int-default)) (fn int-default boolean) (bool-lit true) 0 0)"#
+        );
+    }
+
+    /// **ONE TOKEN, THREE ATOMS.** `&` is `and` over Booleans, `append-text`
+    /// over Text and `append-list` over a List, and the OPERAND type picks.
+    /// Inferring Boolean for it unconditionally made `a & b & "!"` see a
+    /// Boolean meeting a Text at the second `&` -- a disagreement that is not
+    /// in the program.
+    #[test]
+    fn the_ampersand_is_three_operators() {
+        let src = "Chapter: T\n\nSection: S\n  j : Text, Text -> Text\n  j (a) (b) = a & b & \"!\"\n\n  k : Boolean, Boolean -> Boolean\n  k (a) (b) = a & b\n\n  l : List Integer, List Integer -> List Integer\n  l (a) (b) = a & b\n\nSection: E\n  opening : [Console] Nothing = act\n   print-line-uni (j \"x\" \"y\")\n   print-line-uni (show (k True False))\n   print-line-uni (show (list-length (l [1] [2])))\n   print-line-uni (j \"p\" \"q\")\n  end\n";
+        assert!(def_line(src, "j").contains("(binary append-text (binary append-text"), "{}", def_line(src, "j"));
+        assert!(def_line(src, "k").contains("(binary and "), "{}", def_line(src, "k"));
+        assert!(def_line(src, "l").contains("(binary append-list "), "{}", def_line(src, "l"));
     }
 
     /// A pure definition still renders exactly as it did, which is the thing
