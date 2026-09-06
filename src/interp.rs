@@ -1671,6 +1671,23 @@ impl Interp {
                 Err(_) => err(format!("text-to-double-bits on {t:?}, which is not a Real")),
             },
 
+            // **THE WHOLE FILE, OR AN ERROR.** `cx_read_file_uni` panics on a
+            // path it cannot open and on a read that fails, and this refuses
+            // for the same reason: a missing subject that reads as an empty
+            // text is a compile of nothing that reports success.
+            //
+            // It goes through `self.text`, so the contents get an address like
+            // any other text -- the source a compile is about is the single
+            // biggest thing `copy-sx-text` will be asked about, and it has to
+            // be able to answer.
+            ("read-file-uni", [Text(path)]) => match std::fs::read(path.as_str()) {
+                Ok(bytes) => {
+                    let t = String::from_utf8_lossy(&bytes).into_owned();
+                    self.text(t)
+                }
+                Err(e) => err(format!("read-file-uni {:?}: {e}", path.as_str())),
+            },
+
             // **A HOSTED COMPILER HAS NO SELF TYPE TABLE, and answers the
             // EMPTY list.** Bare metal fills this from the type definitions it
             // was itself built with, which is how `pmap-selftest` resolves a
@@ -2826,6 +2843,37 @@ mod tests {
             "let a = __heap-save\n    in let __x = __heap-advance 536870912\n                 in print-line-uni (show (peek-qword (a + 400000000) 0) & \" \" & show (peek-byte (a + 12345678) 0))",
         );
         assert_eq!(out(&src).trim(), "0 0");
+    }
+
+    /// **A FILE COMES BACK WHOLE**, which is the only reason this builtin
+    /// exists here: the harness that drives a compile reads its subject with
+    /// `src <- read-file-uni "/dev/stdin"`, and without it a subject has to be
+    /// inlined as a Text literal -- which put the compiler in its own unit
+    /// TWICE and took the input to 6.9 MB, past the size the zig arm survives.
+    #[test]
+    fn a_file_comes_back_whole() {
+        let path = std::env::temp_dir().join("codexrun-read-test.txt");
+        let body = "Chapter: T\n  a line\n  and a \"quoted\" one\n";
+        std::fs::write(&path, body).unwrap();
+        let src = mem_body(&format!(
+            "let t = read-file-uni \"{}\"\n                 in print-line-uni (show (text-length t) & \" \" & show (text-contains t \"quoted\"))",
+            path.display()
+        ));
+        assert_eq!(out(&src).trim(), format!("{} True", body.len()));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// **A FILE THAT IS NOT THERE IS AN ERROR, NOT AN EMPTY TEXT.** The zig
+    /// plug panics -- `cx_read_file_uni: cannot open` -- and a silent empty
+    /// string would be a compile of nothing that reports success, which is the
+    /// exact shape of a green run that never ran.
+    #[test]
+    fn a_missing_file_is_refused_rather_than_empty() {
+        let src = mem_body(
+            "let t = read-file-uni \"/no/such/file/at/all\"\n                 in print-line-uni (show (text-length t))",
+        );
+        let e = std::panic::catch_unwind(|| out(&src));
+        assert!(e.is_err(), "a missing file must not read as an empty text");
     }
 
     /// Wrap a body in the smallest chapter that can hold it.
