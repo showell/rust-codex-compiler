@@ -44,150 +44,150 @@
 //! chapter emitted with half its defs is not comparable to anything.
 
 use crate::symbol::{Sym, SymTab};
-use crate::ast::{BinaryOp, Chapter, Expr, LiteralKind, TypeExpr};
-use crate::builtins::BUILTIN_IR_TYPES;
+use crate::ast::{BinaryOp, Chapter, Expr, LiteralKind};
+use crate::check::{Binding, Overflow, RealMode, RealWidth, Ty, UnifyState};
 use std::collections::BTreeMap;
 
-/// A source type name as the IR spells it. Only the primitives: anything else
-/// is a name this cannot resolve without the checker.
-fn atom(n: &str) -> Option<&'static str> {
-    Some(match n {
-        "Integer" => "int-default",
-        "Text" => "text",
-        "Boolean" => "boolean",
-        "Char" => "char",
-        "Nothing" => "nothing",
-        "Real" => "real",
-        _ => return None,
-    })
-}
-
-/// A declared type, in the IR's spelling. `A -> B` is `(fn A B)`; the arrow is
-/// right-associative and stays curried, which is what the golds show:
-/// `char-at` is `(fn text (fn int-default char))`.
-pub fn render_type(syms: &SymTab, t: &TypeExpr) -> Option<String> {
+/// A CHECKED type, as the IR spells it -- `ir-emit-type`
+/// (Emit/IRTextEmitter.codex:241), arm for arm.
+///
+/// TOTAL, where `render_type` below is partial. A `CodexType` is the checker's
+/// answer and every one of them has a spelling; a `TypeExpr` is a syntax tree
+/// with no answer for a name the checker resolves, which is why that one
+/// returns an Option and this one does not. The `otherwise` arm upstream keeps
+/// as a floor for a variant added later is the `_ =>` here.
+pub fn render_ty(syms: &SymTab, t: &Ty) -> String {
+    let q = |n: Sym| format!("{:?}", syms.text(n));
+    let list = |xs: &[Ty]| -> String {
+        xs.iter().map(|x| format!(" {}", render_ty(syms, x))).collect()
+    };
     match t {
-        TypeExpr::Named(n, _) => atom(syms.text(*n)).map(str::to_string),
-        TypeExpr::Fun(a, b, _) => {
-            Some(format!("(fn {} {})", render_type(syms, a)?, render_type(syms, b)?))
+        // `is-default-int` (line 104): the unbounded trapping integer, which
+        // is what a bare `Integer` means and most of what a gold carries.
+        Ty::Integer(lo, hi, m) if *lo == i64::MIN && *hi == i64::MAX && *m == Overflow::Error => {
+            "int-default".into()
         }
-        // `List a` is `(list a)` and `Vector a` is `(vector a)`. The golds
-        // carry 228,533 of the first, which makes it the cheapest thing in the
-        // language to be unable to spell.
-        // **`(scopes ...)` IS PARALLEL TO `(effs ...)`**, one string per
-        // effect and empty when that effect is unscoped -- three effects print
-        // `(scopes "" "" "")`. Read off real IR rather than reasoned about: a
-        // single empty list is what a reader expects and it is wrong for every
-        // definition with more than one effect.
-        TypeExpr::Effect(effs, scopes, _, result, _) => {
-            let names: Vec<String> =
-                effs.iter().map(|n| format!(" {:?}", syms.text(*n))).collect();
-            // A scope is written down only when there is one, so the list is
-            // padded to the effects rather than assumed to match.
-            let sc: Vec<String> = (0..effs.len())
-                .map(|i| format!(" {:?}", scopes.get(i).map_or("", |s| s.as_str())))
-                .collect();
-            Some(format!(
-                "(effectful (effs{}) (scopes{}) {})",
-                names.concat(),
-                sc.concat(),
-                render_type(syms, result)?
-            ))
-        }
-        TypeExpr::App(head, args, _) => match (&**head, args.as_slice()) {
-            (TypeExpr::Named(n, _), [only]) if syms.text(*n) == "List" => {
-                Some(format!("(list {})", render_type(syms, only)?))
+        Ty::Integer(lo, hi, m) => format!(
+            "(int {lo} {hi} {})",
+            match m {
+                Overflow::Error => "ov-error",
+                Overflow::Wrapping => "ov-wrap",
+                Overflow::Clamping => "ov-clamp",
             }
-            (TypeExpr::Named(n, _), [only]) if syms.text(*n) == "Vector" => {
-                Some(format!("(vector {})", render_type(syms, only)?))
-            }
-            _ => None,
+        ),
+        Ty::Real(w, m) => match (w, m) {
+            (RealWidth::F64, RealMode::Default) => "real".into(),
+            (RealWidth::F64, RealMode::Trapping) => "real-trapping".into(),
+            (RealWidth::F64, RealMode::Saturating) => "real-saturating".into(),
+            (RealWidth::F32, RealMode::Default) => "real-approx".into(),
+            (RealWidth::F32, RealMode::Trapping) => "real-approx-trapping".into(),
+            (RealWidth::F32, RealMode::Saturating) => "real-approx-saturating".into(),
         },
-        _ => None,
-    }
-}
-
-/// The shape of a type we cannot render, for the refusal histogram. A NAMED
-/// type reports its name, because "which named types are missing" and "which
-/// type constructors are missing" are different questions with different fixes.
-pub fn type_kind(syms: &SymTab, t: &TypeExpr) -> String {
-    match t {
-        TypeExpr::Named(n, _) => format!("Named {}", syms.text(*n)),
-        TypeExpr::Fun(a, b, _) => {
-            if render_type(syms, a).is_none() { type_kind(syms, a) } else { type_kind(syms, b) }
+        Ty::Text => "text".into(),
+        Ty::Boolean => "boolean".into(),
+        Ty::Char => "char".into(),
+        Ty::Void => "void".into(),
+        Ty::Nothing => "nothing".into(),
+        Ty::Error => "error".into(),
+        Ty::NoExpect => "noexpect".into(),
+        Ty::Fun(p, row, r) => format!(
+            "(fn {} {}{})",
+            render_ty(syms, p),
+            render_ty(syms, r),
+            render_row(syms, row)
+        ),
+        Ty::List(e) => format!("(list {})", render_ty(syms, e)),
+        Ty::LinkedList(e) => format!("(llist {})", render_ty(syms, e)),
+        Ty::Var(id) => format!("(tvar {id})"),
+        Ty::ForAll(id, b) => format!("(forall {id} {})", render_ty(syms, b)),
+        // A row quantifier is TRANSPARENT on this wire: upstream emits the
+        // body and drops the binder.
+        Ty::ForAllEff(_, b) => render_ty(syms, b),
+        Ty::Sum(n, a) => format!("(sum {} (args{}))", q(*n), list(a)),
+        Ty::Constructed(n, a) => format!("(ctd {} (args{}))", q(*n), list(a)),
+        Ty::Effectful(effs, sc, r) => format!(
+            "(effectful (effs{}) (scopes{}) {})",
+            effs.iter().map(|n| format!(" {}", q(*n))).collect::<String>(),
+            // A scope is written down only where there is one, so the list is
+            // PADDED to the effects: three effects print `(scopes "" "" "")`.
+            (0..effs.len())
+                .map(|i| format!(" {:?}", sc.get(i).map_or("", |x| x.as_str())))
+                .collect::<String>(),
+            render_ty(syms, r)
+        ),
+        Ty::Unit(n, inner) => format!("(unit {} {})", q(*n), render_ty(syms, inner)),
+        Ty::Vector(n, e) => format!("(vector {n} {})", render_ty(syms, e)),
+        Ty::VectorMask(n) => format!("(vector-mask {n})"),
+        Ty::Linear(inner) => render_ty(syms, inner),
+        Ty::Proof => "proof".into(),
+        Ty::PropEq(a, b) => format!("(propeq {} {})", render_ty(syms, a), render_ty(syms, b)),
+        Ty::TypeCon(n) => format!("(tycon {})", q(*n)),
+        Ty::TypeApply(f, a) => {
+            format!("(tyapply {} {})", render_ty(syms, f), render_ty(syms, a))
         }
-        TypeExpr::App(..) => "App (List a, Maybe a, ...)".into(),
-        TypeExpr::Effect(..) => "Effect row".into(),
-        TypeExpr::BoundedInt(..) => "BoundedInt".into(),
-        TypeExpr::PropEq(..) => "PropEq".into(),
-        TypeExpr::Constrained(..) => "Constrained".into(),
-        TypeExpr::Linear(..) => "Linear".into(),
-        TypeExpr::Forall(..) => "Forall".into(),
+        // `record-ty` recovers its arguments from the field variables when it
+        // has none of its own, and this carries no fields. Left as the floor
+        // it is rather than half-spelled.
+        Ty::Record(n, a) => format!("(record-ty {} (args{}))", q(*n), list(a)),
     }
 }
 
-/// Split `(fn A B)` into its argument and result. Balanced, not regex: `A` is
-/// itself a `(fn ...)` whenever the function takes a function.
-fn split_fn(ty: &str) -> Option<(&str, &str)> {
-    let inner = ty.strip_prefix("(fn ")?.strip_suffix(')')?;
-    let mut depth = 0usize;
-    for (i, c) in inner.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => depth = depth.checked_sub(1)?,
-            ' ' if depth == 0 => return Some((&inner[..i], &inner[i + 1..])),
-            _ => {}
-        }
+/// `ir-emit-row` (line 225). **ONLY A ROW CARRYING CONCRETE LABELS IS
+/// PUBLISHED.** An open row with no labels is a row variable, and rows are
+/// inert through the compiler's own stage 2 -- so a bare row variable is a
+/// fact no consumer can use, and publishing every one of them grew the IR text
+/// 15.4 per cent on `list-pattern` when upstream measured it.
+fn render_row(syms: &SymTab, row: &crate::check::EffectRow) -> String {
+    let _ = syms;
+    if row.labels.is_empty() {
+        return String::new();
     }
-    None
+    let labels: String = row
+        .labels
+        .iter()
+        .map(|(n, sc)| format!(" (label {n:?} {sc:?})"))
+        .collect();
+    format!(" (row (labels{}) {:?} {})", labels, row.tail, row.id)
 }
 
-/// Names in scope, with the type each one carries at a reference site.
-pub struct Env<'a> {
-    /// Carried so the functions below can spell a name without every one of
-    /// them taking a table -- `Env` was already threaded everywhere.
+/// **THE INPUTS `lower-chapter` TAKES.** Upstream's driver hands lowering
+/// `(checked.scoped) (checked.all-bindings) (checked.ust)` -- the chapter, the
+/// bindings the checker made, and the unification state -- and this carries
+/// the same three.
+///
+/// The `Env` that stood here built its own answer from declared types plus a
+/// table of 117 wire spellings, and could therefore never see a row the
+/// checker minted: `print-line-uni` is `(fn text nothing (row ... "" 6))` and
+/// the 6 is fib's own body's arithmetic. A static table has no way to hold it.
+///
+/// **NAMES ARE NOT LOOKED UP HERE AT ALL.** They are read out of `expr-types`
+/// by SPAN, which is what `lookup-expr-type (ctx.ust) sp` does upstream. That
+/// is not a shortcut: `fib` appears twice in its own body and the checker
+/// recorded a different row id at each occurrence, so a lookup by name would
+/// have to pick one and would be wrong about the other.
+pub struct Lower<'a> {
     syms: &'a SymTab,
-    /// **Keyed by symbol, not by text.** These are lookup-only -- nothing
-    /// iterates them -- so the key can be the four-byte name.
-    types: BTreeMap<Sym, String>,
-    locals: BTreeMap<Sym, String>,
+    st: &'a UnifyState,
+    /// This chapter's own definitions, keyed by name, for the `(def ...)`
+    /// headers. Bodies do not consult it.
+    bindings: BTreeMap<Sym, Ty>,
 }
 
-impl<'a> Env<'a> {
-    /// The builtins first, then this chapter's own declared types on top --
-    /// a chapter that defines `max` shadows the builtin, and the golds show
-    /// both spellings for that name.
-    pub fn new(ch: &Chapter) -> Env<'_> {
-        // A builtin this chapter never names cannot be what any symbol here
-        // means, so it needs no entry.
-        let mut types: BTreeMap<Sym, String> = BUILTIN_IR_TYPES
-            .iter()
-            .filter_map(|(n, t)| ch.syms.find(n).map(|s| (s, t.to_string())))
-            .collect();
-        for d in &ch.defs {
-            if let Some(dt) = d.declared_type.first().and_then(|t| render_type(&ch.syms, t)) {
-                types.insert(d.name, dt);
-            }
+impl<'a> Lower<'a> {
+    pub fn new(ch: &'a Chapter, bindings: &[Binding], st: &'a UnifyState) -> Lower<'a> {
+        Lower {
+            syms: &ch.syms,
+            st,
+            bindings: bindings.iter().map(|b| (b.name, b.ty.clone())).collect(),
         }
-        Env { syms: &ch.syms, types, locals: Default::default() }
     }
 
-    fn get(&self, n: Sym) -> Option<&str> {
-        self.locals.get(&n).or_else(|| self.types.get(&n)).map(String::as_str)
-    }
-
-    /// One more name in scope, for a `let` body.
-    fn bind(&self, n: Sym, ty: &str) -> Env<'a> {
-        let mut l = self.locals.clone();
-        l.insert(n, ty.to_string());
-        Env { syms: self.syms, types: self.types.clone(), locals: l }
-    }
-
-    /// A definition's own parameters, in scope for its body only. They shadow:
-    /// a parameter named `max` is the parameter, not the builtin, which is the
-    /// same collision the golds show for that name.
-    fn with_locals(&self, locals: BTreeMap<Sym, String>) -> Env<'a> {
-        Env { syms: self.syms, types: self.types.clone(), locals }
+    /// The type the checker recorded at this exact source position, resolved
+    /// through the substitutions -- `deep-resolve (ctx.ust) (lookup-expr-type
+    /// (ctx.ust) sp)`. A HALF-resolved type reaches the wire as `(tvar 4)`
+    /// where the oracle spells `int-default`, so the walk is the deep one.
+    fn at(&self, sp: crate::ast::Span) -> Option<Ty> {
+        self.st.expr_type_at(sp).map(|t| self.st.deep_resolve(t))
     }
 }
 
@@ -197,37 +197,38 @@ impl<'a> Env<'a> {
 /// corpus refused 1,008 of 1,012 units and nothing about which missing piece
 /// would buy the most, so the next node form got picked by guessing. A reason
 /// turns that into a histogram.
-fn expr(e: &Expr, env: &Env) -> Result<(String, String), String> {
+fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
     match e {
         // Literals carry no type of their own in the IR -- `(int-lit 1)`, not
         // `(int-lit 1 int-default)` -- but their type is needed by whatever
         // encloses them, so it is returned alongside.
         Expr::Lit(v, LiteralKind::IntLit, _) => {
-            Ok((format!("(int-lit {v})"), "int-default".into()))
+            Ok((format!("(int-lit {v})"), Ty::Integer(i64::MIN, i64::MAX, Overflow::Error)))
         }
-        Expr::Lit(v, LiteralKind::TextLit, _) => {
-            Ok((format!("(text-lit {v})"), "text".into()))
-        }
-        Expr::Lit(v, LiteralKind::BoolLit, _) => {
-            Ok((format!("(bool-lit {v})"), "boolean".into()))
-        }
+        Expr::Lit(v, LiteralKind::TextLit, _) => Ok((format!("(text-lit {v})"), Ty::Text)),
+        Expr::Lit(v, LiteralKind::BoolLit, _) => Ok((format!("(bool-lit {v})"), Ty::Boolean)),
         Expr::Lit(_, k, _) => Err(format!("literal kind {k:?}")),
-        Expr::NameRef(n, _) => match env.get(*n) {
-            Some(t) => {
-                let t = t.to_string();
-                Ok((format!("(name {:?} {})", env.syms.text(*n), t), t))
-            }
-            None => Err(format!("no type for name `{}`", env.syms.text(*n))),
+        // Straight out of `expr-types`, at this node's own span.
+        Expr::NameRef(n, sp) => match cx.at(*sp) {
+            Some(t) => Ok((
+                format!("(name {:?} {})", cx.syms.text(*n), render_ty(cx.syms, &t)),
+                t,
+            )),
+            None => Err(format!("the checker recorded no type at `{}`", cx.syms.text(*n))),
         },
         Expr::Apply(f, a, _) => {
-            let (ft, fty) = expr(f, env)?;
-            let (at, _aty) = expr(a, env)?;
+            let (ft, fty) = expr(f, cx)?;
+            let (at, _aty) = expr(a, cx)?;
             // The result of applying one argument is the arrow's right half.
             // A non-arrow here is an over-application, which is a real error
             // and not something to paper over with the same type back.
-            let (_arg, res) = split_fn(&fty)
-                .ok_or_else(|| format!("applying a non-arrow `{fty}`"))?;
-            Ok((format!("(apply {ft} {at} {res})"), res.to_string()))
+            let res = match fty {
+                Ty::Fun(_, _, r) => *r,
+                other => {
+                    return Err(format!("applying a non-arrow `{}`", render_ty(cx.syms, &other)))
+                }
+            };
+            Ok((format!("(apply {ft} {at} {})", render_ty(cx.syms, &res)), res))
         }
         // `(binary <op> L R <type>)`. THE OPERATOR NAME DEPENDS ON THE OPERAND
         // TYPE -- `add-int`, `add-num` and `add-vec` are three names for one
@@ -235,16 +236,20 @@ fn expr(e: &Expr, env: &Env) -> Result<(String, String), String> {
         // where it cannot tell. A comparison answers `boolean` whatever it
         // compared; arithmetic answers what it was given.
         Expr::Binary(l, op, r, _) => {
-            let (lt, lty) = expr(l, env)?;
-            let (rt, rty) = expr(r, env)?;
+            let (lt, lty) = expr(l, cx)?;
+            let (rt, rty) = expr(r, cx)?;
             if lty != rty {
-                return Err(format!("binary operands disagree: `{lty}` vs `{rty}`"));
+                return Err(format!(
+                    "binary operands disagree: `{}` vs `{}`",
+                    render_ty(cx.syms, &lty),
+                    render_ty(cx.syms, &rty)
+                ));
             }
             let arith = |stem: &str| -> Result<String, String> {
-                match lty.as_str() {
-                    "int-default" => Ok(format!("{stem}-int")),
-                    "real" => Ok(format!("{stem}-num")),
-                    other => Err(format!("{stem} on `{other}`")),
+                match &lty {
+                    Ty::Integer(..) => Ok(format!("{stem}-int")),
+                    Ty::Real(..) => Ok(format!("{stem}-num")),
+                    other => Err(format!("{stem} on `{}`", render_ty(cx.syms, other))),
                 }
             };
             let (name, ty) = match op {
@@ -252,33 +257,41 @@ fn expr(e: &Expr, env: &Env) -> Result<(String, String), String> {
                 BinaryOp::OpSub => (arith("sub")?, lty.clone()),
                 BinaryOp::OpMul => (arith("mul")?, lty.clone()),
                 BinaryOp::OpDiv => (arith("div")?, lty.clone()),
-                BinaryOp::OpEq => ("eq".into(), "boolean".to_string()),
-                BinaryOp::OpNotEq => ("ne".into(), "boolean".to_string()),
-                BinaryOp::OpLt => ("lt".into(), "boolean".to_string()),
-                BinaryOp::OpGt => ("gt".into(), "boolean".to_string()),
-                BinaryOp::OpLtEq => ("le".into(), "boolean".to_string()),
-                BinaryOp::OpGtEq => ("ge".into(), "boolean".to_string()),
-                BinaryOp::OpAnd | BinaryOp::OpBoolAnd => ("and".into(), "boolean".to_string()),
-                BinaryOp::OpOr => ("or".into(), "boolean".to_string()),
-                BinaryOp::OpAppend => match lty.as_str() {
-                    "text" => ("append-text".to_string(), lty.clone()),
-                    s if s.starts_with("(list ") => ("append-list".to_string(), lty.clone()),
-                    other => return Err(format!("append on `{other}`")),
+                BinaryOp::OpEq => ("eq".into(), Ty::Boolean),
+                BinaryOp::OpNotEq => ("ne".into(), Ty::Boolean),
+                BinaryOp::OpLt => ("lt".into(), Ty::Boolean),
+                BinaryOp::OpGt => ("gt".into(), Ty::Boolean),
+                BinaryOp::OpLtEq => ("le".into(), Ty::Boolean),
+                BinaryOp::OpGtEq => ("ge".into(), Ty::Boolean),
+                BinaryOp::OpAnd | BinaryOp::OpBoolAnd => ("and".into(), Ty::Boolean),
+                BinaryOp::OpOr => ("or".into(), Ty::Boolean),
+                BinaryOp::OpAppend => match &lty {
+                    Ty::Text => ("append-text".to_string(), lty.clone()),
+                    Ty::List(_) => ("append-list".to_string(), lty.clone()),
+                    other => {
+                        return Err(format!("append on `{}`", render_ty(cx.syms, other)))
+                    }
                 },
                 other => return Err(format!("binary op {other:?}")),
             };
-            Ok((format!("(binary {name} {lt} {rt} {ty})"), ty))
+            let rendered = render_ty(cx.syms, &ty);
+            Ok((format!("(binary {name} {lt} {rt} {rendered})"), ty))
         }
         // `(if C T E <type>)`. The type is the BRANCHES', and both must agree
         // -- if they do not, this is not a place to pick one and move on.
         Expr::If(c, th, el, _) => {
-            let (ct, _) = expr(c, env)?;
-            let (tt, tty) = expr(th, env)?;
-            let (et, ety) = expr(el, env)?;
+            let (ct, _) = expr(c, cx)?;
+            let (tt, tty) = expr(th, cx)?;
+            let (et, ety) = expr(el, cx)?;
             if tty != ety {
-                return Err(format!("if branches disagree: `{tty}` vs `{ety}`"));
+                return Err(format!(
+                    "if branches disagree: `{}` vs `{}`",
+                    render_ty(cx.syms, &tty),
+                    render_ty(cx.syms, &ety)
+                ));
             }
-            Ok((format!("(if {ct} {tt} {et} {tty})"), tty))
+            let rendered = render_ty(cx.syms, &tty);
+            Ok((format!("(if {ct} {tt} {et} {rendered})"), tty))
         }
         // `(list-expr (elems ...) ELEM)` -- the trailing type is the ELEMENT's,
         // not the list's, checked against golds carrying text and nested-list
@@ -286,40 +299,53 @@ fn expr(e: &Expr, env: &Env) -> Result<(String, String), String> {
         // is `(list ELEM)`.
         //
         // An empty list has no element to read a type from and is refused: the
-        // type is in the context, which is the checker's job and not ours.
+        // type is in the context, which the checker decides and this does not.
         Expr::List(xs, _) => {
             if xs.is_empty() {
                 return Err("empty list literal (its type is in the context)".into());
             }
             let mut parts = Vec::new();
-            let mut elem: Option<String> = None;
+            let mut elem: Option<Ty> = None;
             for x in xs {
-                let (xt, xty) = expr(x, env)?;
+                let (xt, xty) = expr(x, cx)?;
                 match &elem {
                     None => elem = Some(xty),
                     Some(e) if *e == xty => {}
-                    Some(e) => return Err(format!("list elements disagree: `{e}` vs `{xty}`")),
+                    Some(e) => {
+                        return Err(format!(
+                            "list elements disagree: `{}` vs `{}`",
+                            render_ty(cx.syms, e),
+                            render_ty(cx.syms, &xty)
+                        ))
+                    }
                 }
                 parts.push(xt);
             }
             let e = elem.unwrap();
-            Ok((format!("(list-expr (elems {}) {})", parts.join(" "), e), format!("(list {e})")))
+            let rendered = render_ty(cx.syms, &e);
+            Ok((
+                format!("(list-expr (elems {}) {rendered})", parts.join(" ")),
+                Ty::List(Box::new(e)),
+            ))
         }
         // `(let "n" TYPE VALUE BODY)`, nested one deep per binding, and the
-        // let's own type is the BODY's -- a let evaluates to its body. Each
-        // binding is in scope for the ones after it and for the body.
+        // let's own type is the BODY's -- a let evaluates to its body.
         Expr::Let(binds, body, _) => {
-            let mut env2 = env.bind(Sym::default(), "");
             let mut heads = Vec::new();
             for b in binds {
-                let (vt, vty) = expr(&b.value, &env2)?;
-                heads.push((b.name.clone(), vty.clone(), vt));
-                env2 = env2.bind(b.name, &vty);
+                let (vt, vty) = expr(&b.value, cx)?;
+                heads.push((b.name, vty, vt));
             }
-            let (bt, bty) = expr(body, &env2)?;
+            let (bt, bty) = expr(body, cx)?;
             let mut out = bt;
             for (n, ty, v) in heads.into_iter().rev() {
-                out = format!("(let {:?} {} {} {})", env.syms.text(n), ty, v, out);
+                out = format!(
+                    "(let {:?} {} {} {})",
+                    cx.syms.text(n),
+                    render_ty(cx.syms, &ty),
+                    v,
+                    out
+                );
             }
             Ok((out, bty))
         }
@@ -328,35 +354,33 @@ fn expr(e: &Expr, env: &Env) -> Result<(String, String), String> {
         // with -- an act evaluates to its last statement, the same way a let
         // evaluates to its body.
         //
-        // A BIND IS IN SCOPE FOR THE STATEMENTS AFTER IT, which is the whole
-        // reason the environment is threaded rather than rebuilt: `x <- f ...`
-        // followed by a statement mentioning `x` is the ordinary shape, and an
-        // act that started each statement from the outer scope would refuse it
-        // as an undefined name.
-        //
         // A bind's written type is the type of what it binds. Upstream's row
         // arithmetic decides what the EFFECT of the block is; this is the
         // value side, which is all the wire carries here.
         Expr::Act(stmts, _) => {
-            let mut env2 = env.bind(Sym::default(), "");
             let mut parts = Vec::new();
-            let mut last = "nothing".to_string();
+            let mut last = Ty::Nothing;
             for st in stmts {
                 match st {
                     crate::ast::ActStmt::Exec(e, _) => {
-                        let (t, ty) = expr(e, &env2)?;
+                        let (t, ty) = expr(e, cx)?;
                         parts.push(format!("(do-exec {t})"));
                         last = ty;
                     }
                     crate::ast::ActStmt::Bind(n, e, _) => {
-                        let (t, ty) = expr(e, &env2)?;
-                        parts.push(format!("(do-bind {:?} {} {})", env.syms.text(*n), ty, t));
-                        env2 = env2.bind(*n, &ty);
+                        let (t, ty) = expr(e, cx)?;
+                        parts.push(format!(
+                            "(do-bind {:?} {} {})",
+                            cx.syms.text(*n),
+                            render_ty(cx.syms, &ty),
+                            t
+                        ));
                         last = ty;
                     }
                 }
             }
-            Ok((format!("(act (stmts {}) {})", parts.join(" "), last), last))
+            let rendered = render_ty(cx.syms, &last);
+            Ok((format!("(act (stmts {}) {rendered})", parts.join(" ")), last))
         }
         other => Err(node_kind(other).to_string()),
     }
@@ -410,8 +434,12 @@ pub const IR_EMIT_ROOTS: [&str; 6] = [
     "fat16-servicer-write",
 ];
 
+/// Check, then lower -- the driver's own two steps, in its own order
+/// (`opening.codex:798`). A caller that already has a `checked` hands it to
+/// `emit_defs_checked` instead of paying for a second pass.
 pub fn emit_defs(ch: &Chapter) -> Result<String, String> {
-    emit_defs_from(ch, &IR_EMIT_ROOTS)
+    let (bindings, st) = crate::check::check_chapter(ch);
+    emit_defs_checked(ch, &bindings, &st, &IR_EMIT_ROOTS)
 }
 
 /// Names reachable from the roots, following NameRefs through def bodies.
@@ -445,48 +473,56 @@ fn reachable(ch: &Chapter, roots: &[&str]) -> std::collections::BTreeSet<String>
     seen
 }
 
-pub fn emit_defs_from(ch: &Chapter, roots: &[&str]) -> Result<String, String> {
+pub fn emit_defs_checked(
+    ch: &Chapter,
+    bindings: &[Binding],
+    st: &UnifyState,
+    roots: &[&str],
+) -> Result<String, String> {
     let keep = reachable(ch, roots);
     if keep.is_empty() {
         return Err("no root reached: the chapter defines none of ir-emit-roots".into());
     }
-    let env = Env::new(ch);
+    let cx = Lower::new(ch, bindings, st);
     // The OPENER is the preamble's last line, so this contributes only the
     // definitions. `preamble::emit` ends at `  (defs` because that is where the
     // syntax-only part of a gold stops.
     let mut out = String::new();
     for d in ch.defs.iter().filter(|d| keep.contains(ch.syms.text(d.name))) {
-        let declared = match d.declared_type.first() {
+        // **THE CHECKER'S BINDING, NOT THE DECLARATION.** They agree wherever
+        // a definition declares a type and only the checker has an answer
+        // where one does not -- `register-all-defs` mints a variable for it,
+        // and that variable is what the arrow spine below has to peel.
+        let bound = match cx.bindings.get(&d.name) {
+            Some(t) => st.deep_resolve(t),
             None => {
-                return Err(format!(
-                    "`{}` has no declared type (needs the checker)",
-                    ch.syms.text(d.name)
-                ))
+                return Err(format!("`{}` was never bound by the checker", ch.syms.text(d.name)))
             }
-            Some(te) => match render_type(&ch.syms, te) {
-                Some(s) => s,
-                None => {
-                    return Err(format!("type not renderable: {}", type_kind(&ch.syms, te)))
-                }
-            },
         };
-        // Parameter types come from walking the declared arrow spine, which is
+        let declared = render_ty(&ch.syms, &bound);
+        // Parameter types come from walking the bound arrow spine, which is
         // the only place they are written down.
-        let mut rest: &str = &declared;
+        let mut rest = bound.clone();
         let mut params = String::new();
-        let mut locals: BTreeMap<Sym, String> = Default::default();
         for p in &d.params {
-            let (arg, res) = split_fn(rest)
-                .ok_or_else(|| {
-                format!("`{}` has more params than its type has arrows", ch.syms.text(d.name))
-            })?;
-            params.push_str(&format!(" (param {:?} {})", ch.syms.text(p.name), arg));
-            locals.insert(p.name, arg.to_string());
+            let (arg, res) = match rest {
+                Ty::Fun(a, _, r) => (*a, *r),
+                _ => {
+                    return Err(format!(
+                        "`{}` has more params than its type has arrows",
+                        ch.syms.text(d.name)
+                    ))
+                }
+            };
+            params.push_str(&format!(
+                " (param {:?} {})",
+                ch.syms.text(p.name),
+                render_ty(&ch.syms, &arg)
+            ));
             rest = res;
         }
-        let denv = env.with_locals(locals);
         let (body, _bty) =
-            expr(&d.body, &denv).map_err(|r| format!("{}: {r}", ch.syms.text(d.name)))?;
+            expr(&d.body, &cx).map_err(|r| format!("{}: {r}", ch.syms.text(d.name)))?;
         out.push_str(&format!(
             "\n  (def {:?} {:?} (params{}) {} {} 0 0)",
             ch.syms.text(d.name), d.chapter_slug, params, declared, body
@@ -669,20 +705,50 @@ mod tests {
         assert!(line.ends_with("int-default) 0 0)"), "the act ends with its last statement's type: {line}");
     }
 
-    /// **WHAT IS STILL MISSING, PINNED SO IT IS A TEST AND NOT A COMMENT.**
-    /// An effectful BUILTIN has no wire type here. Its spelling embeds a row
-    /// VARIABLE ID -- `print-line-uni` is
-    /// `(fn text nothing (row (labels (label "Console.Write" "")) "" 6))` --
-    /// and that 6 is minted by the checker: `fresh-row-id` is a +1 counter
-    /// fired from nine places, and defs the call never touches move the
-    /// number. A static table cannot carry it, so this refuses rather than
-    /// inventing one. Change this test when the checker can answer.
+    /// **THE ROW ID IS THE CHECKER'S, AND IT MOVES.** `print-line-uni` in a
+    /// chapter that applies nothing before it takes row 0; the same call in
+    /// fib takes row 6, because fib's own body left the counter there. The two
+    /// assertions differ in one digit and that digit is the entire reason a
+    /// static table could not answer this.
+    ///
+    /// Both read off `codexir` at `u56-candidate-sunday`. `f` is absent from
+    /// each because nothing calls it.
     #[test]
-    fn an_effectful_builtin_is_the_gap_that_needs_the_checker() {
+    fn an_effectful_builtin_carries_the_row_the_checker_minted() {
         let src = format!(
             "{PURE}Section: E\n  opening : [Console] Nothing = act\n   print-line-uni \"a\"\n  end\n"
         );
-        assert_eq!(ir(&src), "REFUSED: opening: no type for name `print-line-uni`");
+        assert_eq!(
+            def_line(&src, "opening"),
+            r#"(def "opening" "T" (params) (effectful (effs "Console") (scopes "") nothing) (act (stmts (do-exec (apply (name "print-line-uni" (fn text nothing (row (labels (label "Console.Write" "")) "" 0))) (text-lit "a") nothing))) nothing) 0 0)"#
+        );
+    }
+
+    /// **THE ORACLE'S OWN BYTES, FOR THE WHOLE SLICE SUBJECT.**
+    ///
+    /// `codexir < fib.codex` at `u56-candidate-sunday`, the two definition
+    /// lines verbatim. Everything the native road was missing is in the
+    /// `opening` line and nowhere else:
+    ///
+    ///   * `print-line-uni` carries the row the CHECKER minted -- id 6, which
+    ///     is what fib's own body leaves the counter at -- and no static table
+    ///     can answer that.
+    ///   * `show` is `(fn int-default text)`: a `forall` instantiated to a
+    ///     fresh variable, then UNIFIED with the argument through the
+    ///     application. Rendering the declared type gives `(fn (tvar 4) text)`.
+    ///   * every `apply` carries its RESOLVED result, which is the same
+    ///     substitution read a second time.
+    ///
+    /// `double` is absent because nothing calls it and `ir-prune-unreachable-roots`
+    /// runs before emission.
+    #[test]
+    fn fib_is_byte_identical_to_the_oracle() {
+        let src = "Chapter: Fib\n\nSection: Math\n  fib : Integer -> Integer\n  fib (n) =\n   if n <= 1 then n\n   else fib (n - 1) + fib (n - 2)\n\n  double : Integer -> Integer\n  double (n) = n + n\n\nSection: Main\n  opening : [Console] Nothing = act\n   print-line-uni (show (fib 20))\n  end\n";
+        assert_eq!(
+            ir(src),
+            "\n  (def \"fib\" \"Fib\" (params (param \"n\" int-default)) (fn int-default int-default) (if (binary le (name \"n\" int-default) (int-lit 1) boolean) (name \"n\" int-default) (binary add-int (apply (name \"fib\" (fn int-default int-default)) (binary sub-int (name \"n\" int-default) (int-lit 1) int-default) int-default) (apply (name \"fib\" (fn int-default int-default)) (binary sub-int (name \"n\" int-default) (int-lit 2) int-default) int-default) int-default) int-default) 0 0)\
+             \n  (def \"opening\" \"Fib\" (params) (effectful (effs \"Console\") (scopes \"\") nothing) (act (stmts (do-exec (apply (name \"print-line-uni\" (fn text nothing (row (labels (label \"Console.Write\" \"\")) \"\" 6))) (apply (name \"show\" (fn int-default text)) (apply (name \"fib\" (fn int-default int-default)) (int-lit 20) int-default) text) nothing))) nothing) 0 0)"
+        );
     }
 
     /// A pure definition still renders exactly as it did, which is the thing

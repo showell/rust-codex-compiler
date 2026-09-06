@@ -73,7 +73,9 @@ pub enum Ty {
     VectorMask(i64),
     TypeCon(Name),
     TypeApply(Box<Ty>, Box<Ty>),
-    ForAllEff(u32, Box<Ty>),
+    /// The quantified id is a ROW id, and row ids share `EffectRow`'s
+    /// signed spelling: -1 is "no tail", not row 4,294,967,295.
+    ForAllEff(i32, Box<Ty>),
     Linear(Box<Ty>),
 }
 
@@ -92,17 +94,32 @@ pub enum RealWidth {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RealMode {
+    /// `RmDefault`. The mode a bare `Real` carries, and the one that prints as
+    /// `real` rather than `real-trapping` -- a fourth mode of our own read as
+    /// trapping and would have spelled every Real on the wire wrong.
+    Default,
     Trapping,
     Saturating,
-    Approx,
 }
 
 /// An effect row. Empty is the common case and prints as nothing.
-#[derive(Clone, Debug, PartialEq, Default)]
+///
+/// **THE ID IS `-1` UNTIL SOMETHING MINTS ONE.** `empty-row`
+/// (CodexType.codex:74) is `tail-id = -1`, and `open-spine-rows` mints only
+/// where the tail is absent -- so a default of 0 is a row that already has an
+/// id, nothing would ever be minted, and every row the wire spells would be
+/// row zero.
+#[derive(Clone, Debug, PartialEq)]
 pub struct EffectRow {
     pub labels: Vec<(String, String)>,
     pub tail: String,
-    pub id: u32,
+    pub id: i32,
+}
+
+impl Default for EffectRow {
+    fn default() -> EffectRow {
+        EffectRow { labels: Vec::new(), tail: String::new(), id: -1 }
+    }
 }
 
 /// The name `type-kind` prints for a binding, from the check harness:
@@ -151,9 +168,31 @@ pub struct UnifyState {
     pub next_id: u32,
     /// Row ids are a SEPARATE counter from type-variable ids. `next-id` in the
     /// gold counts only the latter, so minting a row must not advance it.
-    pub next_row_id: u32,
-    pub expr_types: Vec<(Sym, Ty)>,
+    pub next_row_id: i32,
+    /// **KEYED BY SPAN, WHICH IS HOW LOWERING FINDS THEM.** Upstream's
+    /// `expr-types` is `List ExprTypeEntry` with a packed span for a key
+    /// (Unifier.codex:134), and `lower-chapter` reads it back with
+    /// `lookup-expr-type (ctx.ust) sp`. A map keyed by NAME cannot answer that
+    /// question at all: `fib` appears twice in its own body and the wire
+    /// spells a different row id at each.
+    pub expr_types: Vec<(u64, Ty)>,
     pub errors: usize,
+    /// Applications this unifier could not decide. **NOT `errors`:** a `false`
+    /// out of a partial unifier is our ignorance and not the program's fault,
+    /// and `check-errors` is graded against the oracle. Counted so the gap is
+    /// visible rather than swallowed.
+    pub unify_gaps: usize,
+}
+
+/// `expr-type-key` (Unifier.codex:133): file id in the top 16 bits, start
+/// offset in the middle 32, length capped at 65535 in the low 16 -- an exact
+/// 64-bit fit. Upstream's previous decimal packing aliased distinct spans
+/// past a megabyte of source, which is a trap worth not re-digging.
+///
+/// One file here, so the file id is the constant 1. It cannot be 0: upstream
+/// calls file id 0 SYNTHETIC and records nothing for it.
+pub fn expr_type_key(sp: crate::ast::Span) -> u64 {
+    (1u64 << 48) + (sp.offset as u64) * 65536 + (sp.len.min(65535) as u64)
 }
 
 impl Default for UnifyState {
@@ -169,6 +208,7 @@ impl Default for UnifyState {
             next_row_id: 0,
             expr_types: Vec::new(),
             errors: 0,
+            unify_gaps: 0,
         }
     }
 }
@@ -188,10 +228,232 @@ impl UnifyState {
     }
 
     /// A fresh effect-row id, on its own counter.
-    pub fn fresh_row(&mut self) -> u32 {
+    pub fn fresh_row(&mut self) -> i32 {
         let id = self.next_row_id;
         self.next_row_id += 1;
         id
+    }
+
+    /// `record-expr-type` (Unifier.codex:148). Appended unsorted, because a
+    /// record is on the hot path and a sort is not.
+    pub fn record_expr_type(&mut self, sp: crate::ast::Span, t: Ty) {
+        self.expr_types.push((expr_type_key(sp), t));
+    }
+
+    /// Sorted ONCE at the check/lower boundary, where upstream sorts it
+    /// (`TypeChecker.codex:2343`), so the lookups lowering does are a binary
+    /// search rather than a scan per node.
+    pub fn sort_expr_types(&mut self) {
+        self.expr_types.sort_by_key(|(k, _)| *k);
+    }
+
+    /// `lookup-expr-type`. Call `sort_expr_types` first -- unsorted, this
+    /// answers None for entries that are present, which is the silent half of
+    /// a wrong answer.
+    pub fn expr_type_at(&self, sp: crate::ast::Span) -> Option<&Ty> {
+        let k = expr_type_key(sp);
+        let i = self.expr_types.partition_point(|(e, _)| *e < k);
+        self.expr_types.get(i).filter(|(e, _)| *e == k).map(|(_, t)| t)
+    }
+
+    /// `instantiate-type` (TypeCheckerInference.codex:214): one fresh variable
+    /// per `forall` and one fresh ROW per `foralleff`, substituted for the
+    /// BOUND id alone. Replacing every variable in the body instead is the
+    /// same type with different ids the moment a type quantifies two.
+    pub fn instantiate(&mut self, t: &Ty) -> Ty {
+        match t {
+            Ty::ForAll(id, body) => {
+                let fr = self.fresh();
+                let b = subst_type_var(body, *id, &fr);
+                self.instantiate(&b)
+            }
+            Ty::ForAllEff(id, body) => {
+                let r = self.fresh_row();
+                let b = subst_row_var(body, *id, r);
+                self.instantiate(&b)
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// `open-spine-rows` (TypeCheckerInference.codex:188): **THE RESULT FIRST,
+    /// THEN THE ARROW HOLDING IT.** One row per arrow in the result chain, so
+    /// a two-parameter function costs two rows at every reference; the
+    /// innermost arrow takes the lower id. A row that already carries a tail
+    /// keeps it.
+    ///
+    /// The PARAMETER is not walked into. `double-it : (Integer -> Integer) ->
+    /// Integer` mints one row, not two -- measured on `codexcheck`, and the
+    /// difference is the whole reason this recurses on `r` alone.
+    pub fn open_spine_rows(&mut self, t: &Ty) -> Ty {
+        match t {
+            Ty::Fun(p, row, r) => {
+                let r2 = self.open_spine_rows(r);
+                let row2 = if row.id < 0 && row.tail.is_empty() {
+                    EffectRow { id: self.fresh_row(), ..row.clone() }
+                } else {
+                    row.clone()
+                };
+                Ty::Fun(p.clone(), row2, Box::new(r2))
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Follow a variable to what it was bound to, one level of structure.
+    /// `resolve` (Unifier.codex:101) reads `list-at substitutions id`, and a
+    /// slot holding itself is an unbound variable.
+    pub fn resolve(&self, t: &Ty) -> Ty {
+        let mut cur = t.clone();
+        // A cycle would be an occurs-check failure upstream refuses to build;
+        // the bound is here so a bug in this file cannot hang a compile.
+        for _ in 0..10_000 {
+            let Ty::Var(i) = cur else { return cur };
+            match self.substitutions.get(i as usize) {
+                Some(slot) if *slot != Ty::Var(i) => cur = slot.clone(),
+                _ => return cur,
+            }
+        }
+        cur
+    }
+
+    /// `deep-resolve`: every variable in the type, not just the outermost.
+    /// This is what lowering prints, so a half-resolved type reaches the wire
+    /// as `(tvar 4)` where the oracle spells `int-default`.
+    pub fn deep_resolve(&self, t: &Ty) -> Ty {
+        let t = self.resolve(t);
+        match t {
+            Ty::Fun(p, row, r) => Ty::Fun(
+                Box::new(self.deep_resolve(&p)),
+                row,
+                Box::new(self.deep_resolve(&r)),
+            ),
+            Ty::List(e) => Ty::List(Box::new(self.deep_resolve(&e))),
+            Ty::LinkedList(e) => Ty::LinkedList(Box::new(self.deep_resolve(&e))),
+            Ty::Linear(e) => Ty::Linear(Box::new(self.deep_resolve(&e))),
+            Ty::Effectful(e, sc, r) => {
+                Ty::Effectful(e, sc, Box::new(self.deep_resolve(&r)))
+            }
+            Ty::Sum(n, a) => Ty::Sum(n, a.iter().map(|x| self.deep_resolve(x)).collect()),
+            Ty::Record(n, a) => Ty::Record(n, a.iter().map(|x| self.deep_resolve(x)).collect()),
+            Ty::Constructed(n, a) => {
+                Ty::Constructed(n, a.iter().map(|x| self.deep_resolve(x)).collect())
+            }
+            Ty::Vector(n, e) => Ty::Vector(n, Box::new(self.deep_resolve(&e))),
+            Ty::Unit(n, e) => Ty::Unit(n, Box::new(self.deep_resolve(&e))),
+            other => other,
+        }
+    }
+
+    fn bind_var(&mut self, id: u32, t: Ty) {
+        if let Some(slot) = self.substitutions.get_mut(id as usize) {
+            *slot = t;
+        }
+    }
+
+    /// Enough of `unify` to bind what an application decided, which is the
+    /// whole of what an inferred type is made of: `show` reaches the wire as
+    /// `(fn int-default text)` only because its instantiated variable met the
+    /// argument here.
+    ///
+    /// **THE ROWS ARE NOT UNIFIED.** `ir-emit-row` publishes only a row
+    /// carrying concrete labels -- an open row is inert through the compiler's
+    /// own stage 2 -- so a row variable meeting a labelled row decides nothing
+    /// this wire can read, and pretending otherwise would move ids that are
+    /// graded.
+    pub fn unify(&mut self, a: &Ty, b: &Ty) -> bool {
+        let a = self.resolve(a);
+        let b = self.resolve(b);
+        match (&a, &b) {
+            // An error type has already been reported once. Unifying against
+            // it succeeds so one unknown name does not cascade.
+            (Ty::Error, _) | (_, Ty::Error) => true,
+            (Ty::Var(i), Ty::Var(j)) if i == j => true,
+            (Ty::Var(i), _) => {
+                self.bind_var(*i, b.clone());
+                true
+            }
+            (_, Ty::Var(j)) => {
+                self.bind_var(*j, a.clone());
+                true
+            }
+            (Ty::Fun(p1, _, r1), Ty::Fun(p2, _, r2)) => {
+                let (p1, r1, p2, r2) = (p1.clone(), r1.clone(), p2.clone(), r2.clone());
+                let l = self.unify(&p1, &p2);
+                let r = self.unify(&r1, &r2);
+                l && r
+            }
+            (Ty::List(x), Ty::List(y)) => {
+                let (x, y) = (x.clone(), y.clone());
+                self.unify(&x, &y)
+            }
+            _ => a == b,
+        }
+    }
+}
+
+/// Replace one BOUND type variable, by id. Everything else is carried through
+/// unchanged, including a nested `forall` that binds a different id.
+fn subst_type_var(t: &Ty, id: u32, with: &Ty) -> Ty {
+    match t {
+        Ty::Var(i) if *i == id => with.clone(),
+        Ty::Fun(p, row, r) => Ty::Fun(
+            Box::new(subst_type_var(p, id, with)),
+            row.clone(),
+            Box::new(subst_type_var(r, id, with)),
+        ),
+        Ty::List(e) => Ty::List(Box::new(subst_type_var(e, id, with))),
+        Ty::LinkedList(e) => Ty::LinkedList(Box::new(subst_type_var(e, id, with))),
+        Ty::Linear(e) => Ty::Linear(Box::new(subst_type_var(e, id, with))),
+        Ty::Effectful(e, sc, r) => Ty::Effectful(
+            e.clone(),
+            sc.clone(),
+            Box::new(subst_type_var(r, id, with)),
+        ),
+        Ty::Sum(n, a) => {
+            Ty::Sum(n.clone(), a.iter().map(|x| subst_type_var(x, id, with)).collect())
+        }
+        Ty::Record(n, a) => {
+            Ty::Record(n.clone(), a.iter().map(|x| subst_type_var(x, id, with)).collect())
+        }
+        Ty::Constructed(n, a) => Ty::Constructed(
+            n.clone(),
+            a.iter().map(|x| subst_type_var(x, id, with)).collect(),
+        ),
+        Ty::Vector(n, e) => Ty::Vector(*n, Box::new(subst_type_var(e, id, with))),
+        Ty::Unit(n, e) => Ty::Unit(n.clone(), Box::new(subst_type_var(e, id, with))),
+        // A quantifier that binds the SAME id shadows it, and the body below
+        // it is not ours to touch.
+        Ty::ForAll(i, _) if *i == id => t.clone(),
+        Ty::ForAll(i, b) => Ty::ForAll(*i, Box::new(subst_type_var(b, id, with))),
+        Ty::ForAllEff(i, b) => Ty::ForAllEff(*i, Box::new(subst_type_var(b, id, with))),
+        other => other.clone(),
+    }
+}
+
+/// Replace one BOUND row variable, by id -- `subst-row-var`, the row half of
+/// the same walk.
+fn subst_row_var(t: &Ty, id: i32, with: i32) -> Ty {
+    match t {
+        Ty::Fun(p, row, r) => {
+            let row2 = if row.id == id && row.tail.is_empty() {
+                EffectRow { id: with, ..row.clone() }
+            } else {
+                row.clone()
+            };
+            Ty::Fun(
+                Box::new(subst_row_var(p, id, with)),
+                row2,
+                Box::new(subst_row_var(r, id, with)),
+            )
+        }
+        Ty::List(e) => Ty::List(Box::new(subst_row_var(e, id, with))),
+        Ty::Effectful(e, sc, r) => {
+            Ty::Effectful(e.clone(), sc.clone(), Box::new(subst_row_var(r, id, with)))
+        }
+        Ty::ForAllEff(i, _) if *i == id => t.clone(),
+        Ty::ForAll(i, b) => Ty::ForAll(*i, Box::new(subst_row_var(b, id, with))),
+        other => other.clone(),
     }
 }
 
@@ -210,7 +472,7 @@ pub fn resolve_declared(syms: &SymTab, t: &crate::ast::TypeExpr) -> Option<Ty> {
             "Boolean" => Ty::Boolean,
             "Char" => Ty::Char,
             "Nothing" => Ty::Nothing,
-            "Real" => Ty::Real(RealWidth::F64, RealMode::Trapping),
+            "Real" => Ty::Real(RealWidth::F64, RealMode::Default),
             _ => Ty::TypeCon(n.clone()),
         },
         T::Fun(a, b, _) => Ty::Fun(
@@ -305,6 +567,9 @@ pub fn check_chapter(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState) {
             env.scope.pop();
         }
     }
+    // The check/lower boundary, where upstream sorts too: everything below
+    // this line looks entries up rather than appending them.
+    st.sort_expr_types();
     (bindings, st)
 }
 
@@ -350,23 +615,23 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
         // fires here is name inference. Counted on fib: 6 names in `fib`, 2 in
         // `double`, 3 in `opening` -- exactly the gold's `expr-types 11`.
         // Recording every expression instead gave 27.
-        E::NameRef(n, _) => {
+        E::NameRef(n, sp) => {
             // INSTANTIATING A FORALL MINTS. `show` is
             // `ForAllTy 0 (FunTy (TypeVar 0) empty-row TextTy)`, and opening
             // applies it -- the third of fib's three missing mints.
-            let t = match env.get(*n).cloned() {
-                Some(Ty::ForAll(_, body)) => {
-                    let fr = st.fresh();
-                    instantiate(&body, &fr)
+            let raw = env.get(*n).cloned();
+            let t = match raw {
+                Some(r) => {
+                    let inst = st.instantiate(&r);
+                    st.open_spine_rows(&inst)
                 }
-                Some(t) => t,
                 None => Ty::Error,
             };
-            // **A FUNCTION-TYPED NAME MINTS ONE ROW, HERE, BEFORE THE
-            // APPLICATION AROUND IT MINTS ANYTHING.** Instantiating the type
-            // gives its effect row a fresh id, and that id is what the wire
-            // spells: `print-line-uni` reaches the IR as
-            // `(fn text nothing (row (labels (label "Console.Write" "")) "" 0))`.
+            // **THE SPINE MINTS BEFORE THE APPLICATION AROUND IT MINTS
+            // ANYTHING**, which is what puts a row id on the wire: in fib,
+            // `print-line-uni` reaches the IR as
+            // `(fn text nothing (row (labels (label "Console.Write" "")) "" 6))`
+            // and 6 is where fib's own body left the counter.
             //
             // Measured, not reasoned: `print-line-uni (read-file-raw "f")` puts
             // Console.Write on row 0 and FileSystem.Read on row 1. Minting all
@@ -374,13 +639,15 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
             // builtin row 3, and minting them after would have given the OUTER
             // one the higher number. Only this order produces 0 and 1.
             //
-            // A name of non-function type mints nothing, which is what keeps
-            // `fib`'s four references to `n` off the counter.
-            if matches!(t, Ty::Fun(..)) {
-                let _ = st.fresh_row();
-            }
-            st.expr_types.push((*n, t.clone()));
-            return t;
+            // `infer-name` (TypeCheckerInference.codex:158) records the INNER
+            // type of an effectful name and hands the row to its caller: the
+            // value side is what this wire spells.
+            let rec = match t {
+                Ty::Effectful(_, _, inner) => *inner,
+                other => other,
+            };
+            st.record_expr_type(*sp, rec.clone());
+            return rec;
         }
         // A comparison answers Boolean; arithmetic answers its operands'.
         // Neither mints, which is why fib's five applications are not the
@@ -408,14 +675,29 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
         // application costs.
         E::Apply(f, a, _) => {
             let ft = infer(f, env, st);
-            let _at = infer(a, env, st);
+            let at = infer(a, env, st);
             let ret = st.fresh();
-            let _row = st.fresh_row();
-            let _row2 = st.fresh_row();
-            match ft {
-                Ty::Fun(_, _, r) => *r,
-                _ => ret,
+            let call_row = st.fresh_row();
+            // `row-union` mints the second (infer-application, line 645): two
+            // rows per application, on top of whatever the function position's
+            // own spine minted.
+            let _union_row = st.fresh_row();
+            // `unify st (fr.inferred-type) (FunTy passed-ty (row-var call-row-id) ret-ty)`
+            // -- and THIS is what decides an inferred type. `show`'s
+            // instantiated variable meets the argument here and nowhere else.
+            let want = Ty::Fun(
+                Box::new(at),
+                EffectRow { id: call_row, ..Default::default() },
+                Box::new(ret.clone()),
+            );
+            if !st.unify(&ft, &want) {
+                st.unify_gaps += 1;
             }
+            // **THE FRESH VARIABLE, NOT THE ARROW'S RIGHT HALF.** Upstream
+            // answers `ret-ty` and lets `deep-resolve` read it back later;
+            // peeling the arrow instead answers the same type only while the
+            // function's own type is already ground.
+            ret
         }
         E::Act(stmts, _) => {
             let mut last = Ty::Nothing;
@@ -438,20 +720,6 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
         _ => Ty::Error,
     };
     t
-}
-
-/// Replace the bound variable of a forall with a fresh one.
-fn instantiate(t: &Ty, fresh: &Ty) -> Ty {
-    match t {
-        Ty::Var(_) => fresh.clone(),
-        Ty::Fun(a, r, b) => Ty::Fun(
-            Box::new(instantiate(a, fresh)),
-            r.clone(),
-            Box::new(instantiate(b, fresh)),
-        ),
-        Ty::List(e) => Ty::List(Box::new(instantiate(e, fresh))),
-        other => other.clone(),
-    }
 }
 
 /// Names in scope during inference.
@@ -526,7 +794,7 @@ fn parse_row(inner: &str) -> EffectRow {
     } else {
         Vec::new()
     };
-    EffectRow { labels, tail: String::new(), id: 0 }
+    EffectRow { labels, ..Default::default() }
 }
 
 fn parse_one(s: &str) -> Option<(Ty, &str)> {
@@ -591,8 +859,8 @@ fn atom(w: &str) -> Option<Ty> {
         "void" => Ty::Void,
         "error" => Ty::Error,
         "proof" => Ty::Proof,
-        "real" => Ty::Real(RealWidth::F64, RealMode::Trapping),
-        "real-approx" => Ty::Real(RealWidth::F32, RealMode::Approx),
+        "real" => Ty::Real(RealWidth::F64, RealMode::Default),
+        "real-approx" => Ty::Real(RealWidth::F32, RealMode::Default),
         _ => return None,
     })
 }
@@ -636,7 +904,7 @@ mod tests {
     use super::*;
 
     /// `(next_id, next_row_id)` after checking one chapter.
-    fn counters(src: &str) -> (u32, u32) {
+    fn counters(src: &str) -> (u32, i32) {
         let bytes = src.as_bytes();
         let parsed = crate::parser::parse(bytes);
         let mut dg = crate::desugar::Desugar::new(bytes);
@@ -688,6 +956,37 @@ mod tests {
         assert_eq!(counters(&eff("print-line-uni (show 1)")), (5, 6));
         // Three applications, still one quantifier.
         assert_eq!(counters(&eff(r#"print-line-uni (show (text-length "xy"))"#)), (6, 9));
+    }
+
+    /// **A ROW IS MINTED PER ARROW IN THE RESULT SPINE, INNERMOST FIRST.**
+    ///
+    /// `open-spine-rows` (TypeCheckerInference.codex:188) recurses into the
+    /// RESULT before minting for the arrow it is holding, so a two-parameter
+    /// function costs TWO rows at every reference and a one-parameter function
+    /// costs one. "One row per function-typed name" agrees with the oracle on
+    /// every one-arrow subject and is wrong the moment a subject has two.
+    ///
+    /// Read off `codexcheck` at `u56-candidate-sunday`, one probe per row.
+    #[test]
+    fn a_row_is_minted_per_arrow_in_the_result_spine() {
+        let one = "  f : Integer -> Integer\n  f (x) = x\n\n  \
+                   h : Integer -> Integer\n  h (x) = f x\n";
+        assert_eq!(counters(&chapter(one)), (3, 3));
+
+        // Two arrows, saturated: two spine rows at the reference to `g`, then
+        // two applications at two rows each.
+        let two = "  g : Integer, Integer -> Integer\n  g (x) (y) = x\n\n  \
+                   h : Integer -> Integer\n  h (x) = g x x\n";
+        assert_eq!(counters(&chapter(two)), (4, 6));
+
+        // A function-typed PARAMETER is not walked into: the spine is the
+        // RESULT chain, so `double-it : (Integer -> Integer) -> Integer` mints
+        // one row and not two.
+        let partial = "  g : Integer, Integer -> Integer\n  g (x) (y) = x\n\n  \
+                       h : Integer -> Integer\n  h (x) = double-it (g x)\n\n  \
+                       double-it : (Integer -> Integer) -> Integer\n  \
+                       double-it (k) = k 1\n";
+        assert_eq!(counters(&chapter(partial)), (5, 10));
     }
 
     /// The slice subject, whole, and the two neighbours that isolate the
