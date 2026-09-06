@@ -30,6 +30,7 @@ unit carrying a carriage return, and fifteen `codex/foreword/*` chapters are
 CRLF. Reading in text mode is the normalising step that refusal asks the caller
 for, and it is what the corpus has always been resolved with.
 """
+import concurrent.futures as cf
 import os
 import pathlib
 import resource
@@ -57,6 +58,10 @@ CODEXIR = pathlib.Path(
 #
 # Four is still a guard -- it stops a runaway on an 8 GB box that runs one
 # program at a time -- and it is no longer the thing being measured.
+# Two, because the box has two cores. Overridable so a serial run stays
+# available for an A/B -- `HOSTS_WORKERS=1` reproduces the old behaviour
+# exactly, which is how the speedup below was measured.
+WORKERS = int(os.environ.get("HOSTS_WORKERS", "2"))
 MEM_LIMIT = 4 << 30
 RUN_TIMEOUT = 180
 ORACLE_TIMEOUT = 120
@@ -124,6 +129,65 @@ def refuse_a_stale_binary(*bins):
             )
 
 
+def grade(subject, arg):
+    """One program, both arms. Returns (name, verdict, secs, detail).
+
+    **PURE APART FROM ITS OWN TEMP FILES**, which is what lets two of these run
+    at once: `NamedTemporaryFile` names are unique per call, so two workers
+    cannot collide on a unit or an oracle input. Nothing here touches shared
+    state -- the tally is built by the caller from what this returns.
+    """
+    path = pathlib.Path(arg)
+    name = path.stem
+    unit_text, missing = resolve(path.resolve())
+    if missing:
+        return (name, "UNRESOLVED", 0.0,
+                "; ".join(f"{q}/{n}" for _, q, n in missing[:2]))
+
+    with tempfile.NamedTemporaryFile("w", suffix=".codex", delete=False) as f:
+        f.write(unit_text)
+        src_path = f.name
+    with tempfile.NamedTemporaryFile("w", suffix=".codex", delete=False) as f:
+        f.write(subject + HARNESS.format(src=src_path))
+        unit = f.name
+    t0 = time.time()
+    try:
+        r = subprocess.run([str(BIN), unit], capture_output=True, text=True,
+                           preexec_fn=_cap_memory, timeout=RUN_TIMEOUT)
+        ours, why = r.stdout.lstrip("\n"), None
+        if r.returncode != 0:
+            # **THE FIRST LINE, NOT THE LAST.** The last line of a Rust failure
+            # is boilerplate -- `note: run with RUST_BACKTRACE=1` grounds
+            # nothing -- and reporting it made an ordinary exhaustion of
+            # MEM_LIMIT read as an interpreter panic.
+            lines = r.stderr.strip().splitlines()
+            why = lines[0][:70] if lines else "nonzero"
+            if "memory allocation of" in r.stderr:
+                why = f"over MEM_LIMIT ({MEM_LIMIT >> 20} MB)"
+    except subprocess.TimeoutExpired:
+        ours, why = "", f"timed out at {RUN_TIMEOUT}s"
+    secs = time.time() - t0
+    os.unlink(unit)
+    with open(src_path, "rb") as fh:
+        o = subprocess.run([str(CODEXIR)], stdin=fh, capture_output=True,
+                           timeout=ORACLE_TIMEOUT)
+    oracle = o.stderr.decode("utf-8", "replace")
+    os.unlink(src_path)
+    # Raw bytes, both ways. Both harnesses pass the chapter literal "Program"
+    # and both refuse in `cir-halted`'s words, so there is nothing left for a
+    # normalising pass to be wrong about.
+    if why:
+        return (name, "REFUSED", secs, why)
+    if ours == oracle:
+        kind = "halt" if ours.startswith("CODEGEN-HALTED") else "bytes"
+        return (name, "agree", secs, f"{len(ours)} {kind}")
+    detail = f"{len(ours)} vs codexir {len(oracle)}"
+    halts = (ours.startswith("CODEGEN-HALTED"), oracle.startswith("CODEGEN-HALTED"))
+    if halts[0] != halts[1]:
+        detail += "  (one halted, one did not)"
+    return (name, "DIFFERS", secs, detail)
+
+
 def main():
     if len(sys.argv) < 3:
         raise SystemExit(__doc__)
@@ -136,63 +200,19 @@ def main():
     refuse_a_stale_binary(BIN)
 
     tally = {}
-    for arg in sys.argv[2:]:
-        path = pathlib.Path(arg)
-        name = path.stem
-        unit_text, missing = resolve(path.resolve())
-        if missing:
-            verdict = "UNRESOLVED"
-            detail = "; ".join(f"{q}/{n}" for _, q, n in missing[:2])
-        else:
-            with tempfile.NamedTemporaryFile("w", suffix=".codex", delete=False) as f:
-                f.write(unit_text)
-                src_path = f.name
-            with tempfile.NamedTemporaryFile("w", suffix=".codex", delete=False) as f:
-                f.write(subject + HARNESS.format(src=src_path))
-                unit = f.name
-            t0 = time.time()
-            try:
-                r = subprocess.run([str(BIN), unit], capture_output=True, text=True,
-                                   preexec_fn=_cap_memory, timeout=RUN_TIMEOUT)
-                ours, why = r.stdout.lstrip("\n"), None
-                if r.returncode != 0:
-                    # **THE FIRST LINE, NOT THE LAST.** The last line of a Rust
-                    # failure is boilerplate -- `note: run with RUST_BACKTRACE=1`
-                    # grounds nothing -- and reporting it made an ordinary
-                    # exhaustion of MEM_LIMIT read as an interpreter panic.
-                    # `browser-pane-fit` is that program: it aborts on
-                    # `memory allocation of 64 bytes failed` under the cap and
-                    # completes without one.
-                    lines = r.stderr.strip().splitlines()
-                    why = lines[0][:70] if lines else "nonzero"
-                    if "memory allocation of" in r.stderr:
-                        why = f"over MEM_LIMIT ({MEM_LIMIT >> 20} MB)"
-            except subprocess.TimeoutExpired:
-                ours, why = "", f"timed out at {RUN_TIMEOUT}s"
-            secs = time.time() - t0
-            os.unlink(unit)
-            with open(src_path, "rb") as fh:
-                o = subprocess.run([str(CODEXIR)], stdin=fh, capture_output=True,
-                                   timeout=ORACLE_TIMEOUT)
-            oracle = o.stderr.decode("utf-8", "replace")
-            os.unlink(src_path)
-            # Raw bytes, both ways. Both harnesses pass the chapter literal
-            # "Program" and both refuse in `cir-halted`'s words, so there is
-            # nothing left for a normalising pass to be wrong about.
-            if why:
-                verdict, detail = "REFUSED", why
-            elif ours == oracle:
-                kind = "halt" if ours.startswith("CODEGEN-HALTED") else "bytes"
-                verdict, detail = "agree", f"{len(ours)} {kind}"
-            else:
-                verdict = "DIFFERS"
-                detail = f"{len(ours)} vs codexir {len(oracle)}"
-                halts = (ours.startswith("CODEGEN-HALTED"), oracle.startswith("CODEGEN-HALTED"))
-                if halts[0] != halts[1]:
-                    detail += "  (one halted, one did not)"
-        tally[verdict] = tally.get(verdict, 0) + 1
-        print(f"{name:34} {verdict:11} {secs if not missing else 0:6.2f}s  {detail}",
-              flush=True)
+    # **TWO AT A TIME, ON A TWO-CORE BOX.** One program at a time left half the
+    # machine idle for the whole sweep. `codexrun` peaks around 600 MB and the
+    # cap is 4 GB each, so two fit with room; more than two would oversubscribe
+    # the cores and make every verdict's TIMING meaningless, which is a number
+    # this harness reports.
+    #
+    # Results are printed IN ORDER, not as they finish, so two runs of the same
+    # corpus produce diffable logs.
+    with cf.ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        for name, verdict, secs, detail in pool.map(
+                lambda a: grade(subject, a), sys.argv[2:]):
+            tally[verdict] = tally.get(verdict, 0) + 1
+            print(f"{name:34} {verdict:11} {secs:6.2f}s  {detail}", flush=True)
     print("\n" + "  ".join(f"{v}: {n}" for v, n in sorted(tally.items())), flush=True)
     return 1 if tally.get("DIFFERS") or tally.get("REFUSED") else 0
 
