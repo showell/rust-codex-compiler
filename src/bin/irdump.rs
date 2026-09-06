@@ -292,7 +292,16 @@ parameter (`compile-frontend source \"Program\" flags`), not a fact about the so
 /// The preamble ends at `  (defs`, `ir::emit_defs` contributes the definition
 /// lines, and the two closing parens shut `(defs` and `(chapter`.
 fn whole(path: &Path, chapter: Option<&str>) -> Result<String, String> {
-    let src = std::fs::read(path).map_err(|e| e.to_string())?;
+    // **RESOLVING IS THIS COMPILER'S JOB, AND IT IS IDEMPOTENT.** `load` fetches
+    // only the cites the file does not already carry, so a raw corpus program is
+    // resolved and a frozen unit is returned untouched. Reading the file raw
+    // here instead forced every caller to resolve first, and `cite_resolve.py`
+    // -- which appends unconditionally -- doubles a unit that is already whole:
+    // `normalize-eq` goes 4256 bytes to 7965, the duplicates parse and type, and
+    // the oracle halts on redefinitions in a file nobody wrote. Over the 28
+    // curated units that reported 20 as "the oracle refused the program", which
+    // is a believable number for a young front end and was entirely the harness.
+    let src = codexc::bundle::load(path)?;
     let parsed = parser::parse(&src);
     let head = preamble::emit(&parsed.tree, &src, chapter);
     let mut dg = codexc::desugar::Desugar::new(&src);
