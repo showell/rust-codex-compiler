@@ -373,7 +373,12 @@ impl<'a> Compiler<'a> {
         // `Nothing` are three of the eight that declare no type, and they are
         // constructors rather than anything to call.
         if self.syms.text(n).chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
-            return Code::Const(Value::Ctor(n, Rc::new(Vec::new())));
+            // A payload-free constructor folded at COMPILE time has a
+            // literal's lifetime -- built once, never freed -- so it gets a
+            // literal's address rather than one off a heap that does not
+            // exist yet.
+            let addr = crate::bump::intern_literal(8);
+            return Code::Const(Value::Ctor(n, Rc::new(crate::interp::Cell { addr, v: Vec::new() })));
         }
         if let Some(name) = self.names.builtin_undeclared.get(&n).copied() {
             return Code::Fail(format!(

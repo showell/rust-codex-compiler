@@ -49,7 +49,7 @@ pub enum Value {
     /// records the same symptom, so this is a transcribed defect and not a
     /// guess. `list-set-at` is the ONLY writer; `list-push`, `&` and `::` all
     /// allocate.
-    List(Rc<RefCell<Vec<Value>>>),
+    List(Rc<Cell<RefCell<Vec<Value>>>>),
     /// A record literal: its type name and its fields. A name is a four-byte
     /// `Sym`, so building a record copies nothing and this variant is the
     /// smallest thing that can carry two.
@@ -81,9 +81,9 @@ pub enum Value {
     ///
     /// `Rc<RefCell<..>>` is still one pointer, so `Value` stays 16 bytes -- the
     /// property that made `Rc<str>` cost 16% does not apply here.
-    Record(Sym, Rc<RefCell<Vec<(Sym, Value)>>>),
+    Record(Sym, Rc<Cell<RefCell<Vec<(Sym, Value)>>>>),
     /// A variant constructor, saturated or not.
-    Ctor(Sym, Rc<Vec<Value>>),
+    Ctor(Sym, Rc<Cell<Vec<Value>>>),
     Fun(Rc<Closure>),
     /// `Nothing` and friends -- a nullary name we do not otherwise know.
     Unit,
@@ -121,6 +121,34 @@ pub struct Closure {
     pub body: Body,
     pub env: Env,
     pub applied: Vec<Value>,
+}
+
+/// **ANYTHING THE ALLOCATOR HANDED OUT, AND WHERE.**
+///
+/// The address is not decoration. `mcopy-type`, `mcopy-row`, `mcopy-fields`,
+/// `mcopy-ctors` and `copy-sx-text` all decide whether a value is durable with
+/// `a < mc.mc-floor`, and the checker's cons table builds its content keys out
+/// of the same answers. A host pointer is on a scale five orders of magnitude
+/// above every floor the compiler computes, so it makes all of that false for
+/// every value, always -- which for texts cost 2.3 GB on a 112 KB subject and
+/// for types leaves the whole memo layer answering in the wrong units.
+///
+/// Behind the `Rc` rather than beside it in the variant, because `Value` is two
+/// words and that is load-bearing: it was 24 bytes once and 16% slower.
+#[derive(Debug)]
+pub struct Cell<T> {
+    pub addr: i64,
+    /// Public only so `crate::code` can fold a payload-free constructor at
+    /// compile time. Everything else builds one through `Interp::list`,
+    /// `record` or `ctor`, which is where the address comes from.
+    pub v: T,
+}
+
+impl<T> std::ops::Deref for Cell<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.v
+    }
 }
 
 /// A TEXT, AND WHERE IT LIVES.
@@ -221,11 +249,19 @@ fn err<T>(msg: impl Into<String>) -> R<T> {
     Err(Error(msg.into()))
 }
 
-/// A FRESH list. Every construction goes through here, because a shared
-/// backing that was meant to be new is the way `list-set-at`'s write-through
-/// turns into a leak between two lists that were never the same one.
-fn list(cells: Vec<Value>) -> Value {
-    Value::List(Rc::new(RefCell::new(cells)))
+/// **WHAT A VALUE OCCUPIES, in the units the compiler reserves in.**
+///
+/// Everything upstream is a word: a record is one per field, a list is one per
+/// element over a header, a constructor is its fields plus its tag. Exact
+/// layout is not knowable from here and does not need to be -- only the
+/// ORDERING matters for `a < mc.mc-floor`, and the size matters only so that
+/// `deck-short-of` and its neighbours are asked a question of roughly the
+/// right scale. A size of zero would make two allocations share an address,
+/// which is the one thing that must not happen.
+const WORD: i64 = 8;
+
+fn words(n: usize) -> i64 {
+    WORD * (n as i64 + 1)
 }
 
 /// Stamp a location on an error that does not have one. The innermost frame
@@ -676,7 +712,10 @@ impl Interp {
         for (i, name, arity) in ctors {
             let rc = name;
             globals[i as usize] = if arity == 0 {
-                Value::Ctor(rc, Rc::new(Vec::new()))
+                // Built once, before there is an interpreter, and never freed.
+                // That is a literal's lifetime, so it gets a literal's address.
+                let addr = crate::bump::intern_literal(words(0));
+                Value::Ctor(rc, Rc::new(Cell { addr, v: Vec::new() }))
             } else {
                 Value::Fun(Rc::new(Closure {
                     name: rc,
@@ -894,7 +933,7 @@ impl Interp {
                 for x in xs {
                     out.push(self.eval(x, env)?);
                 }
-                Ok(list(out))
+                Ok(self.list(out))
             }
             Code::Record(name, fields) => {
                 let mut out = Vec::with_capacity(fields.len());
@@ -906,7 +945,7 @@ impl Interp {
                     }
                     out.push((f.name.clone(), v));
                 }
-                Ok(Value::Record(name.clone(), Rc::new(RefCell::new(out))))
+                Ok(self.record(name.clone(), out))
             }
             Code::FieldAccess(obj, field, sp) => match self.eval(obj, env)? {
                 Value::Record(name, fs) => fs
@@ -1010,7 +1049,7 @@ impl Interp {
                 self.cur = c.name;
             }
             let body = match &c.body {
-                Body::Ctor(name) => return Ok(Value::Ctor(name.clone(), Rc::new(applied))),
+                Body::Ctor(name) => return Ok(self.ctor(name.clone(), applied)),
                 Body::Builtin(name) => {
                     let name = *name;
                     return self.builtin(name, applied);
@@ -1167,7 +1206,8 @@ impl Interp {
         if let Value::Ctor(n, fields) = &f {
             let mut out = (**fields).clone();
             out.push(arg);
-            return Ok(Step::Done(Value::Ctor(n.clone(), Rc::new(out))));
+            let n = n.clone();
+            return Ok(Step::Done(self.ctor(n, out)));
         }
         let Value::Fun(c) = f else {
             return err(format!("applied {} to an argument", type_name(&f)));
@@ -1311,6 +1351,30 @@ impl Interp {
     /// The size is the byte length, word-aligned, which is what a text
     /// occupies upstream -- `cx_concat` allocates `b.len` and bare metal bumps
     /// r10 by the same.
+    /// A FRESH list, at the cursor. Every construction goes through here: a
+    /// shared backing that was meant to be new is how `list-set-at`'s
+    /// write-through leaks between two lists that were never the same one,
+    /// and a shared ADDRESS is how the cons table adopts the wrong type.
+    fn list(&mut self, cells: Vec<Value>) -> Value {
+        let addr = self.bump.alloc(words(cells.len()));
+        Value::List(Rc::new(Cell { addr, v: RefCell::new(cells) }))
+    }
+
+    fn record(&mut self, name: Sym, fields: Vec<(Sym, Value)>) -> Value {
+        let addr = self.bump.alloc(words(fields.len()));
+        Value::Record(name, Rc::new(Cell { addr, v: RefCell::new(fields) }))
+    }
+
+    /// **A PAYLOAD-FREE CONSTRUCTOR IS BOXED**, so it gets an address like
+    /// anything else. Bare metal boxes them; the zig plug answers the tag word
+    /// instead, which is measured, ours, and wrong -- see the memory on
+    /// address-of semantics. Answering the tag here would make every `Leaf`
+    /// in a program one object as far as the memo layer is concerned.
+    fn ctor(&mut self, name: Sym, fields: Vec<Value>) -> Value {
+        let addr = self.bump.alloc(words(fields.len()));
+        Value::Ctor(name, Rc::new(Cell { addr, v: fields }))
+    }
+
     fn text(&mut self, s: String) -> R<Value> {
         let addr = self.bump.alloc(s.len() as i64);
         Ok(Value::Text(Rc::new(Str { addr, s })))
@@ -1464,7 +1528,7 @@ impl Interp {
             // load-bearing over there for a reason that cannot exist here: a
             // reallocation inside emit-all-defs' save/restore bracket lands in
             // scratch the bracket reclaims. Nothing here reclaims anything.
-            ("__list-with-capacity", [Int(_)]) => Ok(list(Vec::new())),
+            ("__list-with-capacity", [Int(_)]) => Ok(self.list(Vec::new())),
             // **THE ONE WRITER.** It answers the list it was handed, which is
             // the same list the caller still holds -- see `Value::List`.
             ("list-set-at", [List(xs), Int(i), v]) => {
@@ -1498,19 +1562,18 @@ impl Interp {
             ("bit-shr" | "bit-shru", [Int(a), Int(b)]) => {
                 Ok(Int(((*a as u64) >> (*b as u32 & 63)) as i64))
             }
-            ("text-split", [Text(t), Text(sep)]) => Ok(list(
-                if sep.is_empty() {
-                    vec![Text(t.clone())]
+            ("text-split", [Text(t), Text(sep)]) => {
+                let parts: Vec<String> = if sep.is_empty() {
+                    vec![t.as_str().to_string()]
                 } else {
-                    let parts: Vec<String> =
-                        t.split(sep.as_str()).map(|p| p.to_string()).collect();
-                    let mut out = Vec::with_capacity(parts.len());
-                    for part in parts {
-                        out.push(self.text(part)?);
-                    }
-                    return Ok(list(out));
-                },
-            )),
+                    t.split(sep.as_str()).map(|p| p.to_string()).collect()
+                };
+                let mut out = Vec::with_capacity(parts.len());
+                for part in parts {
+                    out.push(self.text(part)?);
+                }
+                Ok(self.list(out))
+            }
 
             // -- reals --------------------------------------------------------
             // ONE ARM FOR EIGHT NAMES WAS WRONG ABOUT FIVE OF THEM. Only the
@@ -1591,9 +1654,9 @@ impl Interp {
             // metal. What it is NOT is bare metal's number, and nothing may
             // compare it across arms or embed it in output.
             ("address-of", [Int(i)]) => Ok(Int(*i)),
-            ("address-of", [Record(_, fs)]) => Ok(Int(Rc::as_ptr(fs) as i64)),
-            ("address-of", [List(xs)]) => Ok(Int(Rc::as_ptr(xs) as *const u8 as i64)),
-            ("address-of", [Ctor(_, fs)]) => Ok(Int(Rc::as_ptr(fs) as *const u8 as i64)),
+            ("address-of", [Record(_, fs)]) => Ok(Int(fs.addr)),
+            ("address-of", [List(xs)]) => Ok(Int(xs.addr)),
+            ("address-of", [Ctor(_, fs)]) => Ok(Int(fs.addr)),
             // **A TEXT ANSWERS WHERE IT WAS ALLOCATED**, from the same cursor
             // `__heap-save` reads. This was the host pointer, and the host
             // pointer is on a scale five orders of magnitude above every base
@@ -1647,7 +1710,7 @@ impl Interp {
             //
             // The capacity is a hint upstream and there is nothing here to
             // reserve, exactly as with `__list-with-capacity`.
-            ("__linked-list-empty", [Int(_)]) => Ok(list(Vec::new())),
+            ("__linked-list-empty", [Int(_)]) => Ok(self.list(Vec::new())),
             ("__linked-list-push", [List(xs), v]) => {
                 xs.borrow_mut().push(v.clone());
                 Ok(List(xs.clone()))
@@ -1695,7 +1758,7 @@ impl Interp {
             // their name tables -- zig maps it to `cx_ll_empty(TypeBinding)`
             // and wasm to `list_with_capacity 0` -- so the empty answer is the
             // fixed point rather than a gap here.
-            ("__self-type-defs", []) => Ok(list(Vec::new())),
+            ("__self-type-defs", []) => Ok(self.list(Vec::new())),
 
             // -- the flat memory ---------------------------------------------
             // Every one of these takes a BASE and an OFFSET and adds them, so
@@ -1909,10 +1972,15 @@ fn unescape(raw: &str) -> String {
 /// disjoint fields, and Rust will let both be borrowed at once when it can see
 /// that.
 fn binary(syms: &SymTab, bump: &mut crate::bump::Bump, op: BinaryOp, a: Value, b: Value) -> R<Value> {
-    let mut cat = |s: String| {
+    // Nested fns rather than closures: two closures cannot both hold the bump.
+    fn cat(bump: &mut crate::bump::Bump, s: String) -> Value {
         let addr = bump.alloc(s.len() as i64);
         Text(Rc::new(Str { addr, s }))
-    };
+    }
+    fn mklist(bump: &mut crate::bump::Bump, cells: Vec<Value>) -> Value {
+        let addr = bump.alloc(words(cells.len()));
+        List(Rc::new(Cell { addr, v: RefCell::new(cells) }))
+    }
     use BinaryOp::*;
     use Value::*;
     Ok(match (op, &a, &b) {
@@ -1948,13 +2016,13 @@ fn binary(syms: &SymTab, bump: &mut crate::bump::Bump, op: BinaryOp, a: Value, b
         (OpNotEq, _, _) => Bool(!equal(&a, &b)),
         (OpDefEq, _, _) => Bool(equal(&a, &b)),
         // `&` is one operator with four meanings, chosen by what it is given.
-        (OpAnd | OpAppend, Text(x), Text(y)) => cat(format!("{x}{y}")),
-        (OpAnd | OpAppend, Text(x), _) => cat(format!("{x}{}", show(syms, &b))),
-        (OpAnd | OpAppend, _, Text(y)) => cat(format!("{}{y}", show(syms, &a))),
+        (OpAnd | OpAppend, Text(x), Text(y)) => cat(bump, format!("{x}{y}")),
+        (OpAnd | OpAppend, Text(x), _) => cat(bump, format!("{x}{}", show(syms, &b))),
+        (OpAnd | OpAppend, _, Text(y)) => cat(bump, format!("{}{y}", show(syms, &a))),
         (OpAnd | OpAppend, List(x), List(y)) => {
             let mut out = x.borrow().clone();
             out.extend(y.borrow().iter().cloned());
-            list(out)
+            mklist(bump, out)
         }
         (OpAnd, Bool(x), Bool(y)) => Bool(*x && *y),
         (OpAnd, Int(x), Int(y)) => Int(x & y),
@@ -1962,7 +2030,7 @@ fn binary(syms: &SymTab, bump: &mut crate::bump::Bump, op: BinaryOp, a: Value, b
         (OpCons, _, List(y)) => {
             let mut out = vec![a.clone()];
             out.extend(y.borrow().iter().cloned());
-            list(out)
+            mklist(bump, out)
         }
         _ => {
             return err(format!(
@@ -2807,6 +2875,31 @@ mod tests {
             "let lit = \"a literal, which lives in the image\"\n    in let early = \"made\" & \" early\"\n    in let b = __heap-save\n    in let late = \"made\" & \" late\"\n                 in print-line-uni (show (address-of lit < b) & \" \" & show (address-of early < b) & \" \" & show (address-of late < b))",
         );
         assert_eq!(out(&src).trim(), "True True False");
+    }
+
+    /// **A RECORD, A LIST AND A CONSTRUCTOR ANSWER THE ALLOCATOR TOO.**
+    ///
+    /// The same property `Text` needed, for the same reason and in the same
+    /// machinery: `mcopy-type`, `mcopy-row`, `mcopy-fields` and `mcopy-ctors`
+    /// all gate on `if a < mc.mc-floor then t`, and a host pointer makes that
+    /// false for every value, always. A CodexType is a constructor, a record's
+    /// fields are a list, and the cons table's content keys are built from
+    /// their addresses -- so leaving these three on host pointers left the
+    /// checker's whole memo layer answering a question in the wrong units.
+    #[test]
+    fn a_record_a_list_and_a_ctor_are_durable_against_a_later_base() {
+        let src = "Chapter: T\n\nSection: S\n\n  Box = record {\n    n : Integer\n  }\n\n  Tree =\n    | Leaf\n    | Node (Integer)\n\nSection: E\n\n  opening : [Console] Nothing = act\n                 let r = Box { n = 1 }\n    in let l = [1, 2, 3]\n    in let c = Node 7\n    in let b = __heap-save\n    in let r2 = Box { n = 2 }\n                 in print-line-uni (show (address-of r < b) & \" \" & show (address-of l < b) & \" \" & show (address-of c < b) & \" \" & show (address-of r2 < b))\n  end\n";
+        assert_eq!(out(src).trim(), "True True True False");
+    }
+
+    /// Two of anything are two addresses. A payload-free constructor is the
+    /// exception upstream BOXES, so it gets one too rather than answering the
+    /// tag -- the zig plug's tag-word answer for that case is measured, ours,
+    /// and wrong.
+    #[test]
+    fn two_records_are_two_addresses() {
+        let src = "Chapter: T\n\nSection: S\n\n  Box = record {\n    n : Integer\n  }\n\nSection: E\n\n  opening : [Console] Nothing = act\n                 let a = Box { n = 1 }\n    in let b = Box { n = 1 }\n                 in print-line-uni (show (address-of a == address-of b) & \" \" & show (address-of a == 0) & \" \" & show ([1] == [1]))\n  end\n";
+        assert_eq!(out(src).trim(), "False False True");
     }
 
     /// Two texts are two addresses, or every content key in the checker's cons
