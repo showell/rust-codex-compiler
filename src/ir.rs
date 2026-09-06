@@ -45,7 +45,7 @@
 
 use crate::symbol::{Sym, SymTab};
 use crate::ast::{BinaryOp, Chapter, Expr, LiteralKind};
-use crate::check::{Binding, Overflow, RealMode, RealWidth, Ty, UnifyState};
+use crate::check::{Binding, Overflow, RealMode, RealWidth, Ty, TypeDefs, UnifyState};
 use std::collections::BTreeMap;
 
 /// A CHECKED type, as the IR spells it -- `ir-emit-type`
@@ -168,16 +168,26 @@ fn render_row(syms: &SymTab, row: &crate::check::EffectRow) -> String {
 pub struct Lower<'a> {
     syms: &'a SymTab,
     st: &'a UnifyState,
+    /// The chapter's type declarations. Lowering asks them two things a field
+    /// access needs and the checker did not record: the field's TYPE, and its
+    /// SLOT, which the wire spells as `"py/1"`.
+    tds: &'a TypeDefs,
     /// This chapter's own definitions, keyed by name, for the `(def ...)`
     /// headers. Bodies do not consult it.
     bindings: BTreeMap<Sym, Ty>,
 }
 
 impl<'a> Lower<'a> {
-    pub fn new(ch: &'a Chapter, bindings: &[Binding], st: &'a UnifyState) -> Lower<'a> {
+    pub fn new(
+        ch: &'a Chapter,
+        bindings: &[Binding],
+        st: &'a UnifyState,
+        tds: &'a TypeDefs,
+    ) -> Lower<'a> {
         Lower {
             syms: &ch.syms,
             st,
+            tds,
             bindings: bindings.iter().map(|b| (b.name, b.ty.clone())).collect(),
         }
     }
@@ -208,6 +218,15 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
         Expr::Lit(v, LiteralKind::TextLit, _) => Ok((format!("(text-lit {v})"), Ty::Text)),
         Expr::Lit(v, LiteralKind::BoolLit, _) => Ok((format!("(bool-lit {v})"), Ty::Boolean)),
         Expr::Lit(_, k, _) => Err(format!("literal kind {k:?}")),
+        // `(negate X TYPE)`, and the type is the OPERAND's -- negating does
+        // not change it. `-n` is this; `0 - n` is a `binary sub-int` and the
+        // two are different nodes on the wire even where a reader would call
+        // them the same expression.
+        Expr::Unary(x, _) => {
+            let (xt, xty) = expr(x, cx)?;
+            let rendered = render_ty(cx.syms, &xty);
+            Ok((format!("(negate {xt} {rendered})"), xty))
+        }
         // Straight out of `expr-types`, at this node's own span.
         Expr::NameRef(n, sp) => match cx.at(*sp) {
             Some(t) => Ok((
@@ -390,6 +409,57 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
             let rendered = render_ty(cx.syms, &last);
             Ok((format!("(act (stmts {}) {rendered})", parts.join(" ")), last))
         }
+        // `(record "P" (fields (field-val "px" X) ...) TYPE)`. The fields are
+        // emitted IN THE ORDER THE EXPRESSION WRITES THEM, not the order the
+        // record declares them -- measured, because the reverse is the obvious
+        // guess and it is wrong.
+        Expr::Record(n, fields, sp) => {
+            let ty = cx
+                .at(*sp)
+                .ok_or_else(|| format!("no recorded type for record `{}`", cx.syms.text(*n)))?;
+            let mut parts = String::new();
+            for f in fields {
+                let (v, _) = expr(&f.value, cx)?;
+                parts.push_str(&format!(" (field-val {:?} {v})", cx.syms.text(f.name)));
+            }
+            let rendered = render_ty(cx.syms, &ty);
+            Ok((
+                format!("(record {:?} (fields{}) {rendered})", cx.syms.text(*n), parts),
+                ty,
+            ))
+        }
+        // `(field-access OBJ "py/1" TYPE)` -- the field's name AND its slot in
+        // the declaration. The checker records no type here, so both the type
+        // and the slot are read back out of the type declarations.
+        Expr::FieldAccess(r, f, _) => {
+            let (rt, rty) = expr(r, cx)?;
+            let name = match &rty {
+                Ty::Record(n, _) | Ty::Constructed(n, _) => *n,
+                other => {
+                    return Err(format!(
+                        "field access on `{}`, which is not a record",
+                        render_ty(cx.syms, other)
+                    ))
+                }
+            };
+            let (Some(fty), Some(slot)) = (cx.tds.field(name, *f), cx.tds.field_index(name, *f))
+            else {
+                return Err(format!(
+                    "`{}` has no field `{}` here",
+                    cx.syms.text(name),
+                    cx.syms.text(*f)
+                ));
+            };
+            let fty = cx.st.deep_resolve(fty);
+            let rendered = render_ty(cx.syms, &fty);
+            Ok((
+                format!(
+                    "(field-access {rt} {:?} {rendered})",
+                    format!("{}/{}", cx.syms.text(*f), slot)
+                ),
+                fty,
+            ))
+        }
         other => Err(node_kind(other).to_string()),
     }
 }
@@ -446,8 +516,8 @@ pub const IR_EMIT_ROOTS: [&str; 6] = [
 /// (`opening.codex:798`). A caller that already has a `checked` hands it to
 /// `emit_defs_checked` instead of paying for a second pass.
 pub fn emit_defs(ch: &Chapter) -> Result<String, String> {
-    let (bindings, st) = crate::check::check_chapter(ch);
-    emit_defs_checked(ch, &bindings, &st, &IR_EMIT_ROOTS)
+    let (bindings, st, tds) = crate::check::check_chapter_full(ch);
+    emit_defs_checked(ch, &bindings, &st, &tds, &IR_EMIT_ROOTS)
 }
 
 /// Names reachable from the roots, following NameRefs through def bodies.
@@ -485,13 +555,14 @@ pub fn emit_defs_checked(
     ch: &Chapter,
     bindings: &[Binding],
     st: &UnifyState,
+    tds: &TypeDefs,
     roots: &[&str],
 ) -> Result<String, String> {
     let keep = reachable(ch, roots);
     if keep.is_empty() {
         return Err("no root reached: the chapter defines none of ir-emit-roots".into());
     }
-    let cx = Lower::new(ch, bindings, st);
+    let cx = Lower::new(ch, bindings, st, tds);
     // The OPENER is the preamble's last line, so this contributes only the
     // definitions. `preamble::emit` ends at `  (defs` because that is where the
     // syntax-only part of a gold stops.
@@ -823,6 +894,55 @@ mod tests {
                 .contains(r#"(name "ident" (fn (list int-default) (list int-default)))"#),
             "the call site resolves: {}",
             def_line(src, "opening")
+        );
+    }
+
+    /// **`-n` IS A NEGATE NODE; `0 - n` IS A BINARY.** The two spell
+    /// differently on the wire even though a reader would call them the same
+    /// expression, and the negate carries its OPERAND's type. `codexir`'s
+    /// bytes, with `neg2` called twice so it survives the single-caller pass.
+    #[test]
+    fn a_unary_minus_is_a_negate_node() {
+        let src = "Chapter: T\n\nSection: S\n  neg2 : Integer -> Integer\n  neg2 (n) = -n\n\nSection: E\n  opening : [Console] Nothing = act\n   print-line-uni (show (neg2 1))\n   print-line-uni (show (neg2 2))\n  end\n";
+        assert_eq!(
+            def_line(src, "neg2"),
+            r#"(def "neg2" "T" (params (param "n" int-default)) (fn int-default int-default) (negate (name "n" int-default) int-default) 0 0)"#
+        );
+    }
+
+    /// **A RECORD LITERAL EMITS ITS FIELDS IN THE ORDER THE EXPRESSION WRITES
+    /// THEM, AND A FIELD ACCESS CARRIES THE DECLARATION'S SLOT.** Both halves
+    /// measured: `P { py = ..., px = ... }` emits `py` first even though the
+    /// declaration puts `px` first, and `p.py` is `"py/1"` because `py` is
+    /// declared second.
+    #[test]
+    fn a_record_writes_its_fields_in_expression_order_and_reads_them_by_slot() {
+        let decl = "Chapter: T\n\nSection: S\n  P = record { px : Integer, py : Text }\n\n";
+        let calls = "\nSection: E\n  opening : [Console] Nothing = act\n   print-line-uni (show (getx (mk 1)))\n   print-line-uni (show (getx (mk 2)))\n  end\n";
+        let src = format!(
+            "{decl}  mk : Integer -> P\n  mk (a) = P {{ px = a, py = \"z\" }}\n\n  \
+             getx : P -> Integer\n  getx (p) = p.px\n{calls}"
+        );
+        assert_eq!(
+            def_line(&src, "mk"),
+            r#"(def "mk" "T" (params (param "a" int-default)) (fn int-default (record-ty "P" (args))) (record "P" (fields (field-val "px" (name "a" int-default)) (field-val "py" (text-lit "z"))) (record-ty "P" (args))) 0 0)"#
+        );
+        assert_eq!(
+            def_line(&src, "getx"),
+            r#"(def "getx" "T" (params (param "p" (record-ty "P" (args)))) (fn (record-ty "P" (args)) int-default) (field-access (name "p" (record-ty "P" (args))) "px/0" int-default) 0 0)"#
+        );
+
+        // Written out of declaration order, and emitted the way it is written.
+        let swapped = format!(
+            "{decl}  mk : Integer -> P\n  mk (a) = P {{ py = \"z\", px = a }}\n\n  \
+             getx : P -> Integer\n  getx (p) = p.px\n{calls}"
+        );
+        assert!(
+            def_line(&swapped, "mk").contains(
+                r#"(fields (field-val "py" (text-lit "z")) (field-val "px" (name "a" int-default)))"#
+            ),
+            "got: {}",
+            def_line(&swapped, "mk")
         );
     }
 

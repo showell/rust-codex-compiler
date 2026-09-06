@@ -622,6 +622,13 @@ impl TypeDefs {
     pub fn field(&self, rec: Sym, field: Sym) -> Option<&Ty> {
         self.fields.get(&rec)?.iter().find(|(n, _)| *n == field).map(|(_, t)| t)
     }
+
+    /// Its SLOT, which the wire spells alongside the name: a field access is
+    /// `(field-access OBJ "py/1" text)`, and the number is the field's position
+    /// in the DECLARATION -- not in the expression that built the record.
+    pub fn field_index(&self, rec: Sym, field: Sym) -> Option<usize> {
+        self.fields.get(&rec)?.iter().position(|(n, _)| *n == field)
+    }
 }
 
 pub fn resolve_declared(
