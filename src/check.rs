@@ -175,6 +175,11 @@ pub struct UnifyState {
     /// `lookup-expr-type (ctx.ust) sp`. A map keyed by NAME cannot answer that
     /// question at all: `fib` appears twice in its own body and the wire
     /// spells a different row id at each.
+    /// **ROWS RESOLVE THROUGH THEIR OWN SLOT ARRAY**, the way types resolve
+    /// through `substitutions`. `add-row-subst` binds an open row's tail to
+    /// another row, and `resolve-row` follows it -- without which two rows
+    /// already equated by an earlier unification look distinct and mint again.
+    pub row_subst: Vec<EffectRow>,
     pub expr_types: Vec<(u64, Ty)>,
     pub errors: usize,
     /// Applications this unifier could not decide. **NOT `errors`:** a `false`
@@ -206,6 +211,7 @@ impl Default for UnifyState {
             substitutions: vec![Ty::Var(0), Ty::Var(1)],
             next_id: 2,
             next_row_id: 0,
+            row_subst: Vec::new(),
             expr_types: Vec::new(),
             errors: 0,
             unify_gaps: 0,
@@ -230,8 +236,89 @@ impl UnifyState {
     /// A fresh effect-row id, on its own counter.
     pub fn fresh_row(&mut self) -> i32 {
         let id = self.next_row_id;
+        // A slot holding itself is an unbound row variable, exactly as a
+        // substitution slot holding `Var(i)` is an unbound type variable.
+        self.row_subst.push(EffectRow { id, ..Default::default() });
         self.next_row_id += 1;
         id
+    }
+
+    /// `resolve-row`: follow an open row's tail to what it was bound to.
+    pub fn resolve_row(&self, r: &EffectRow) -> EffectRow {
+        let mut cur = r.clone();
+        for _ in 0..10_000 {
+            if cur.id < 0 {
+                return cur;
+            }
+            match self.row_subst.get(cur.id as usize) {
+                Some(slot) if slot.id != cur.id || !slot.labels.is_empty() => {
+                    // The labels a row picked up on the way are kept: an open
+                    // row bound to a closed one carries that one's effects.
+                    let mut next = slot.clone();
+                    for l in &cur.labels {
+                        if !next.labels.contains(l) {
+                            next.labels.push(l.clone());
+                        }
+                    }
+                    if next.id == cur.id {
+                        return next;
+                    }
+                    cur = next;
+                }
+                _ => return cur,
+            }
+        }
+        cur
+    }
+
+    fn add_row_subst(&mut self, id: i32, r: EffectRow) {
+        if let Some(slot) = self.row_subst.get_mut(id as usize) {
+            *slot = r;
+        }
+    }
+
+    /// `unify-row` (Unifier.codex:344). **THE ONLY ARM THAT MINTS IS
+    /// OPEN-MEETS-OPEN WITH DIFFERENT TAILS**, which equates the two variables
+    /// through a third: two closed rows agree or fail, and an open row meeting
+    /// a closed one is simply bound to it.
+    ///
+    /// That one mint is what a row-parametric signature costs beyond its
+    /// registration and its own instantiation, and it is what an application
+    /// costs beyond its call row. Not unifying rows at all left both of those
+    /// unaccounted, so every `[e]` in the depot came out one row low per use.
+    pub fn unify_row(&mut self, r1: &EffectRow, r2: &EffectRow) -> bool {
+        let a = self.resolve_row(r1);
+        let b = self.resolve_row(r2);
+        if a.labels == b.labels && a.tail == b.tail && a.id == b.id {
+            return true;
+        }
+        let only1: Vec<_> = a.labels.iter().filter(|l| !b.labels.contains(l)).cloned().collect();
+        let only2: Vec<_> = b.labels.iter().filter(|l| !a.labels.contains(l)).cloned().collect();
+        match (a.id >= 0, b.id >= 0) {
+            // Both closed: they agree or they do not, and neither mints.
+            (false, false) => only1.is_empty() && only2.is_empty(),
+            (true, false) => {
+                if !only1.is_empty() {
+                    return false;
+                }
+                self.add_row_subst(a.id, EffectRow { labels: only2, ..Default::default() });
+                true
+            }
+            (false, true) => {
+                if !only2.is_empty() {
+                    return false;
+                }
+                self.add_row_subst(b.id, EffectRow { labels: only1, ..Default::default() });
+                true
+            }
+            (true, true) if a.id == b.id => only1.is_empty() && only2.is_empty(),
+            (true, true) => {
+                let t3 = self.fresh_row();
+                self.add_row_subst(a.id, EffectRow { labels: only2, tail: String::new(), id: t3 });
+                self.add_row_subst(b.id, EffectRow { labels: only1, tail: String::new(), id: t3 });
+                true
+            }
+        }
     }
 
     /// `record-expr-type` (Unifier.codex:148). Appended unsorted, because a
@@ -264,37 +351,17 @@ impl UnifyState {
         self.instantiate_inner(t, 1)
     }
 
-    /// The same walk, for a definition's OWN body. **A ROW PARAMETER COSTS TWO
-    /// ROWS HERE AND A TYPE PARAMETER ONE VARIABLE**, which is not symmetric
-    /// and is measured rather than derived.
-    ///
-    /// A distinct row parameter costs THREE rows in total, on a signature
-    /// nobody calls: `f : Integer -> [e] Integer` with body `n` is
-    /// `next-row-id 3` where the same signature without `[e]` is 0, and two
-    /// distinct row parameters cost six. One of the three is
-    /// `parameterize-row` at registration and one is `instantiate-collect`
-    /// here. **THE THIRD IS NOT LOCATED**: `check-definition` does more than
-    /// instantiate, and which of those steps mints it has not been read out of
-    /// the source. Referencing such a function from elsewhere costs the same
-    /// three rows a pure one costs, so the extra is the signature's alone.
-    pub fn instantiate_own(&mut self, t: &Ty) -> Ty {
-        self.instantiate_inner(t, 2)
-    }
-
-    fn instantiate_inner(&mut self, t: &Ty, rows_per_eff: usize) -> Ty {
+    fn instantiate_inner(&mut self, t: &Ty, _unused: usize) -> Ty {
         match t {
             Ty::ForAll(id, body) => {
                 let fr = self.fresh();
                 let b = subst_type_var(body, *id, &fr);
-                self.instantiate_inner(&b, rows_per_eff)
+                self.instantiate_inner(&b, 0)
             }
             Ty::ForAllEff(id, body) => {
                 let r = self.fresh_row();
-                for _ in 1..rows_per_eff {
-                    let _ = self.fresh_row();
-                }
                 let b = subst_row_var(body, *id, r);
-                self.instantiate_inner(&b, rows_per_eff)
+                self.instantiate_inner(&b, 0)
             }
             other => other.clone(),
         }
@@ -380,11 +447,6 @@ impl UnifyState {
     /// `(fn int-default text)` only because its instantiated variable met the
     /// argument here.
     ///
-    /// **THE ROWS ARE NOT UNIFIED.** `ir-emit-row` publishes only a row
-    /// carrying concrete labels -- an open row is inert through the compiler's
-    /// own stage 2 -- so a row variable meeting a labelled row decides nothing
-    /// this wire can read, and pretending otherwise would move ids that are
-    /// graded.
     pub fn unify(&mut self, a: &Ty, b: &Ty) -> bool {
         let a = self.resolve(a);
         let b = self.resolve(b);
@@ -401,11 +463,13 @@ impl UnifyState {
                 self.bind_var(*j, a.clone());
                 true
             }
-            (Ty::Fun(p1, _, r1), Ty::Fun(p2, _, r2)) => {
+            (Ty::Fun(p1, row1, r1), Ty::Fun(p2, row2, r2)) => {
                 let (p1, r1, p2, r2) = (p1.clone(), r1.clone(), p2.clone(), r2.clone());
+                let (row1, row2) = (row1.clone(), row2.clone());
                 let l = self.unify(&p1, &p2);
+                let rw = self.unify_row(&row1, &row2);
                 let r = self.unify(&r1, &r2);
-                l && r
+                l && rw && r
             }
             (Ty::List(x), Ty::List(y)) => {
                 let (x, y) = (x.clone(), y.clone());
@@ -568,6 +632,16 @@ pub fn resolve_declared(syms: &SymTab, t: &crate::ast::TypeExpr) -> Option<Ty> {
         T::Linear(inner, _) => Ty::Linear(Box::new(resolve_declared(syms, inner)?)),
         _ => return None,
     })
+}
+
+/// `strip-forall-ty`: the body of a quantifier chain, with its ORIGINAL ids.
+/// Not an instantiation -- the point of the tie is to meet the signature's own
+/// variables, not fresh ones.
+fn strip_forall(t: &Ty) -> Ty {
+    match t {
+        Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => strip_forall(b),
+        other => other.clone(),
+    }
 }
 
 /// The head of an application spine and every argument, left to right.
@@ -759,7 +833,8 @@ pub fn check_chapter(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState) {
         // second time here. That is the other half of what a type parameter
         // costs, and it is paid whether or not anything calls the definition.
         let own = bindings.iter().find(|b| b.name == d.name).map(|b| b.ty.clone());
-        let mut spine = own.map(|t| st.instantiate_own(&t));
+        let instantiated = own.clone().map(|t| st.instantiate(&t));
+        let mut spine = instantiated.clone();
         let mut saved = Vec::new();
         for p in &d.params {
             let arg = match spine {
@@ -791,6 +866,22 @@ pub fn check_chapter(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState) {
         };
         if let Some(w) = want {
             if !st.unify(&body_ty, &w) {
+                st.unify_gaps += 1;
+            }
+        }
+        // **A QUANTIFIED DEFINITION IS TIED BACK TO ITS OWN SIGNATURE**, after
+        // the body -- `check-def-normal`'s `tied-state` (TypeChecker.codex:866)
+        // unifies the instantiated type against `strip-forall-ty env-type`.
+        //
+        // For a type parameter both sides carry empty rows and nothing is
+        // minted; for a ROW parameter the instantiated row and the signature's
+        // row are two OPEN rows with different tails, and equating them is the
+        // third row such a signature costs. Its position matters: it lands
+        // after everything the body minted, not before.
+        if let (Some(Ty::ForAll(..) | Ty::ForAllEff(..)), Some(inst)) = (own.clone(), instantiated)
+        {
+            let bare = strip_forall(&own.unwrap());
+            if !st.unify(&inst, &bare) {
                 st.unify_gaps += 1;
             }
         }
@@ -912,11 +1003,13 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
             let ft = infer(f, env, st);
             let at = infer(a, env, st);
             let ret = st.fresh();
+            // **ONE ROW HERE, AND THE SECOND COMES FROM UNIFICATION.** An
+            // application was measured at two rows and this minted both; with
+            // `unify-row` in place the second is where upstream actually makes
+            // it -- the function's arrow row meeting `(row-var call-row-id)`,
+            // two open rows with different tails. Minting it here as well
+            // counted it twice.
             let call_row = st.fresh_row();
-            // `row-union` mints the second (infer-application, line 645): two
-            // rows per application, on top of whatever the function position's
-            // own spine minted.
-            let _union_row = st.fresh_row();
             // `unify st (fr.inferred-type) (FunTy passed-ty (row-var call-row-id) ret-ty)`
             // -- and THIS is what decides an inferred type. `show`'s
             // instantiated variable meets the argument here and nowhere else.
