@@ -758,14 +758,28 @@ pub fn register_defs(
 /// and not three; a variant with no parameters costs nothing however many arms
 /// it has. Measured on `codexcheck`.
 ///
-/// A RECORD DECLARES NO FUNCTION. `P { px = 1 }` is a record expression, not an
-/// application, so there is no constructor arrow to register and nothing here
-/// to mint. If that turns out to cost a mint somewhere, it needs its own probe.
+/// **A RECORD IS ITS OWN CONSTRUCTOR, AND IT IS PARAMETERISED TOO.** It costs
+/// one fresh variable per distinct type parameter -- `R (a) (b) = record { x :
+/// a, y : b }` costs two, `R = record { a : Integer }` costs none -- which is
+/// the same rule a variant's constructors follow. Measured on `codexcheck`;
+/// the note that stood here said a record declared no function and needed its
+/// own probe, and this is that probe's answer.
+///
+/// So in both shapes it is exactly the CONSTRUCTORS that parameterise: a
+/// variant's arms, and a record's single one, which is named after the type.
 fn register_ctors(ch: &crate::ast::Chapter, tds: &TypeDefs, st: &mut UnifyState) -> Vec<Binding> {
     use crate::ast::TypeDef;
     let mut out = Vec::new();
     for td in &ch.type_defs {
-        let TypeDef::Variant(name, params, ctors, _) = td else { continue };
+        let (name, params, ctors) = match td {
+            TypeDef::Variant(n, ps, cs, _) => (n, ps, cs),
+            TypeDef::Record(n, ps, ..) => {
+                let ty = Ty::Record(*n, ps.iter().map(|p| Ty::TypeCon(*p)).collect());
+                out.push(Binding { name: *n, ty: parameterize(&ty, &ch.syms, st) });
+                continue;
+            }
+            TypeDef::Unit(..) => continue,
+        };
         let result = Ty::Constructed(*name, params.iter().map(|p| Ty::TypeCon(*p)).collect());
         for c in ctors {
             // Right to left: the spine is built inside out, so the first field
@@ -869,6 +883,16 @@ fn param_walk(t: &Ty, syms: &SymTab, st: &mut UnifyState, entries: &mut Vec<Para
             *n,
             args.iter().map(|a| param_walk(a, syms, st, entries)).collect(),
         ),
+        // A record and a sum carry their arguments the same way a constructed
+        // type does, and a walk that stopped at them left a record's own
+        // parameters unbound -- which is every `R (a) = record { x : a }` in
+        // the depot.
+        Ty::Record(n, args) => {
+            Ty::Record(*n, args.iter().map(|a| param_walk(a, syms, st, entries)).collect())
+        }
+        Ty::Sum(n, args) => {
+            Ty::Sum(*n, args.iter().map(|a| param_walk(a, syms, st, entries)).collect())
+        }
         other => other.clone(),
     }
 }
@@ -1202,7 +1226,7 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
             let _ = infer(scrut, env, st);
             let result = st.fresh();
             for a in arms {
-                let bound = bind_pattern(&a.pattern, env, st);
+                let bound = bind_pattern(&a.pattern, None, env, st);
                 let _ = infer(&a.guard, env, st);
                 let arm_ty = infer(&a.body, env, st);
                 if !st.unify(&arm_ty, &result) {
@@ -1287,19 +1311,56 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
     t
 }
 
-/// A pattern's variables, bound to fresh variables for the arm's body. Returns
-/// how many were pushed so the caller can pop exactly those.
-fn bind_pattern(p: &crate::ast::Pat, env: &mut TyEnv<'_>, st: &mut UnifyState) -> usize {
+/// A pattern's variables, bound for the arm's body. Returns how many were
+/// pushed so the caller can pop exactly those.
+///
+/// **A CONSTRUCTOR PATTERN INSTANTIATES THE CONSTRUCTOR, NOT ITS VARIABLES.**
+/// One mint per QUANTIFIER of the constructor's own type, and each sub-pattern
+/// takes its type from the corresponding instantiated FIELD.
+///
+/// Minting one per bound variable instead agrees on `Just (x)` -- one
+/// quantifier, one variable -- and is wrong wherever the two differ: `None`
+/// binds nothing and still mints, `Left (x)` on `Either (a) (b)` binds one and
+/// mints two. Five definitions in `Foreword Maybe`, one `None` arm each, and
+/// the unit came out five variables low.
+///
+/// `expected` is the type the enclosing pattern decided for this position;
+/// only where there is none does a variable mint one of its own.
+fn bind_pattern(
+    p: &crate::ast::Pat,
+    expected: Option<Ty>,
+    env: &mut TyEnv<'_>,
+    st: &mut UnifyState,
+) -> usize {
     use crate::ast::Pat as P;
     match p {
         P::Var(n, _) => {
-            let t = st.fresh();
+            let t = expected.unwrap_or_else(|| st.fresh());
             env.bind(*n, t);
             1
         }
-        P::Ctor(_, subs, _) | P::Vec_(subs, _) => {
-            subs.iter().map(|s| bind_pattern(s, env, st)).sum()
+        P::Ctor(name, subs, _) => {
+            // The constructor's arrow spine, instantiated: `Just` is
+            // `forall a. a -> Maybe a`, so this mints the `a` and the field
+            // type falls out of it.
+            let mut spine = env.get(*name).cloned().map(|t| st.instantiate(&t));
+            let mut bound = 0;
+            for sub in subs {
+                let field = match spine {
+                    Some(Ty::Fun(a, _, r)) => {
+                        spine = Some(*r);
+                        Some(*a)
+                    }
+                    _ => {
+                        spine = None;
+                        None
+                    }
+                };
+                bound += bind_pattern(sub, field, env, st);
+            }
+            bound
         }
+        P::Vec_(subs, _) => subs.iter().map(|s| bind_pattern(s, None, env, st)).sum(),
         P::Lit(..) | P::Wild(_) => 0,
     }
 }
@@ -1670,6 +1731,40 @@ mod tests {
         assert_eq!(with("  Two (a) =\n    | MkL (a)\n    | MkR (a)\n"), (4, 0));
         // No parameters, no mint -- the constructors are still declared.
         assert_eq!(with("  Mono =\n    | MkA\n    | MkB\n"), (2, 0));
+    }
+
+    /// **A CONSTRUCTOR PATTERN INSTANTIATES THE CONSTRUCTOR, NOT ITS
+    /// VARIABLES.** One mint per QUANTIFIER of the constructor's type, and the
+    /// sub-patterns take their types from the instantiated fields.
+    ///
+    /// Minting one per bound variable instead agrees on `Just (x)` -- one
+    /// quantifier, one variable -- and is wrong wherever the two differ: a
+    /// NULLARY constructor binds nothing and still mints (`None` on
+    /// `Maybe (a)`), and `Left (x)` on `Either (a) (b)` binds one and mints
+    /// two. A wildcard arm mints nothing at all.
+    ///
+    /// Read off `codexcheck` at `u56-candidate-sunday`.
+    #[test]
+    fn a_constructor_pattern_instantiates_the_constructor() {
+        let maybe = "  Maybe (a) =\n    | Just (a)\n    | None\n\n";
+        let either = "  Either (a) (b) =\n    | Left (a)\n    | Right (b)\n\n";
+        let f = |decl: &str, arms: &str| {
+            counters(&chapter(&format!(
+                "{decl}  f : {} -> Boolean\n  f (m) = when m\n{arms}",
+                if decl == maybe { "Maybe a" } else { "Either a b" }
+            )))
+        };
+        // `Just (x)` mints one and binds one; `None` mints one and binds none.
+        assert_eq!(f(maybe, "    is Just (x) -> True\n    is None -> False\n"), (9, 0));
+        // A wildcard is not a constructor and costs nothing.
+        assert_eq!(f(maybe, "    is Just (x) -> True\n    is otherwise -> False\n"), (8, 0));
+        // Two quantifiers, one bound variable, twice.
+        assert_eq!(f(either, "    is Left (x) -> True\n    is Right (y) -> False\n"), (15, 0));
+        // The same constructor twice costs the same twice.
+        assert_eq!(
+            f(maybe, "    is Just (x) -> True\n    is Just (y) -> False\n    is None -> False\n"),
+            (10, 0)
+        );
     }
 
     /// The slice subject, whole, and the two neighbours that isolate the
