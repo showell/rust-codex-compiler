@@ -284,6 +284,50 @@ impl UnifyState {
         }
     }
 
+    /// `row-union` (Unifier.codex:377). **IT NEVER MINTS.** Two rows meeting
+    /// as a compound expression's ambient effects is not the same event as two
+    /// rows being unified: an empty side yields the other, identical sides
+    /// yield themselves, and only when both are open with different tails does
+    /// one tail get SUBSTITUTED to the other -- a substitution, not a fresh id.
+    /// Getting that wrong would move `next-row-id` at every binary operator.
+    fn row_union(&mut self, r1: &EffectRow, r2: &EffectRow) -> EffectRow {
+        let a = self.resolve_row(r1);
+        let b = self.resolve_row(r2);
+        if a.labels.is_empty() && a.id < 0 {
+            return b;
+        }
+        if b.labels.is_empty() && b.id < 0 {
+            return a;
+        }
+        if a.labels == b.labels && a.id == b.id && a.tail == b.tail {
+            return a;
+        }
+        let mut merged = a.labels.clone();
+        merged.extend(b.labels.iter().cloned());
+        if a.id < 0 {
+            return EffectRow { labels: merged, tail: b.tail, id: b.id };
+        }
+        if b.id < 0 || a.id == b.id {
+            return EffectRow { labels: merged, tail: a.tail, id: a.id };
+        }
+        self.add_row_subst(a.id, EffectRow { id: b.id, ..Default::default() });
+        EffectRow { labels: merged, tail: b.tail, id: b.id }
+    }
+
+    /// `open-row-if-closed` (TypeCheckerInference.codex:529). **A LAMBDA MINTS
+    /// A ROW ONLY WHEN ITS BODY'S IS CLOSED.** An application hands back an
+    /// open row -- it minted a call row -- so `\u -> f x` costs nothing here
+    /// while `\u -> n` costs one. Minting unconditionally is +1 per lambda
+    /// over an effectful body, which is one character of IR (`"" 848` against
+    /// `"" 847`) and no other visible symptom.
+    fn open_row_if_closed(&mut self, row: &EffectRow) -> EffectRow {
+        let r = self.resolve_row(row);
+        if r.id >= 0 {
+            return r;
+        }
+        EffectRow { labels: r.labels, tail: String::new(), id: self.fresh_row() }
+    }
+
     /// `unify-row` (Unifier.codex:344). **THE ONLY ARM THAT MINTS IS
     /// OPEN-MEETS-OPEN WITH DIFFERENT TAILS**, which equates the two variables
     /// through a third: two closed rows agree or fail, and an open row meeting
@@ -1109,7 +1153,28 @@ pub fn section(syms: &SymTab, bindings: &[Binding], st: &UnifyState) -> String {
 /// Every expression's type is recorded, because the IR carries one on nearly
 /// every node and `expr-types` counts them.
 pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> Ty {
+    infer_row(e, env, st).0
+}
+
+/// The walk, carrying what upstream's `CheckResult` carries: the inferred type
+/// AND the expression's ambient effect row.
+///
+/// **THE ROW IS NOT DECORATION -- ONE SITE CONSUMES IT.** `open-row-if-closed`
+/// at a lambda mints a row id only when the body's row is closed, so a checker
+/// with no row channel has to mint unconditionally and runs one ahead. Every
+/// other reader of these rows is `row-union`, which never mints, so propagating
+/// them is free in both counters.
+///
+/// **CLOSED AND EMPTY IS THE DEFAULT** because that is `empty-row`, what
+/// upstream answers for a literal, a name and a lambda. An arm that forgets to
+/// set `row` therefore behaves as this checker did before it existed.
+pub fn infer_row(
+    e: &crate::ast::Expr,
+    env: &mut TyEnv<'_>,
+    st: &mut UnifyState,
+) -> (Ty, EffectRow) {
     use crate::ast::Expr as E;
+    let mut row = EffectRow::default();
     let t = match e {
         E::Lit(_, crate::ast::LiteralKind::IntLit, _) => {
             Ty::Integer(i64::MIN, i64::MAX, Overflow::Error)
@@ -1148,19 +1213,41 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
             // `infer-name` (TypeCheckerInference.codex:158) records the INNER
             // type of an effectful name and hands the row to its caller: the
             // value side is what this wire spells.
+            // **AN EFFECTFUL NAME HANDS ITS ROW UP, AND THAT ROW IS CLOSED.**
+            // `make-row-from-names` (TypeChecker.codex:29) builds the labels and
+            // sets `tail-id = -1`, so a lambda whose body is a bare effectful
+            // name still mints one at `open-row-if-closed`. Only an application
+            // opens a row.
             let rec = match t {
-                Ty::Effectful(_, _, inner) => *inner,
+                Ty::Effectful(effs, scopes, inner) => {
+                    row = EffectRow {
+                        labels: effs
+                            .iter()
+                            .enumerate()
+                            .map(|(i, e)| {
+                                (
+                                    env.syms.text(*e).to_string(),
+                                    scopes.get(i).cloned().unwrap_or_default(),
+                                )
+                            })
+                            .collect(),
+                        tail: String::new(),
+                        id: -1,
+                    };
+                    *inner
+                }
                 other => other,
             };
             st.record_expr_type(*sp, rec.clone());
-            return rec;
+            return (rec, row);
         }
         // A comparison answers Boolean; arithmetic answers its operands'.
         // Neither mints, which is why fib's five applications are not the
         // whole of its next-id.
         E::Binary(l, op, r, sp) => {
-            let lt = infer(l, env, st);
-            let _rt = infer(r, env, st);
+            let (lt, lrow) = infer_row(l, env, st);
+            let (_rt, rrow) = infer_row(r, env, st);
+            row = st.row_union(&lrow, &rrow);
             use crate::ast::BinaryOp::*;
             // **`&` RECORDS AN EXPRESSION TYPE; NO OTHER OPERATOR DOES.**
             // `infer-and` (TypeCheckerInference.codex:414) records the LEFT
@@ -1192,9 +1279,11 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
             }
         }
         E::If(c, a, b, _) => {
-            let _ = infer(c, env, st);
-            let ta = infer(a, env, st);
-            let _tb = infer(b, env, st);
+            let (_, crow) = infer_row(c, env, st);
+            let (ta, arow) = infer_row(a, env, st);
+            let (_tb, brow) = infer_row(b, env, st);
+            let both = st.row_union(&crow, &arow);
+            row = st.row_union(&both, &brow);
             ta
         }
         // Mints a result variable and TWO row ids, after both halves are in.
@@ -1202,8 +1291,8 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
         // (see the NameRef arm); these two are the rest of the three an
         // application costs.
         E::Apply(f, a, _) => {
-            let ft = infer(f, env, st);
-            let at = infer(a, env, st);
+            let (ft, frow) = infer_row(f, env, st);
+            let (at, arow) = infer_row(a, env, st);
             let ret = st.fresh();
             // **ONE ROW HERE, AND THE SECOND COMES FROM UNIFICATION.** An
             // application was measured at two rows and this minted both; with
@@ -1227,6 +1316,12 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
             // answers `ret-ty` and lets `deep-resolve` read it back later;
             // peeling the arrow instead answers the same type only while the
             // function's own type is already ground.
+            //
+            // **AN APPLICATION'S ROW IS OPEN, AND THAT IS WHY A LAMBDA OVER ONE
+            // MINTS NOTHING.** The call row goes into the union last, exactly
+            // as `infer-application` (line 644) does it.
+            let halves = st.row_union(&frow, &arow);
+            row = st.row_union(&halves, &EffectRow { id: call_row, ..Default::default() });
             ret
         }
         E::Act(stmts, _) => {
@@ -1234,7 +1329,9 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
             for s in stmts {
                 match s {
                     crate::ast::ActStmt::Exec(x, _) | crate::ast::ActStmt::Bind(_, x, _) => {
-                        last = infer(x, env, st)
+                        let (t, srow) = infer_row(x, env, st);
+                        last = t;
+                        row = st.row_union(&row, &srow);
                     }
                 }
             }
@@ -1242,10 +1339,21 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
         }
         E::Let(binds, body, _) => {
             for b in binds {
-                let t = infer(&b.value, env, st);
-                env.bind(b.name, t);
+                let (t, brow) = infer_row(&b.value, env, st);
+                // **A LET BINDS THE DEEP-RESOLVED TYPE, NOT THE INFERRED ONE.**
+                // `infer-let-bindings` (TypeCheckerInference.codex:504) resolves
+                // before it binds, and the difference is not cosmetic: binding
+                // `f = list-at ts 0` raw leaves a bare variable in the
+                // environment, so the later `f 0` finds no arrow and
+                // `open-spine-rows` mints nothing where upstream mints for the
+                // spine it can now see.
+                let resolved = st.deep_resolve(&t);
+                env.bind(b.name, resolved);
+                row = st.row_union(&row, &brow);
             }
-            infer(body, env, st)
+            let (t, body_row) = infer_row(body, env, st);
+            row = st.row_union(&row, &body_row);
+            t
         }
         // **EVERY REMAINING FORM IS WALKED, EVEN WHERE THE TYPE IS NOT KNOWN.**
         // A `_ => Ty::Error` arm that did not recurse skipped whole subtrees in
@@ -1261,8 +1369,11 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
         // application rule was; until then they recurse and mint nothing of
         // their own, which is a number that can be checked rather than a
         // subtree that cannot.
-        E::Unary(x, _) => infer(x, env, st),
-        E::Lazy(x, _) => infer(x, env, st),
+        E::Unary(x, _) | E::Lazy(x, _) => {
+            let (t, xrow) = infer_row(x, env, st);
+            row = xrow;
+            t
+        }
         // **AN EMPTY LIST MINTS ONE VARIABLE AND RECORDS IT; A NON-EMPTY ONE
         // MINTS NOTHING.** `[]` has no element to read a type from, so the
         // element type is a fresh variable that unification decides from the
@@ -1274,11 +1385,13 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
             if xs.is_empty() {
                 let e = st.fresh();
                 st.record_expr_type(*sp, e.clone());
-                return Ty::List(Box::new(e));
+                return (Ty::List(Box::new(e)), EffectRow::default());
             }
             let mut elem = Ty::Error;
             for x in xs {
-                elem = infer(x, env, st);
+                let (t, erow) = infer_row(x, env, st);
+                elem = t;
+                row = st.row_union(&row, &erow);
             }
             Ty::List(Box::new(elem))
         }
@@ -1290,19 +1403,24 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
                 arg = st.fresh();
                 env.bind(*p, arg.clone());
             }
-            let ret = infer(body, env, st);
+            let (ret, body_row) = infer_row(body, env, st);
             for _ in params {
                 env.scope.pop();
             }
-            // **AND ONE ROW, AFTER THE BODY.** `open-row-if-closed`
-            // (TypeCheckerInference.codex:529) mints when the body's effect row
-            // has no tail, and a pure body's never does. The parameters' type
-            // variables come BEFORE the body; this comes after, so the two
-            // counters move at different moments and the order is graded.
-            let row = EffectRow { id: st.fresh_row(), ..Default::default() };
-            let t = Ty::Fun(Box::new(arg), row, Box::new(ret));
+            // **AND ONE ROW, AFTER THE BODY -- BUT ONLY IF THE BODY'S IS
+            // CLOSED.** `open-row-if-closed` (TypeCheckerInference.codex:529)
+            // reuses an already-open row and mints only when there is no tail.
+            // A body that is an APPLICATION is already open, because the
+            // application minted a call row; a body that is a name or an
+            // arithmetic operator is not. The parameters' type variables come
+            // BEFORE the body and this comes after, so the two counters move at
+            // different moments and the order is graded.
+            let lam_row = st.open_row_if_closed(&body_row);
+            let t = Ty::Fun(Box::new(arg), lam_row, Box::new(ret));
             st.record_expr_type(*sp, t.clone());
-            return t;
+            // A lambda's OWN ambient row is empty: the effects are the arrow's,
+            // not the surrounding expression's (`infer-lambda`, line 543).
+            return (t, EffectRow::default());
         }
         // **A MATCH MINTS ONE VARIABLE FOR ITS RESULT, AND THAT VARIABLE IS
         // ITS TYPE.** `infer-match` (TypeCheckerInference.codex:1305) mints it
@@ -1311,12 +1429,15 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
         // One per MATCH, not per arm and not per pattern variable: a two-field
         // destructure and a three-field one both cost the same one.
         E::Match(scrut, arms, _) | E::Induction(scrut, arms, _) => {
-            let _ = infer(scrut, env, st);
+            let (_, srow) = infer_row(scrut, env, st);
+            row = srow;
             let result = st.fresh();
             for a in arms {
                 let bound = bind_pattern(&a.pattern, None, env, st);
-                let _ = infer(&a.guard, env, st);
-                let arm_ty = infer(&a.body, env, st);
+                let (_, grow) = infer_row(&a.guard, env, st);
+                row = st.row_union(&row, &grow);
+                let (arm_ty, arow) = infer_row(&a.body, env, st);
+                row = st.row_union(&row, &arow);
                 if !st.unify(&arm_ty, &result) {
                     st.unify_gaps += 1;
                 }
@@ -1344,10 +1465,11 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
                 result = *r;
             }
             for f in fields {
-                let _ = infer(&f.value, env, st);
+                let (_, frow) = infer_row(&f.value, env, st);
+                row = st.row_union(&row, &frow);
             }
             st.record_expr_type(*sp, result.clone());
-            return result;
+            return (result, row);
         }
         // **A FIELD ACCESS ON A TYPE THAT IS NOT A RECORD MINTS A FRESH
         // VARIABLE**, which is most of them here: the field's type comes from
@@ -1409,7 +1531,7 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
         }
         E::Error(..) => Ty::Error,
     };
-    t
+    (t, row)
 }
 
 /// A pattern's variables, bound for the arm's body. Returns how many were
