@@ -814,8 +814,8 @@ impl<'a> Desugar<'a> {
             // POSITIONAL, because a scope in the middle of a row cannot be
             // recovered by padding the end.
             NodeKind::EffectType => {
-                let (effs, scopes) = self.effect_row(n);
-                TypeExpr::Effect(effs, scopes, Vec::new(), Rc::new(first(0)), sp)
+                let (effs, scopes, tail) = self.effect_row(n);
+                TypeExpr::Effect(effs, scopes, tail, Rc::new(first(0)), sp)
             }
             NodeKind::TupleType => {
                 let elems: Vec<TypeExpr> = kids.iter().map(|k| self.type_expr(k)).collect();
@@ -826,37 +826,64 @@ impl<'a> Desugar<'a> {
         }
     }
 
-    /// `[Console "stdout", FileSystem.Read "/config/"]` as its names and its
-    /// scopes, one scope per effect and empty where the row grants none.
+    /// `[Console "stdout", FileSystem.Read "/config/", e]` as its effect names,
+    /// their scopes, and the ROW TAIL.
+    ///
+    /// **A LOWERCASE IDENTIFIER IN AN EFFECT ROW IS THE TAIL, NOT AN EFFECT.**
+    /// `parse-row-tail` (Syntax/Parser.codex) accepts at most one, refuses a
+    /// dot on it (`cdx-row-tail-decorated`) and refuses a second
+    /// (`cdx-row-two-tails`); an effect NAME is a TypeIdentifier, may be dotted
+    /// and may carry a scope literal. The token kind is the whole distinction.
+    ///
+    /// It is what makes `[e]` a row VARIABLE, which `parameterize-type` mints
+    /// an id for and every reference instantiates. Treated as an effect name it
+    /// is an undefined effect that costs nothing and spells nothing.
     ///
     /// Assembled from the TOKENS rather than read off child nodes: an effect
     /// row is not a type, so the parser leaves it flat and a dotted name
     /// arrives as three tokens.
-    fn effect_row(&self, n: &Node) -> (Vec<Name>, Vec<String>) {
-        let (mut effs, mut scopes) = (Vec::new(), Vec::new());
+    fn effect_row(&self, n: &Node) -> (Vec<Name>, Vec<String>, Vec<Name>) {
+        let (mut effs, mut scopes, mut tail) = (Vec::new(), Vec::new(), Vec::new());
         let mut name = String::new();
         let mut scope = String::new();
-        let mut flush = |name: &mut String, scope: &mut String| {
-            if !name.is_empty() {
+        let mut is_tail = false;
+        let mut flush = |name: &mut String, scope: &mut String, is_tail: &mut bool| {
+            if name.is_empty() {
+                return;
+            }
+            if *is_tail {
+                tail.push(std::mem::take(name));
+                scope.clear();
+            } else {
                 effs.push(std::mem::take(name));
                 scopes.push(std::mem::take(scope));
             }
+            *is_tail = false;
         };
         for t in n.own_tokens().filter(|t| !t.kind.is_trivia()) {
             match t.kind {
                 Kind::LeftBracket | Kind::RightBracket => {}
-                Kind::Comma => flush(&mut name, &mut scope),
+                Kind::Comma => flush(&mut name, &mut scope, &mut is_tail),
                 // The scope is a text literal, and what the wire carries is
                 // its VALUE -- the quotes are syntax.
                 Kind::TextLiteral => {
                     let raw = String::from_utf8_lossy(t.text(self.src)).to_string();
                     scope = raw.trim_matches('"').to_string();
                 }
-                _ => name.push_str(&String::from_utf8_lossy(t.text(self.src))),
+                _ => {
+                    if name.is_empty() && t.kind == Kind::Identifier {
+                        is_tail = true;
+                    }
+                    name.push_str(&String::from_utf8_lossy(t.text(self.src)));
+                }
             }
         }
-        flush(&mut name, &mut scope);
-        (effs.iter().map(|e| self.sym_str(e)).collect(), scopes)
+        flush(&mut name, &mut scope, &mut is_tail);
+        (
+            effs.iter().map(|e| self.sym_str(e)).collect(),
+            scopes,
+            tail.iter().map(|e| self.sym_str(e)).collect(),
+        )
     }
 
     // -- patterns ------------------------------------------------------------

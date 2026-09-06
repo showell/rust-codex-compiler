@@ -261,16 +261,40 @@ impl UnifyState {
     /// BOUND id alone. Replacing every variable in the body instead is the
     /// same type with different ids the moment a type quantifies two.
     pub fn instantiate(&mut self, t: &Ty) -> Ty {
+        self.instantiate_inner(t, 1)
+    }
+
+    /// The same walk, for a definition's OWN body. **A ROW PARAMETER COSTS TWO
+    /// ROWS HERE AND A TYPE PARAMETER ONE VARIABLE**, which is not symmetric
+    /// and is measured rather than derived.
+    ///
+    /// A distinct row parameter costs THREE rows in total, on a signature
+    /// nobody calls: `f : Integer -> [e] Integer` with body `n` is
+    /// `next-row-id 3` where the same signature without `[e]` is 0, and two
+    /// distinct row parameters cost six. One of the three is
+    /// `parameterize-row` at registration and one is `instantiate-collect`
+    /// here. **THE THIRD IS NOT LOCATED**: `check-definition` does more than
+    /// instantiate, and which of those steps mints it has not been read out of
+    /// the source. Referencing such a function from elsewhere costs the same
+    /// three rows a pure one costs, so the extra is the signature's alone.
+    pub fn instantiate_own(&mut self, t: &Ty) -> Ty {
+        self.instantiate_inner(t, 2)
+    }
+
+    fn instantiate_inner(&mut self, t: &Ty, rows_per_eff: usize) -> Ty {
         match t {
             Ty::ForAll(id, body) => {
                 let fr = self.fresh();
                 let b = subst_type_var(body, *id, &fr);
-                self.instantiate(&b)
+                self.instantiate_inner(&b, rows_per_eff)
             }
             Ty::ForAllEff(id, body) => {
                 let r = self.fresh_row();
+                for _ in 1..rows_per_eff {
+                    let _ = self.fresh_row();
+                }
                 let b = subst_row_var(body, *id, r);
-                self.instantiate(&b)
+                self.instantiate_inner(&b, rows_per_eff)
             }
             other => other.clone(),
         }
@@ -436,7 +460,12 @@ fn subst_type_var(t: &Ty, id: u32, with: &Ty) -> Ty {
 fn subst_row_var(t: &Ty, id: i32, with: i32) -> Ty {
     match t {
         Ty::Fun(p, row, r) => {
-            let row2 = if row.id == id && row.tail.is_empty() {
+            // **KEYED ON THE ID, AND THE TAIL NAME SURVIVES.** `subst-row-var`
+            // (TypeCheckerInference.codex:251) matches `row.tail-id == old-id`
+            // and calls `row-with-tail-id`, which rewrites the id and keeps the
+            // name. Requiring an empty tail here meant the substitution never
+            // fired on the row variables it exists for.
+            let row2 = if row.id == id {
                 EffectRow { id: with, ..row.clone() }
             } else {
                 row.clone()
@@ -475,13 +504,45 @@ pub fn resolve_declared(syms: &SymTab, t: &crate::ast::TypeExpr) -> Option<Ty> {
             "Real" => Ty::Real(RealWidth::F64, RealMode::Default),
             _ => Ty::TypeCon(n.clone()),
         },
-        T::Fun(a, b, _) => Ty::Fun(
-            Box::new(resolve_declared(syms, a)?),
-            EffectRow::default(),
-            Box::new(resolve_declared(syms, b)?),
-        ),
+        // **AN EFFECT ANNOTATION ON AN ARROW'S RESULT IS THE ARROW'S ROW**,
+        // and the result is what is left underneath. `resolve-type-expr`
+        // (TypeChecker.codex:14) does exactly this, and the builtin table
+        // agrees: `print-line-uni : Text -> [Console] Nothing` is
+        // `(fn text (row Console.Write) nothing)` and not a function returning
+        // an effectful type.
+        //
+        // Folding it wrong cost every `[e]` in the depot: a row variable that
+        // stays inside an `EffectfulTy` is not on an arrow, so
+        // `parameterize-type` never sees a tail to mint an id for.
+        T::Fun(a, b, _) => {
+            let arg = Box::new(resolve_declared(syms, a)?);
+            match &**b {
+                T::Effect(effs, scopes, tail, inner, _) => Ty::Fun(
+                    arg,
+                    EffectRow {
+                        labels: effs
+                            .iter()
+                            .enumerate()
+                            .map(|(i, e)| {
+                                (
+                                    syms.text(*e).to_string(),
+                                    scopes.get(i).cloned().unwrap_or_default(),
+                                )
+                            })
+                            .collect(),
+                        tail: tail.first().map_or(String::new(), |t| syms.text(*t).to_string()),
+                        id: -1,
+                    },
+                    Box::new(resolve_declared(syms, inner)?),
+                ),
+                _ => Ty::Fun(arg, EffectRow::default(), Box::new(resolve_declared(syms, b)?)),
+            }
+        }
         // `[Console] Nothing` -- the effect row is what makes `opening` print
         // as `eff` rather than as its result type.
+        // A standalone effect annotation stays an `EffectfulTy`, and its TAIL
+        // is dropped -- `resolve-type-expr`'s own arm passes only effs and
+        // scopes through.
         T::Effect(effs, scopes, _, inner, _) => Ty::Effectful(
             effs.clone(),
             scopes.clone(),
@@ -512,12 +573,104 @@ pub fn register_defs(ch: &crate::ast::Chapter, st: &mut UnifyState) -> Vec<Bindi
     let mut out = Vec::new();
     for d in &ch.defs {
         let ty = match d.declared_type.first().and_then(|t| resolve_declared(&ch.syms, t)) {
-            Some(t) => t,
+            Some(t) => parameterize(&t, &ch.syms, st),
             None => st.fresh(),
         };
         out.push(Binding { name: d.name, ty });
     }
     out
+}
+
+/// One parameter of a signature: the name it was written with, and the id it
+/// was given.
+struct ParamEntry {
+    name: String,
+    id: u32,
+    is_row: bool,
+}
+
+/// `parameterize-type` (TypeChecker.codex:569): a signature's free names become
+/// bound variables, and the type is wrapped in one quantifier per DISTINCT one.
+///
+/// **THIS MINTS, AT REGISTRATION, BEFORE ANY BODY IS WALKED.** `ident : List a
+/// -> List a` costs one fresh variable here and one more when its own body is
+/// checked, with no caller anywhere -- and `eff-id : (Integer -> [e] Integer)
+/// -> [e] Integer` costs two ROWS the same way. Measured on `codexcheck`
+/// against a monomorphic control that costs nothing.
+///
+/// A LOWERCASE INITIAL IS WHAT MAKES A NAME A PARAMETER. `a`, `elem` and
+/// `alpha` all parameterise and cost two; an uppercase name that no type
+/// definition declares is `CDX3008 Undefined type name` instead. Upstream's
+/// `is-value-name` reads as `char-code 'e' .. char-code 'z'`, which in CCE is
+/// the letters e to z and would exclude `a` -- the measurement says `a`
+/// parameterises anyway, so something above it already settled the question and
+/// the range is not the gate it looks like. Measured behaviour, not the
+/// predicate.
+fn parameterize(t: &Ty, syms: &SymTab, st: &mut UnifyState) -> Ty {
+    let mut entries: Vec<ParamEntry> = Vec::new();
+    let walked = param_walk(t, syms, st, &mut entries);
+    // Entry 0 is the OUTERMOST quantifier: `wrap-forall-from-entries` recurses
+    // before it wraps, so the first parameter found binds the whole type.
+    entries.iter().rev().fold(walked, |inner, e| {
+        if e.is_row {
+            Ty::ForAllEff(e.id as i32, Box::new(inner))
+        } else {
+            Ty::ForAll(e.id, Box::new(inner))
+        }
+    })
+}
+
+fn param_of(name: &str, is_row: bool, st: &mut UnifyState, entries: &mut Vec<ParamEntry>) -> u32 {
+    if let Some(e) = entries.iter().find(|e| e.name == name && e.is_row == is_row) {
+        return e.id;
+    }
+    // The two counters again: a row parameter is minted off the row counter and
+    // must not move `next-id`.
+    let id = if is_row { st.fresh_row() as u32 } else { st.next_id };
+    if !is_row {
+        let _ = st.fresh();
+    }
+    entries.push(ParamEntry { name: name.to_string(), id, is_row });
+    id
+}
+
+fn param_walk(t: &Ty, syms: &SymTab, st: &mut UnifyState, entries: &mut Vec<ParamEntry>) -> Ty {
+    let lower = |n: Name| syms.text(n).chars().next().is_some_and(char::is_lowercase);
+    match t {
+        Ty::TypeCon(n) if lower(*n) => {
+            Ty::Var(param_of(syms.text(*n), false, st, entries))
+        }
+        Ty::Constructed(n, args) if lower(*n) && args.is_empty() => {
+            Ty::Var(param_of(syms.text(*n), false, st, entries))
+        }
+        // The parameter first, then the ROW, then the result -- the order the
+        // ids come out in, and they are graded.
+        Ty::Fun(p, row, r) => {
+            let p2 = param_walk(p, syms, st, entries);
+            let row2 = if row.tail.is_empty() || row.id >= 0 {
+                row.clone()
+            } else {
+                let tail = row.tail.clone();
+                EffectRow { id: param_of(&tail, true, st, entries) as i32, ..row.clone() }
+            };
+            let r2 = param_walk(r, syms, st, entries);
+            Ty::Fun(Box::new(p2), row2, Box::new(r2))
+        }
+        Ty::List(e) => Ty::List(Box::new(param_walk(e, syms, st, entries))),
+        Ty::LinkedList(e) => Ty::LinkedList(Box::new(param_walk(e, syms, st, entries))),
+        Ty::Linear(e) => Ty::Linear(Box::new(param_walk(e, syms, st, entries))),
+        Ty::Vector(n, e) => Ty::Vector(*n, Box::new(param_walk(e, syms, st, entries))),
+        Ty::Effectful(effs, sc, r) => Ty::Effectful(
+            effs.clone(),
+            sc.clone(),
+            Box::new(param_walk(r, syms, st, entries)),
+        ),
+        Ty::Constructed(n, args) => Ty::Constructed(
+            *n,
+            args.iter().map(|a| param_walk(a, syms, st, entries)).collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 /// Register every definition, then infer every body.
@@ -546,7 +699,13 @@ pub fn check_chapter(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState) {
         // starting next-id at 0 where upstream starts at 2 -- and the ids would
         // have been shifted by two all the way into the IR, where they are
         // printed as `(tvar N)`. Two wrongs summing to 8.
-        let mut spine = bindings.iter().find(|b| b.name == d.name).map(|b| b.ty.clone());
+        // **`instantiate-collect`: A DEFINITION'S OWN BODY INSTANTIATES ITS OWN
+        // SIGNATURE.** The body wants the opposite of a quantifier -- concrete
+        // variables it can unify against -- so every parameter is minted a
+        // second time here. That is the other half of what a type parameter
+        // costs, and it is paid whether or not anything calls the definition.
+        let own = bindings.iter().find(|b| b.name == d.name).map(|b| b.ty.clone());
+        let mut spine = own.map(|t| st.instantiate_own(&t));
         let mut saved = Vec::new();
         for p in &d.params {
             let arg = match spine {
@@ -1170,6 +1329,44 @@ mod tests {
                        double-it : (Integer -> Integer) -> Integer\n  \
                        double-it (k) = k 1\n";
         assert_eq!(counters(&chapter(partial)), (5, 10));
+    }
+
+    /// **A TYPE PARAMETER COSTS TWO FRESH VARIABLES AND A ROW PARAMETER TWO
+    /// FRESH ROWS -- BEFORE ANYONE CALLS THE DEFINITION.**
+    ///
+    /// `parameterize-type` (TypeChecker.codex:569) mints one for each DISTINCT
+    /// parameter when the signature is registered, and `instantiate-collect`
+    /// mints another for each when the definition's OWN body is checked. Every
+    /// reference afterwards instantiates and mints one more.
+    ///
+    /// Read off `codexcheck` at `u56-candidate-sunday`. The monomorphic
+    /// control is what makes the numbers mean anything: `ident : List Integer
+    /// -> List Integer` costs nothing at all, so the difference is
+    /// parameterisation and not the shape of the definition.
+    #[test]
+    fn a_type_parameter_costs_two_before_anyone_calls_it() {
+        let ident = "  ident : List a -> List a\n  ident (xs) = xs\n";
+        // Registration and the definition's own body: two, with no caller.
+        assert_eq!(counters(&chapter(ident)), (4, 0));
+
+        // Distinct parameters, not occurrences: `a` appears twice above and
+        // costs two, while `a` and `b` below cost four.
+        let pair = "  pair : List a, List b -> List a\n  pair (xs) (ys) = xs\n";
+        assert_eq!(counters(&chapter(pair)), (6, 0));
+
+        // A caller adds one instantiation per parameter, on top of what the
+        // application itself costs.
+        let call = |n: usize| {
+            let body = (0..n).fold("ys".to_string(), |acc, _| format!("ident ({acc})"));
+            format!("{ident}\n  use : List Integer -> List Integer\n  use (ys) = {body}\n")
+        };
+        assert_eq!(counters(&chapter(&call(1))), (6, 3));
+        assert_eq!(counters(&chapter(&call(2))), (8, 6));
+
+        // The ROW parameter is the same rule on the other counter: `[e]` costs
+        // two rows, and the body's one application and one spine cost three.
+        let eff = "  eff-id : (Integer -> [e] Integer) -> [e] Integer\n  eff-id (g) = g 1\n";
+        assert_eq!(counters(&chapter(eff)), (3, 5));
     }
 
     /// The slice subject, whole, and the two neighbours that isolate the
