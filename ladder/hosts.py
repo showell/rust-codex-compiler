@@ -25,10 +25,13 @@ harness passes that literal, so passing it here too makes the comparison raw
 bytes -- no normalising pass, nothing to get subtly wrong. The bank names the
 entry chapter instead, which is why grading against it ever needed one.
 
-The unit comes from `cite_resolve.py` because `bundle` now REFUSES to write a
-unit carrying a carriage return, and fifteen `codex/foreword/*` chapters are
-CRLF. Reading in text mode is the normalising step that refusal asks the caller
-for, and it is what the corpus has always been resolved with.
+THE UNIT COMES FROM THIS COMPILER'S OWN `bundle`. It used to come from the
+ladder's `cite_resolve.py`, because `bundle` refuses to write a unit carrying a
+carriage return and fifteen `codex/foreword/*` chapters were CRLF -- Python's
+text mode normalised them by accident, which is also how the IR bank came to be
+cut from source no compiler could have read. Those fifteen are LF as of
+COMPILER-54, so the accident is no longer load-bearing and the resolver that
+grades this arm is the one under test.
 """
 import os
 import pathlib
@@ -38,13 +41,35 @@ import sys
 import tempfile
 import time
 
-sys.path.insert(0, "/home/steve/showell_repos/codex-zig-ladder")
-from cite_resolve import resolve
-
 TARGET = pathlib.Path(
     os.environ.get("CARGO_TARGET_DIR", os.path.expanduser("~/build/rust-target"))
 ) / "release"
 BIN = TARGET / "codexrun"
+
+BUNDLE = TARGET / "bundle"
+
+
+def resolve(path):
+    """The unit, and the cites that could not be found.
+
+    **THIS COMPILER'S OWN RESOLVER, NOT THE LADDER'S.** `cite_resolve.py` lived
+    in a repository that is retired, and it could not read its own output: its
+    presence check matches only the depot's `Chapter: Quire--Name` while the
+    units it writes carry a bare `Chapter: ListUtils`, so handed a unit it had
+    already resolved it walked every cite again and appended a second copy.
+    `normalize-eq` went 4256 bytes to 7965; the duplicates parse and they type,
+    so the oracle halted on ordinary redefinition errors in a file nobody wrote
+    and 20 of 28 curated units read as "the oracle refused the program".
+
+    `bundle one` fetches only the cites a file does not already carry, so a raw
+    corpus program is resolved and a frozen unit comes back untouched. Verified
+    byte-identical to what the ladder's resolver produced on 80 corpus programs.
+    """
+    r = subprocess.run([str(BUNDLE), "one", str(path)], capture_output=True, text=True)
+    if r.returncode != 0:
+        return None, [ln for ln in r.stderr.strip().splitlines() if ln][:2]
+    return r.stdout, []
+
 CODEXIR = pathlib.Path(
     "/home/steve/showell_repos/codex-zig-transpiler/generated/local/codexir")
 
@@ -142,7 +167,7 @@ def main():
         unit_text, missing = resolve(path.resolve())
         if missing:
             verdict = "UNRESOLVED"
-            detail = "; ".join(f"{q}/{n}" for _, q, n in missing[:2])
+            detail = "; ".join(missing[:2])
         else:
             with tempfile.NamedTemporaryFile("w", suffix=".codex", delete=False) as f:
                 f.write(unit_text)

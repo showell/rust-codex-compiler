@@ -9,7 +9,7 @@ compiling Codex to IR directly, no Codex compiler in the loop -- reaches the
 same document.
 
 **THE CONTROL IS THE SAME `codexir`, ON THE SAME UNIT.** Both arms are handed
-the bytes `cite_resolve.py` produces and both name the entry chapter
+the bytes this compiler's own `bundle` produces and both name the entry chapter
 `"Program"`, so a difference is ours and there is no third explanation. Grading
 against `$CODEX_GOLDS/ir` instead would carry a different pin, a different tree
 and a different resolver, none of which is the thing under test.
@@ -27,9 +27,7 @@ import sys
 import tempfile
 import time
 
-sys.path.insert(0, "/home/steve/showell_repos/codex-zig-ladder")
-from cite_resolve import resolve
-from hosts import CODEXIR, TARGET, refuse_a_stale_binary
+from hosts import CODEXIR, TARGET, refuse_a_stale_binary, resolve
 
 IRDUMP = TARGET / "irdump"
 RUN_TIMEOUT = 120
