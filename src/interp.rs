@@ -2747,6 +2747,24 @@ mod tests {
     ///
     /// ```text
     /// in let dummy1 = list-set-at (pred.forward) i new-node
+    /// **A NULLARY THAT ANSWERS A LIST IS NOT CACHEABLE IF ANYTHING PUSHES.**
+    /// `list-push` writes through and hands back the same list, so a cached
+    /// nullary gives every mention one list and the second use sees the first
+    /// one's entries. The `writes` guard listed only `list-set-at` and
+    /// `__record-set`, so a program whose only mutator was a push kept the
+    /// cache and shared the list.
+    ///
+    /// Measured against upstream on `signal-bus-test`, whose `signal-queue-empty`
+    /// is exactly this shape. The failure surfaced three tests later as a count
+    /// that was too LOW -- the loop bounds itself by a `count` field that had
+    /// not moved while the shared list grew past it -- which is why it took a
+    /// curated set to find and a ten-line probe to see.
+    #[test]
+    fn a_nullary_list_is_fresh_at_every_mention_when_anything_pushes() {
+        let src = "Chapter: T\n\nSection: S\n\n  empty-box : List Integer\n  empty-box = []\n\nSection: E\n\n  opening : [Console] Nothing = act\n                 let a = list-push empty-box 1\n    in let b = list-push empty-box 2\n                 in print-line-uni (show (list-length a) & \" \" & show (list-length b))\n  end\n";
+        assert_eq!(out(src).trim(), "1 1");
+    }
+
     /// in let dummy2 = list-set-at (pred.spans) i (new-pos - pred-rank)
     /// in splice-new-node s path new-node height new-pos (i + 1)
     /// ```
@@ -3212,8 +3230,25 @@ fn program_writes(
     consts: &[&crate::ast::Def],
     funs: &[(u32, &crate::ast::Def)],
 ) -> bool {
-    let writers: Vec<Sym> =
-        ["list-set-at", "__record-set"].iter().filter_map(|n| syms.find(n)).collect();
+    // **EVERY BUILTIN THAT WRITES THROUGH, not just the two named after
+    // writing.** `list-push` and `list-snoc` mutate in place and hand back the
+    // same list -- deliberately, because upstream's do and the compiler's skip
+    // list depends on it -- so a program whose only mutator is a push still
+    // has a writer, and a cached nullary still hands its list to everyone.
+    //
+    // `signal-bus-test` is the program that proves it: `signal-queue-empty` is
+    // a nullary record holding `pending = []`, every `signal-send` pushes onto
+    // it, and with `list-push` absent from this list the cache handed the same
+    // list to two independent uses. The second saw the first's entries -- and
+    // the failure surfaced three tests later, as a count that was too LOW,
+    // because the loop bounds itself by a `count` field that had not moved.
+    let writers: Vec<Sym> = [
+        "list-set-at", "__record-set", "list-push", "list-snoc",
+        "list-insert-at", "__linked-list-push",
+    ]
+    .iter()
+    .filter_map(|n| syms.find(n))
+    .collect();
     let mut found = false;
     for d in consts.iter().copied().chain(funs.iter().map(|(_, d)| *d)) {
         d.body.walk(&mut |x| match x {
