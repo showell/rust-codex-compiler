@@ -1260,7 +1260,13 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
             for _ in params {
                 env.scope.pop();
             }
-            let t = Ty::Fun(Box::new(arg), EffectRow::default(), Box::new(ret));
+            // **AND ONE ROW, AFTER THE BODY.** `open-row-if-closed`
+            // (TypeCheckerInference.codex:529) mints when the body's effect row
+            // has no tail, and a pure body's never does. The parameters' type
+            // variables come BEFORE the body; this comes after, so the two
+            // counters move at different moments and the order is graded.
+            let row = EffectRow { id: st.fresh_row(), ..Default::default() };
+            let t = Ty::Fun(Box::new(arg), row, Box::new(ret));
             st.record_expr_type(*sp, t.clone());
             return t;
         }
@@ -1868,6 +1874,26 @@ mod tests {
         assert_eq!(with("  N a b =\n    | E\n    | B (N a b)\n"), 21);
         // Through a `List`, which is the shape the depot actually writes.
         assert_eq!(with("  N a =\n    | E\n    | B (List (N a))\n"), 13);
+    }
+
+    /// **A LAMBDA MINTS ONE ROW, AFTER ITS BODY.** `infer-lambda` ends with
+    /// `open-row-if-closed` (TypeCheckerInference.codex:529), which mints when
+    /// the body's effect row has no tail -- and a pure body's never does. The
+    /// type variables for its parameters are minted BEFORE the body, by
+    /// `bind-lambda-params`, so the two counters move at different moments.
+    ///
+    /// Read off `codexcheck`: one lambda costs one row, two cost two, and
+    /// `next-id` does not move either way.
+    #[test]
+    fn a_lambda_mints_one_row_after_its_body() {
+        let ap = "  ap : (Integer -> Integer), Integer -> Integer\n  ap (g) (x) = g x\n\n";
+        let one = format!("{ap}  f : Integer -> Integer\n  f (n) = ap (\\y -> y) n\n");
+        assert_eq!(counters(&chapter(&one)), (6, 10));
+
+        let two = format!(
+            "{ap}  f : Integer -> Integer\n  f (n) = ap (\\y -> y) (ap (\\z -> z) n)\n"
+        );
+        assert_eq!(counters(&chapter(&two)), (9, 17));
     }
 
     /// The slice subject, whole, and the two neighbours that isolate the
