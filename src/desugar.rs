@@ -806,13 +806,16 @@ impl<'a> Desugar<'a> {
                     .unwrap_or_default();
                 TypeExpr::Forall(var, Rc::new(first(0)), Rc::new(first(1)), sp)
             }
+            // **A DOTTED EFFECT IS ONE NAME AND A SCOPE BELONGS TO THE EFFECT
+            // IT FOLLOWS.** `[Console "stdout", FileSystem.Read "/config/"]` is
+            // two effects, `Console` and `FileSystem.Read`, with a scope each.
+            // Taking the identifiers alone made `Device.Block` two effects and
+            // dropped every scope in the depot; the scopes must also be
+            // POSITIONAL, because a scope in the middle of a row cannot be
+            // recovered by padding the end.
             NodeKind::EffectType => {
-                let effs: Vec<Name> = n
-                    .own_tokens()
-                    .filter(|t| matches!(t.kind, Kind::Identifier | Kind::TypeIdentifier))
-                    .map(|t| self.sym(t))
-                    .collect();
-                TypeExpr::Effect(effs, Vec::new(), Vec::new(), Rc::new(first(0)), sp)
+                let (effs, scopes) = self.effect_row(n);
+                TypeExpr::Effect(effs, scopes, Vec::new(), Rc::new(first(0)), sp)
             }
             NodeKind::TupleType => {
                 let elems: Vec<TypeExpr> = kids.iter().map(|k| self.type_expr(k)).collect();
@@ -821,6 +824,39 @@ impl<'a> Desugar<'a> {
             }
             _ => TypeExpr::Named(Name::default(), sp),
         }
+    }
+
+    /// `[Console "stdout", FileSystem.Read "/config/"]` as its names and its
+    /// scopes, one scope per effect and empty where the row grants none.
+    ///
+    /// Assembled from the TOKENS rather than read off child nodes: an effect
+    /// row is not a type, so the parser leaves it flat and a dotted name
+    /// arrives as three tokens.
+    fn effect_row(&self, n: &Node) -> (Vec<Name>, Vec<String>) {
+        let (mut effs, mut scopes) = (Vec::new(), Vec::new());
+        let mut name = String::new();
+        let mut scope = String::new();
+        let mut flush = |name: &mut String, scope: &mut String| {
+            if !name.is_empty() {
+                effs.push(std::mem::take(name));
+                scopes.push(std::mem::take(scope));
+            }
+        };
+        for t in n.own_tokens().filter(|t| !t.kind.is_trivia()) {
+            match t.kind {
+                Kind::LeftBracket | Kind::RightBracket => {}
+                Kind::Comma => flush(&mut name, &mut scope),
+                // The scope is a text literal, and what the wire carries is
+                // its VALUE -- the quotes are syntax.
+                Kind::TextLiteral => {
+                    let raw = String::from_utf8_lossy(t.text(self.src)).to_string();
+                    scope = raw.trim_matches('"').to_string();
+                }
+                _ => name.push_str(&String::from_utf8_lossy(t.text(self.src))),
+            }
+        }
+        flush(&mut name, &mut scope);
+        (effs.iter().map(|e| self.sym_str(e)).collect(), scopes)
     }
 
     // -- patterns ------------------------------------------------------------

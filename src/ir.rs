@@ -751,6 +751,35 @@ mod tests {
         );
     }
 
+    /// **A DOTTED EFFECT IS ONE NAME, AND A SCOPE BELONGS TO THE EFFECT IT
+    /// FOLLOWS.** `[Device.Block]` is one effect; taking the identifiers and
+    /// dropping the dots makes it two, pads `(scopes)` to match, and produces
+    /// a signature no reader can resolve.
+    ///
+    /// Both lines are `codexir`'s at `u56-candidate-sunday`. The second is
+    /// `[Console "stdout", FileSystem.Read "/config/"]`, which is the shape
+    /// that needs the scope kept POSITIONAL: a scope in the middle of a row
+    /// cannot be recovered by padding the end.
+    #[test]
+    fn an_effect_row_keeps_dotted_names_and_their_scopes() {
+        let dotted = "Chapter: BlockIdentify\n\nSection: Body\n  opening : [Device.Block] Integer = block-sector-count\n";
+        assert!(
+            def_line(dotted, "opening")
+                .contains(r#"(effectful (effs "Device.Block") (scopes "") int-default)"#),
+            "got: {}",
+            def_line(dotted, "opening")
+        );
+
+        let scoped = "Chapter: Sc\n\nSection: S\n  opening : [Console \"stdout\", FileSystem.Read \"/config/\"] Nothing = act\n   print-line-uni \"a\"\n  end\n";
+        assert!(
+            def_line(scoped, "opening").contains(
+                r#"(effectful (effs "Console" "FileSystem.Read") (scopes "stdout" "/config/") nothing)"#
+            ),
+            "got: {}",
+            def_line(scoped, "opening")
+        );
+    }
+
     /// A pure definition still renders exactly as it did, which is the thing
     /// these changes must not disturb: it is already byte-identical to the
     /// oracle and that is the only verified ground the native road stands on.
