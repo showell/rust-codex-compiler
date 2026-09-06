@@ -196,6 +196,13 @@ pub struct UnifyState {
 ///
 /// One file here, so the file id is the constant 1. It cannot be 0: upstream
 /// calls file id 0 SYNTHETIC and records nothing for it.
+/// Upstream's `is-synthetic-span` is `span.file-id == 0`. There is one file
+/// here, so the marker is the LINE: source lines are 1-based, and only a span
+/// this desugarer invented has line 0.
+pub fn is_synthetic(sp: crate::ast::Span) -> bool {
+    sp.line == 0
+}
+
 pub fn expr_type_key(sp: crate::ast::Span) -> u64 {
     (1u64 << 48) + (sp.offset as u64) * 65536 + (sp.len.min(65535) as u64)
 }
@@ -323,7 +330,17 @@ impl UnifyState {
 
     /// `record-expr-type` (Unifier.codex:148). Appended unsorted, because a
     /// record is on the hot path and a sort is not.
+    ///
+    /// **A SYNTHETIC SPAN RECORDS NOTHING**, which is upstream's first line:
+    /// `if is-synthetic-span sp then st`. The desugarer's derived definitions
+    /// -- `__eq_<T>` for a self-recursive variant -- are built entirely from
+    /// synthetic spans, so they mint type variables and contribute no
+    /// expression types at all. That asymmetry is visible in the numbers:
+    /// `encode-ini`'s unit matched on `expr-types` while `next-id` was short.
     pub fn record_expr_type(&mut self, sp: crate::ast::Span, t: Ty) {
+        if is_synthetic(sp) {
+            return;
+        }
         self.expr_types.push((expr_type_key(sp), t));
     }
 
@@ -814,12 +831,14 @@ struct ParamEntry {
 ///
 /// A LOWERCASE INITIAL IS WHAT MAKES A NAME A PARAMETER. `a`, `elem` and
 /// `alpha` all parameterise and cost two; an uppercase name that no type
-/// definition declares is `CDX3008 Undefined type name` instead. Upstream's
-/// `is-value-name` reads as `char-code 'e' .. char-code 'z'`, which in CCE is
-/// the letters e to z and would exclude `a` -- the measurement says `a`
-/// parameterises anyway, so something above it already settled the question and
-/// the range is not the gate it looks like. Measured behaviour, not the
-/// predicate.
+/// definition declares is `CDX3008 Undefined type name` instead.
+///
+/// Upstream spells it `char-code 'e' .. char-code 'z'` (TypeChecker.codex:551),
+/// which reads like "e through z" and is not: **CCE IS FREQUENCY-ORDERED**, so
+/// its lowercase band is `etaoinshrdlcumwfgypbvkjxqz` -- `e` is code 13, the
+/// FIRST letter, and `z` is 38, the LAST. The range is the whole lowercase
+/// band, named by its endpoints. Reading it as an alphabetical span says `a` is
+/// excluded, which is wrong and disagrees with every probe.
 fn parameterize(t: &Ty, syms: &SymTab, st: &mut UnifyState) -> Ty {
     let mut entries: Vec<ParamEntry> = Vec::new();
     let walked = param_walk(t, syms, st, &mut entries);
@@ -1765,6 +1784,48 @@ mod tests {
             f(maybe, "    is Just (x) -> True\n    is Just (y) -> False\n    is None -> False\n"),
             (10, 0)
         );
+    }
+
+    /// **A RECURSIVE SUM COSTS FAR MORE THAN ITS SHAPE SUGGESTS**, because a
+    /// `SumTy` carries its whole CONSTRUCTOR LIST and a self-referencing field
+    /// pulls that list back into the type `parameterize-type` walks.
+    ///
+    /// `build-type-def-map` resolves a constructor's fields against the PARTIAL
+    /// map -- the entries built so far, not this one -- so the self-reference
+    /// stays a small `ConstructedTy` there. But `build-ctor-type`
+    /// (TypeChecker.codex:4278) then resolves the same fields against the FULL
+    /// map, and `N` now looks up to the finished `SumTy` with every constructor
+    /// and every field type in it.
+    ///
+    /// Read off `codexcheck` at `u56-candidate-sunday`, against a chapter whose
+    /// only definition is monomorphic so the difference is the declaration.
+    #[test]
+    fn a_recursive_sum_pulls_its_own_constructor_list_in() {
+        let f = "\n  f : Integer -> Integer\n  f (n) = n\n";
+        let with = |decl: &str| counters(&chapter(&format!("{decl}{f}"))).0;
+
+        // The non-recursive controls: a variant that never names itself gets
+        // no derived definition, so only its constructors parameterise.
+        assert_eq!(with("  N a =\n    | E\n    | L (a)\n"), 4);
+        assert_eq!(with("  N =\n    | E\n    | L (Integer)\n"), 2);
+
+        // One self-naming arm, and a whole `__eq_N` appears. With no type
+        // parameters the cost is exactly the matches it contains: one over
+        // `__ex`, and one over `__ey` per constructor.
+        assert_eq!(with("  N =\n    | B (N)\n"), 4);
+        assert_eq!(with("  N =\n    | E\n    | B (N)\n"), 5);
+        assert_eq!(with("  N =\n    | E\n    | B (N)\n    | C (N)\n"), 6);
+        // Two self-naming FIELDS in one constructor are still one arm.
+        assert_eq!(with("  N =\n    | E\n    | B (N) (N)\n"), 5);
+
+        // A type parameter multiplies it: every constructor pattern in the
+        // derived body instantiates that constructor's own quantifier.
+        assert_eq!(with("  N a =\n    | B (N a)\n"), 9);
+        assert_eq!(with("  N a =\n    | E\n    | B (N a)\n"), 13);
+        assert_eq!(with("  N a =\n    | E\n    | L (a)\n    | B (N a)\n"), 17);
+        assert_eq!(with("  N a b =\n    | E\n    | B (N a b)\n"), 21);
+        // Through a `List`, which is the shape the depot actually writes.
+        assert_eq!(with("  N a =\n    | E\n    | B (List (N a))\n"), 13);
     }
 
     /// The slice subject, whole, and the two neighbours that isolate the

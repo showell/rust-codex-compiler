@@ -582,8 +582,112 @@ impl<'a> Desugar<'a> {
                 ch.rt_names.push(self.str_of(self.def_name(d)));
             }
         }
+        // **THE DESUGARER SYNTHESISES DEFINITIONS, AND THEY GO LAST.**
+        // `desugar-document` (Ast/Desugarer.codex:610) appends family-member,
+        // conversion and DERIVED defs after the chapter's own, in type-
+        // declaration order.
+        self.synth_derived_defs(&mut ch);
         ch.syms = std::mem::take(&mut *self.syms.borrow_mut());
         ch
+    }
+
+    /// `synth-derived-defs`: one `__eq_<T>` per variant that NAMES ITSELF.
+    ///
+    /// **A SELF-RECURSIVE VARIANT GETS STRUCTURAL EQUALITY WHETHER IT ASKS OR
+    /// NOT** -- `push-derived-for-type` fires on `deriving-has "Eq" |
+    /// td-self-recursive td`, and a constructor field naming the type is
+    /// enough. It is a REAL definition, two parameters and a nested `when`, so
+    /// it registers, checks and can be lowered like any other; a chapter
+    /// missing it reports a smaller `next-id` than upstream for the same
+    /// source and can emit a `(defs ...)` short of a definition.
+    ///
+    /// `deriving Show` and `deriving Ord` synthesise two more. Those are NOT
+    /// here: our parser does not capture the `deriving` clause at all, so they
+    /// need a parser change first. Fifteen files in the depot carry one.
+    fn synth_derived_defs(&self, ch: &mut Chapter) {
+        let mut out = Vec::new();
+        for td in &ch.type_defs {
+            let TypeDef::Variant(name, _, ctors, _) = td else { continue };
+            let names_itself = ctors.iter().any(|c| {
+                c.fields.iter().any(|f| type_names(f, *name))
+            });
+            if names_itself {
+                out.push(self.eq_def(*name, ctors, &ch.syms));
+            }
+        }
+        ch.defs.extend(out);
+    }
+
+    /// `gen-eq-def`: `__eq_T (__ex) (__ey)` is a `when` over `__ex` whose every
+    /// arm is a `when` over `__ey` -- the same constructor, comparing fields
+    /// pairwise, or a wildcard answering False.
+    ///
+    /// EVERY SPAN HERE IS SYNTHETIC, which is load-bearing: `record-expr-type`
+    /// skips a synthetic span, so none of these names reaches `expr-types`.
+    /// That is why `expr-types` already matched on units whose `next-id` did
+    /// not -- the missing definitions mint variables and record nothing.
+    fn eq_def(&self, tname: Name, ctors: &[VariantCtorDef], syms: &SymTab) -> Def {
+        let sp = Span::default();
+        let (xn, yn) = (self.sym_str("__ex"), self.sym_str("__ey"));
+        let tref = TypeExpr::Named(tname, sp);
+        let boolean = TypeExpr::Named(self.sym_str("Boolean"), sp);
+        let arms = ctors
+            .iter()
+            .map(|c| {
+                let n = c.fields.len();
+                let xv: Vec<Name> = (0..n).map(|i| self.sym_str(&format!("__exf{i}"))).collect();
+                let yv: Vec<Name> = (0..n).map(|i| self.sym_str(&format!("__eyf{i}"))).collect();
+                let pats = |vs: &[Name]| vs.iter().map(|v| Pat::Var(*v, sp)).collect::<Vec<_>>();
+                // Field equality, folded left with `&`; no fields is `True`.
+                let body = xv.iter().zip(&yv).fold(None::<Expr>, |acc, (x, y)| {
+                    let one = Expr::Binary(
+                        Rc::new(Expr::NameRef(*x, sp)),
+                        BinaryOp::OpEq,
+                        Rc::new(Expr::NameRef(*y, sp)),
+                        sp,
+                    );
+                    Some(match acc {
+                        None => one,
+                        Some(a) => Expr::Binary(Rc::new(a), BinaryOp::OpAnd, Rc::new(one), sp),
+                    })
+                })
+                .unwrap_or_else(|| Expr::Lit("True".into(), LiteralKind::BoolLit, sp));
+                let yes = MatchArm {
+                    pattern: Pat::Ctor(c.name, pats(&yv), sp),
+                    body,
+                    guard: Expr::Lit("True".into(), LiteralKind::BoolLit, sp),
+                    span: sp,
+                    alt_group: NO_ALT_GROUP,
+                };
+                let no = MatchArm {
+                    pattern: Pat::Wild(sp),
+                    body: Expr::Lit("False".into(), LiteralKind::BoolLit, sp),
+                    guard: Expr::Lit("True".into(), LiteralKind::BoolLit, sp),
+                    span: sp,
+                    alt_group: NO_ALT_GROUP,
+                };
+                MatchArm {
+                    pattern: Pat::Ctor(c.name, pats(&xv), sp),
+                    body: Expr::Match(Rc::new(Expr::NameRef(yn, sp)), vec![yes, no], sp),
+                    guard: Expr::Lit("True".into(), LiteralKind::BoolLit, sp),
+                    span: sp,
+                    alt_group: NO_ALT_GROUP,
+                }
+            })
+            .collect();
+        Def {
+            name: self.sym_str(&format!("__eq_{}", syms.text(tname))),
+            params: vec![Param { name: xn, span: sp }, Param { name: yn, span: sp }],
+            declared_type: vec![TypeExpr::Fun(
+                Rc::new(tref.clone()),
+                Rc::new(TypeExpr::Fun(Rc::new(tref), Rc::new(boolean), sp)),
+                sp,
+            )],
+            body: Expr::Match(Rc::new(Expr::NameRef(xn, sp)), arms, sp),
+            chapter_slug: String::new(),
+            span: sp,
+            is_claim: false,
+        }
     }
 
     fn def_name(&self, d: &Node) -> Name {
@@ -914,6 +1018,30 @@ impl<'a> Desugar<'a> {
             }
             _ => Pat::Wild(sp),
         }
+    }
+}
+
+/// **NOT FANNED OUT OF A `|`-GROUP.** Upstream writes `-1`; our `alt_group` is
+/// the source OFFSET of the pattern it came from and so cannot hold one. A
+/// synthetic arm has no offset to give, and every synthetic arm sharing 0 would
+/// claim they were all alternatives of one pattern. Nothing reads the field
+/// today -- when something does, this is the value it has to know about.
+const NO_ALT_GROUP: u32 = u32::MAX;
+
+/// Does this type expression NAME the given type? `td-self-recursive` asks it
+/// of every constructor field, and `List (N a)` counts as much as a bare `N`.
+fn type_names(t: &TypeExpr, n: Name) -> bool {
+    match t {
+        TypeExpr::Named(m, _) => *m == n,
+        TypeExpr::Fun(a, b, _) => type_names(a, n) || type_names(b, n),
+        TypeExpr::App(h, args, _) => {
+            type_names(h, n) || args.iter().any(|a| type_names(a, n))
+        }
+        TypeExpr::Effect(_, _, _, r, _) => type_names(r, n),
+        TypeExpr::Linear(i, _) | TypeExpr::BoundedInt(i, ..) => type_names(i, n),
+        TypeExpr::PropEq(a, b, _) => type_names(a, n) || type_names(b, n),
+        TypeExpr::Constrained(_, _, i, _) => type_names(i, n),
+        TypeExpr::Forall(_, a, b, _) => type_names(a, n) || type_names(b, n),
     }
 }
 
