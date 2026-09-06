@@ -7,9 +7,19 @@
 trailing harness dropped. Each program is BUNDLED FIRST, because the bank is a
 bank of units: `neg-int-parse` alone is one definition and its gold carries
 ListUtils and Tuple folded in, five type definitions and seven section titles.
-The bundled text is then inlined as a Text literal in a harness chapter that
-calls `compile-frontend-cdx`, run under `codexrun` and diffed against
-`$CODEX_GOLDS/ir`.
+The bundled unit is left on disk and the harness READS IT, under `codexrun`,
+and the output is diffed against `$CODEX_GOLDS/ir`.
+
+THE SUBJECT ARRIVES BY `read-file-uni`, NOT AS A TEXT LITERAL, because those
+are two different states of the machinery under test. A literal is interned
+below `bump::HEAP_ORIGIN`, so `copy-sx-text`'s `address-of t < b` is true of
+every substring of it and the compiler shares the source rather than copying
+it; a file read lands on the heap, where that test is false and the copies are
+made. That is the same allocator arithmetic whose host-pointer version made
+every durability test false, and the bank was cut by bare metal READING A
+FILE, as `codexir` reads stdin. The literal form also has to escape the source
+-- survivable on this corpus, where no program contains a tab or a backslash,
+but it refused two programs outright for non-ASCII and a read refuses none.
 
 THE HARNESS IS `emit-ir-uni`, THE DRIVER'S OWN IR MODE, with ONE deviation.
 Emulating a driver's phases by hand is how every deviation gets in, so this
@@ -57,14 +67,10 @@ HARNESS = '''
 
 Chapter: Parsmi--Rungs
 
-Section: Subject
-
-  src : Text
-  src = "{src}"
-
 Section: Entry
 
-  opening : [Console] Nothing = act
+  opening : [Console, FileSystem] Nothing = act
+    src <- read-file-uni "{src}"
     let mb = init-phase-allocator
     in let db = __heap-save
     in let ds = __deck-set db
@@ -99,33 +105,25 @@ def _cap_memory():
 class Refused(Exception):
     """This program never reached the interpreter, and why.
 
-    A refusal here is about the HARNESS -- a cite it cannot resolve, a byte it
-    cannot quote -- and says nothing about the interpreter. Kept apart from a
-    diff for that reason, and counted separately.
+    A refusal here is about the HARNESS -- a cite it cannot resolve, a run that
+    outgrew the cap -- and says nothing about the interpreter's answer. Kept
+    apart from a diff for that reason, and counted separately.
     """
-
-
-def quote(text):
-    """A Codex Text literal holding this source.
-
-    NON-ASCII IS REFUSED RATHER THAN GUESSED AT. Codex source is CCE on the way
-    in and a byte above 127 means the file carries something this escape cannot
-    honestly represent; silently mangling it would produce a diff nobody could
-    read.
-    """
-    if any(ord(c) > 127 for c in text):
-        raise Refused("non-ASCII source: this harness cannot quote it")
-    esc = {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\t": "\\t"}
-    return "".join(esc.get(c, c) for c in text)
 
 
 def bundled(path):
-    """The unit this program is, cites folded in.
+    """The unit this program is, cites folded in, LEFT ON DISK for the harness.
 
     `bundle` writes its complaints to stdout and its unit to a file, so the
     complaints are not mixed into the source. A DEAD QUIRE line is about the
     registry pointing at a checkout that is not here and says nothing about
     this program, so it is not fatal.
+
+    The caller gets the path as well as the text: the text is only read here to
+    find the entry chapter's name, and the file itself is what the run reads.
+    Decoding is lossy for that reason alone -- a `Chapter:` line is ASCII, so a
+    byte this scan cannot read is a byte it does not need, and the interpreter
+    gets the file unmediated either way.
     """
     with tempfile.NamedTemporaryFile(suffix=".codex", delete=False) as f:
         out = f.name
@@ -136,9 +134,7 @@ def bundled(path):
     if r.returncode != 0:
         os.unlink(out)
         raise Refused(r.stderr.strip().splitlines()[-1][:90] if r.stderr.strip() else "bundle refused")
-    text = pathlib.Path(out).read_text()
-    os.unlink(out)
-    return text
+    return pathlib.Path(out).read_bytes().decode("utf-8", "replace"), out
 
 
 def main():
@@ -160,15 +156,14 @@ def main():
             print(f"{name:34} NO GOLD", flush=True)
             continue
         try:
-            src = bundled(path)
-            harness_src = quote(src)
+            src, src_path = bundled(path)
         except Refused as e:
             refused += 1
             print(f"{name:34} REFUSED  {'':7} {e}", flush=True)
             continue
         # A bundle puts the cited chapters first, so the entry is the last one.
         chapters = [l.split(":", 1)[1].strip() for l in src.splitlines() if l.startswith("Chapter:")]
-        harness = HARNESS.format(src=harness_src, name=chapters[-1] if chapters else name)
+        harness = HARNESS.format(src=src_path, name=chapters[-1] if chapters else name)
         with tempfile.NamedTemporaryFile("w", suffix=".codex", delete=False) as f:
             f.write(subject + harness)
             unit = f.name
@@ -183,11 +178,13 @@ def main():
             )
         except subprocess.TimeoutExpired:
             os.unlink(unit)
+            os.unlink(src_path)
             refused += 1
             print(f"{name:34} REFUSED  {RUN_TIMEOUT:6.2f}s  timed out", flush=True)
             continue
         secs = time.time() - t0
         os.unlink(unit)
+        os.unlink(src_path)
         if r.returncode != 0:
             refused += 1
             print(f"{name:34} REFUSED  {secs:6.2f}s  {r.stderr.strip().splitlines()[-1][:90]}", flush=True)
