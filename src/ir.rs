@@ -74,6 +74,26 @@ pub fn render_type(syms: &SymTab, t: &TypeExpr) -> Option<String> {
         // `List a` is `(list a)` and `Vector a` is `(vector a)`. The golds
         // carry 228,533 of the first, which makes it the cheapest thing in the
         // language to be unable to spell.
+        // **`(scopes ...)` IS PARALLEL TO `(effs ...)`**, one string per
+        // effect and empty when that effect is unscoped -- three effects print
+        // `(scopes "" "" "")`. Read off real IR rather than reasoned about: a
+        // single empty list is what a reader expects and it is wrong for every
+        // definition with more than one effect.
+        TypeExpr::Effect(effs, scopes, _, result, _) => {
+            let names: Vec<String> =
+                effs.iter().map(|n| format!(" {:?}", syms.text(*n))).collect();
+            // A scope is written down only when there is one, so the list is
+            // padded to the effects rather than assumed to match.
+            let sc: Vec<String> = (0..effs.len())
+                .map(|i| format!(" {:?}", scopes.get(i).map_or("", |s| s.as_str())))
+                .collect();
+            Some(format!(
+                "(effectful (effs{}) (scopes{}) {})",
+                names.concat(),
+                sc.concat(),
+                render_type(syms, result)?
+            ))
+        }
         TypeExpr::App(head, args, _) => match (&**head, args.as_slice()) {
             (TypeExpr::Named(n, _), [only]) if syms.text(*n) == "List" => {
                 Some(format!("(list {})", render_type(syms, only)?))
@@ -302,6 +322,41 @@ fn expr(e: &Expr, env: &Env) -> Result<(String, String), String> {
                 out = format!("(let {:?} {} {} {})", env.syms.text(n), ty, v, out);
             }
             Ok((out, bty))
+        }
+        // `(act (stmts S...) TYPE)`, one `(do-exec E)` or `(do-bind "n" TYPE E)`
+        // per statement, and the block's type is the type of what it ENDS
+        // with -- an act evaluates to its last statement, the same way a let
+        // evaluates to its body.
+        //
+        // A BIND IS IN SCOPE FOR THE STATEMENTS AFTER IT, which is the whole
+        // reason the environment is threaded rather than rebuilt: `x <- f ...`
+        // followed by a statement mentioning `x` is the ordinary shape, and an
+        // act that started each statement from the outer scope would refuse it
+        // as an undefined name.
+        //
+        // A bind's written type is the type of what it binds. Upstream's row
+        // arithmetic decides what the EFFECT of the block is; this is the
+        // value side, which is all the wire carries here.
+        Expr::Act(stmts, _) => {
+            let mut env2 = env.bind(Sym::default(), "");
+            let mut parts = Vec::new();
+            let mut last = "nothing".to_string();
+            for st in stmts {
+                match st {
+                    crate::ast::ActStmt::Exec(e, _) => {
+                        let (t, ty) = expr(e, &env2)?;
+                        parts.push(format!("(do-exec {t})"));
+                        last = ty;
+                    }
+                    crate::ast::ActStmt::Bind(n, e, _) => {
+                        let (t, ty) = expr(e, &env2)?;
+                        parts.push(format!("(do-bind {:?} {} {})", env.syms.text(*n), ty, t));
+                        env2 = env2.bind(*n, &ty);
+                        last = ty;
+                    }
+                }
+            }
+            Ok((format!("(act (stmts {}) {})", parts.join(" "), last), last))
         }
         other => Err(node_kind(other).to_string()),
     }
@@ -533,5 +588,112 @@ fn shape(syms: &SymTab, e: &Expr, d: usize, out: &mut String) {
         Expr::Lambda(_, b, _) => shape(syms, b, d + 1, out),
         Expr::FieldAccess(r, _, _) => shape(syms, r, d + 1, out),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The IR text for one chapter, or the refusal.
+    ///
+    /// Through the real front end -- parse, desugar, emit -- because the point
+    /// of these is the SPELLING that reaches the wire, and a unit test that
+    /// built a `TypeExpr` by hand would be testing my idea of the AST rather
+    /// than the one the parser makes.
+    fn ir(src: &str) -> String {
+        let bytes = src.as_bytes().to_vec();
+        let parsed = crate::parser::parse(&bytes);
+        let mut dg = crate::desugar::Desugar::new(&bytes);
+        let ch = dg.chapter(&parsed.tree);
+        match super::emit_defs(&ch) {
+            Ok(s) => s,
+            Err(e) => format!("REFUSED: {e}"),
+        }
+    }
+
+    /// Just the one definition's line, which is what these are about.
+    fn def_line(src: &str, name: &str) -> String {
+        let all = ir(src);
+        all.lines()
+            .find(|l| l.contains(&format!("(def {name:?}")))
+            .map(|l| l.trim().to_string())
+            .unwrap_or(all)
+    }
+
+    const PURE: &str = "Chapter: T\n\nSection: S\n  f : Integer -> Integer\n  f (n) = n\n\n";
+
+    /// **`[Console] Nothing` IS `(effectful (effs "Console") (scopes "") nothing)`.**
+    ///
+    /// `scopes` is PARALLEL TO `effs`, one string per effect and empty when the
+    /// effect is unscoped -- read off real IR rather than guessed, where three
+    /// effects print `(scopes "" "" "")`. Rendering it as a single empty list
+    /// would be wrong for every multi-effect definition and right for the one
+    /// a test would obviously reach for.
+    #[test]
+    fn an_effect_row_renders_with_a_scope_for_each_effect() {
+        let src = format!(
+            "{PURE}Section: E\n  opening : [Console] Nothing = act\n   f 1\n  end\n"
+        );
+        assert!(
+            def_line(&src, "opening")
+                .contains(r#"(effectful (effs "Console") (scopes "") nothing)"#),
+            "got: {}",
+            def_line(&src, "opening")
+        );
+    }
+
+    #[test]
+    fn two_effects_carry_two_scopes() {
+        let src = format!(
+            "{PURE}Section: E\n  opening : [Console, FileSystem] Nothing = act\n   f 1\n  end\n"
+        );
+        assert!(
+            def_line(&src, "opening").contains(
+                r#"(effectful (effs "Console" "FileSystem") (scopes "" "") nothing)"#
+            ),
+            "got: {}",
+            def_line(&src, "opening")
+        );
+    }
+
+    /// **AN `act` IS `(act (stmts ...) TYPE)` and each statement is wrapped.**
+    /// `print-line-uni "a"` alone is one `do-exec`; the block's type is the
+    /// type of what it ends with.
+    #[test]
+    fn an_act_block_wraps_its_statements() {
+        let src = format!(
+            "{PURE}Section: E\n  opening : [Console] Nothing = act\n   f 1\n   f 2\n  end\n"
+        );
+        let line = def_line(&src, "opening");
+        assert!(line.contains("(act (stmts (do-exec "), "got: {line}");
+        assert!(line.matches("(do-exec ").count() == 2, "one per statement: {line}");
+        assert!(line.ends_with("int-default) 0 0)"), "the act ends with its last statement's type: {line}");
+    }
+
+    /// **WHAT IS STILL MISSING, PINNED SO IT IS A TEST AND NOT A COMMENT.**
+    /// An effectful BUILTIN has no wire type here. Its spelling embeds a row
+    /// VARIABLE ID -- `print-line-uni` is
+    /// `(fn text nothing (row (labels (label "Console.Write" "")) "" 6))` --
+    /// and that 6 is minted by the checker: `fresh-row-id` is a +1 counter
+    /// fired from nine places, and defs the call never touches move the
+    /// number. A static table cannot carry it, so this refuses rather than
+    /// inventing one. Change this test when the checker can answer.
+    #[test]
+    fn an_effectful_builtin_is_the_gap_that_needs_the_checker() {
+        let src = format!(
+            "{PURE}Section: E\n  opening : [Console] Nothing = act\n   print-line-uni \"a\"\n  end\n"
+        );
+        assert_eq!(ir(&src), "REFUSED: opening: no type for name `print-line-uni`");
+    }
+
+    /// A pure definition still renders exactly as it did, which is the thing
+    /// these changes must not disturb: it is already byte-identical to the
+    /// oracle and that is the only verified ground the native road stands on.
+    #[test]
+    fn a_pure_definition_is_unchanged() {
+        let src = "Chapter: Fib\n\nSection: M\n  fib : Integer -> Integer\n  fib (n) =\n   if n <= 1 then n\n   else fib (n - 1) + fib (n - 2)\n\nSection: E\n  opening : Integer\n  opening = fib 20\n";
+        assert_eq!(
+            def_line(src, "fib"),
+            r#"(def "fib" "Fib" (params (param "n" int-default)) (fn int-default int-default) (if (binary le (name "n" int-default) (int-lit 1) boolean) (name "n" int-default) (binary add-int (apply (name "fib" (fn int-default int-default)) (binary sub-int (name "n" int-default) (int-lit 1) int-default) int-default) (apply (name "fib" (fn int-default int-default)) (binary sub-int (name "n" int-default) (int-lit 2) int-default) int-default) int-default) int-default) 0 0)"#
+        );
     }
 }
