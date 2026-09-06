@@ -257,7 +257,21 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
         Expr::Binary(l, op, r, _) => {
             let (lt, lty) = expr(l, cx)?;
             let (rt, rty) = expr(r, cx)?;
-            if lty != rty {
+            // **THE RESULT IS THE LEFT OPERAND'S TYPE, AND TWO INTEGERS OF
+            // DIFFERENT BOUNDS ARE COMPATIBLE.** `b + 1` over
+            // `Integer between 0 and 255` answers `(int 0 255 ov-error)` and
+            // `1 + b` answers `int-default` -- so the rule is simply the LEFT,
+            // not the wider or the narrower of the two. Two differently
+            // bounded operands follow the same rule.
+            //
+            // Requiring the two to be EQUAL refused every arithmetic touching a
+            // bounded declaration, which the depot writes constantly.
+            let compatible = match (&lty, &rty) {
+                (Ty::Integer(..), Ty::Integer(..)) => true,
+                (Ty::Real(..), Ty::Real(..)) => true,
+                _ => lty == rty,
+            };
+            if !compatible {
                 return Err(format!(
                     "binary operands disagree: `{}` vs `{}`",
                     render_ty(cx.syms, &lty),
@@ -943,6 +957,32 @@ mod tests {
             ),
             "got: {}",
             def_line(&swapped, "mk")
+        );
+    }
+
+    /// **A BOUNDED INTEGER MEETING AN ORDINARY ONE ANSWERS THE LEFT.**
+    /// `b + 1` over `Integer between 0 and 255` is `(int 0 255 ov-error)`;
+    /// `1 + b` is `int-default`. Not the wider, not the narrower -- the left.
+    #[test]
+    fn arithmetic_on_a_bounded_integer_answers_the_left_operand() {
+        let calls = "\nSection: E\n  opening : [Console] Nothing = act\n   print-line-uni (show (w 3))\n   print-line-uni (show (w 4))\n  end\n";
+        let right = format!(
+            "Chapter: T\n\nSection: S\n  w : Integer between 0 and 255 -> Integer\n  w (b) = b + 1\n{calls}"
+        );
+        assert_eq!(
+            def_line(&right, "w"),
+            r#"(def "w" "T" (params (param "b" (int 0 255 ov-error))) (fn (int 0 255 ov-error) int-default) (binary add-int (name "b" (int 0 255 ov-error)) (int-lit 1) (int 0 255 ov-error)) 0 0)"#
+        );
+
+        let left = format!(
+            "Chapter: T\n\nSection: S\n  w : Integer between 0 and 255 -> Integer\n  w (b) = 1 + b\n{calls}"
+        );
+        assert!(
+            def_line(&left, "w").contains(
+                r#"(binary add-int (int-lit 1) (name "b" (int 0 255 ov-error)) int-default)"#
+            ),
+            "got: {}",
+            def_line(&left, "w")
         );
     }
 
