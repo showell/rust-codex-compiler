@@ -362,6 +362,23 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
                 Some(t) => t,
                 None => Ty::Error,
             };
+            // **A FUNCTION-TYPED NAME MINTS ONE ROW, HERE, BEFORE THE
+            // APPLICATION AROUND IT MINTS ANYTHING.** Instantiating the type
+            // gives its effect row a fresh id, and that id is what the wire
+            // spells: `print-line-uni` reaches the IR as
+            // `(fn text nothing (row (labels (label "Console.Write" "")) "" 0))`.
+            //
+            // Measured, not reasoned: `print-line-uni (read-file-raw "f")` puts
+            // Console.Write on row 0 and FileSystem.Read on row 1. Minting all
+            // of an application's rows up front would have given the inner
+            // builtin row 3, and minting them after would have given the OUTER
+            // one the higher number. Only this order produces 0 and 1.
+            //
+            // A name of non-function type mints nothing, which is what keeps
+            // `fib`'s four references to `n` off the counter.
+            if matches!(t, Ty::Fun(..)) {
+                let _ = st.fresh_row();
+            }
             st.expr_types.push((*n, t.clone()));
             return t;
         }
@@ -385,13 +402,16 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
             let _tb = infer(b, env, st);
             ta
         }
-        // The one site that mints, and it mints TWICE: a result variable and a
-        // row id, in that order.
+        // Mints a result variable and TWO row ids, after both halves are in.
+        // The application's own row is minted by the name in function position
+        // (see the NameRef arm); these two are the rest of the three an
+        // application costs.
         E::Apply(f, a, _) => {
             let ft = infer(f, env, st);
             let _at = infer(a, env, st);
             let ret = st.fresh();
             let _row = st.fresh_row();
+            let _row2 = st.fresh_row();
             match ft {
                 Ty::Fun(_, _, r) => *r,
                 _ => ret,
@@ -467,25 +487,84 @@ pub fn parse_ty(s: &str) -> Option<Ty> {
     if rest.trim().is_empty() { Some(t) } else { None }
 }
 
+/// The text of a parenthesised group and what follows it, parens balanced.
+///
+/// Needed because a row is a GROUP THAT CONTRIBUTES NO TYPE. Recursing into it
+/// with `parse_one` cannot say that: the only "no type here" it can return is
+/// `None`, which is also how it says "this does not parse" -- so `(row ...)`
+/// killed the whole type and every effectful builtin was dropped from the
+/// environment in silence. `print-line-uni` was absent for that reason, which
+/// cost it the row its name is supposed to mint.
+fn take_group(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start();
+    if !s.starts_with('(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&s[1..i], &s[i + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `(row Console.Write)` and `(row)` as the wire's own record. `empty` is the
+/// row with no labels, which is what a pure builtin declares.
+fn parse_row(inner: &str) -> EffectRow {
+    let mut it = inner.split_whitespace();
+    let head = it.next().unwrap_or("");
+    let labels = if head == "row" {
+        it.map(|w| (w.to_string(), String::new())).collect()
+    } else {
+        Vec::new()
+    };
+    EffectRow { labels, tail: String::new(), id: 0 }
+}
+
 fn parse_one(s: &str) -> Option<(Ty, &str)> {
     let s = s.trim_start();
     if let Some(inner) = s.strip_prefix('(') {
         let (head, mut rest) = take_word(inner);
         let mut args: Vec<Ty> = Vec::new();
         let mut words: Vec<String> = Vec::new();
+        let mut rows: Vec<EffectRow> = Vec::new();
         loop {
             let r = rest.trim_start();
             if let Some(after) = r.strip_prefix(')') {
-                return Some((build(head, &args, &words)?, after));
+                return Some((build(head, &args, &words, &rows)?, after));
             }
             if r.starts_with('(') {
+                // A row group is consumed whole and contributes a row, not a
+                // type; anything else is an ordinary nested type.
+                let is_row = take_group(r)
+                    .map(|(inner, _)| {
+                        let w = inner.split_whitespace().next().unwrap_or("");
+                        w == "row" || w == "empty"
+                    })
+                    .unwrap_or(false);
+                if is_row {
+                    let (inner, after) = take_group(r)?;
+                    rows.push(parse_row(inner));
+                    rest = after;
+                    continue;
+                }
                 let (t, after) = parse_one(r)?;
                 args.push(t);
                 rest = after;
             } else {
                 let (w, after) = take_word(r);
                 words.push(w.to_string());
-                if let Some(t) = atom(w) {
+                if w == "empty" {
+                    rows.push(EffectRow::default());
+                } else if let Some(t) = atom(w) {
                     args.push(t);
                 }
                 rest = after;
@@ -518,12 +597,15 @@ fn atom(w: &str) -> Option<Ty> {
     })
 }
 
-fn build(head: &str, args: &[Ty], words: &[String]) -> Option<Ty> {
+fn build(head: &str, args: &[Ty], words: &[String], rows: &[EffectRow]) -> Option<Ty> {
     Some(match head {
-        // `(fn A ROW B)` -- the row contributes no Ty, so A and B are args 0/1.
+        // `(fn A ROW B)` -- the row contributes no Ty, so A and B are args 0/1,
+        // and the row itself is CARRIED rather than defaulted away: its labels
+        // are what the wire spells for an effectful builtin, and its id is what
+        // the checker mints on the way past.
         "fn" => Ty::Fun(
             Box::new(args.first()?.clone()),
-            EffectRow::default(),
+            rows.first().cloned().unwrap_or_default(),
             Box::new(args.get(1)?.clone()),
         ),
         "tvar" => Ty::Var(words.first()?.parse().ok()?),
@@ -531,7 +613,6 @@ fn build(head: &str, args: &[Ty], words: &[String]) -> Option<Ty> {
         "foralleff" => Ty::ForAllEff(words.first()?.parse().ok()?, Box::new(args.first()?.clone())),
         "list" => Ty::List(Box::new(args.first()?.clone())),
         "eff" => Ty::Effectful(Vec::new(), Vec::new(), Box::new(args.first()?.clone())),
-        "row" | "empty" => return None,
         _ => return None,
     })
 }
@@ -548,4 +629,84 @@ pub fn builtin_env(syms: &SymTab) -> TyEnv<'_> {
         env.bind(sym, t);
     }
     env
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `(next_id, next_row_id)` after checking one chapter.
+    fn counters(src: &str) -> (u32, u32) {
+        let bytes = src.as_bytes();
+        let parsed = crate::parser::parse(bytes);
+        let mut dg = crate::desugar::Desugar::new(bytes);
+        let ch = dg.chapter(&parsed.tree);
+        let (_, st) = check_chapter(&ch);
+        (st.next_id, st.next_row_id)
+    }
+
+    fn chapter(body: &str) -> String {
+        format!("Chapter: T\n\nSection: S\n{body}")
+    }
+
+    /// **EVERY NUMBER HERE WAS READ OFF `codexcheck`, NOT REASONED OUT.**
+    /// One probe per row, `codexcheck < probe.codex`, at
+    /// `u56-candidate-sunday`. The rule they pin down:
+    ///
+    ///   * an APPLICATION mints exactly THREE row ids
+    ///   * they are allocated OUTERMOST FIRST -- before recursing into the
+    ///     function and the argument, not after
+    ///   * a type variable is minted once per application and once per
+    ///     `forall` quantifier instantiated
+    ///
+    /// The ordering is what the nesting rows prove. `print-line-uni` is the
+    /// outermost application in all three of the last shapes and takes row 0
+    /// in every one of them, however deep the argument goes; a checker that
+    /// minted after recursing would give it 0, 3 and 6 instead.
+    #[test]
+    fn row_ids_are_three_per_application_outermost_first() {
+        // No application anywhere: neither counter moves off its base.
+        assert_eq!(counters(&chapter("  a : Integer\n  a = 1\n")), (2, 0));
+        assert_eq!(counters(&chapter("  f : Integer -> Integer\n  f (x) = x\n")), (2, 0));
+
+        // One application of a user function: three rows, one type variable.
+        assert_eq!(
+            counters(&chapter(
+                "  f : Integer -> Integer\n  f (x) = x\n\n  \
+                 h : Integer -> Integer\n  h (x) = f x\n"
+            )),
+            (3, 3)
+        );
+
+        // A builtin is no different: one application, three rows.
+        let eff = |body: &str| {
+            chapter(&format!("  opening : [Console] Nothing = act\n   {body}\n  end\n"))
+        };
+        assert_eq!(counters(&eff(r#"print-line-uni "a""#)), (3, 3));
+        // Two applications, and `show` is `forall 0` -- so +2 vars for the
+        // applications and +1 for the quantifier.
+        assert_eq!(counters(&eff("print-line-uni (show 1)")), (5, 6));
+        // Three applications, still one quantifier.
+        assert_eq!(counters(&eff(r#"print-line-uni (show (text-length "xy"))"#)), (6, 9));
+    }
+
+    /// The slice subject, whole, and the two neighbours that isolate the
+    /// effectful half. `fib` alone is two recursive applications; each print
+    /// adds three more (`print-line-uni`, `show`, `fib`), which is why the
+    /// rows go 6 -> 15 -> 24 in steps of nine.
+    #[test]
+    fn fib_matches_the_oracle_on_both_counters() {
+        let math = "  fib : Integer -> Integer\n  fib (n) =\n   if n <= 1 then n\n   \
+                    else fib (n - 1) + fib (n - 2)\n";
+        assert_eq!(counters(&chapter(math)), (4, 6));
+
+        let with = |n: usize| {
+            let prints: String = (0..n)
+                .map(|i| format!("   print-line-uni (show (fib {}))\n", 20 + i))
+                .collect();
+            chapter(&format!("{math}\n  opening : [Console] Nothing = act\n{prints}  end\n"))
+        };
+        assert_eq!(counters(&with(1)), (8, 15));
+        assert_eq!(counters(&with(2)), (12, 24));
+    }
 }
