@@ -1415,9 +1415,9 @@ impl Interp {
             ("char-code-at", [Text(t), Int(i)]) => Ok(Int(t
                 .as_bytes()
                 .get(*i as usize)
-                .map(|b| char_code(*b))
+                .map(|b| char_code(*b as char))
                 .unwrap_or(0))),
-            ("char-code", [Char(c)]) => Ok(Int(char_code(*c as u8))),
+            ("char-code", [Char(c)]) => Ok(Int(char_code(*c))),
             ("code-to-char", [Int(c)]) => Ok(Char(code_to_char(*c))),
             ("char-to-text" | "char-encode", [Char(c)]) => {
                 let t = c.to_string();
@@ -1474,12 +1474,12 @@ impl Interp {
             // that shows it: a tab and a carriage return are NOT whitespace
             // here, because the alphabet gives them no code at all.
             ("is-letter", [Char(c)]) => {
-                let k = char_code(*c as u8);
+                let k = char_code(*c);
                 Ok(Bool((13..=64).contains(&k) || (97..=127).contains(&k)))
             }
-            ("is-digit", [Char(c)]) => Ok(Bool((3..=12).contains(&char_code(*c as u8)))),
+            ("is-digit", [Char(c)]) => Ok(Bool((3..=12).contains(&char_code(*c)))),
             ("is-whitespace", [Char(c)]) => {
-                Ok(Bool((1..=2).contains(&char_code(*c as u8))))
+                Ok(Bool((1..=2).contains(&char_code(*c))))
             }
             // `List Integer -> Text`, the bytes as written.
             ("raw-bytes-to-text", [List(xs)]) => {
@@ -1869,15 +1869,36 @@ fn ordinal(f: f64) -> i64 {
 }
 
 /// `char-code`, the private frequency-ordered alphabet. NOT ASCII.
-fn char_code(b: u8) -> i64 {
-    if (b as usize) < crate::charcode::CHAR_CODE.len() {
-        crate::charcode::CHAR_CODE[b as usize] as i64
-    } else {
-        0
+/// A CHARACTER's code, over the WHOLE alphabet and not just the ASCII half.
+///
+/// Takes a `char` and not a `u8` on purpose: `é` is CCE 97, and a byte cannot
+/// say that. The old signature forced every caller to write `c as u8`, which
+/// silently truncates every non-ASCII character to a byte the table does not
+/// describe and answers 0 -- the same 0 that means "not in the alphabet".
+fn char_code(c: char) -> i64 {
+    if (c as u32) < crate::charcode::CHAR_CODE.len() as u32 {
+        return crate::charcode::CHAR_CODE[c as usize] as i64;
     }
+    crate::charcode::CHAR_CODE_HIGH
+        .iter()
+        .position(|h| *h == c)
+        .map(|i| crate::charcode::HIGH_BASE + i as i64)
+        .unwrap_or(0)
 }
 
+/// The character a code names, or NUL when the alphabet does not name one.
+///
+/// The NUL is still here and is still a real answer -- code 0 is "not in the
+/// alphabet" and the compiler answers nothing for it either. What changed is
+/// that it is no longer reached by codes 97..=127, which ARE in the alphabet
+/// and used to fall through to it.
 fn code_to_char(code: i64) -> char {
+    if (crate::charcode::HIGH_BASE..crate::charcode::HIGH_BASE
+        + crate::charcode::CHAR_CODE_HIGH.len() as i64)
+        .contains(&code)
+    {
+        return crate::charcode::CHAR_CODE_HIGH[(code - crate::charcode::HIGH_BASE) as usize];
+    }
     crate::charcode::CHAR_CODE
         .iter()
         .position(|c| *c as i64 == code && code != 0)

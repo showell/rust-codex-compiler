@@ -131,3 +131,54 @@ pub const CHAR_CODE: [u8; 128] = [
     92, // 126 '~'
     0, // 127 (not in the alphabet)
 ];
+
+/// CCE codes 97..=127, the half of the alphabet that is not ASCII.
+///
+/// **DERIVED FROM THE COMPILER, like the table above, and for a sharper
+/// reason.** `CHAR_CODE` is indexed by BYTE and so can only ever describe the
+/// 128 codes a byte can reach. The alphabet does not stop there: 97..=112 are
+/// accented Latin and 113..=127 are Cyrillic, and a program that names them
+/// says so out loud -- `vbe-mode-set` carries the section title
+/// `"Accented(CCE 97-112->approx glyphs)" "Cyrillic(CCE 113-127->...)"`.
+///
+/// Without this, `code-to-char` fell through `unwrap_or('\0')` and answered NUL
+/// for every one of them. Ten corpus programs emitted IR that was byte-for-byte
+/// right except for a run of NULs where the oracle had Cyrillic, and every one
+/// of them differed from the oracle by exactly 61 bytes -- the same silent
+/// fallback wearing ten different sizes.
+///
+/// **THE ALPHABET ENDS AT 127.** Probing the compiler past it answers U+FFFD,
+/// and at 233 a clapping-hands emoji: that is the native binary reading off the
+/// end of its own table, not a mapping, so nothing here extends beyond 127.
+pub const CHAR_CODE_HIGH: [char; 31] = [
+    'é', 'è', 'ê', 'ë', 'á', 'à', 'â', 'ä', // 97..104
+    'ó', 'ô', 'ö', 'ú', 'ü', 'ñ', 'ç', 'í', // 105..112
+    'а', 'о', 'е', 'и', 'н', 'т', 'с', 'р', // 113..120
+    'в', 'л', 'к', 'м', 'д', 'п', 'у', // 121..127
+];
+
+/// The lowest code `CHAR_CODE_HIGH` describes.
+pub const HIGH_BASE: i64 = 97;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **EVERY PAIR READ OFF THE COMPILER**, by transpiling a program that
+    /// prints `char-to-text (code-to-char i)` for each code and running the
+    /// binary. Not transcribed from the section title that names the ranges:
+    /// that title says "Accented(CCE 97-112)" and "Cyrillic(CCE 113-127)" and
+    /// says nothing about WHICH accented letters, or their order.
+    #[test]
+    fn the_alphabet_does_not_stop_at_ascii() {
+        assert_eq!(CHAR_CODE_HIGH.len(), 31, "97..=127 is thirty-one codes");
+        assert_eq!(CHAR_CODE_HIGH[0], 'é');
+        assert_eq!(CHAR_CODE_HIGH[15], 'í'); // 112, the last accented one
+        assert_eq!(CHAR_CODE_HIGH[16], 'а'); // 113, the first Cyrillic one
+        assert_eq!(CHAR_CODE_HIGH[30], 'у'); // 127, the last code there is
+        // The two halves do not overlap: an accented letter is Latin-1 and a
+        // Cyrillic one is not, which is what makes the boundary checkable.
+        assert!(CHAR_CODE_HIGH[..16].iter().all(|c| (*c as u32) < 0x100));
+        assert!(CHAR_CODE_HIGH[16..].iter().all(|c| (0x400..0x460).contains(&(*c as u32))));
+    }
+}
