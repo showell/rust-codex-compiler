@@ -548,19 +548,41 @@ pub fn resolve_declared(syms: &SymTab, t: &crate::ast::TypeExpr) -> Option<Ty> {
             scopes.clone(),
             Box::new(resolve_declared(syms, inner)?),
         ),
-        T::App(head, args, _) => match (&**head, args.as_slice()) {
-            (T::Named(n, _), [only]) if syms.text(*n) == "List" => {
-                Ty::List(Box::new(resolve_declared(syms, only)?))
+        // **A TYPE APPLICATION IS CURRIED, ONE ARGUMENT PER NODE.**
+        // `apply-atype-args` (Ast/Desugarer.codex:343) wraps a fresh `AAppType`
+        // around the base for each argument, so `(a, b)` is
+        // `App(App(Tup2, [a]), [b])` and not `App(Tup2, [a, b])`. Matching only
+        // a `Named` head therefore saw NOTHING with more than one argument:
+        // every tuple in the depot resolved to nothing, `register_defs` minted
+        // a bare variable in its place, and the signature lost both parameters.
+        T::App(..) => {
+            let (head, args) = flatten_app(t);
+            let T::Named(n, _) = head else { return None };
+            let rendered: Vec<Ty> =
+                args.iter().map(|a| resolve_declared(syms, a)).collect::<Option<_>>()?;
+            match (syms.text(*n), rendered.as_slice()) {
+                ("List", [only]) => Ty::List(Box::new(only.clone())),
+                _ => Ty::Constructed(*n, rendered),
             }
-            (T::Named(n, _), _) => Ty::Constructed(
-                n.clone(),
-                args.iter().filter_map(|t| resolve_declared(syms, t)).collect(),
-            ),
-            _ => return None,
-        },
+        }
         T::Linear(inner, _) => Ty::Linear(Box::new(resolve_declared(syms, inner)?)),
         _ => return None,
     })
+}
+
+/// The head of an application spine and every argument, left to right.
+fn flatten_app(t: &crate::ast::TypeExpr) -> (&crate::ast::TypeExpr, Vec<&crate::ast::TypeExpr>) {
+    use crate::ast::TypeExpr as T;
+    let mut args: Vec<&T> = Vec::new();
+    let mut cur = t;
+    while let T::App(head, a, _) = cur {
+        // Reversed at the end: the spine is walked outside in, so the LAST
+        // argument is met first.
+        args.extend(a.iter().rev());
+        cur = head;
+    }
+    args.reverse();
+    (cur, args)
 }
 
 /// Register every definition's declared type, in source order.
@@ -570,13 +592,45 @@ pub fn resolve_declared(syms: &SymTab, t: &crate::ast::TypeExpr) -> Option<Ty> {
 /// because the fresh-variable count is graded, and skipping the mint would
 /// report a smaller `next-id` than upstream for the same program.
 pub fn register_defs(ch: &crate::ast::Chapter, st: &mut UnifyState) -> Vec<Binding> {
-    let mut out = Vec::new();
+    let mut out = register_ctors(ch, st);
     for d in &ch.defs {
         let ty = match d.declared_type.first().and_then(|t| resolve_declared(&ch.syms, t)) {
             Some(t) => parameterize(&t, &ch.syms, st),
             None => st.fresh(),
         };
         out.push(Binding { name: d.name, ty });
+    }
+    out
+}
+
+/// A variant's constructors, as the functions they are.
+///
+/// `MkTup2 (a) (b)` inside `Tup2 (a) (b)` is `a -> b -> Tup2 a b`, and it is
+/// PARAMETERISED like any other signature -- which is where the mint comes
+/// from. **THE TYPE NAME ITSELF IS NOT.** `Box (a) = | MkBox (a)` costs one
+/// fresh variable and not two, and `Two (a) = | MkL (a) | MkR (a)` costs two
+/// and not three; a variant with no parameters costs nothing however many arms
+/// it has. Measured on `codexcheck`.
+///
+/// A RECORD DECLARES NO FUNCTION. `P { px = 1 }` is a record expression, not an
+/// application, so there is no constructor arrow to register and nothing here
+/// to mint. If that turns out to cost a mint somewhere, it needs its own probe.
+fn register_ctors(ch: &crate::ast::Chapter, st: &mut UnifyState) -> Vec<Binding> {
+    use crate::ast::TypeDef;
+    let mut out = Vec::new();
+    for td in &ch.type_defs {
+        let TypeDef::Variant(name, params, ctors, _) = td else { continue };
+        let result = Ty::Constructed(*name, params.iter().map(|p| Ty::TypeCon(*p)).collect());
+        for c in ctors {
+            // Right to left: the spine is built inside out, so the first field
+            // ends up the outermost argument.
+            let mut ty = result.clone();
+            for f in c.fields.iter().rev() {
+                let Some(a) = resolve_declared(&ch.syms, f) else { continue };
+                ty = Ty::Fun(Box::new(a), EffectRow::default(), Box::new(ty));
+            }
+            out.push(Binding { name: c.name, ty: parameterize(&ty, &ch.syms, st) });
+        }
     }
     out
 }
@@ -1367,6 +1421,32 @@ mod tests {
         // two rows, and the body's one application and one spine cost three.
         let eff = "  eff-id : (Integer -> [e] Integer) -> [e] Integer\n  eff-id (g) = g 1\n";
         assert_eq!(counters(&chapter(eff)), (3, 5));
+    }
+
+    /// **A VARIANT'S CONSTRUCTORS ARE PARAMETERISED; THE TYPE NAME IS NOT.**
+    ///
+    /// `Box (a) = | MkBox (a)` costs ONE fresh variable, not two -- if the
+    /// binding for `Box` itself were parameterised alongside `MkBox` it would
+    /// be two, and `Two (a) = | MkL (a) | MkR (a)` would be three rather than
+    /// the two it measures. A variant with no type parameters costs nothing at
+    /// all, however many constructors it declares.
+    ///
+    /// Read off `codexcheck` at `u56-candidate-sunday`, against a chapter whose
+    /// only definition is monomorphic so the difference is the type
+    /// declaration alone.
+    #[test]
+    fn a_variant_mints_once_per_type_parameter_per_constructor() {
+        let f = "\n  f : Integer -> Integer\n  f (n) = n\n";
+        let with = |decl: &str| counters(&chapter(&format!("{decl}{f}")));
+
+        assert_eq!(with(""), (2, 0));
+        assert_eq!(with("  Box (a) =\n    | MkBox (a)\n"), (3, 0));
+        assert_eq!(with("  Pair (a) (b) =\n    | MkPair (a) (b)\n"), (4, 0));
+        assert_eq!(with("  Trip (a) (b) (c) =\n    | MkTrip (a) (b) (c)\n"), (5, 0));
+        // Once per CONSTRUCTOR, so two arms naming the same parameter cost two.
+        assert_eq!(with("  Two (a) =\n    | MkL (a)\n    | MkR (a)\n"), (4, 0));
+        // No parameters, no mint -- the constructors are still declared.
+        assert_eq!(with("  Mono =\n    | MkA\n    | MkB\n"), (2, 0));
     }
 
     /// The slice subject, whole, and the two neighbours that isolate the

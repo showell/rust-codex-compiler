@@ -48,7 +48,16 @@ BIN = TARGET / "codexrun"
 CODEXIR = pathlib.Path(
     "/home/steve/showell_repos/codex-zig-transpiler/generated/local/codexir")
 
-MEM_LIMIT = 1 << 30
+# **ADDRESS SPACE, NOT RESIDENT SIZE, AND 1 GB WAS TOO TIGHT.** `RLIMIT_AS`
+# caps what the process may MAP; `browser-pane-fit` and fifteen `desk-*`
+# programs aborted on `memory allocation of 64 bytes failed` under a gigabyte
+# while never exceeding 613 MB resident, and they complete under two. The
+# harness itself advances 512 MB of Codex heap before the compiler starts, so
+# half the old cap was spoken for before any work happened.
+#
+# Four is still a guard -- it stops a runaway on an 8 GB box that runs one
+# program at a time -- and it is no longer the thing being measured.
+MEM_LIMIT = 4 << 30
 RUN_TIMEOUT = 180
 ORACLE_TIMEOUT = 120
 
