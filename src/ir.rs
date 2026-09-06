@@ -800,6 +800,32 @@ mod tests {
         );
     }
 
+    /// **A POLYMORPHIC DEFINITION SPELLS THE TYPE ITS OWN BODY WAS CHECKED
+    /// WITH.** `ident : List a -> List a` reaches the wire as
+    /// `(fn (list (tvar 2)) (list (tvar 2)))` -- the variable
+    /// `instantiate-collect` minted for it -- and its parameter carries the
+    /// same. The generalised `forall` is what REFERENCES instantiate from; it
+    /// has no arrow to peel, and lowering that instead refused every
+    /// polymorphic definition in the corpus.
+    ///
+    /// `codexir`'s bytes at `u56-candidate-sunday`, with `ident` called twice
+    /// so the single-caller pass leaves it standing. Note the call sites carry
+    /// `int-default`, resolved, while the definition keeps its variable.
+    #[test]
+    fn a_polymorphic_definition_keeps_its_own_type_variable() {
+        let src = "Chapter: T\n\nSection: S\n  ident : List a -> List a\n  ident (xs) = xs\n\nSection: E\n  opening : [Console] Nothing = act\n   print-line-uni (show (list-length (ident [1])))\n   print-line-uni (show (list-length (ident [2])))\n  end\n";
+        assert_eq!(
+            def_line(src, "ident"),
+            r#"(def "ident" "T" (params (param "xs" (list (tvar 2)))) (fn (list (tvar 2)) (list (tvar 2))) (name "xs" (list (tvar 2))) 0 0)"#
+        );
+        assert!(
+            def_line(src, "opening")
+                .contains(r#"(name "ident" (fn (list int-default) (list int-default)))"#),
+            "the call site resolves: {}",
+            def_line(src, "opening")
+        );
+    }
+
     /// A pure definition still renders exactly as it did, which is the thing
     /// these changes must not disturb: it is already byte-identical to the
     /// oracle and that is the only verified ground the native road stands on.

@@ -966,6 +966,9 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
     // Builtins first, then the chapter's own names on top: a chapter that
     // defines `max` shadows the builtin, which the golds show for that name.
     let mut env = builtin_env(&ch.syms, &tds);
+    // Collected during the walk and appended after it, so a lookup by name
+    // finds the instantiated type rather than the generalised one.
+    let mut per_def: Vec<Binding> = Vec::new();
     for b in &bindings {
         env.bind(b.name, b.ty.clone());
     }
@@ -987,6 +990,21 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
         // costs, and it is paid whether or not anything calls the definition.
         let own = bindings.iter().find(|b| b.name == d.name).map(|b| b.ty.clone());
         let instantiated = own.clone().map(|t| st.instantiate(&t));
+        // **WHAT LOWERING SPELLS FOR THIS DEFINITION IS THIS TYPE, NOT THE
+        // GENERALISED ONE.** `check-def-normal` answers
+        // `inferred-type = declared.expected-type` -- the INSTANTIATED type --
+        // and `check-all-defs` accumulates those into the bindings lowering is
+        // handed. The `forall` lives in the environment, for references.
+        //
+        // The oracle shows it directly: `ident : List a -> List a` reaches the
+        // wire as `(fn (list (tvar 2)) (list (tvar 2)))`, carrying the variable
+        // its own body was checked with, and its parameter as `(list (tvar 2))`.
+        // A `forall` has no arrow to peel, which is why every polymorphic
+        // definition in the corpus refused with "more params than its type has
+        // arrows".
+        if let Some(t) = instantiated.clone() {
+            per_def.push(Binding { name: d.name, ty: t });
+        }
         let mut spine = instantiated.clone();
         let mut saved = Vec::new();
         for p in &d.params {
@@ -1045,6 +1063,8 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
     // The check/lower boundary, where upstream sorts too: everything below
     // this line looks entries up rather than appending them.
     st.sort_expr_types();
+    let mut bindings = bindings;
+    bindings.extend(per_def);
     (bindings, st, tds)
 }
 
