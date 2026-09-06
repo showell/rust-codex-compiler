@@ -978,10 +978,25 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
         // A comparison answers Boolean; arithmetic answers its operands'.
         // Neither mints, which is why fib's five applications are not the
         // whole of its next-id.
-        E::Binary(l, op, r, _) => {
+        E::Binary(l, op, r, sp) => {
             let lt = infer(l, env, st);
             let _rt = infer(r, env, st);
             use crate::ast::BinaryOp::*;
+            // **`&` RECORDS AN EXPRESSION TYPE; NO OTHER OPERATOR DOES.**
+            // `infer-and` (TypeCheckerInference.codex:414) records the LEFT
+            // operand's resolved type at the binary's own span, because `&` is
+            // one token doing two jobs -- boolean AND and text append -- and
+            // the recorded type is the only thing that separates them
+            // afterwards. Upstream's own note: an unrecorded boolean `&` is
+            // indistinguishable from an expression nothing knows the type of,
+            // and every reader treats the absence as the worst case.
+            //
+            // The key is offset AND length, so this cannot collide with its
+            // own left operand's entry.
+            if matches!(op, OpAnd) {
+                let resolved = st.resolve(&lt);
+                st.record_expr_type(*sp, resolved);
+            }
             match op {
                 OpEq | OpNotEq | OpLt | OpGt | OpLtEq | OpGtEq | OpAnd | OpBoolAnd | OpOr => {
                     Ty::Boolean
@@ -1096,18 +1111,27 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
             st.record_expr_type(*sp, t.clone());
             return t;
         }
+        // **A MATCH MINTS ONE VARIABLE FOR ITS RESULT, AND THAT VARIABLE IS
+        // ITS TYPE.** `infer-match` (TypeCheckerInference.codex:1305) mints it
+        // straight after the scrutinee and before any arm, then unifies every
+        // arm into it -- so the match answers the variable, not the last arm.
+        // One per MATCH, not per arm and not per pattern variable: a two-field
+        // destructure and a three-field one both cost the same one.
         E::Match(scrut, arms, _) | E::Induction(scrut, arms, _) => {
             let _ = infer(scrut, env, st);
-            let mut last = Ty::Error;
+            let result = st.fresh();
             for a in arms {
                 let bound = bind_pattern(&a.pattern, env, st);
                 let _ = infer(&a.guard, env, st);
-                last = infer(&a.body, env, st);
+                let arm_ty = infer(&a.body, env, st);
+                if !st.unify(&arm_ty, &result) {
+                    st.unify_gaps += 1;
+                }
                 for _ in 0..bound {
                     env.scope.pop();
                 }
             }
-            last
+            result
         }
         // A record literal is the other site `record-expr-type` is populated
         // from (Unifier.codex:131).
@@ -1119,11 +1143,21 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
             st.record_expr_type(*sp, t.clone());
             return t;
         }
-        // The field's type is in the chapter's type definitions, which this
-        // does not read yet. The RECORD is still walked.
+        // **A FIELD ACCESS ON A TYPE THAT IS NOT A RECORD MINTS A FRESH
+        // VARIABLE**, which is most of them here: the field's type comes from
+        // the chapter's type definitions and this does not carry them yet.
+        // `infer-expr`'s `AFieldAccess` arm (TypeCheckerInference.codex:1629)
+        // looks the field up when the object resolves to a `RecordTy` or to a
+        // `ConstructedTy` over one, and falls to `fresh-and-advance` in every
+        // other case -- including a bare type variable and a variant.
+        //
+        // Minting unconditionally is right only while no field type can be
+        // looked up. **When record fields are carried, the successful lookup
+        // must mint NOTHING** or every record access in the depot moves the
+        // counter by one.
         E::FieldAccess(r, _, _) => {
             let _ = infer(r, env, st);
-            Ty::Error
+            st.fresh()
         }
         E::FieldAssign(r, _, v, _) => {
             let _ = infer(r, env, st);
