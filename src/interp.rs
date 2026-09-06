@@ -167,34 +167,49 @@ impl<T> std::ops::Deref for Cell<T> {
 pub struct Str {
     pub addr: i64,
     s: String,
-    /// **The byte offset of every CCE unit, and `None` when they are the
-    /// byte offsets.**
+    /// **Where the multi-byte characters are, and nothing else.**
     ///
     /// A Codex `Text` is a sequence of CCE units, one per character, so
-    /// `text-length "café!"` is 5 where the UTF-8 is six bytes. On ASCII the
-    /// two indices coincide and this stays `None`, which is the case that
-    /// matters: the compiler's own source is ASCII and the lexer indexes it
-    /// constantly.
+    /// `text-length "café!"` is 5 where the UTF-8 is six bytes. Byte index and
+    /// unit index therefore disagree, but only ever BY THE EXTRA BYTES OF THE
+    /// CHARACTERS BEFORE YOU -- so recording those is enough to convert
+    /// between them, and recording anything else is waste.
     ///
-    /// **IT IS AN INDEX AND NOT A FLAG BECAUSE ONE CHARACTER POISONS A WHOLE
-    /// TEXT.** A single Cyrillic letter in one section title makes the entire
-    /// 3.4 MB unit non-ASCII, and walking `char_indices()` per lookup made
-    /// every `substring` O(n) against it: `gopfish-scene` went from 35 seconds
-    /// to 179, and it is the SOURCE being scanned, not the section title.
-    /// Built once per non-ASCII text, four bytes a unit, and every lookup
-    /// after it is a subscript.
-    units: Option<Box<[u32]>>,
+    /// Each entry is `(unit index of a multi-byte character, total extra bytes
+    /// contributed up to and including it)`, so the byte offset of unit `i` is
+    /// `i` plus the running total of the last entry before it.
+    ///
+    /// **THIS IS SIZED BY THE EXCEPTIONS, NOT BY THE TEXT.** One cited chapter
+    /// carrying a Cyrillic section title makes a whole compilation unit
+    /// non-ASCII: `gopfish-scene` is 709 KB with FIFTEEN characters above
+    /// ASCII in it, two thousandths of a percent. Walking `char_indices()` per
+    /// lookup made every `substring` against that source O(n) and took the
+    /// program from 35 seconds to 179; a table with a slot per unit fixed the
+    /// speed by spending 2.8 MB to describe fifteen letters. This holds
+    /// fifteen entries.
+    marks: Box<[(u32, u32)]>,
 }
 
 impl Str {
-    /// The one place the index is decided, so it cannot disagree with `s`.
+    /// The one place the marks are decided, so they cannot disagree with `s`.
     pub fn new(addr: i64, s: String) -> Str {
-        let units = if s.is_ascii() {
-            None
+        // The ASCII case allocates nothing and is the case that matters: the
+        // compiler's own source is ASCII and the lexer indexes it constantly.
+        let marks: Box<[(u32, u32)]> = if s.is_ascii() {
+            Box::new([])
         } else {
-            Some(s.char_indices().map(|(i, _)| i as u32).collect::<Vec<_>>().into_boxed_slice())
+            let mut v = Vec::new();
+            let mut extra: u32 = 0;
+            for (unit, c) in s.chars().enumerate() {
+                let len = c.len_utf8();
+                if len > 1 {
+                    extra += len as u32 - 1;
+                    v.push((unit as u32, extra));
+                }
+            }
+            v.into_boxed_slice()
         };
-        Str { addr, s, units }
+        Str { addr, s, marks }
     }
 
     pub fn as_str(&self) -> &str {
@@ -203,24 +218,20 @@ impl Str {
 
     /// The length in CCE units: characters, not bytes.
     pub fn units(&self) -> usize {
-        match &self.units {
-            None => self.s.len(),
-            Some(ix) => ix.len(),
-        }
+        self.s.len() - self.marks.last().map_or(0, |(_, e)| *e as usize)
     }
 
-    /// The byte range of `len` units from `start`, clamped as upstream clamps.
-    fn byte_range(&self, start: i64, len: i64) -> (usize, usize) {
+    /// The byte offset of a unit index, clamped to the ends.
+    fn byte_of(&self, unit: usize) -> usize {
         let n = self.units();
-        let a = start.clamp(0, n as i64) as usize;
-        let z = (a + len.max(0) as usize).min(n);
-        match &self.units {
-            None => (a, z),
-            Some(ix) => (
-                ix.get(a).copied().unwrap_or(self.s.len() as u32) as usize,
-                ix.get(z).copied().unwrap_or(self.s.len() as u32) as usize,
-            ),
+        if unit >= n {
+            return self.s.len();
         }
+        if self.marks.is_empty() {
+            return unit;
+        }
+        let before = self.marks.partition_point(|(u, _)| (*u as usize) < unit);
+        unit + if before == 0 { 0 } else { self.marks[before - 1].1 as usize }
     }
 
     /// The character at a unit index.
@@ -228,19 +239,25 @@ impl Str {
         if i < 0 || i as usize >= self.units() {
             return None;
         }
-        match &self.units {
-            None => Some(self.s.as_bytes()[i as usize] as char),
-            Some(ix) => self.s[ix[i as usize] as usize..].chars().next(),
-        }
+        self.s[self.byte_of(i as usize)..].chars().next()
     }
 
-    /// `len` units from `start`. **Slicing on unit boundaries is the point**:
-    /// the byte-indexed version cut multi-byte sequences in half and re-encoded
-    /// the halves through `from_utf8_lossy`, so a one-unit slice of `café`
-    /// came back three bytes long as U+FFFD.
+    /// `len` units from `start`, clamped as upstream clamps.
+    ///
+    /// **Slicing on unit boundaries is the point**: the byte-indexed version
+    /// cut multi-byte sequences in half and re-encoded the halves through
+    /// `from_utf8_lossy`, so a one-unit slice of `café` came back three bytes
+    /// long as U+FFFD.
     pub fn unit_slice(&self, start: i64, len: i64) -> &str {
-        let (a, z) = self.byte_range(start, len);
-        &self.s[a..z]
+        let n = self.units() as i64;
+        let a = start.clamp(0, n) as usize;
+        let z = (a + len.max(0) as usize).min(n as usize);
+        &self.s[self.byte_of(a)..self.byte_of(z)]
+    }
+
+    #[cfg(test)]
+    pub fn mark_count(&self) -> usize {
+        self.marks.len()
     }
 }
 
@@ -3099,6 +3116,45 @@ mod tests {
         assert_eq!(probe(r#"text-length "аое""#), "3");
         assert_eq!(probe(r#"char-code-at "аое" 0"#), "113");
         assert_eq!(says(r#"substring "аое" 1 2"#), "ое");
+    }
+
+    /// **THE INDEX IS SIZED BY THE EXCEPTIONS, NOT BY THE TEXT.**
+    ///
+    /// This is the property that makes the representation affordable, so it is
+    /// pinned rather than left to be re-derived. `gopfish-scene`'s compilation
+    /// unit is 709 KB and holds FIFTEEN characters above ASCII -- one cited
+    /// chapter's section title. A table with a slot per unit would spend
+    /// 2.8 MB describing those fifteen letters, and walking `char_indices()`
+    /// per lookup instead made every `substring` against that source O(n),
+    /// taking the program from 35 seconds to 179.
+    ///
+    /// A megabyte of ASCII with one `é` in it costs ONE entry, and every unit
+    /// after that `é` still resolves to the right byte.
+    #[test]
+    fn the_unit_index_costs_one_entry_per_multibyte_character() {
+        let ascii = Str::new(0, "a".repeat(1_000_000));
+        assert_eq!(ascii.mark_count(), 0, "pure ASCII indexes nothing at all");
+        assert_eq!(ascii.units(), 1_000_000);
+
+        let mut big = "a".repeat(500_000);
+        big.push('é');
+        big.push_str(&"b".repeat(500_000));
+        let t = Str::new(0, big);
+        assert_eq!(t.mark_count(), 1, "one multi-byte character, one entry");
+        assert_eq!(t.units(), 1_000_001);
+        assert_eq!(t.unit_at(500_000), Some('é'));
+        assert_eq!(t.unit_at(500_001), Some('b'), "units after it still land right");
+        assert_eq!(t.unit_at(1_000_000), Some('b'));
+        assert_eq!(t.unit_at(1_000_001), None, "one past the end is past the end");
+        assert_eq!(t.unit_slice(499_999, 3), "aéb");
+
+        // The Cyrillic that started this: fifteen characters, fifteen entries,
+        // whatever the size of the text they sit in.
+        let title = format!("{}Cyrillic (CCE 113-127 -> а о е и н т с р в л к м д п у){}",
+                            "x".repeat(10_000), "y".repeat(10_000));
+        let c = Str::new(0, title);
+        assert_eq!(c.mark_count(), 15);
+        assert_eq!(c.unit_slice(10_000, 8), "Cyrillic");
     }
 
     fn mem_body(body: &str) -> String {
