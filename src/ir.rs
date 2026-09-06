@@ -555,6 +555,7 @@ pub fn emit_defs_checked(
 /// shows the difference directly: nothing calls `double`, the IR gold drops it,
 /// and lower.truth keeps it.
 pub fn lower_section(ch: &Chapter, _roots: &[&str]) -> String {
+    let tds = crate::check::TypeDefs::new(ch);
     let defs: Vec<&crate::ast::Def> = ch.defs.iter().collect();
     let mut s = String::from("--- lower ---\n");
     s.push_str(&format!("ir-name |{}|\n", ch.syms.text(ch.name)));
@@ -564,7 +565,7 @@ pub fn lower_section(ch: &Chapter, _roots: &[&str]) -> String {
         let ty = d
             .declared_type
             .first()
-            .and_then(|t| crate::check::resolve_declared(&ch.syms, t))
+            .and_then(|t| crate::check::resolve_declared(&ch.syms, &tds, t))
             .map_or_else(|| "other".to_string(), |t| crate::check::type_kind(&ch.syms, &t));
         s.push_str(&format!(
             "irdef {} params {} slug {} punctual 0 uparams 0 ty {}\n",

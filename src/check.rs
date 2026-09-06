@@ -556,7 +556,62 @@ fn subst_row_var(t: &Ty, id: i32, with: i32) -> Ty {
 /// settle every binding the gold names. What it cannot do is invent a type for
 /// a definition that declares none -- that is inference, and it returns None
 /// here rather than a plausible stand-in.
-pub fn resolve_declared(syms: &SymTab, t: &crate::ast::TypeExpr) -> Option<Ty> {
+/// **THE CHAPTER'S OWN TYPE NAMES, AND WHAT A RECORD'S FIELDS ARE.**
+///
+/// `resolve-type-name tdm name` (TypeChecker.codex:13) looks a bare type name
+/// up in this map; without it `Rgb` resolves to a bare type constructor, a
+/// field access on it finds no field, and the fallback in `infer-expr`'s
+/// `AFieldAccess` arm mints a fresh variable for every one -- 88 of them on
+/// `encode-qoi`'s unit alone.
+///
+/// BUILT IN TWO PASSES, because a field's type may name another declaration:
+/// the shells first, then the fields against them.
+#[derive(Default)]
+pub struct TypeDefs {
+    by_name: std::collections::BTreeMap<Sym, Ty>,
+    fields: std::collections::BTreeMap<Sym, Vec<(Sym, Ty)>>,
+}
+
+impl TypeDefs {
+    pub fn new(ch: &crate::ast::Chapter) -> TypeDefs {
+        use crate::ast::TypeDef;
+        let mut td = TypeDefs::default();
+        for d in &ch.type_defs {
+            let (n, params, is_record) = match d {
+                TypeDef::Record(n, ps, ..) => (n, ps, true),
+                TypeDef::Variant(n, ps, ..) => (n, ps, false),
+                TypeDef::Unit(n, _, _) => {
+                    td.by_name.insert(*n, Ty::TypeCon(*n));
+                    continue;
+                }
+            };
+            let args: Vec<Ty> = params.iter().map(|p| Ty::TypeCon(*p)).collect();
+            td.by_name
+                .insert(*n, if is_record { Ty::Record(*n, args) } else { Ty::Sum(*n, args) });
+        }
+        for d in &ch.type_defs {
+            let TypeDef::Record(n, _, fs, ..) = d else { continue };
+            let fields = fs
+                .iter()
+                .filter_map(|f| Some((f.name, resolve_declared(&ch.syms, &td, &f.type_expr)?)))
+                .collect();
+            td.fields.insert(*n, fields);
+        }
+        td
+    }
+
+    /// The type of one field of one record, or None where the name is not a
+    /// record this chapter declares.
+    pub fn field(&self, rec: Sym, field: Sym) -> Option<&Ty> {
+        self.fields.get(&rec)?.iter().find(|(n, _)| *n == field).map(|(_, t)| t)
+    }
+}
+
+pub fn resolve_declared(
+    syms: &SymTab,
+    tds: &TypeDefs,
+    t: &crate::ast::TypeExpr,
+) -> Option<Ty> {
     use crate::ast::TypeExpr as T;
     Some(match t {
         T::Named(n, _) => match syms.text(*n) {
@@ -566,8 +621,21 @@ pub fn resolve_declared(syms: &SymTab, t: &crate::ast::TypeExpr) -> Option<Ty> {
             "Char" => Ty::Char,
             "Nothing" => Ty::Nothing,
             "Real" => Ty::Real(RealWidth::F64, RealMode::Default),
-            _ => Ty::TypeCon(n.clone()),
+            // A name this chapter DECLARES resolves to what it declared.
+            _ => tds.by_name.get(n).cloned().unwrap_or(Ty::TypeCon(*n)),
         },
+        // `Integer between 0 and 255` -- a record field's usual shape. Without
+        // this arm every such field failed to resolve and the record was left
+        // with no fields at all.
+        T::BoundedInt(_, lo, hi, mode, _) => Ty::Integer(
+            *lo,
+            *hi,
+            match mode {
+                crate::ast::OverflowMode::Error => Overflow::Error,
+                crate::ast::OverflowMode::Wrapping => Overflow::Wrapping,
+                crate::ast::OverflowMode::Clamping => Overflow::Clamping,
+            },
+        ),
         // **AN EFFECT ANNOTATION ON AN ARROW'S RESULT IS THE ARROW'S ROW**,
         // and the result is what is left underneath. `resolve-type-expr`
         // (TypeChecker.codex:14) does exactly this, and the builtin table
@@ -579,7 +647,7 @@ pub fn resolve_declared(syms: &SymTab, t: &crate::ast::TypeExpr) -> Option<Ty> {
         // stays inside an `EffectfulTy` is not on an arrow, so
         // `parameterize-type` never sees a tail to mint an id for.
         T::Fun(a, b, _) => {
-            let arg = Box::new(resolve_declared(syms, a)?);
+            let arg = Box::new(resolve_declared(syms, tds, a)?);
             match &**b {
                 T::Effect(effs, scopes, tail, inner, _) => Ty::Fun(
                     arg,
@@ -597,9 +665,9 @@ pub fn resolve_declared(syms: &SymTab, t: &crate::ast::TypeExpr) -> Option<Ty> {
                         tail: tail.first().map_or(String::new(), |t| syms.text(*t).to_string()),
                         id: -1,
                     },
-                    Box::new(resolve_declared(syms, inner)?),
+                    Box::new(resolve_declared(syms, tds, inner)?),
                 ),
-                _ => Ty::Fun(arg, EffectRow::default(), Box::new(resolve_declared(syms, b)?)),
+                _ => Ty::Fun(arg, EffectRow::default(), Box::new(resolve_declared(syms, tds, b)?)),
             }
         }
         // `[Console] Nothing` -- the effect row is what makes `opening` print
@@ -610,7 +678,7 @@ pub fn resolve_declared(syms: &SymTab, t: &crate::ast::TypeExpr) -> Option<Ty> {
         T::Effect(effs, scopes, _, inner, _) => Ty::Effectful(
             effs.clone(),
             scopes.clone(),
-            Box::new(resolve_declared(syms, inner)?),
+            Box::new(resolve_declared(syms, tds, inner)?),
         ),
         // **A TYPE APPLICATION IS CURRIED, ONE ARGUMENT PER NODE.**
         // `apply-atype-args` (Ast/Desugarer.codex:343) wraps a fresh `AAppType`
@@ -623,13 +691,13 @@ pub fn resolve_declared(syms: &SymTab, t: &crate::ast::TypeExpr) -> Option<Ty> {
             let (head, args) = flatten_app(t);
             let T::Named(n, _) = head else { return None };
             let rendered: Vec<Ty> =
-                args.iter().map(|a| resolve_declared(syms, a)).collect::<Option<_>>()?;
+                args.iter().map(|a| resolve_declared(syms, tds, a)).collect::<Option<_>>()?;
             match (syms.text(*n), rendered.as_slice()) {
                 ("List", [only]) => Ty::List(Box::new(only.clone())),
                 _ => Ty::Constructed(*n, rendered),
             }
         }
-        T::Linear(inner, _) => Ty::Linear(Box::new(resolve_declared(syms, inner)?)),
+        T::Linear(inner, _) => Ty::Linear(Box::new(resolve_declared(syms, tds, inner)?)),
         _ => return None,
     })
 }
@@ -665,10 +733,14 @@ fn flatten_app(t: &crate::ast::TypeExpr) -> (&crate::ast::TypeExpr, Vec<&crate::
 /// declares no type and binds the declared one otherwise. Both halves are here
 /// because the fresh-variable count is graded, and skipping the mint would
 /// report a smaller `next-id` than upstream for the same program.
-pub fn register_defs(ch: &crate::ast::Chapter, st: &mut UnifyState) -> Vec<Binding> {
-    let mut out = register_ctors(ch, st);
+pub fn register_defs(
+    ch: &crate::ast::Chapter,
+    tds: &TypeDefs,
+    st: &mut UnifyState,
+) -> Vec<Binding> {
+    let mut out = register_ctors(ch, tds, st);
     for d in &ch.defs {
-        let ty = match d.declared_type.first().and_then(|t| resolve_declared(&ch.syms, t)) {
+        let ty = match d.declared_type.first().and_then(|t| resolve_declared(&ch.syms, tds, t)) {
             Some(t) => parameterize(&t, &ch.syms, st),
             None => st.fresh(),
         };
@@ -689,7 +761,7 @@ pub fn register_defs(ch: &crate::ast::Chapter, st: &mut UnifyState) -> Vec<Bindi
 /// A RECORD DECLARES NO FUNCTION. `P { px = 1 }` is a record expression, not an
 /// application, so there is no constructor arrow to register and nothing here
 /// to mint. If that turns out to cost a mint somewhere, it needs its own probe.
-fn register_ctors(ch: &crate::ast::Chapter, st: &mut UnifyState) -> Vec<Binding> {
+fn register_ctors(ch: &crate::ast::Chapter, tds: &TypeDefs, st: &mut UnifyState) -> Vec<Binding> {
     use crate::ast::TypeDef;
     let mut out = Vec::new();
     for td in &ch.type_defs {
@@ -700,7 +772,7 @@ fn register_ctors(ch: &crate::ast::Chapter, st: &mut UnifyState) -> Vec<Binding>
             // ends up the outermost argument.
             let mut ty = result.clone();
             for f in c.fields.iter().rev() {
-                let Some(a) = resolve_declared(&ch.syms, f) else { continue };
+                let Some(a) = resolve_declared(&ch.syms, tds, f) else { continue };
                 ty = Ty::Fun(Box::new(a), EffectRow::default(), Box::new(ty));
             }
             out.push(Binding { name: c.name, ty: parameterize(&ty, &ch.syms, st) });
@@ -808,11 +880,20 @@ fn param_walk(t: &Ty, syms: &SymTab, st: &mut UnifyState, entries: &mut Vec<Para
 /// would find `fib` undefined inside its own body and mint a fresh variable
 /// for it -- reaching a plausible answer with the wrong `next-id`.
 pub fn check_chapter(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState) {
+    let (bindings, st, _) = check_chapter_full(ch);
+    (bindings, st)
+}
+
+/// The checker's three outputs, which is what `lower-chapter` is handed: the
+/// bindings, the unification state, and the type declarations -- a field
+/// access has to be able to read them.
+pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState, TypeDefs) {
     let mut st = UnifyState::default();
-    let bindings = register_defs(ch, &mut st);
+    let tds = TypeDefs::new(ch);
+    let bindings = register_defs(ch, &tds, &mut st);
     // Builtins first, then the chapter's own names on top: a chapter that
     // defines `max` shadows the builtin, which the golds show for that name.
-    let mut env = builtin_env(&ch.syms);
+    let mut env = builtin_env(&ch.syms, &tds);
     for b in &bindings {
         env.bind(b.name, b.ty.clone());
     }
@@ -892,7 +973,7 @@ pub fn check_chapter(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState) {
     // The check/lower boundary, where upstream sorts too: everything below
     // this line looks entries up rather than appending them.
     st.sort_expr_types();
-    (bindings, st)
+    (bindings, st, tds)
 }
 
 /// The `--- check ---` section, in the harness's own format so it can be
@@ -1155,9 +1236,21 @@ pub fn infer(e: &crate::ast::Expr, env: &mut TyEnv<'_>, st: &mut UnifyState) -> 
         // looked up. **When record fields are carried, the successful lookup
         // must mint NOTHING** or every record access in the depot moves the
         // counter by one.
-        E::FieldAccess(r, _, _) => {
-            let _ = infer(r, env, st);
-            st.fresh()
+        E::FieldAccess(r, f, _) => {
+            let obj = infer(r, env, st);
+            // **A SUCCESSFUL LOOKUP MINTS NOTHING.** The arm looks the field up
+            // when the object resolves to a record and falls to
+            // `fresh-and-advance` in every other case; minting either way put
+            // 88 extra variables on `encode-qoi`'s unit, one per field access
+            // in the two chapters that declare records.
+            let name = match st.deep_resolve(&obj) {
+                Ty::Record(n, _) | Ty::Constructed(n, _) => Some(n),
+                _ => None,
+            };
+            match name.and_then(|n| env.type_defs.field(n, *f)).cloned() {
+                Some(t) => t,
+                None => st.fresh(),
+            }
         }
         E::FieldAssign(r, _, v, _) => {
             let _ = infer(r, env, st);
@@ -1216,14 +1309,17 @@ pub struct TyEnv<'a> {
     /// Carried so inference can spell a type's name without every function
     /// here taking a table.
     pub syms: &'a SymTab,
+    /// The chapter's type declarations, for the one question inference asks of
+    /// them: what type does this field of this record have.
+    pub type_defs: &'a TypeDefs,
     /// **Symbols, not text.** This is a linear scan on the hot path of
     /// inference, and it now compares four bytes.
     pub scope: Vec<(Sym, Ty)>,
 }
 
 impl<'a> TyEnv<'a> {
-    pub fn new(syms: &'a SymTab) -> TyEnv<'a> {
-        TyEnv { syms, scope: Vec::new() }
+    pub fn new(syms: &'a SymTab, type_defs: &'a TypeDefs) -> TyEnv<'a> {
+        TyEnv { syms, type_defs, scope: Vec::new() }
     }
     pub fn get(&self, n: Sym) -> Option<&Ty> {
         self.scope.iter().rev().find(|(k, _)| *k == n).map(|(_, v)| v)
@@ -1411,8 +1507,8 @@ fn build(syms: &SymTab, head: &str, args: &[Ty], words: &[String], rows: &[Effec
 /// Every builtin whose declared type the probe could render, for the checker's
 /// environment. Without these `show` resolves to ErrorTy and instantiating it
 /// mints nothing -- which is one of the eight fresh variables fib expects.
-pub fn builtin_env(syms: &SymTab) -> TyEnv<'_> {
-    let mut env = TyEnv::new(syms);
+pub fn builtin_env<'a>(syms: &'a SymTab, type_defs: &'a TypeDefs) -> TyEnv<'a> {
+    let mut env = TyEnv::new(syms, type_defs);
     for (n, s) in crate::builtins::BUILTIN_TYPES {
         // A builtin the chapter never names cannot be what any symbol here
         // means, so it needs no binding.
