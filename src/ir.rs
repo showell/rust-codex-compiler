@@ -485,6 +485,44 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
                 fty,
             ))
         }
+        // `(field-store OBJ "parts/0" VALUE TYPE)`, and **THE TYPE IS THE
+        // RECORD'S, NOT THE FIELD'S** -- `lower-expr`'s `AFieldAssignExpr` arm
+        // builds `IrFieldStore rec-ir (field.value) val-ir rec-ty s`, so a
+        // store evaluates to the record it wrote into. The `let __seq` the
+        // desugarer wraps it in therefore binds the record type, which is what
+        // makes `sb.parts = ...` sequenceable.
+        //
+        // The slot comes from the type declarations exactly as it does for a
+        // read: the emitter calls `ir-resolve-field-index (ir-expr-type r) f`
+        // on the OBJECT's type in both cases.
+        Expr::FieldAssign(r, f, v, _) => {
+            let (rt, rty) = expr(r, cx)?;
+            let name = match &rty {
+                Ty::Record(n, _) | Ty::Constructed(n, _) => *n,
+                other => {
+                    return Err(format!(
+                        "field store into `{}`, which is not a record",
+                        render_ty(cx.syms, other)
+                    ))
+                }
+            };
+            let Some(slot) = cx.tds.field_index(name, *f) else {
+                return Err(format!(
+                    "`{}` has no field `{}` here",
+                    cx.syms.text(name),
+                    cx.syms.text(*f)
+                ));
+            };
+            let (vt, _) = expr(v, cx)?;
+            let rendered = render_ty(cx.syms, &rty);
+            Ok((
+                format!(
+                    "(field-store {rt} {:?} {vt} {rendered})",
+                    format!("{}/{}", cx.syms.text(*f), slot)
+                ),
+                rty,
+            ))
+        }
         // `(match SC (branches (branch PAT BODY GUARD) ...) TYPE)`. Every arm
         // carries a guard -- an unguarded one carries `(bool-lit true)`, which
         // the desugarer put there -- and the arms have already been unified
