@@ -105,17 +105,17 @@ pub fn emit_defs_checked(
     }
     let cx = crate::lowering::Lower::new(ch, bindings, st, tds);
     let mut defs = Vec::new();
-    for d in ch.defs.iter().filter(|d| keep.contains(ch.syms.text(d.name))) {
+    for d in ch.defs.iter() {
         defs.push(crate::lowering::lower_def(d, &cx)?);
     }
+
 
     // **A LIFTED NAME IS A NAME THE CHAPTER'S TABLE NEVER INTERNED.** `Sym` is
     // an index into the table that made it, so `__lam_0` needs a table that
     // holds it. Interning is append-only, so a clone extended with the lifted
     // names leaves every existing `Sym` meaning exactly what it did.
     let mut syms = ch.syms.clone();
-    let names = crate::lambda_lifting::number_lambdas(ch);
-    let defs = crate::lambda_lifting::lift_lambdas(defs, &names, &mut syms);
+    let defs = crate::lambda_lifting::lift_lambdas(defs, &mut syms);
     let defs = crate::ir_passes::pipeline(defs, &syms);
     let defs = crate::ir_passes::prune_unreachable_roots(defs, roots, &syms);
     Ok(crate::ir_text::emit_defs(&syms, &defs))

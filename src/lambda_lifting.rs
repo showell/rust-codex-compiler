@@ -28,17 +28,54 @@ use crate::ir_chapter::{IrActStmt, IrDef, IrExpr, IrParam, IrPat};
 use crate::symbol::{Sym, SymTab};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// `gen-unique-name` (LambdaLifting.codex:59112): the reserved set and the
+/// counter, minted DURING the lift.
+///
+/// **THERE IS NO SEPARATE NUMBERING PASS UPSTREAM, AND OURS COST 90
+/// DEFINITIONS.** It keyed each name by the lambda's span, and a lambda the
+/// DESUGARER built has a synthetic one -- `for l in xs -> l.name` becomes a
+/// `map-list` over a lambda with no source position of its own -- so they all
+/// collided. The 3.44 MB self-host emitted ninety definitions called
+/// `__lam_372` where `codexir` has ninety distinct ones.
+///
+/// Interior mutability because `lift_expr` threads this through an immutable
+/// borrow, exactly as upstream threads `ctx`.
+pub struct LamNames {
+    reserved: std::cell::RefCell<BTreeSet<String>>,
+    counter: std::cell::Cell<u32>,
+}
+
+impl LamNames {
+    /// `collect-reserved-names`, over the LOWERED definitions -- which is the
+    /// set upstream reserves from, not the chapter's AST.
+    fn new(defs: &[IrDef], syms: &SymTab) -> LamNames {
+        LamNames {
+            reserved: std::cell::RefCell::new(
+                defs.iter().map(|d| syms.text(d.name).to_string()).collect(),
+            ),
+            counter: std::cell::Cell::new(0),
+        }
+    }
+
+    /// `gen-unique-name-loop`: the first `__lam_N` nothing has taken, and the
+    /// counter resumes past it.
+    fn gen(&self) -> String {
+        let mut reserved = self.reserved.borrow_mut();
+        loop {
+            let cand = format!("__lam_{}", self.counter.get());
+            self.counter.set(self.counter.get() + 1);
+            if reserved.insert(cand.clone()) {
+                return cand;
+            }
+        }
+    }
+}
+
 /// `lift-lambdas` (LambdaLifting.codex:19). The definitions with every lambda
 /// replaced, followed by the definitions those lambdas became.
 ///
-/// `names` maps a lambda's span to the `__lam_N` reserved for it by
-/// `number_lambdas`, which is a separate pass because it must see definitions
-/// this one never will.
-pub fn lift_lambdas(
-    defs: Vec<IrDef>,
-    names: &BTreeMap<u64, String>,
-    syms: &mut SymTab,
-) -> Vec<IrDef> {
+pub fn lift_lambdas(defs: Vec<IrDef>, syms: &mut SymTab) -> Vec<IrDef> {
+    let names = &LamNames::new(&defs, syms);
     let mut lifted = Vec::new();
     let mut out = Vec::with_capacity(defs.len());
     for d in defs {
@@ -58,7 +95,7 @@ pub fn lift_lambdas(
 fn lift_expr(
     e: IrExpr,
     enclosing: &mut Vec<Sym>,
-    names: &BTreeMap<u64, String>,
+    names: &LamNames,
     syms: &mut SymTab,
     lifted: &mut Vec<IrDef>,
 ) -> IrExpr {
@@ -170,7 +207,7 @@ fn lift_one(
     ty: Ty,
     sp: Span,
     enclosing: &mut Vec<Sym>,
-    names: &BTreeMap<u64, String>,
+    names: &LamNames,
     syms: &mut SymTab,
     lifted: &mut Vec<IrDef>,
 ) -> IrExpr {
@@ -188,13 +225,10 @@ fn lift_one(
     let mut bound: Vec<Sym> = ps.iter().map(|p| p.name).collect();
     free_vars(&body, &mut bound, enclosing, syms, &mut caps);
 
-    // The numbering pass reserved a name for this span. A lambda it never saw
-    // is a bug in that pass, not something to paper over with a fresh name --
-    // two lambdas sharing a name would emit two definitions under one.
-    let name = match names.get(&crate::check::expr_type_key(sp)) {
-        Some(n) => syms.intern(n),
-        None => syms.intern("__lam_unnumbered"),
-    };
+    // **THE NAME IS TAKEN AFTER THE BODY**, which is what makes a nested
+    // lambda take the lower number: `lift-one-lambda` calls `gen-unique-name`
+    // on the context its own `lift-expr` returned.
+    let name = syms.intern(&names.gen());
 
     // `infer-lambda-return-ty` peels one arrow per parameter, and
     // `build-function-ty` builds the lifted arrows with `empty-row`.
@@ -321,104 +355,3 @@ pub fn pat_names(p: &IrPat, out: &mut Vec<Sym>) {
     }
 }
 
-/// Every lambda in the chapter, keyed by `expr_type_key` of its span, mapped
-/// to the `__lam_N` it will be lifted to.
-///
-/// **THIS WALKS THE AST, AND IT WALKS ALL OF IT.** Numbering happens before
-/// pruning upstream, so a lambda in a definition the emitter will never reach
-/// still consumed a number. `collect-reserved-names` seeds the reserved set
-/// with every definition name, so a chapter that already defines `__lam_0`
-/// pushes the first lambda to `__lam_1`.
-pub fn number_lambdas(ch: &crate::ast::Chapter) -> BTreeMap<u64, String> {
-    let mut reserved: BTreeSet<String> =
-        ch.defs.iter().map(|d| ch.syms.text(d.name).to_string()).collect();
-    let mut counter: u32 = 0;
-    let mut out = BTreeMap::new();
-    for d in &ch.defs {
-        number(absorbed_body(&d.body), &mut reserved, &mut counter, &mut out);
-    }
-    out
-}
-
-/// The body under any lambdas a definition wears directly, whose parameters
-/// are the definition's own.
-fn absorbed_body(body: &crate::ast::Expr) -> &crate::ast::Expr {
-    let mut b = body;
-    while let crate::ast::Expr::Lambda(_, inner, _) = b {
-        b = inner;
-    }
-    b
-}
-
-/// `lift-expr`'s traversal, for numbering alone. The ORDER is the whole point,
-/// so this mirrors the arms rather than reusing `Expr::walk` -- that one is
-/// pre-order and would number a lambda before its own body.
-fn number(
-    e: &crate::ast::Expr,
-    reserved: &mut BTreeSet<String>,
-    counter: &mut u32,
-    out: &mut BTreeMap<u64, String>,
-) {
-    use crate::ast::ActStmt;
-    use crate::ast::Expr as E;
-    let mut go = |x: &E| number(x, reserved, counter, out);
-    match e {
-        E::Lit(..) | E::NameRef(..) | E::Error(..) => {}
-        E::Lambda(_, body, sp) => {
-            // A curried chain is ONE lifted definition: `lift-one-lambda`
-            // recurses on a lambda body with the parameters concatenated.
-            number(absorbed_body(body), reserved, counter, out);
-            // `gen-unique-name-loop`: the first `__lam_N` nothing has taken,
-            // and the counter resumes past it.
-            let name = loop {
-                let cand = format!("__lam_{}", *counter);
-                *counter += 1;
-                if reserved.insert(cand.clone()) {
-                    break cand;
-                }
-            };
-            out.insert(crate::check::expr_type_key(*sp), name);
-        }
-        E::Apply(a, b, _) | E::Binary(a, _, b, _) | E::FieldAssign(a, _, b, _) => {
-            go(a);
-            go(b);
-        }
-        E::Unary(a, _) | E::Lazy(a, _) | E::FieldAccess(a, _, _) => go(a),
-        E::If(a, b, c, _) => {
-            go(a);
-            go(b);
-            go(c);
-        }
-        E::Let(bs, body, _) => {
-            for b in bs {
-                go(&b.value);
-            }
-            go(body);
-        }
-        // `lift-branches` takes the body before the guard.
-        E::Match(s, arms, _) | E::Induction(s, arms, _) => {
-            go(s);
-            for a in arms {
-                go(&a.body);
-                go(&a.guard);
-            }
-        }
-        E::List(xs, _) => xs.iter().for_each(go),
-        E::Record(_, fs, _) => fs.iter().for_each(|f| go(&f.value)),
-        E::Act(ss, _) => ss.iter().for_each(|s| match s {
-            ActStmt::Bind(_, v, _) | ActStmt::Exec(v, _) => go(v),
-        }),
-        E::Handle(h) => {
-            go(&h.body);
-            h.clauses.iter().for_each(|c| go(&c.body));
-        }
-        E::WithTimeout(w) => go(&w.body),
-        E::Try(t) => {
-            for group in [&t.body, &t.fallback, &t.failure] {
-                group.iter().for_each(|s| match s {
-                    ActStmt::Bind(_, v, _) | ActStmt::Exec(v, _) => go(v),
-                });
-            }
-        }
-    }
-}

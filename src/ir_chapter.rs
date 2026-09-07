@@ -64,6 +64,8 @@ pub enum IrBinOp {
     AppendText,
     AppendList,
     ConsList,
+    ApproxEq,
+    ApproxEqExact,
 }
 
 impl IrBinOp {
@@ -89,6 +91,8 @@ impl IrBinOp {
             IrBinOp::AppendText => "append-text",
             IrBinOp::AppendList => "append-list",
             IrBinOp::ConsList => "cons-list",
+            IrBinOp::ApproxEq => "approx-eq",
+            IrBinOp::ApproxEqExact => "approx-eq-exact",
         }
     }
 }

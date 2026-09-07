@@ -236,20 +236,25 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
             // What replaced it is a stronger gate, not a weaker one: the whole
             // 3.44 MB unit is now lowered and diffed against `codexir`, which
             // compares every node instead of the two at one operator.
-            let arith = |int: IrBinOp, num: IrBinOp| -> Result<IrBinOp, String> {
+            // **INTEGER IS THE DEFAULT, NOT A REFUSAL.** `lower-bin-op`
+            // (IR/Lowering.codex:54201) tests vector, then the three Real
+            // modes, then number, and ends `else IrMulInt` -- so an operand
+            // type it cannot read still gets an operator. Refusing instead
+            // sank `catmull-rom`, whose left operand lowers to `error`.
+            //
+            // The vector and Real-mode arms are not modelled here yet; when
+            // they are, they go BEFORE the Real test, in upstream's order.
+            let arith = |int: IrBinOp, num: IrBinOp| -> IrBinOp {
                 match &lty {
-                    Ty::Integer(..) => Ok(int),
-                    Ty::Real(..) => Ok(num),
-                    other => {
-                        Err(format!("{} on `{}`", int.atom(), render_ty(cx.syms, other)))
-                    }
+                    Ty::Real(..) => num,
+                    _ => int,
                 }
             };
             let (name, ty) = match op {
-                BinaryOp::OpAdd => (arith(IrBinOp::AddInt, IrBinOp::AddNum)?, lty.clone()),
-                BinaryOp::OpSub => (arith(IrBinOp::SubInt, IrBinOp::SubNum)?, lty.clone()),
-                BinaryOp::OpMul => (arith(IrBinOp::MulInt, IrBinOp::MulNum)?, lty.clone()),
-                BinaryOp::OpDiv => (arith(IrBinOp::DivInt, IrBinOp::DivNum)?, lty.clone()),
+                BinaryOp::OpAdd => (arith(IrBinOp::AddInt, IrBinOp::AddNum), lty.clone()),
+                BinaryOp::OpSub => (arith(IrBinOp::SubInt, IrBinOp::SubNum), lty.clone()),
+                BinaryOp::OpMul => (arith(IrBinOp::MulInt, IrBinOp::MulNum), lty.clone()),
+                BinaryOp::OpDiv => (arith(IrBinOp::DivInt, IrBinOp::DivNum), lty.clone()),
                 BinaryOp::OpEq => (IrBinOp::Eq, Ty::Boolean),
                 BinaryOp::OpNotEq => (IrBinOp::NotEq, Ty::Boolean),
                 BinaryOp::OpLt => (IrBinOp::Lt, Ty::Boolean),
@@ -275,6 +280,10 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
                         _ => Ty::List(Box::new(lty.clone())),
                     },
                 ),
+                // `binary-result-type` groups these with the comparisons:
+                // Boolean, or a vector mask over a vector.
+                BinaryOp::OpApproxEq => (IrBinOp::ApproxEq, Ty::Boolean),
+                BinaryOp::OpApproxEqExact => (IrBinOp::ApproxEqExact, Ty::Boolean),
                 BinaryOp::OpBoolAnd => (IrBinOp::And, Ty::Boolean),
                 BinaryOp::OpOr => (IrBinOp::Or, Ty::Boolean),
                 other => return Err(format!("binary op {other:?}")),
@@ -500,6 +509,12 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
             let b = expr(inner, &ret, cx)?;
             Ok(IrExpr::Lambda(ir_params, Box::new(b), lam_ty, *s))
         }
+        // **A PROOF IS ERASED TO `0`.** `lower-expr-at`'s own arm
+        // (IR/Lowering.codex:54365) is
+        // `is AInductionExpr (scrut) (arms) (s) -> deck-record (IrIntLit 0 s)`
+        // -- an induction term carries no runtime value, so nothing of it
+        // reaches the wire and the arms are not walked at all.
+        Expr::Induction(_, _, s) => Ok(IrExpr::IntLit(0, *s)),
         other => Err(node_kind(other).to_string()),
     }
 }
