@@ -2380,3 +2380,37 @@ fn pat_span(p: &crate::ast::Pat) -> crate::ast::Span {
         P::Var(_, s) | P::Lit(_, _, s) | P::Ctor(_, _, s) | P::Wild(s) | P::Vec_(_, s) => *s,
     }
 }
+
+/// What a definition with no signature costs, measured against `codexcheck`.
+///
+/// `UnifyState::default` starts at `next_id = 2`, so these totals include the
+/// two slots upstream's `empty-unification-state` starts with. The
+/// registration variable is the first; `build_undeclared_fun_type` mints the
+/// rest.
+#[cfg(test)]
+mod undeclared_definition_cost {
+    fn counts(src: &str) -> (u32, i32) {
+        let bytes = src.as_bytes().to_vec();
+        let parsed = crate::parser::parse(&bytes);
+        let mut dg = crate::desugar::Desugar::new(&bytes);
+        let ch = dg.chapter(&parsed.tree);
+        let (_, st) = super::check_chapter(&ch);
+        (st.next_id, st.next_row_id)
+    }
+
+    #[test]
+    fn a_nullary_definition_costs_two_variables_and_no_row() {
+        assert_eq!(counts("Chapter: P\nSection: S\n  a = 7\n"), (4, 0));
+    }
+
+    #[test]
+    fn each_parameter_adds_a_variable_and_the_spine_adds_one_row() {
+        assert_eq!(counts("Chapter: P\nSection: S\n  a (x) = x\n"), (5, 1));
+        assert_eq!(counts("Chapter: P\nSection: S\n  a (x) (y) = x\n"), (6, 1));
+    }
+
+    #[test]
+    fn a_declared_definition_costs_nothing_beyond_its_registration() {
+        assert_eq!(counts("Chapter: P\nSection: S\n  a : Integer\n  a = 7\n"), (2, 0));
+    }
+}
