@@ -54,7 +54,7 @@ fn span_of(t: &Token) -> Span {
 /// The first real token under a node -- every AST span upstream builds is
 /// `token-span` of some token this node holds.
 fn head_token<'n>(n: &'n Node) -> Option<&'n Token> {
-    n.tokens().find(|t| !t.kind.is_trivia() && t.kind != Kind::Newline)
+    n.tokens().find(|t| !t.kind.is_trivia() && !t.kind.is_layout())
 }
 
 fn head_span(n: &Node) -> Span {
@@ -456,7 +456,13 @@ impl<'a> Desugar<'a> {
     }
 
     fn binary(&self, n: &Node, kids: &[&Node], sp: Span) -> Expr {
-        let op_tok = n.own_tokens().find(|t| !t.kind.is_trivia()).copied();
+        // **THE OPERATOR IS NEVER A LAYOUT TOKEN.** `a\n + b` puts the
+        // newline before the `+` among this node's own tokens, and picking the
+        // first non-trivia one took the NEWLINE as the operator -- which
+        // `binary_op` then read as `&`, because `&` was its fallback. Nine
+        // definitions in `ringplug-source.codex` are written that way.
+        let op_tok =
+            n.own_tokens().find(|t| !t.kind.is_trivia() && !t.kind.is_layout()).copied();
         let (l, r) = match kids {
             [l, r] => (self.expr(l), self.expr(r)),
             _ => return Expr::Error("bin".into(), sp),
@@ -468,11 +474,14 @@ impl<'a> Desugar<'a> {
         if op.kind == Kind::PipeForward {
             return Expr::Apply(Rc::new(r), Rc::new(l), osp);
         }
-        Expr::Binary(Rc::new(l), binary_op(op.kind), Rc::new(r), osp)
+        let Some(bop) = binary_op(op.kind) else {
+            return Expr::Error(format!("binary operator {:?}", op.kind), osp);
+        };
+        Expr::Binary(Rc::new(l), bop, Rc::new(r), osp)
     }
 
     fn unary(&self, n: &Node, kids: &[&Node], sp: Span) -> Expr {
-        let op = n.own_tokens().find(|t| !t.kind.is_trivia()).copied();
+        let op = n.own_tokens().find(|t| !t.kind.is_trivia() && !t.kind.is_layout()).copied();
         let inner = kids.first().map_or(Expr::Error(String::new(), sp), |k| self.expr(k));
         let Some(op) = op else { return inner };
         let osp = span_of(&op);
@@ -1128,8 +1137,17 @@ fn literal_kind(k: Kind) -> LiteralKind {
     }
 }
 
-fn binary_op(k: Kind) -> BinaryOp {
-    match k {
+/// **NO FALLBACK.** This answered `&` for anything it did not recognise, and
+/// what actually reached it was a NEWLINE -- so nine definitions in
+/// `ringplug-source.codex` had their `+` and `|` rewritten to `&` by the
+/// desugarer, silently. The types still agreed (upstream's `&` answers its
+/// left operand) so nothing failed; the only tell was that `&` is the one
+/// operator that RECORDS an expression type, and the checker's `expr-types`
+/// counter ran one over the oracle's. The token filter is fixed above; this
+/// refuses rather than guess, so the next unrecognised token is a named error
+/// instead of a counter nobody can explain.
+fn binary_op(k: Kind) -> Option<BinaryOp> {
+    Some(match k {
         Kind::Plus => BinaryOp::OpAdd,
         Kind::Minus => BinaryOp::OpSub,
         Kind::Star => BinaryOp::OpMul,
@@ -1154,6 +1172,37 @@ fn binary_op(k: Kind) -> BinaryOp {
         Kind::XorKeyword => BinaryOp::OpNotEq,
         Kind::Tilde => BinaryOp::OpApproxEq,
         Kind::TildeZero => BinaryOp::OpApproxEqExact,
-        _ => BinaryOp::OpAnd,
+        _ => return None,
+    })
+}
+
+/// A binary operator that begins a continuation line is still that operator.
+///
+/// The subject is `ringplug-source.codex`, where nine definitions are written
+/// this way; the first of them, `is-zig-primitive`, is what these two cases
+/// are cut down from.
+#[cfg(test)]
+mod continuation_line_operator {
+    use crate::ast::{BinaryOp, Expr};
+
+    fn body_op(src: &str) -> BinaryOp {
+        let bytes = src.as_bytes().to_vec();
+        let parsed = crate::parser::parse(&bytes);
+        let mut dg = super::Desugar::new(&bytes);
+        let ch = dg.chapter(&parsed.tree);
+        match &ch.defs.last().expect("one definition").body {
+            Expr::Binary(_, op, _, _) => *op,
+            other => panic!("not a binary: {other:?}"),
+        }
+    }
+
+    const ONE_LINE: &str = "Chapter: P\nSection: S\n  f : Text -> Integer\n  f (s) = text-length s + text-length s\n";
+
+    const TWO_LINES: &str = "Chapter: P\nSection: S\n  f : Text -> Integer\n  f (s) =\n   text-length s\n   + text-length s\n";
+
+    #[test]
+    fn a_newline_before_the_operator_does_not_make_it_an_ampersand() {
+        assert_eq!(body_op(ONE_LINE), BinaryOp::OpAdd);
+        assert_eq!(body_op(TWO_LINES), BinaryOp::OpAdd);
     }
 }

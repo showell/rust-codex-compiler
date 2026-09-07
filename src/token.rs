@@ -130,6 +130,20 @@ impl Kind {
         matches!(self, Kind::Spaces | Kind::SkippedProse | Kind::Unmapped)
     }
 
+    /// Layout, not syntax: the tokens the lexer emits to describe where lines
+    /// and blocks begin. Cobblestone's parser consumes them for structure and
+    /// they never spell an operator or a literal.
+    ///
+    /// **`is_trivia` IS NOT THE SAME QUESTION AND ANSWERING IT COST A COUNTER.**
+    /// That predicate means "ours rather than Cobblestone's" -- a projection
+    /// for `lex.truth` -- so a Newline passes it. `desugar::binary` picked its
+    /// operator with `!is_trivia` and, wherever a continuation line began with
+    /// the operator, took the NEWLINE as the operator token: nine of them in
+    /// `ringplug-source.codex`, each falling through `binary_op` to `&`.
+    pub fn is_layout(self) -> bool {
+        matches!(self, Kind::Newline | Kind::Indent | Kind::Dedent)
+    }
+
     /// The spelling `lex.truth` uses.
     pub fn name(self) -> &'static str {
         match self {
