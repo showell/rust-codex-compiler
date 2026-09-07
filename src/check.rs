@@ -1398,10 +1398,11 @@ pub fn infer_row(
         // `bind-lambda-params` mints one variable per parameter -- a lambda,
         // unlike a declared definition, has nowhere else to get them from.
         E::Lambda(params, body, sp) => {
-            let mut arg = Ty::Error;
+            let mut arg_tys = Vec::with_capacity(params.len());
             for p in params {
-                arg = st.fresh();
-                env.bind(*p, arg.clone());
+                let a = st.fresh();
+                env.bind(*p, a.clone());
+                arg_tys.push(a);
             }
             let (ret, body_row) = infer_row(body, env, st);
             for _ in params {
@@ -1416,7 +1417,18 @@ pub fn infer_row(
             // BEFORE the body and this comes after, so the two counters move at
             // different moments and the order is graded.
             let lam_row = st.open_row_if_closed(&body_row);
-            let t = Ty::Fun(Box::new(arg), lam_row, Box::new(ret));
+            // **`wrap-fun-type` CURRIES, AND ONLY THE INNERMOST ARROW CARRIES
+            // THE ROW** (TypeCheckerInference.codex:571) -- the outer ones are
+            // built by `wrap-fun-type-loop` with `empty-row`. A three-parameter
+            // lambda is three arrows, not one: collapsing them to the last
+            // parameter alone made `\acc ch idx -> ...` type as
+            // `(fn int-default int-default)` where the wire wants
+            // `(fn int-default (fn char (fn int-default int-default)))`.
+            let mut t = ret;
+            for (i, a) in arg_tys.into_iter().enumerate().rev() {
+                let row = if i + 1 == params.len() { lam_row.clone() } else { EffectRow::default() };
+                t = Ty::Fun(Box::new(a), row, Box::new(t));
+            }
             st.record_expr_type(*sp, t.clone());
             // A lambda's OWN ambient row is empty: the effects are the arrow's,
             // not the surrounding expression's (`infer-lambda`, line 543).
