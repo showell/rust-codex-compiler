@@ -103,18 +103,23 @@ pub fn emit_defs_checked(
     if keep.is_empty() {
         return Err("no root reached: the chapter defines none of ir-emit-roots".into());
     }
-    let cx = crate::lowering::Lower::new(ch, bindings, st, tds);
-    let mut defs = Vec::new();
-    for d in ch.defs.iter() {
-        defs.push(crate::lowering::lower_def(d, &cx)?);
-    }
-
-
     // **A LIFTED NAME IS A NAME THE CHAPTER'S TABLE NEVER INTERNED.** `Sym` is
     // an index into the table that made it, so `__lam_0` needs a table that
     // holds it. Interning is append-only, so a clone extended with the lifted
     // names leaves every existing `Sym` meaning exactly what it did.
+    //
+    // `__linked-list-empty` is the same case one stage earlier: lowering
+    // WRITES that call for an empty list in linked-list position, and no
+    // source has to have named it.
     let mut syms = ch.syms.clone();
+    let ll_empty = syms.intern("__linked-list-empty");
+    let mut defs = Vec::new();
+    {
+        let cx = crate::lowering::Lower::new(&syms, bindings, st, tds, ll_empty);
+        for d in ch.defs.iter() {
+            defs.push(crate::lowering::lower_def(d, &cx)?);
+        }
+    }
     let defs = crate::lambda_lifting::lift_lambdas(defs, &mut syms);
     let defs = crate::ir_passes::pipeline(defs, &syms);
     let defs = crate::ir_passes::prune_unreachable_roots(defs, roots, &syms);
@@ -532,6 +537,24 @@ mod tests {
         assert!(def_line(src, "j").contains("(binary append-text (binary append-text"), "{}", def_line(src, "j"));
         assert!(def_line(src, "k").contains("(binary and "), "{}", def_line(src, "k"));
         assert!(def_line(src, "l").contains("(binary append-list "), "{}", def_line(src, "l"));
+    }
+
+    /// **`[]` IS NOT ALWAYS A LIST.** An empty list has no element to speak
+    /// for it, so its type is the bare variable the checker minted and the
+    /// CONTEXT decides what that stands for. In linked-list position upstream
+    /// emits a call to the `__linked-list-empty` builtin rather than a list
+    /// literal, and the two spellings are not interchangeable below the IR.
+    #[test]
+    fn an_empty_list_in_linked_list_position_calls_the_builtin() {
+        let src = "Chapter: T\n\nSection: S\n  e : Integer -> LinkedList Text\n  e (n) = []\n\n  p : Integer -> List Text\n  p (n) = []\n\nSection: E\n  opening : Integer\n  opening = list-length (p 1) + list-length (__linked-list-to-list (e 1))\n";
+        assert!(
+            def_line(src, "e").contains(
+                r#"(apply (name "__linked-list-empty" (fn int-default (llist text))) (int-lit 0) (llist text))"#
+            ),
+            "{}",
+            def_line(src, "e")
+        );
+        assert!(def_line(src, "p").contains("(list-expr (elems) text)"), "{}", def_line(src, "p"));
     }
 
     /// A pure definition still renders exactly as it did, which is the thing

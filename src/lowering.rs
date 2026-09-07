@@ -52,20 +52,26 @@ pub struct Lower<'a> {
     /// spells as `"py/1"`.
     tds: &'a TypeDefs,
     bindings: BTreeMap<Sym, Ty>,
+    /// `__linked-list-empty`, which `lower-empty-list` CALLS and no source
+    /// need ever name. Interned into the table before lowering starts, since
+    /// a `Sym` is an index into the table that made it.
+    ll_empty: Sym,
 }
 
 impl<'a> Lower<'a> {
     pub fn new(
-        ch: &'a Chapter,
+        syms: &'a SymTab,
         bindings: &[Binding],
         st: &'a UnifyState,
         tds: &'a TypeDefs,
+        ll_empty: Sym,
     ) -> Lower<'a> {
         Lower {
-            syms: &ch.syms,
+            syms,
             st,
             tds,
             bindings: bindings.iter().map(|b| (b.name, b.ty.clone())).collect(),
+            ll_empty,
         }
     }
 
@@ -315,33 +321,34 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
         // `(list-expr (elems ...) ELEM)` -- the trailing type is the ELEMENT's,
         // checked against golds carrying text and nested-list elements rather
         // than assumed from the integer cases.
+        Expr::List(xs, s) if xs.is_empty() => Ok(empty_list(want, cx, *s)),
         Expr::List(xs, s) => {
-            // An empty list has no element to read a type from: the type is
-            // the variable the checker minted for it, so `[]` in a call to
-            // `list-length` spells `(list-expr (elems) int-default)`.
-            if xs.is_empty() {
-                let e = cx.at(*s).ok_or("empty list literal with no recorded element type")?;
-                return Ok(IrExpr::List(Vec::new(), e, *s));
-            }
+            // `lower-nonempty-list` (Lowering.codex:1376). The element type
+            // comes from the EXPECTATION where there is one, and from the
+            // first element only where there is not -- and every element is
+            // then lowered AGAINST it. Ours lowered each with no expectation
+            // and refused when they disagreed, which is neither the same
+            // answer nor a stricter version of it.
+            let from_context = match cx.st.deep_resolve(want) {
+                Ty::List(e) => *e,
+                _ => Ty::Error,
+            };
+            let elem = if lt::has_error(&from_context) {
+                expr(&xs[0], &Ty::NoExpect, cx)?.ty()
+            } else if !lt::has_typevars(&from_context) {
+                from_context
+            } else {
+                // `list-elem-witnessed`: the first element may say what the
+                // context's variable stands for, but only if it is a witness
+                // worth having.
+                let w = expr(&xs[0], &Ty::NoExpect, cx)?.ty();
+                if lt::has_error(&w) || lt::admits_widening(&w) { from_context } else { w }
+            };
             let mut parts = Vec::new();
-            let mut elem: Option<Ty> = None;
             for x in xs {
-                let x = expr(x, &Ty::NoExpect, cx)?;
-                let xty = x.ty();
-                match &elem {
-                    None => elem = Some(xty),
-                    Some(e) if *e == xty => {}
-                    Some(e) => {
-                        return Err(format!(
-                            "list elements disagree: `{}` vs `{}`",
-                            render_ty(cx.syms, e),
-                            render_ty(cx.syms, &xty)
-                        ))
-                    }
-                }
-                parts.push(x);
+                parts.push(expr(x, &elem, cx)?);
             }
-            Ok(IrExpr::List(parts, elem.unwrap(), *s))
+            Ok(IrExpr::List(parts, elem, *s))
         }
         // `(let "n" TYPE VALUE BODY)`, nested one deep per binding, and the
         // let's own type is the BODY's -- a let evaluates to its body. The
@@ -520,6 +527,41 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
 }
 
 /// The record or constructed type's name, or the reason this is neither.
+/// `lower-empty-list` (Lowering.codex:1359). **`[]` IS NOT ALWAYS A LIST.**
+///
+/// Its type is the bare variable the checker minted, so what it stands for is
+/// whatever the context taught it. A `LinkedList` there is not a list literal
+/// at all -- upstream emits a CALL to the `__linked-list-empty` builtin,
+/// applied to a zero, and only a `ListTy` reaches the wire as `(list-expr
+/// (elems) T)`. A third answer, neither of those, is an empty list of
+/// `ErrorTy` rather than a refusal.
+fn empty_list(want: &Ty, cx: &Lower, s: crate::ast::Span) -> IrExpr {
+    // `empty-list-element-source`: the expectation when it already names a
+    // container, and otherwise whatever the checker recorded at this span.
+    let resolved = match cx.st.deep_resolve(want) {
+        t @ (Ty::List(_) | Ty::LinkedList(_)) => t,
+        _ => cx.recorded(s),
+    };
+    match resolved {
+        Ty::LinkedList(e) => {
+            let ll = Ty::LinkedList(e);
+            let fun = Ty::Fun(
+                Box::new(Ty::Integer(i64::MIN, i64::MAX, crate::check::Overflow::Error)),
+                crate::check::EffectRow::default(),
+                Box::new(ll.clone()),
+            );
+            IrExpr::Apply(
+                Box::new(IrExpr::Name(cx.ll_empty, fun, s)),
+                Box::new(IrExpr::IntLit(0, s)),
+                ll,
+                s,
+            )
+        }
+        Ty::List(e) => IrExpr::List(Vec::new(), *e, s),
+        _ => IrExpr::List(Vec::new(), Ty::Error, s),
+    }
+}
+
 fn record_name(t: &Ty, cx: &Lower, what: &str) -> Result<Sym, String> {
     match t {
         Ty::Record(n, _) | Ty::Constructed(n, _) => Ok(*n),

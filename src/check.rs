@@ -1635,10 +1635,18 @@ pub fn infer_row(
         // `f (x) = []` is next-id 3 and expr-types 1 where `f (x) = [x]` is 2
         // and 1, on a body with no names in it at all.
         E::List(xs, sp) => {
+            // **AN EMPTY LIST IS A BARE VARIABLE, NOT A LIST OF ONE.**
+            // `infer-list` (TypeCheckerInference.codex:1249) answers
+            // `fr-ty` and records `fr-ty` -- so `[]` is whatever the context
+            // makes it, INCLUDING a `LinkedList`. Answering `ListTy fr-ty`
+            // instead pinned the element rather than the container, and
+            // lowering could no longer tell the two apart: forty empty lists
+            // in the compiler reached the wire as `(list-expr (elems) T)`
+            // where the oracle calls `__linked-list-empty`.
             if xs.is_empty() {
                 let e = st.fresh();
                 st.record_expr_type(*sp, e.clone());
-                return (Ty::List(Box::new(e)), EffectRow::default());
+                return (e, EffectRow::default());
             }
             let mut elem = Ty::Error;
             for x in xs {
