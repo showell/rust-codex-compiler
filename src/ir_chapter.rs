@@ -69,6 +69,24 @@ pub enum IrBinOp {
 }
 
 impl IrBinOp {
+    /// `bin-op-atom-typed`. **THE OVERFLOW MODE IS PART OF THE OPERATOR'S
+    /// NAME**, for the three integer operations that can overflow: over a
+    /// wrapping integer `+`, `-` and `*` are spelled `add-int-wrapping`,
+    /// `sub-int-wrapping` and `mul-int-wrapping`. Nothing else changes.
+    ///
+    /// The type asked is the BINARY NODE'S OWN, not either operand's.
+    pub fn atom_typed(self, ty: &Ty) -> &'static str {
+        if int_ty_wraps(ty) {
+            match self {
+                IrBinOp::AddInt => return "add-int-wrapping",
+                IrBinOp::SubInt => return "sub-int-wrapping",
+                IrBinOp::MulInt => return "mul-int-wrapping",
+                _ => {}
+            }
+        }
+        self.atom()
+    }
+
     /// The atom `ir-emit-binop` writes.
     pub fn atom(self) -> &'static str {
         match self {
@@ -141,6 +159,15 @@ pub enum IrPat {
     Ctor(Sym, Vec<IrPat>, Ty, Span),
     Wild(Span),
     Vec_(Vec<IrPat>, Ty, Span),
+}
+
+/// `int-ty-wraps`. A unit type answers for what is inside it.
+fn int_ty_wraps(ty: &Ty) -> bool {
+    match ty {
+        Ty::Integer(_, _, m) => *m == crate::check::Overflow::Wrapping,
+        Ty::Unit(_, inner) => int_ty_wraps(inner),
+        _ => false,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -285,4 +312,31 @@ pub struct IrDef {
     pub body: IrExpr,
     pub chapter_slug: String,
     pub span: Span,
+}
+
+/// The overflow mode is part of the operator's NAME.
+#[cfg(test)]
+mod wrapping_is_in_the_operator {
+    use super::{int_ty_wraps, IrBinOp};
+    use crate::check::{Overflow, Ty};
+
+    const WRAP: Ty = Ty::Integer(i64::MIN, i64::MAX, Overflow::Wrapping);
+    const PLAIN: Ty = Ty::Integer(i64::MIN, i64::MAX, Overflow::Error);
+
+    #[test]
+    fn only_the_three_that_can_overflow_are_respelled() {
+        assert_eq!(IrBinOp::MulInt.atom_typed(&WRAP), "mul-int-wrapping");
+        assert_eq!(IrBinOp::AddInt.atom_typed(&WRAP), "add-int-wrapping");
+        assert_eq!(IrBinOp::SubInt.atom_typed(&WRAP), "sub-int-wrapping");
+        assert_eq!(IrBinOp::DivInt.atom_typed(&WRAP), "div-int");
+        assert_eq!(IrBinOp::Lt.atom_typed(&WRAP), "lt");
+        assert_eq!(IrBinOp::MulInt.atom_typed(&PLAIN), "mul-int");
+    }
+
+    #[test]
+    fn a_unit_answers_for_what_is_inside_it() {
+        let sym = crate::symbol::SymTab::default().intern("Meter");
+        assert!(int_ty_wraps(&Ty::Unit(sym, Box::new(WRAP))));
+        assert!(!int_ty_wraps(&Ty::Unit(sym, Box::new(PLAIN))));
+    }
 }

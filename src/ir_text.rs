@@ -158,7 +158,7 @@ pub fn emit_expr(syms: &SymTab, e: &IrExpr) -> String {
         E::CharLit(c, _) => format!("(char-lit {c})"),
         E::Name(n, ty, _) => format!("(name {} {})", q(*n), t(ty)),
         E::Binary(op, l, r, ty, _) => {
-            format!("(binary {} {} {} {})", op.atom(), sub(l), sub(r), t(ty))
+            format!("(binary {} {} {} {})", op.atom_typed(ty), sub(l), sub(r), t(ty))
         }
         E::Negate(x, ty, _) => format!("(negate {} {})", sub(x), t(ty)),
         E::If(c, th, el, ty, _) => {
