@@ -63,6 +63,7 @@ pub enum IrBinOp {
     Or,
     AppendText,
     AppendList,
+    ConsList,
 }
 
 impl IrBinOp {
@@ -87,6 +88,7 @@ impl IrBinOp {
             IrBinOp::Or => "or",
             IrBinOp::AppendText => "append-text",
             IrBinOp::AppendList => "append-list",
+            IrBinOp::ConsList => "cons-list",
         }
     }
 }

@@ -875,7 +875,7 @@ pub fn resolve_declared(
 /// `strip-forall-ty`: the body of a quantifier chain, with its ORIGINAL ids.
 /// Not an instantiation -- the point of the tie is to meet the signature's own
 /// variables, not fresh ones.
-fn strip_forall(t: &Ty) -> Ty {
+pub fn strip_forall(t: &Ty) -> Ty {
     match t {
         Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => strip_forall(b),
         other => other.clone(),

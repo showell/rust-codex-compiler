@@ -41,8 +41,9 @@ use std::collections::BTreeMap;
 
 /// The types lowering needs and the checker's answers, for one chapter.
 ///
-/// **NAMES ARE NOT LOOKED UP HERE AT ALL** -- they are read out of
-/// `expr-types` by span. `bindings` serves the `(def ...)` headers only.
+/// **A NAME IS READ OUT OF `expr-types` BY SPAN**, and `bindings` is the
+/// fallback `lower-name-normal` reaches for when the span is synthetic and the
+/// checker therefore recorded nothing -- plus the `(def ...)` headers.
 pub struct Lower<'a> {
     pub syms: &'a SymTab,
     st: &'a UnifyState,
@@ -74,6 +75,18 @@ impl<'a> Lower<'a> {
     /// deep one.
     fn at(&self, sp: crate::ast::Span) -> Option<Ty> {
         self.st.expr_type_at(sp).map(|t| self.st.deep_resolve(t))
+    }
+
+    /// `lookup-expr-type` (Unifier.codex:46165), which is TOTAL: its first
+    /// line is `if is-synthetic-span sp then ErrorTy`, and a key it does not
+    /// hold answers `ErrorTy` too.
+    ///
+    /// **THE ABSENCE IS AN ANSWER, NOT A FAILURE.** Every caller upstream
+    /// dispatches on `is ErrorTy | NoExpectTy`, so a refusal here is not a
+    /// stricter version of the same rule -- it is a different rule, and it
+    /// stopped the self-host lowering at one comprehension.
+    fn recorded(&self, sp: crate::ast::Span) -> Ty {
+        self.at(sp).unwrap_or(Ty::Error)
     }
 }
 
@@ -156,10 +169,31 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
             let t = x.ty();
             Ok(IrExpr::Negate(Box::new(x), t, *s))
         }
-        Expr::NameRef(n, s) => match cx.at(*s) {
-            Some(t) => Ok(IrExpr::Name(*n, t, *s)),
-            None => Err(format!("the checker recorded no type at `{}`", cx.syms.text(*n))),
-        },
+        // `lower-name-normal` (IR/Lowering.codex:54520) is a THREE-LEVEL
+        // fallback, and only the first level was here.
+        //
+        // **THE RECORDED ANSWER IS ABSENT FOR A SYNTHETIC SPAN, AND THE
+        // DESUGARER MAKES THOSE.** `for r in temps -> r` becomes a `map-list`
+        // application whose name node the checker never saw a source position
+        // for, so `record-expr-type` skipped it -- `lookup-expr-type`'s own
+        // first line is `if is-synthetic-span sp then ErrorTy`. Refusing here
+        // is what stopped the whole 3.44 MB self-host from lowering, on one
+        // comprehension in `tco-ensure-temps`.
+        //
+        // Upstream falls back to the name's BINDING, stripped of its forall,
+        // and then to the expectation. Neither is a guess: the binding is the
+        // checker's own answer for the name, and the expectation is what the
+        // caller of this node already committed to.
+        Expr::NameRef(n, s) => {
+            let t = match cx.at(*s) {
+                Some(t) => t,
+                None => match cx.bindings.get(n) {
+                    Some(raw) => crate::check::strip_forall(&cx.st.deep_resolve(raw)),
+                    None => want.clone(),
+                },
+            };
+            Ok(IrExpr::Name(*n, t, *s))
+        }
         Expr::Apply(f, a, s) => {
             let f = expr(f, &Ty::NoExpect, cx)?;
             let a = expr(a, &Ty::NoExpect, cx)?;
@@ -181,25 +215,27 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
         Expr::Binary(l, op, r, s) => {
             let l = expr(l, &Ty::NoExpect, cx)?;
             let r = expr(r, &Ty::NoExpect, cx)?;
-            let (lty, rty) = (l.ty(), r.ty());
+            let lty = l.ty();
             // **THE RESULT IS THE LEFT OPERAND'S TYPE, AND TWO INTEGERS OF
             // DIFFERENT BOUNDS ARE COMPATIBLE.** `b + 1` over
             // `Integer between 0 and 255` answers `(int 0 255 ov-error)` and
             // `1 + b` answers `int-default` -- the rule is simply the LEFT.
             // Requiring the two to be EQUAL refused every arithmetic touching
             // a bounded declaration, which the depot writes constantly.
-            let compatible = match (&lty, &rty) {
-                (Ty::Integer(..), Ty::Integer(..)) => true,
-                (Ty::Real(..), Ty::Real(..)) => true,
-                _ => lty == rty,
-            };
-            if !compatible {
-                return Err(format!(
-                    "binary operands disagree: `{}` vs `{}`",
-                    render_ty(cx.syms, &lty),
-                    render_ty(cx.syms, &rty)
-                ));
-            }
+            // **THERE IS NO AGREEMENT CHECK, BECAUSE UPSTREAM HAS NONE.**
+            // `binary-result-type` (IR/Lowering.codex:54225) reads the
+            // operator, the LEFT type and the expectation, and never compares
+            // the two sides. A check that the two agreed was here, and it
+            // earned its keep while the operand types were the thing being
+            // got right -- but it is not this layer's rule, and on the
+            // self-host it refused two constructs that are simply not
+            // symmetric: `a :: List a`, and a `for ... in` comprehension
+            // appended to a concrete list, whose element type is a variable
+            // upstream carries just as happily.
+            //
+            // What replaced it is a stronger gate, not a weaker one: the whole
+            // 3.44 MB unit is now lowered and diffed against `codexir`, which
+            // compares every node instead of the two at one operator.
             let arith = |int: IrBinOp, num: IrBinOp| -> Result<IrBinOp, String> {
                 match &lty {
                     Ty::Integer(..) => Ok(int),
@@ -230,6 +266,15 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
                     Ty::List(_) => (IrBinOp::AppendList, lty.clone()),
                     other => return Err(format!("`&` on `{}`", render_ty(cx.syms, other))),
                 },
+                // `binary-result-type`: the EXPECTATION when it is a list,
+                // and a list of the left operand otherwise.
+                BinaryOp::OpCons => (
+                    IrBinOp::ConsList,
+                    match cx.st.deep_resolve(want) {
+                        t @ Ty::List(_) => t,
+                        _ => Ty::List(Box::new(lty.clone())),
+                    },
+                ),
                 BinaryOp::OpBoolAnd => (IrBinOp::And, Ty::Boolean),
                 BinaryOp::OpOr => (IrBinOp::Or, Ty::Boolean),
                 other => return Err(format!("binary op {other:?}")),
@@ -427,25 +472,30 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
             // `expected-or-recorded-ty`: what the context wants, and only
             // where it wants nothing does the recorded type answer.
             let lam_ty = if lt::has_error(want) {
-                cx.at(*s).ok_or("the checker recorded no type for this lambda")?
+                cx.recorded(*s)
             } else {
                 cx.st.deep_resolve(want)
             };
+            // **`peel-fun-param` ANSWERS `ErrorTy` FOR ANYTHING THAT IS NOT AN
+            // ARROW**, and `get-lambda-return` does the same
+            // (IR/Lowering.codex:55108). Upstream says why in its own prose:
+            // "when nothing above expects a type there is nothing to peel ...
+            // and the arrow is recorded with a failure atom in each position".
+            //
+            // So a lambda whose expectation and recorded type are both absent
+            // still lowers, with `error` in every parameter slot. Refusing
+            // instead is a different rule, and the one that stopped a
+            // `for r in temps -> r` -- whose lambda the desugarer gives a
+            // synthetic span, so nothing recorded a type for it.
             let mut ret = lam_ty.clone();
             let mut ir_params = Vec::new();
             for p in &params {
-                match ret {
-                    Ty::Fun(a, _, r) => {
-                        ir_params.push(IrParam { name: *p, ty: *a, span: *s });
-                        ret = *r;
-                    }
-                    _ => {
-                        return Err(format!(
-                            "lambda parameter `{}` has no arrow to come from",
-                            cx.syms.text(*p)
-                        ))
-                    }
-                }
+                let (a, r) = match ret {
+                    Ty::Fun(a, _, r) => (*a, *r),
+                    _ => (Ty::Error, Ty::Error),
+                };
+                ir_params.push(IrParam { name: *p, ty: a, span: *s });
+                ret = r;
             }
             let b = expr(inner, &ret, cx)?;
             Ok(IrExpr::Lambda(ir_params, Box::new(b), lam_ty, *s))
