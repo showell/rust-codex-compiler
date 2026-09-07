@@ -283,3 +283,33 @@ pub fn lit_text_to_integer(t: &str) -> i64 {
         acc.wrapping_mul(10).wrapping_add((c.wrapping_sub(b'0')) as i64)
     })
 }
+
+/// A text literal's CHARACTERS -- the body between the quotes with its escapes
+/// resolved.
+///
+/// **A Codex `Text` is CCE UNITS, one per CHARACTER**, so `text-length` counts
+/// these and not bytes. `\n` is one character, and so is `\\`.
+///
+/// This exists because our AST carries a text literal AS THE SOURCE SPELLED
+/// IT, quotes included, where upstream's desugarer decodes the token once and
+/// everything downstream sees the decoded text. That is a divergence worth
+/// closing at the desugarer rather than here -- `interp.rs` has a third copy
+/// of this decode, and its `\t` and upstream's disagree.
+pub fn text_literal_chars(raw: &str) -> Vec<char> {
+    let body = raw.strip_prefix('"').map_or(raw, |s| s.strip_suffix('"').unwrap_or(s));
+    let mut out = Vec::with_capacity(body.len());
+    let mut it = body.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('n') | Some('r') => out.push('\n'),
+            Some('t') => out.push(' '),
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out
+}
