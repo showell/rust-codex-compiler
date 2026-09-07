@@ -903,6 +903,29 @@ fn flatten_app(t: &crate::ast::TypeExpr) -> (&crate::ast::TypeExpr, Vec<&crate::
 /// declares no type and binds the declared one otherwise. Both halves are here
 /// because the fresh-variable count is graded, and skipping the mint would
 /// report a smaller `next-id` than upstream for the same program.
+/// `build-undeclared-fun-type` (TypeChecker.codex:48787). The shape a
+/// definition with no signature is checked against: a fresh variable for the
+/// result, and one arrow per parameter.
+///
+/// **ONLY THE INNERMOST ARROW CARRIES A ROW**, and the parameters are minted
+/// from the LAST one backwards -- `build-fun-type-loop` wraps the spine
+/// outward with empty rows. The ids reach the wire as `(tvar N)`, so the order
+/// is as load-bearing as the count.
+fn build_undeclared_fun_type(st: &mut UnifyState, pcount: usize) -> Ty {
+    let body = st.fresh();
+    if pcount == 0 {
+        return body;
+    }
+    let row = EffectRow { id: st.fresh_row(), ..Default::default() };
+    let last = st.fresh();
+    let mut acc = Ty::Fun(Box::new(last), row, Box::new(body));
+    for _ in 0..pcount - 1 {
+        let p = st.fresh();
+        acc = Ty::Fun(Box::new(p), EffectRow::default(), Box::new(acc));
+    }
+    acc
+}
+
 pub fn register_defs(
     ch: &crate::ast::Chapter,
     tds: &TypeDefs,
@@ -1142,7 +1165,32 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
         // second time here. That is the other half of what a type parameter
         // costs, and it is paid whether or not anything calls the definition.
         let own = bindings.iter().find(|b| b.name == d.name).map(|b| b.ty.clone());
-        let instantiated = own.clone().map(|t| st.instantiate(&t));
+        // **A DEFINITION THAT DECLARES NOTHING IS BUILT A SHAPE, NOT HANDED
+        // ITS REGISTRATION.** `resolve-declared-type` (TypeChecker.codex:48765)
+        // splits on `list-length (def.declared-type) == 0`: the declared side
+        // instantiates the signature, and the undeclared side calls
+        // `build-undeclared-fun-type`, which mints a SECOND variable for the
+        // result and an arrow spine for the parameters. The registration
+        // variable is then tied to it -- `check-def-normal`'s `linked-state`
+        // unifies `env-lookup rn` against the expected type -- so the two
+        // describe the same definition and only one of them is a mint we were
+        // making.
+        //
+        // Reusing the registration variable was one mint short per undeclared
+        // definition, and one row short per undeclared definition WITH
+        // parameters. `ringplug-source.codex` has two of them, both nullary,
+        // which is exactly its `next-id` -2 with its rows already exact.
+        let instantiated = if d.declared_type.is_empty() {
+            let t = build_undeclared_fun_type(&mut st, d.params.len());
+            if let Some(o) = own.clone() {
+                if !st.unify(&o, &t) {
+                    st.unify_gaps += 1;
+                }
+            }
+            Some(t)
+        } else {
+            own.clone().map(|t| st.instantiate(&t))
+        };
         // **WHAT LOWERING SPELLS FOR THIS DEFINITION IS THIS TYPE, NOT THE
         // GENERALISED ONE.** `check-def-normal` answers
         // `inferred-type = declared.expected-type` -- the INSTANTIATED type --
@@ -2071,6 +2119,21 @@ mod tests {
     /// outermost application in all three of the last shapes and takes row 0
     /// in every one of them, however deep the argument goes; a checker that
     /// minted after recursing would give it 0, 3 and 6 instead.
+    /// A definition with NO declared type costs TWO variables, not one.
+    ///
+    /// Registration mints the first; `build-undeclared-fun-type` mints the
+    /// second for the result, plus one ROW and one variable per parameter, and
+    /// `check-def-normal` unifies the two. Read off `codexcheck` on these four
+    /// probes, and off `ringplug-source.codex`, whose two undeclared
+    /// definitions are exactly its `next-id` -2.
+    #[test]
+    fn an_undeclared_definition_costs_two_variables() {
+        assert_eq!(counters(&chapter("  a : Integer\n  a = 7\n")), (2, 0));
+        assert_eq!(counters(&chapter("  a = 7\n")), (4, 0));
+        assert_eq!(counters(&chapter("  a (x) = x\n")), (5, 1));
+        assert_eq!(counters(&chapter("  a (x) (y) = x\n")), (6, 1));
+    }
+
     #[test]
     fn row_ids_are_three_per_application_outermost_first() {
         // No application anywhere: neither counter moves off its base.
