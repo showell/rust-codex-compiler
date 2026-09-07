@@ -124,8 +124,17 @@ pub fn emit_defs_checked(
         }
     }
     let mut syms = syms.into_inner();
-    let defs = crate::lambda_lifting::lift_lambdas(defs, &mut syms);
+    // **THE PIPELINE RUNS BEFORE THE LIFT, AND THE ORDER IS THE POINT.**
+    // `compile-frontend-ir` lowers and then calls `run-ir-pipeline`;
+    // `lift-ir-for-emit` is a separate step the emitter takes afterwards
+    // (subject 65601 and 66599). Lifting first is not a rearrangement --
+    // `once-binder-free` REFUSES an `IrLambda`, so a definition whose body is
+    // a comprehension is not an inline candidate at all upstream. With the
+    // lift first its lambda is already a name and the definition inlines and
+    // disappears: that is where the `mcopy-*-node` family and
+    // `copy-sx-ctordef` went, five definitions the oracle keeps.
     let defs = crate::ir_passes::pipeline(defs, &syms);
+    let defs = crate::lambda_lifting::lift_lambdas(defs, &mut syms);
     let defs = crate::ir_passes::prune_unreachable_roots(defs, roots, &syms);
     Ok(crate::ir_text::emit_defs(&syms, &defs))
 }
@@ -602,6 +611,23 @@ mod tests {
             "{}",
             def_line(src, "g")
         );
+    }
+
+    /// **A DEFINITION WHOSE BODY IS A COMPREHENSION IS NOT AN INLINE
+    /// CANDIDATE**, and it stays in the chapter even with one caller.
+    ///
+    /// That is entirely a question of ORDER. `once-binder-free` refuses an
+    /// `IrLambda` by its default arm, so upstream -- which runs the pipeline
+    /// on the lowered tree and lifts afterwards -- never sees this body as
+    /// eligible. Lifting first turns the lambda into a name, the body becomes
+    /// admissible, the definition is spliced into its one caller and vanishes.
+    /// Five definitions of the compiler disappeared that way.
+    #[test]
+    fn the_pipeline_runs_before_the_lift() {
+        let src = "Chapter: T\n\nSection: S\n  node : List Integer, Integer -> List Integer\n  node (xs) (k) = for x in xs -> x + k\n\n  ins : List Integer, Integer -> Integer\n  ins (xs) (k) = list-length (node xs k)\n\nSection: E\n  opening : Integer\n  opening = ins [1] 2\n";
+        let all = ir(src);
+        assert!(all.contains(r#"(def "node" "T""#), "node was inlined away:\n{all}");
+        assert!(all.contains(r#"(name "node" ("#), "the call to node went too:\n{all}");
     }
 
     /// A pure definition still renders exactly as it did, which is the thing
