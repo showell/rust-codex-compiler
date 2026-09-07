@@ -1602,6 +1602,14 @@ pub fn infer_row(
             st.deep_resolve(&last)
         }
         E::Let(binds, body, _) => {
+            // **A LET'S BINDINGS ARE SCOPED TO ITS BODY**, and forgetting to
+            // unwind them is not a local mistake: `check_chapter_full` pops N
+            // entries for a definition's N parameters, so k leaked bindings
+            // leave k PARAMETERS bound for every definition after this one.
+            // `build-all-names-scope (top-names) (ctor-names) (builtins)` did
+            // exactly that, and five later references to the global `builtins`
+            // got that parameter's `List Text` instead of `List BuiltinSpec`.
+            let mark = env.scope.len();
             for b in binds {
                 let (t, brow) = infer_row(&b.value, env, st);
                 // **A LET BINDS THE DEEP-RESOLVED TYPE, NOT THE INFERRED ONE.**
@@ -1617,6 +1625,7 @@ pub fn infer_row(
             }
             let (t, body_row) = infer_row(body, env, st);
             row = st.row_union(&row, &body_row);
+            env.scope.truncate(mark);
             t
         }
         // **EVERY REMAINING FORM IS WALKED, EVEN WHERE THE TYPE IS NOT KNOWN.**
@@ -1853,6 +1862,7 @@ pub fn infer_row(
         // fallback and the failure arm are all program the checker sees.
         E::Try(t) => {
             let mut last = Ty::Nothing;
+            let mark = env.scope.len();
             for stmts in [&t.body, &t.fallback, &t.failure] {
                 for stmt in stmts {
                     match stmt {
@@ -1864,6 +1874,7 @@ pub fn infer_row(
                     }
                 }
             }
+            env.scope.truncate(mark);
             last
         }
         E::Error(..) => Ty::Error,
@@ -2617,5 +2628,37 @@ mod applied_types_that_are_not_constructors {
     #[test]
     fn a_vector_reads_its_length_out_of_a_name() {
         assert_eq!(param_ty("Vector 4 Real"), Ty::Vector(4, Box::new(Ty::Real(RealWidth::F64, RealMode::Default))));
+    }
+}
+
+/// A `let` inside one definition must not be visible in the next.
+///
+/// The leak is not local. `check_chapter_full` pops as many entries as the
+/// definition had PARAMETERS, so k bindings left behind by the body pop k
+/// parameters instead -- and those parameters stay bound for the rest of the
+/// chapter, shadowing globals of the same name.
+#[cfg(test)]
+mod a_let_does_not_outlive_its_definition {
+    #[test]
+    fn a_parameter_does_not_shadow_a_global_in_a_later_definition() {
+        // `holder` has a parameter named `table`, and a `let` in its body: one
+        // leaked binding, one parameter left bound. `after` then reads the
+        // global `table` and must still see `List Text`, not `Integer`.
+        let src = "Chapter: T\nSection: S\n  table : List Text\n  table = []\n\n  holder : Integer -> Integer\n  holder (table) = let x = table in x\n\n  after : Integer -> Integer\n  after (n) = list-length table\n";
+        let bytes = src.as_bytes();
+        let parsed = crate::parser::parse(bytes);
+        let mut dg = crate::desugar::Desugar::new(bytes);
+        let ch = dg.chapter(&parsed.tree);
+        let (bindings, st, _) = super::check_chapter_full(&ch);
+        let after = ch.defs.iter().find(|d| ch.syms.text(d.name) == "after").expect("after");
+        // The body is `list-length table`; the argument's recorded type is the
+        // global's.
+        let crate::ast::Expr::Apply(_, arg, _) = &after.body else { panic!("not an apply") };
+        let crate::ast::Expr::NameRef(_, sp) = &**arg else { panic!("not a name") };
+        assert_eq!(
+            st.expr_type_at(*sp).map(|t| crate::ir_text::render_ty(&ch.syms, t)),
+            Some("(list text)".to_string())
+        );
+        let _ = bindings;
     }
 }
