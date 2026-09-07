@@ -252,3 +252,34 @@ impl Token {
         &src[self.offset as usize..(self.offset + self.len) as usize]
     }
 }
+
+/// `lit-text-to-integer` (Token.codex:144). An integer literal's VALUE.
+///
+/// **`#` IS THE HEX PREFIX, NOT `0x`**, and an underscore is a separator the
+/// decimal path skips. The arithmetic is declared `wrapping` upstream, so a
+/// literal past the range wraps rather than trapping -- reproduced here, since
+/// a panic where upstream wraps is a different program.
+///
+/// The decimal path subtracts the char-code of `'0'` rather than the byte, but
+/// the alphabet numbers `0..9` consecutively, so the digits come out the same;
+/// the hex path SKIPS anything that is not a hex digit, which is how it steps
+/// over the `#` it starts one past anyway.
+pub fn lit_text_to_integer(t: &str) -> i64 {
+    let hex_digit = |c: u8| -> Option<i64> {
+        match c {
+            b'0'..=b'9' => Some((c - b'0') as i64),
+            b'a'..=b'f' => Some((c - b'a') as i64 + 10),
+            b'A'..=b'F' => Some((c - b'A') as i64 + 10),
+            _ => None,
+        }
+    };
+    let b = t.as_bytes();
+    if b.first() == Some(&b'#') {
+        return b[1..].iter().filter_map(|c| hex_digit(*c)).fold(0i64, |acc, d| {
+            acc.wrapping_mul(16).wrapping_add(d)
+        });
+    }
+    b.iter().filter(|c| **c != b'_').fold(0i64, |acc, c| {
+        acc.wrapping_mul(10).wrapping_add((c.wrapping_sub(b'0')) as i64)
+    })
+}
