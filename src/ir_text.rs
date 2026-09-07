@@ -13,6 +13,25 @@ use crate::check::{Overflow, RealMode, RealWidth, Ty};
 use crate::ir_chapter::{IrActStmt, IrDef, IrExpr, IrPat};
 use crate::symbol::{Sym, SymTab};
 
+/// `safe-int-text` (IRTextEmitter.codex:112). **`i64::MIN` IS A SENTINEL
+/// ATOM ON THIS WIRE**, not a number.
+///
+/// Upstream's reason is its own: `__itoa` negates a negative input into a
+/// positive register before its digit loop, and `abs(i64-min)` overflows, so
+/// the emitter cannot spell it. Ours has no such trouble and must print
+/// `i64-min` anyway, because the plug parsers on the far side read the atom.
+///
+/// Four sites spell an integer on this wire and all four go through here:
+/// the two bounds of `(int lo hi mode)`, the two of `(a-bounded ...)`, and
+/// `(int-lit n)` / `(num-lit n)`.
+pub fn safe_int_text(n: i64) -> String {
+    if n == i64::MIN {
+        "i64-min".into()
+    } else {
+        n.to_string()
+    }
+}
+
 /// A CHECKED type, as the IR spells it -- `ir-emit-type`
 /// (Emit/IRTextEmitter.codex:241), arm for arm.
 ///
@@ -33,7 +52,9 @@ pub fn render_ty(syms: &SymTab, t: &Ty) -> String {
             "int-default".into()
         }
         Ty::Integer(lo, hi, m) => format!(
-            "(int {lo} {hi} {})",
+            "(int {} {} {})",
+            safe_int_text(*lo),
+            safe_int_text(*hi),
             match m {
                 Overflow::Error => "ov-error",
                 Overflow::Wrapping => "ov-wrap",
@@ -124,8 +145,8 @@ pub fn emit_expr(syms: &SymTab, e: &IrExpr) -> String {
     match e {
         // A literal carries no type on the wire: `(int-lit 1)`, never
         // `(int-lit 1 int-default)`.
-        E::IntLit(v, _) => format!("(int-lit {v})"),
-        E::NumLit(v, _) => format!("(num-lit {v})"),
+        E::IntLit(v, _) => format!("(int-lit {})", safe_int_text(*v)),
+        E::NumLit(v, _) => format!("(num-lit {})", safe_int_text(*v)),
         // `ir-quote` (line 71). The literal arrives DECODED, and only three
         // characters are escaped on the way back out -- backslash, quote and
         // newline. A tab does not appear in the list because a tab cannot

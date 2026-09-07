@@ -196,6 +196,10 @@ fn atype(n: &Node, src: &[u8]) -> String {
             // token, and dropping it turned -1 into 1 in the compiler's own
             // `EffectRow.tail-id`. A minus is a SIGN here only when a number
             // follows it immediately.
+            // The bound is a VALUE by the time it reaches the wire, not the
+            // text that spelled it: upstream parses with `lit-text-to-integer`
+            // and prints with `safe-int-text`, so `#FF` comes back as `255`
+            // and `-9223372036854775808` as the atom `i64-min`.
             let toks: Vec<_> = n.tokens().filter(|t| !t.kind.is_trivia()).collect();
             let mut nums: Vec<String> = Vec::new();
             for (i, t) in toks.iter().enumerate() {
@@ -203,7 +207,12 @@ fn atype(n: &Node, src: &[u8]) -> String {
                     continue;
                 }
                 let negated = i > 0 && toks[i - 1].kind == Kind::Minus;
-                nums.push(format!("{}{}", if negated { "-" } else { "" }, text_of(t, src)));
+                let v = crate::token::lit_text_to_integer(&text_of(t, src));
+                nums.push(crate::ir_text::safe_int_text(if negated {
+                    v.wrapping_neg()
+                } else {
+                    v
+                }));
             }
             let mode = n
                 .tokens()

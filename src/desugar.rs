@@ -921,8 +921,18 @@ impl<'a> Desugar<'a> {
                 for (i, t) in toks.iter().enumerate() {
                     if t.kind == Kind::IntegerLiteral {
                         let neg = i > 0 && toks[i - 1].kind == Kind::Minus;
-                        let v: i64 = self.text(t).parse().unwrap_or(0);
-                        nums.push(if neg { -v } else { v });
+                        // **`parse()` CANNOT READ THE LOWER BOUND.**
+                        // `Integer between -9223372036854775808 and ...` is
+                        // written as a minus and a literal, and
+                        // `9223372036854775807 + 1` is not an `i64`, so
+                        // `parse::<i64>()` failed and `unwrap_or(0)` made the
+                        // bound zero -- 20 definitions of the compiler said
+                        // `(int 0 ...)` where every gold says `(int i64-min
+                        // ...)`. `lit-text-to-integer` accumulates `acc * 10 +
+                        // d` in wrapping arithmetic, which lands exactly on
+                        // `i64::MIN`, and negating that wraps back to itself.
+                        let v = crate::token::lit_text_to_integer(&self.text(t));
+                        nums.push(if neg { v.wrapping_neg() } else { v });
                     }
                 }
                 let mode = n
@@ -1204,5 +1214,45 @@ mod continuation_line_operator {
     fn a_newline_before_the_operator_does_not_make_it_an_ampersand() {
         assert_eq!(body_op(ONE_LINE), BinaryOp::OpAdd);
         assert_eq!(body_op(TWO_LINES), BinaryOp::OpAdd);
+    }
+}
+
+/// The lower bound of a full-range integer.
+///
+/// `Integer between -9223372036854775808 and 9223372036854775807 wrapping` is
+/// how the compiler's own `cons-mix` declares its accumulator, and
+/// `parse::<i64>()` cannot read the magnitude: it is one past `i64::MAX`. The
+/// bound arrived as zero, and twenty definitions of the compiler said `(int 0
+/// ...)` where every gold says `(int i64-min ...)`.
+#[cfg(test)]
+mod full_range_integer_bound {
+    use crate::ast::{OverflowMode, TypeExpr};
+
+    fn bounds(src: &str) -> (i64, i64, OverflowMode) {
+        let bytes = src.as_bytes().to_vec();
+        let parsed = crate::parser::parse(&bytes);
+        let mut dg = super::Desugar::new(&bytes);
+        let ch = dg.chapter(&parsed.tree);
+        let d = ch.defs.last().expect("one definition");
+        let mut t = d.declared_type.first().expect("a declared type");
+        while let TypeExpr::Fun(a, _, _) = t {
+            t = a;
+        }
+        match t {
+            TypeExpr::BoundedInt(_, lo, hi, m, _) => (*lo, *hi, *m),
+            other => panic!("not a bounded integer: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_lower_bound_is_i64_min_and_not_zero() {
+        let src = "Chapter: P\nSection: S\n  mix : Integer between -9223372036854775808 and 9223372036854775807 wrapping -> Integer\n  mix (h) = h\n";
+        assert_eq!(bounds(src), (i64::MIN, i64::MAX, OverflowMode::Wrapping));
+    }
+
+    #[test]
+    fn an_ordinary_bound_is_unchanged() {
+        let src = "Chapter: P\nSection: S\n  f : Integer between 0 and 255 -> Integer\n  f (b) = b\n";
+        assert_eq!(bounds(src), (0, 255, OverflowMode::Error));
     }
 }

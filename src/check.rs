@@ -862,14 +862,76 @@ pub fn resolve_declared(
             let T::Named(n, _) = head else { return None };
             let rendered: Vec<Ty> =
                 args.iter().map(|a| resolve_declared(syms, tds, a)).collect::<Option<_>>()?;
-            match (syms.text(*n), rendered.as_slice()) {
-                ("List", [only]) => Ty::List(Box::new(only.clone())),
-                _ => Ty::Constructed(*n, rendered),
-            }
+            resolve_applied(syms, *n, &args, rendered)
         }
         T::Linear(inner, _) => Ty::Linear(Box::new(resolve_declared(syms, tds, inner)?)),
         _ => return None,
     })
+}
+
+/// `resolve-applied-type` (TypeChecker.codex:63). **FOUR NAMES ARE NOT
+/// CONSTRUCTORS**, and the wire spells each of them its own way: `List`,
+/// `LinkedList`, `Real` and `Vector`.
+///
+/// `LinkedList` missing from here spelled 99 definitions of the compiler
+/// `(ctd "LinkedList" (args T))` where every gold says `(llist T)` -- it is
+/// the same shape as `List`, one arm below it, and the two are not
+/// interchangeable anywhere else in the pipeline either.
+///
+/// The wrong-arity cases answer the CONTAINER with `ErrorTy` inside rather
+/// than falling through to a constructor, so `List a b` stays a list.
+fn resolve_applied(syms: &SymTab, n: Name, args: &[&crate::ast::TypeExpr], rendered: Vec<Ty>) -> Ty {
+    match (syms.text(n), rendered.as_slice()) {
+        ("List", [only]) => Ty::List(Box::new(only.clone())),
+        ("List", _) => Ty::List(Box::new(Ty::Error)),
+        ("LinkedList", [only]) => Ty::LinkedList(Box::new(only.clone())),
+        ("LinkedList", _) => Ty::LinkedList(Box::new(Ty::Error)),
+        ("Real", _) => resolve_real_quals(syms, n, args, rendered),
+        // The length is a NAME, not a literal: `Vector 4 Real` parses `4` as
+        // an identifier in type position, and its text is read as an integer.
+        ("Vector", [_, elem]) => {
+            let len = match args.first() {
+                Some(crate::ast::TypeExpr::Named(w, _)) => {
+                    crate::token::lit_text_to_integer(syms.text(*w))
+                }
+                _ => 0,
+            };
+            Ty::Vector(len, Box::new(elem.clone()))
+        }
+        ("Vector", _) => Ty::Vector(2, Box::new(Ty::Error)),
+        _ => Ty::Constructed(n, rendered),
+    }
+}
+
+/// `resolve-real-quals` (TypeChecker.codex:50). `Real approximate trapping` is
+/// a Real, `Real a` is a constructor -- ONE argument that is not a qualifier
+/// makes the whole application ordinary again.
+fn resolve_real_quals(
+    syms: &SymTab,
+    n: Name,
+    args: &[&crate::ast::TypeExpr],
+    rendered: Vec<Ty>,
+) -> Ty {
+    if args.is_empty() {
+        return Ty::Real(RealWidth::F64, RealMode::Default);
+    }
+    let (mut w, mut m, mut all) = (RealWidth::F64, RealMode::Default, true);
+    for a in args {
+        match a {
+            crate::ast::TypeExpr::Named(word, _) => match syms.text(*word) {
+                "approximate" => w = RealWidth::F32,
+                "trapping" => m = RealMode::Trapping,
+                "saturating" => m = RealMode::Saturating,
+                _ => all = false,
+            },
+            _ => all = false,
+        }
+    }
+    if all {
+        Ty::Real(w, m)
+    } else {
+        Ty::Constructed(n, rendered)
+    }
 }
 
 /// `strip-forall-ty`: the body of a quantifier chain, with its ORIGINAL ids.
@@ -2464,5 +2526,60 @@ mod act_bind_is_in_scope {
         // `codexcheck` on this unit: next-id 4, next-row-id 6, expr-types 7.
         // It was 5 while the bind was discarded.
         assert_eq!((st.next_id, st.next_row_id, st.expr_types.len()), (4, 6, 7));
+    }
+}
+
+/// The four applied types that are not constructors.
+///
+/// `resolve-applied-type` gives `List`, `LinkedList`, `Real` and `Vector` each
+/// their own `CodexType`; everything else is a `ConstructedTy`. `LinkedList`
+/// missing from that list spelled 99 definitions of the compiler
+/// `(ctd "LinkedList" (args T))` where the oracle says `(llist T)`.
+#[cfg(test)]
+mod applied_types_that_are_not_constructors {
+    use super::{RealMode, RealWidth, Ty};
+
+    /// The declared parameter type of the chapter's last definition.
+    fn param_ty(decl: &str) -> Ty {
+        let src = format!("Chapter: P\nSection: S\n  f : {decl} -> Integer\n  f (x) = 1\n");
+        let bytes = src.as_bytes().to_vec();
+        let parsed = crate::parser::parse(&bytes);
+        let mut dg = crate::desugar::Desugar::new(&bytes);
+        let ch = dg.chapter(&parsed.tree);
+        let tds = super::TypeDefs::new(&ch);
+        let t = ch.defs.last().expect("one definition").declared_type.first().expect("a type");
+        match super::resolve_declared(&ch.syms, &tds, t).expect("resolved") {
+            Ty::Fun(p, _, _) => *p,
+            other => panic!("not an arrow: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_linked_list_is_not_a_constructor() {
+        assert_eq!(param_ty("LinkedList Text"), Ty::LinkedList(Box::new(Ty::Text)));
+        assert_eq!(param_ty("List Text"), Ty::List(Box::new(Ty::Text)));
+    }
+
+    #[test]
+    fn the_wrong_arity_keeps_the_container_and_loses_the_element() {
+        assert_eq!(param_ty("List Text Text"), Ty::List(Box::new(Ty::Error)));
+        assert_eq!(param_ty("LinkedList Text Text"), Ty::LinkedList(Box::new(Ty::Error)));
+    }
+
+    #[test]
+    fn every_argument_to_real_must_be_a_qualifier() {
+        assert_eq!(param_ty("Real approximate"), Ty::Real(RealWidth::F32, RealMode::Default));
+        assert_eq!(
+            param_ty("Real approximate trapping"),
+            Ty::Real(RealWidth::F32, RealMode::Trapping)
+        );
+        assert_eq!(param_ty("Real saturating"), Ty::Real(RealWidth::F64, RealMode::Saturating));
+        // `Real a` is an application of a name that happens to be `Real`.
+        assert!(matches!(param_ty("Real a"), Ty::Constructed(..)));
+    }
+
+    #[test]
+    fn a_vector_reads_its_length_out_of_a_name() {
+        assert_eq!(param_ty("Vector 4 Real"), Ty::Vector(4, Box::new(Ty::Real(RealWidth::F64, RealMode::Default))));
     }
 }
