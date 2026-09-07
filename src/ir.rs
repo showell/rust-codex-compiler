@@ -175,6 +175,36 @@ pub struct Lower<'a> {
     /// This chapter's own definitions, keyed by name, for the `(def ...)`
     /// headers. Bodies do not consult it.
     bindings: BTreeMap<Sym, Ty>,
+    /// The `__lam_N` each lambda in the chapter lifts to, by span. Assigned
+    /// over the WHOLE chapter before any pruning -- see `lambda_names`.
+    lam_names: BTreeMap<u64, String>,
+    /// The `(def "__lam_N" ...)` lines lifted so far, appended after the
+    /// chapter's own definitions in the order they were lifted.
+    lifted: std::cell::RefCell<Vec<String>>,
+    /// The LOCAL binders in scope at the node being lowered -- `enclosing`,
+    /// the set a lambda may capture from. Only lambda lifting reads it, but
+    /// every binding form has to maintain it, so it lives here rather than
+    /// widening `expr`'s signature for one caller.
+    scope: std::cell::RefCell<Vec<Sym>>,
+}
+
+/// A scope push that pops itself, so a `?` out of the middle of a binding form
+/// cannot leave `enclosing` holding names that went out of scope.
+struct Scope<'s>(&'s std::cell::RefCell<Vec<Sym>>, usize);
+
+impl Drop for Scope<'_> {
+    fn drop(&mut self) {
+        self.0.borrow_mut().truncate(self.1);
+    }
+}
+
+impl<'s> Scope<'s> {
+    fn open(cx: &'s Lower) -> Scope<'s> {
+        Scope(&cx.scope, cx.scope.borrow().len())
+    }
+    fn bind(&self, n: Sym) {
+        self.0.borrow_mut().push(n);
+    }
 }
 
 impl<'a> Lower<'a> {
@@ -189,6 +219,9 @@ impl<'a> Lower<'a> {
             st,
             tds,
             bindings: bindings.iter().map(|b| (b.name, b.ty.clone())).collect(),
+            lam_names: lambda_names(ch),
+            lifted: std::cell::RefCell::new(Vec::new()),
+            scope: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -222,6 +255,14 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
         Expr::Lit(v, LiteralKind::BoolLit, _) => Ok((
             format!("(bool-lit {})", if v == "True" { "true" } else { "false" }),
             Ty::Boolean,
+        )),
+        // `(char-lit 15)` for `'a'` -- the CHAR-CODE, not the byte and not the
+        // codepoint. `lower-literal` reads `text-to-integer text` because
+        // upstream's desugarer already turned the token into that number;
+        // ours keeps the raw token, so the decode happens at this end instead.
+        Expr::Lit(v, LiteralKind::CharLit, _) => Ok((
+            format!("(char-lit {})", crate::charcode::char_literal_code(v)),
+            Ty::Char,
         )),
         Expr::Lit(_, k, _) => Err(format!("literal kind {k:?}")),
         // `(negate X TYPE)`, and the type is the OPERAND's -- negating does
@@ -383,9 +424,14 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
         // `(let "n" TYPE VALUE BODY)`, nested one deep per binding, and the
         // let's own type is the BODY's -- a let evaluates to its body.
         Expr::Let(binds, body, _) => {
+            let scope = Scope::open(cx);
             let mut heads = Vec::new();
             for b in binds {
                 let (vt, vty) = expr(&b.value, cx)?;
+                // `lift-expr`'s `IrLet` arm adds the name for the BODY only,
+                // and the golds nest one let per binding -- so binding i's
+                // value sees 0..i and not itself.
+                scope.bind(b.name);
                 heads.push((b.name, vty, vt));
             }
             let (bt, bty) = expr(body, cx)?;
@@ -410,6 +456,7 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
         // arithmetic decides what the EFFECT of the block is; this is the
         // value side, which is all the wire carries here.
         Expr::Act(stmts, _) => {
+            let scope = Scope::open(cx);
             let mut parts = Vec::new();
             let mut last = Ty::Nothing;
             for st in stmts {
@@ -421,6 +468,9 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
                     }
                     crate::ast::ActStmt::Bind(n, e, _) => {
                         let (t, ty) = expr(e, cx)?;
+                        // `lift-act-stmts` binds the name for the statements
+                        // AFTER this one, not for its own value.
+                        scope.bind(*n);
                         parts.push(format!(
                             "(do-bind {:?} {} {})",
                             cx.syms.text(*n),
@@ -485,6 +535,107 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
                 fty,
             ))
         }
+        // **A LAMBDA IS NOT A NODE ON THIS WIRE.** `lift-lambdas` turned it
+        // into a top-level `__lam_N` and left a reference behind, so what this
+        // arm emits is that reference -- `(name "__lam_0" TY)`, applied to
+        // each captured variable -- and it pushes the definition itself onto
+        // `cx.lifted` for `emit_defs_checked` to append.
+        Expr::Lambda(ps, body, sp) => {
+            // `lift-one-lambda` recursing on an `IrLambda` body concatenates
+            // the parameters, so `\a -> \b -> e` lifts to ONE definition of
+            // two parameters. Its name was reserved for the outer span.
+            let mut params: Vec<Sym> = ps.clone();
+            let mut inner: &Expr = body;
+            while let Expr::Lambda(ips, ib, _) = inner {
+                params.extend(ips.iter().copied());
+                inner = ib;
+            }
+            let name = cx
+                .lam_names
+                .get(&crate::check::expr_type_key(*sp))
+                .ok_or("a lambda the numbering pass never saw")?
+                .clone();
+            // `expected-or-recorded-ty`: we have only the recorded half, which
+            // is what `lower-lambda` falls back to when nothing above expects
+            // a type. Where the two disagree this will show as a diff rather
+            // than as a wrong answer that reads right.
+            let lam_ty = cx.at(*sp).ok_or("the checker recorded no type for this lambda")?;
+            // `infer-lambda-return-ty` peels one arrow per parameter, and
+            // `lower-lambda-params` reads the parameter types off the same
+            // spine.
+            let mut ret = lam_ty;
+            let mut param_tys = Vec::new();
+            for p in &params {
+                match ret {
+                    Ty::Fun(a, _, r) => {
+                        param_tys.push(*a);
+                        ret = *r;
+                    }
+                    _ => {
+                        return Err(format!(
+                            "lambda parameter `{}` has no arrow to come from",
+                            cx.syms.text(*p)
+                        ))
+                    }
+                }
+            }
+            // The body is lifted FIRST -- which is what makes a nested lambda
+            // take the lower number -- with the parameters in scope.
+            let body_text = {
+                let scope = Scope::open(cx);
+                params.iter().for_each(|p| scope.bind(*p));
+                expr(inner, cx)?.0
+            };
+            // `collect-free-vars body-expr param-names enclosing []`: bound is
+            // the lambda's OWN parameters, capturable is the scope outside it.
+            let outer: Vec<Sym> = cx.scope.borrow().clone();
+            let mut caps = BTreeMap::new();
+            let mut bound = params.clone();
+            free_vars(inner, &mut bound, &outer, cx, &mut caps)?;
+            // `build-function-ty` uses `empty-row` for every arrow it builds.
+            let arrows = |ps: &[(Sym, Ty)], ret: &Ty| -> Ty {
+                ps.iter().rev().fold(ret.clone(), |acc, (_, t)| {
+                    Ty::Fun(Box::new(t.clone()), Default::default(), Box::new(acc))
+                })
+            };
+            let own: Vec<(Sym, Ty)> =
+                params.iter().copied().zip(param_tys.into_iter()).collect();
+            // `build-lifted-params`: the captures come FIRST, in name order.
+            let captures: Vec<(Sym, Ty)> = caps.into_values().collect();
+            let lifted_params: Vec<(Sym, Ty)> =
+                captures.iter().cloned().chain(own.iter().cloned()).collect();
+            let lifted_ty = arrows(&lifted_params, &ret);
+            let params_text: String = lifted_params
+                .iter()
+                .map(|(n, t)| {
+                    format!(" (param {:?} {})", cx.syms.text(*n), render_ty(cx.syms, t))
+                })
+                .collect();
+            cx.lifted.borrow_mut().push(format!(
+                "\n  (def {:?} \"\" (params{}) {} {} 0 0)",
+                name,
+                params_text,
+                render_ty(cx.syms, &lifted_ty),
+                body_text
+            ));
+            // `build-partial-app`: the name, then one apply per capture, each
+            // typed with what is LEFT of the arrow after it.
+            let mut acc = format!("(name {name:?} {})", render_ty(cx.syms, &lifted_ty));
+            let mut acc_ty = lifted_ty;
+            for (n, t) in &captures {
+                acc_ty = match acc_ty {
+                    Ty::Fun(_, _, r) => *r,
+                    other => other,
+                };
+                acc = format!(
+                    "(apply {acc} (name {:?} {}) {})",
+                    cx.syms.text(*n),
+                    render_ty(cx.syms, t),
+                    render_ty(cx.syms, &acc_ty)
+                );
+            }
+            Ok((acc, acc_ty))
+        }
         // `(field-store OBJ "parts/0" VALUE TYPE)`, and **THE TYPE IS THE
         // RECORD'S, NOT THE FIELD'S** -- `lower-expr`'s `AFieldAssignExpr` arm
         // builds `IrFieldStore rec-ir (field.value) val-ir rec-ty s`, so a
@@ -533,6 +684,13 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
             let mut ty: Option<Ty> = None;
             for a in arms {
                 let pat = pattern(&a.pattern, &sty, cx)?;
+                // The names the pattern binds are in scope for the body AND
+                // the guard -- `lift-branches` builds one `branch-enclosing`
+                // and hands it to both.
+                let scope = Scope::open(cx);
+                let mut names = Vec::new();
+                pat_names(&a.pattern, &mut names);
+                names.into_iter().for_each(|n| scope.bind(n));
                 let (body, bty) = expr(&a.body, cx)?;
                 let (guard, _) = expr(&a.guard, cx)?;
                 parts.push_str(&format!(" (branch {pat} {body} {guard})"));
@@ -728,7 +886,19 @@ pub fn emit_defs_checked(
         // the only place they are written down.
         let mut rest = bound.clone();
         let mut params = String::new();
-        for p in &d.params {
+        // `absorb-outer-lambdas`: a definition written `f = \x -> ...` carries
+        // that lambda's parameters as its OWN, and the lambda is never lifted.
+        let mut own: Vec<Sym> = d.params.iter().map(|p| p.name).collect();
+        let mut body_expr: &Expr = &d.body;
+        while let Expr::Lambda(ps, inner, _) = body_expr {
+            own.extend(ps.iter().copied());
+            body_expr = inner;
+        }
+        // `lift-defs` opens each definition with its parameters as the whole
+        // of `enclosing` -- nothing outside a definition is capturable.
+        let scope = Scope::open(&cx);
+        own.iter().for_each(|p| scope.bind(*p));
+        for p in &own {
             let (arg, res) = match rest {
                 Ty::Fun(a, _, r) => (*a, *r),
                 _ => {
@@ -740,17 +910,26 @@ pub fn emit_defs_checked(
             };
             params.push_str(&format!(
                 " (param {:?} {})",
-                ch.syms.text(p.name),
+                ch.syms.text(*p),
                 render_ty(&ch.syms, &arg)
             ));
             rest = res;
         }
         let (body, _bty) =
-            expr(&d.body, &cx).map_err(|r| format!("{}: {r}", ch.syms.text(d.name)))?;
+            expr(body_expr, &cx).map_err(|r| format!("{}: {r}", ch.syms.text(d.name)))?;
+        drop(scope);
         out.push_str(&format!(
             "\n  (def {:?} {:?} (params{}) {} {} 0 0)",
             ch.syms.text(d.name), d.chapter_slug, params, declared, body
         ));
+    }
+    // `lift-lambdas` appends its definitions after the chapter's own:
+    // `__record-set chapter "defs" (defs & (ctx.lifted))`. Pruning is not a
+    // second question here -- a lifted definition is reachable exactly when
+    // the definition that referenced it is, and only kept definitions were
+    // walked.
+    for d in cx.lifted.borrow().iter() {
+        out.push_str(d);
     }
     Ok(out)
 }
@@ -1179,4 +1358,259 @@ mod tests {
             r#"(def "fib" "Fib" (params (param "n" int-default)) (fn int-default int-default) (if (binary le (name "n" int-default) (int-lit 1) boolean) (name "n" int-default) (binary add-int (apply (name "fib" (fn int-default int-default)) (binary sub-int (name "n" int-default) (int-lit 1) int-default) int-default) (apply (name "fib" (fn int-default int-default)) (binary sub-int (name "n" int-default) (int-lit 2) int-default) int-default) int-default) int-default) 0 0)"#
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Lambda lifting -- `lift-lambdas` (LambdaLifting.codex:19)
+// ---------------------------------------------------------------------------
+//
+// A lambda never reaches the IR text as a lambda. `lift-lambdas` runs between
+// lowering and emission and rewrites every one into a TOP-LEVEL definition
+// named `__lam_N`, appended after the chapter's own defs with an empty
+// chapter-slug, plus a reference to it at the site the lambda stood.
+//
+// Three things about it are load-bearing and none is guessable:
+//
+//   * **The name is allocated AFTER the body is lifted**, so a nested lambda
+//     gets the LOWER number. `lift-one-lambda` lifts the body, then calls
+//     `gen-unique-name`.
+//   * **Numbering runs over the WHOLE chapter, before pruning.** The driver
+//     writes `emit-ir-chapter (ir-prune-unreachable-roots lifted-ir ...)`, so
+//     a lambda inside a definition the gold never shows still consumed a
+//     number. That is why the counter is assigned by a pre-pass over
+//     `ch.defs` rather than as the emitter walks the definitions it keeps.
+//   * **Captured variables become the LEADING parameters, sorted by name**,
+//     and the reference site is a partial application over them.
+//
+// A definition whose body IS a lambda is not lifted at all:
+// `absorb-outer-lambdas` merges those parameters into the definition's own.
+
+/// Every lambda in the chapter, keyed by `expr_type_key` of its span, mapped
+/// to the `__lam_N` it will be lifted to.
+///
+/// `collect-reserved-names` seeds the reserved set with every definition name,
+/// so a chapter that already defines `__lam_0` pushes the first lambda to
+/// `__lam_1`. Contrived, and one line.
+fn lambda_names(ch: &Chapter) -> BTreeMap<u64, String> {
+    let mut reserved: std::collections::BTreeSet<String> =
+        ch.defs.iter().map(|d| ch.syms.text(d.name).to_string()).collect();
+    let mut counter: u32 = 0;
+    let mut out = BTreeMap::new();
+    for d in &ch.defs {
+        number_lambdas(absorbed_body(&d.body), &mut reserved, &mut counter, &mut out);
+    }
+    out
+}
+
+/// `absorb-outer-lambdas`: the body under any lambdas a definition wears
+/// directly, whose parameters are the definition's own.
+fn absorbed_body(body: &Expr) -> &Expr {
+    let mut b = body;
+    while let Expr::Lambda(_, inner, _) = b {
+        b = inner;
+    }
+    b
+}
+
+/// `gen-unique-name-loop`: the first `__lam_N` nothing has taken, and the
+/// counter resumes past it.
+fn gen_lam_name(reserved: &mut std::collections::BTreeSet<String>, counter: &mut u32) -> String {
+    loop {
+        let cand = format!("__lam_{}", *counter);
+        *counter += 1;
+        if reserved.insert(cand.clone()) {
+            return cand;
+        }
+    }
+}
+
+/// `lift-expr`'s traversal, for numbering alone. The ORDER is the whole point,
+/// so this mirrors the arms rather than reusing `Expr::walk` -- that one is
+/// pre-order and would number a lambda before its own body.
+fn number_lambdas(
+    e: &Expr,
+    reserved: &mut std::collections::BTreeSet<String>,
+    counter: &mut u32,
+    out: &mut BTreeMap<u64, String>,
+) {
+    use crate::ast::ActStmt;
+    let mut go = |x: &Expr| number_lambdas(x, reserved, counter, out);
+    match e {
+        Expr::Lit(..) | Expr::NameRef(..) | Expr::Error(..) => {}
+        Expr::Lambda(_, body, sp) => {
+            // A curried chain is ONE lifted definition: `lift-one-lambda`
+            // recurses on an `IrLambda` body with the parameters concatenated.
+            number_lambdas(absorbed_body(body), reserved, counter, out);
+            let n = gen_lam_name(reserved, counter);
+            out.insert(crate::check::expr_type_key(*sp), n);
+        }
+        Expr::Apply(a, b, _) | Expr::Binary(a, _, b, _) | Expr::FieldAssign(a, _, b, _) => {
+            go(a);
+            go(b);
+        }
+        Expr::Unary(a, _) | Expr::Lazy(a, _) | Expr::FieldAccess(a, _, _) => go(a),
+        Expr::If(a, b, c, _) => {
+            go(a);
+            go(b);
+            go(c);
+        }
+        Expr::Let(bs, body, _) => {
+            for b in bs {
+                go(&b.value);
+            }
+            go(body);
+        }
+        // `lift-branches` takes the body before the guard.
+        Expr::Match(s, arms, _) | Expr::Induction(s, arms, _) => {
+            go(s);
+            for a in arms {
+                go(&a.body);
+                go(&a.guard);
+            }
+        }
+        Expr::List(xs, _) => xs.iter().for_each(go),
+        Expr::Record(_, fs, _) => fs.iter().for_each(|f| go(&f.value)),
+        Expr::Act(ss, _) => ss.iter().for_each(|s| match s {
+            ActStmt::Bind(_, v, _) | ActStmt::Exec(v, _) => go(v),
+        }),
+        Expr::Handle(h) => {
+            go(&h.body);
+            h.clauses.iter().for_each(|c| go(&c.body));
+        }
+        Expr::WithTimeout(w) => go(&w.body),
+        Expr::Try(t) => {
+            for group in [&t.body, &t.fallback, &t.failure] {
+                group.iter().for_each(|s| match s {
+                    ActStmt::Bind(_, v, _) | ActStmt::Exec(v, _) => go(v),
+                });
+            }
+        }
+    }
+}
+
+/// Every name a pattern binds, for the branch's `enclosing` set.
+fn pat_names(p: &crate::ast::Pat, out: &mut Vec<Sym>) {
+    use crate::ast::Pat as P;
+    match p {
+        P::Var(n, _) => out.push(*n),
+        P::Wild(..) | P::Lit(..) => {}
+        P::Ctor(_, subs, _) | P::Vec_(subs, _) => subs.iter().for_each(|s| pat_names(s, out)),
+    }
+}
+
+/// `collect-free-vars`: the names this body reads that the ENCLOSING scope
+/// binds and the lambda's own parameters do not.
+///
+/// A global -- another definition, a builtin -- is never captured, which falls
+/// out of `capturable` holding only local binders. The type is the one the
+/// checker recorded at the FIRST occurrence, because `free-var-has` stops the
+/// second from replacing it.
+fn free_vars(
+    e: &Expr,
+    bound: &mut Vec<Sym>,
+    capturable: &[Sym],
+    cx: &Lower,
+    out: &mut BTreeMap<String, (Sym, Ty)>,
+) -> Result<(), String> {
+    use crate::ast::ActStmt;
+    match e {
+        Expr::NameRef(n, sp) => {
+            if capturable.contains(n) && !bound.contains(n) {
+                let key = cx.syms.text(*n).to_string();
+                if !out.contains_key(&key) {
+                    let t = cx.at(*sp).ok_or_else(|| {
+                        format!("no recorded type for the captured `{}`", cx.syms.text(*n))
+                    })?;
+                    out.insert(key, (*n, t));
+                }
+            }
+        }
+        Expr::Lit(..) | Expr::Error(..) => {}
+        Expr::Lambda(ps, body, _) => {
+            let n = bound.len();
+            bound.extend(ps.iter().copied());
+            free_vars(body, bound, capturable, cx, out)?;
+            bound.truncate(n);
+        }
+        Expr::Apply(a, b, _) | Expr::Binary(a, _, b, _) | Expr::FieldAssign(a, _, b, _) => {
+            free_vars(a, bound, capturable, cx, out)?;
+            free_vars(b, bound, capturable, cx, out)?;
+        }
+        Expr::Unary(a, _) | Expr::Lazy(a, _) | Expr::FieldAccess(a, _, _) => {
+            free_vars(a, bound, capturable, cx, out)?
+        }
+        Expr::If(a, b, c, _) => {
+            free_vars(a, bound, capturable, cx, out)?;
+            free_vars(b, bound, capturable, cx, out)?;
+            free_vars(c, bound, capturable, cx, out)?;
+        }
+        Expr::Let(bs, body, _) => {
+            let n = bound.len();
+            for b in bs {
+                free_vars(&b.value, bound, capturable, cx, out)?;
+                bound.push(b.name);
+            }
+            free_vars(body, bound, capturable, cx, out)?;
+            bound.truncate(n);
+        }
+        Expr::Match(s, arms, _) | Expr::Induction(s, arms, _) => {
+            free_vars(s, bound, capturable, cx, out)?;
+            for a in arms {
+                let n = bound.len();
+                pat_names(&a.pattern, bound);
+                free_vars(&a.body, bound, capturable, cx, out)?;
+                free_vars(&a.guard, bound, capturable, cx, out)?;
+                bound.truncate(n);
+            }
+        }
+        Expr::List(xs, _) => {
+            for x in xs {
+                free_vars(x, bound, capturable, cx, out)?;
+            }
+        }
+        Expr::Record(_, fs, _) => {
+            for f in fs {
+                free_vars(&f.value, bound, capturable, cx, out)?;
+            }
+        }
+        Expr::Act(ss, _) => {
+            let n = bound.len();
+            for s in ss {
+                match s {
+                    ActStmt::Bind(nm, v, _) => {
+                        free_vars(v, bound, capturable, cx, out)?;
+                        bound.push(*nm);
+                    }
+                    ActStmt::Exec(v, _) => free_vars(v, bound, capturable, cx, out)?,
+                }
+            }
+            bound.truncate(n);
+        }
+        Expr::Handle(h) => {
+            free_vars(&h.body, bound, capturable, cx, out)?;
+            for c in &h.clauses {
+                let n = bound.len();
+                bound.push(c.resume_name);
+                free_vars(&c.body, bound, capturable, cx, out)?;
+                bound.truncate(n);
+            }
+        }
+        Expr::WithTimeout(w) => free_vars(&w.body, bound, capturable, cx, out)?,
+        Expr::Try(t) => {
+            for group in [&t.body, &t.fallback, &t.failure] {
+                let n = bound.len();
+                for s in group {
+                    match s {
+                        ActStmt::Bind(nm, v, _) => {
+                            free_vars(v, bound, capturable, cx, out)?;
+                            bound.push(*nm);
+                        }
+                        ActStmt::Exec(v, _) => free_vars(v, bound, capturable, cx, out)?,
+                    }
+                }
+                bound.truncate(n);
+            }
+        }
+    }
+    Ok(())
 }

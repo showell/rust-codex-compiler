@@ -160,6 +160,39 @@ pub const CHAR_CODE_HIGH: [char; 31] = [
 /// The lowest code `CHAR_CODE_HIGH` describes.
 pub const HIGH_BASE: i64 = 97;
 
+
+/// A char literal's VALUE, which is its char-code and not its byte --
+/// `decode-char-literal-value` (Desugarer.codex:96).
+///
+/// The desugarer decodes a char literal where it decodes a text one, so by the
+/// time anything downstream sees `ALitExpr` the token `'a'` has become the
+/// text `"15"`. Ours keeps the raw token, so the decode happens here instead.
+///
+/// **`\t` IS A SPACE AND `\r` IS A NEWLINE.** The alphabet has no code for
+/// either, and rather than answer 0 the desugarer folds them onto the nearest
+/// code that exists. Anything else after a backslash is its own char-code, so
+/// `\q` is `q`.
+pub fn char_literal_code(raw: &str) -> i64 {
+    let body = raw.strip_prefix('\'').map_or(raw, |s| s.strip_suffix('\'').unwrap_or(s));
+    let b = body.as_bytes();
+    if b.is_empty() {
+        return 0;
+    }
+    let code = |c: u8| -> i64 { CHAR_CODE.get(c as usize).copied().unwrap_or(0) as i64 };
+    let c0 = code(b[0]);
+    if c0 != code(b'\\') || b.len() < 2 {
+        return c0;
+    }
+    let nc = code(b[1]);
+    if nc == code(b'n') || nc == code(b'r') {
+        code(b'\n')
+    } else if nc == code(b't') {
+        code(b' ')
+    } else {
+        nc
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
