@@ -111,8 +111,11 @@ pub fn emit_defs_checked(
     // `__linked-list-empty` is the same case one stage earlier: lowering
     // WRITES that call for an empty list in linked-list position, and no
     // source has to have named it.
-    let mut syms = ch.syms.clone();
-    let ll_empty = syms.intern("__linked-list-empty");
+    // **THE TABLE IS SHARED WITH LOWERING, NOT LENT TO IT.** `binder-fresh`
+    // mints `max_1` for a binder that shadows, so lowering interns as it goes
+    // and the cell is what lets it while every read stays a borrow.
+    let syms = std::cell::RefCell::new(ch.syms.clone());
+    let ll_empty = syms.borrow_mut().intern("__linked-list-empty");
     let mut defs = Vec::new();
     {
         let cx = crate::lowering::Lower::new(&syms, bindings, st, tds, ll_empty);
@@ -120,6 +123,7 @@ pub fn emit_defs_checked(
             defs.push(crate::lowering::lower_def(d, &cx)?);
         }
     }
+    let mut syms = syms.into_inner();
     let defs = crate::lambda_lifting::lift_lambdas(defs, &mut syms);
     let defs = crate::ir_passes::pipeline(defs, &syms);
     let defs = crate::ir_passes::prune_unreachable_roots(defs, roots, &syms);
@@ -573,6 +577,30 @@ mod tests {
         assert_eq!(
             def_line(src, "__lam_0"),
             r#"(def "__lam_0" "" (params (param "t" text)) (fn text int-default) (apply (name "text-length" (fn text int-default)) (name "t" text) int-default) 0 0)"#
+        );
+    }
+
+    /// **A BINDER THAT SHADOWS IS RE-SPELLED**, and the references to it move
+    /// with it. `binder-emitted` counts upward from `_1` until the name is
+    /// free of BOTH the enclosing scope and the base -- and the base includes
+    /// the builtins, which is why a `let max` is renamed in a chapter that
+    /// never defines `max`.
+    ///
+    /// Twenty-two definitions of the compiler turned on this one rule.
+    #[test]
+    fn a_shadowing_binder_is_renamed_and_so_are_its_readers() {
+        let src = "Chapter: T\n\nSection: S\n  f : Integer -> Integer\n  f (n) = let max = n + 1 in max\n\n  g : Integer -> Integer\n  g (n) = let a = n in let a = a + 1 in a\n\nSection: E\n  opening : Integer\n  opening = f 1 + g 2\n";
+        // `max` is a builtin, so the very first binding of it already shadows.
+        assert!(def_line(src, "f").contains(r#"(let "max_1" int-default"#), "{}", def_line(src, "f"));
+        assert!(def_line(src, "f").contains(r#"(name "max_1" int-default)"#), "{}", def_line(src, "f"));
+        // `a` is free, so the first one keeps its name and only the inner one
+        // moves -- and the inner value still reads the OUTER `a`.
+        assert!(
+            def_line(src, "g").contains(
+                r#"(let "a" int-default (name "n" int-default) (let "a_1" int-default (binary add-int (name "a" int-default) (int-lit 1) int-default) (name "a_1" int-default)))"#
+            ),
+            "{}",
+            def_line(src, "g")
         );
     }
 

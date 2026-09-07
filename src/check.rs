@@ -2173,6 +2173,23 @@ fn build(syms: &SymTab, head: &str, args: &[Ty], words: &[String], rows: &[Effec
     })
 }
 
+/// The names `builtin_env` binds, and nothing else.
+///
+/// **`binder-free` ASKS THE BUILTINS TOO.** Its `base` is the checker's whole
+/// binding list, so `is IrTry (max) ...` -- a pattern variable named after the
+/// builtin `max` -- is a SHADOW and is emitted `max_1`. Answering from the
+/// chapter's own definitions alone left nine definitions of the compiler
+/// spelling the unshadowed name.
+pub fn builtin_names(syms: &SymTab) -> Vec<Sym> {
+    crate::builtins::BUILTIN_TYPES
+        .iter()
+        .filter_map(|(n, s)| {
+            let sym = syms.find(n)?;
+            parse_ty(syms, s).map(|_| sym)
+        })
+        .collect()
+}
+
 /// Every builtin whose declared type the probe could render, for the checker's
 /// environment. Without these `show` resolves to ErrorTy and instantiating it
 /// mints nothing -- which is one of the eight fresh variables fib expects.

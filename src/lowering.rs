@@ -45,7 +45,10 @@ use std::collections::BTreeMap;
 /// fallback `lower-name-normal` reaches for when the span is synthetic and the
 /// checker therefore recorded nothing -- plus the `(def ...)` headers.
 pub struct Lower<'a> {
-    pub syms: &'a SymTab,
+    /// **BEHIND A CELL BECAUSE LOWERING MINTS NAMES.** `binder-fresh` spells a
+    /// shadowing `let max` as `max_1`, and that name is in no source. Reads
+    /// borrow for a line at a time; the only writer is `bind_local`.
+    pub syms: &'a std::cell::RefCell<SymTab>,
     st: &'a UnifyState,
     /// The chapter's type declarations. Lowering asks them two things the
     /// checker did not record: a field's TYPE and its SLOT, which the wire
@@ -56,23 +59,103 @@ pub struct Lower<'a> {
     /// need ever name. Interned into the table before lowering starts, since
     /// a `Sym` is an index into the table that made it.
     ll_empty: Sym,
+    /// `base`, for `binder-free` alone: every name the checker had a type for,
+    /// the BUILTINS included. Being in here is what makes a binder a shadow.
+    base: std::collections::BTreeSet<Sym>,
+    /// `overlay` -- what is in scope right here, keyed by the EMITTED name,
+    /// innermost last. A stack rather than upstream's persistent list: the
+    /// walk is strictly depth-first and a binding is visible in exactly one
+    /// subtree, so pushing on the way in and truncating on the way out is the
+    /// same set at every point.
+    overlay: std::cell::RefCell<Vec<(Sym, Ty)>>,
+    /// `binders` -- source name to emitted name, innermost last. Separate
+    /// from the overlay because a rename must be found by the name the SOURCE
+    /// wrote while the shadow test must be answered about the name we would
+    /// EMIT.
+    binders: std::cell::RefCell<Vec<(Sym, Sym)>>,
 }
 
 impl<'a> Lower<'a> {
     pub fn new(
-        syms: &'a SymTab,
+        syms: &'a std::cell::RefCell<SymTab>,
         bindings: &[Binding],
         st: &'a UnifyState,
         tds: &'a TypeDefs,
         ll_empty: Sym,
     ) -> Lower<'a> {
+        let mut base: std::collections::BTreeSet<Sym> =
+            crate::check::builtin_names(&syms.borrow()).into_iter().collect();
+        base.extend(bindings.iter().map(|b| b.name));
         Lower {
             syms,
             st,
             tds,
             bindings: bindings.iter().map(|b| (b.name, b.ty.clone())).collect(),
             ll_empty,
+            base,
+            overlay: std::cell::RefCell::new(Vec::new()),
+            binders: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    /// The text of a name. One borrow, one line.
+    fn text(&self, n: Sym) -> String {
+        self.syms.borrow().text(n).to_string()
+    }
+
+    /// `lookup-overlay`: the innermost binding of an EMITTED name.
+    fn overlay_ty(&self, n: Sym) -> Option<Ty> {
+        self.overlay.borrow().iter().rev().find(|(m, _)| *m == n).map(|(_, t)| t.clone())
+    }
+
+    /// `bound-name` (subject 55194): what a source name is EMITTED as here.
+    /// Unrenamed names are not in the table, so the fallback is the name.
+    pub fn bound_name(&self, n: Sym) -> Sym {
+        self.binders.borrow().iter().rev().find(|(src, _)| *src == n).map_or(n, |(_, e)| *e)
+    }
+
+    /// `binder-free` (subject 55199): neither in the overlay nor in the base.
+    fn binder_free(&self, n: Sym) -> bool {
+        self.overlay_ty(n).is_none() && !self.base.contains(&n)
+    }
+
+    /// `bind-local` (subject 55228). Answers the name to EMIT, which is the
+    /// source name unless it is already taken -- then `binder-fresh` counts
+    /// upward from `_1` until it is not.
+    fn bind_local(&self, n: Sym, t: Ty) -> Sym {
+        let emitted = if self.binder_free(n) {
+            n
+        } else {
+            let base = self.text(n);
+            let mut k = 1u32;
+            loop {
+                let cand = self.syms.borrow_mut().intern(&format!("{base}_{k}"));
+                if self.binder_free(cand) {
+                    break cand;
+                }
+                k += 1;
+            }
+        };
+        self.overlay.borrow_mut().push((emitted, t));
+        self.binders.borrow_mut().push((n, emitted));
+        emitted
+    }
+
+    /// A parameter of the DEFINITION, which `bind-params-to-ctx` pushes
+    /// straight onto the overlay: no rename and no binder entry, so a
+    /// definition's own parameter is never re-spelled.
+    fn bind_param(&self, n: Sym, t: Ty) {
+        self.overlay.borrow_mut().push((n, t));
+    }
+
+    /// How deep the scopes are, to unwind back to.
+    fn mark(&self) -> (usize, usize) {
+        (self.overlay.borrow().len(), self.binders.borrow().len())
+    }
+
+    fn release(&self, (o, b): (usize, usize)) {
+        self.overlay.borrow_mut().truncate(o);
+        self.binders.borrow_mut().truncate(b);
     }
 
     /// The type the checker recorded at this exact source position, resolved
@@ -106,7 +189,7 @@ pub fn lower_def(d: &crate::ast::Def, cx: &Lower) -> Result<IrDef, String> {
         // a definition declares a type, and only the checker has an answer
         // where one does not.
         Some(t) => cx.st.deep_resolve(t),
-        None => return Err(format!("`{}` was never bound by the checker", cx.syms.text(name))),
+        None => return Err(format!("`{}` was never bound by the checker", cx.text(name))),
     };
     let mut own: Vec<Sym> = d.params.iter().map(|p| p.name).collect();
     let mut body_expr: &Expr = &d.body;
@@ -116,6 +199,9 @@ pub fn lower_def(d: &crate::ast::Def, cx: &Lower) -> Result<IrDef, String> {
     }
     // Parameter types come from walking the bound arrow spine, which is the
     // only place they are written down.
+    // **THE SCOPE STARTS EMPTY FOR EVERY DEFINITION.** A refusal leaves the
+    // stack wherever it stopped, so this is a reset rather than an assertion.
+    cx.release((0, 0));
     let mut rest = bound.clone();
     let mut params = Vec::new();
     for p in &own {
@@ -124,14 +210,15 @@ pub fn lower_def(d: &crate::ast::Def, cx: &Lower) -> Result<IrDef, String> {
             _ => {
                 return Err(format!(
                     "`{}` has more params than its type has arrows",
-                    cx.syms.text(name)
+                    cx.text(name)
                 ))
             }
         };
+        cx.bind_param(*p, arg.clone());
         params.push(IrParam { name: *p, ty: arg, span: d.span });
         rest = res;
     }
-    let body = expr(body_expr, &rest, cx).map_err(|r| format!("{}: {r}", cx.syms.text(name)))?;
+    let body = expr(body_expr, &rest, cx).map_err(|r| format!("{}: {r}", cx.text(name)))?;
     Ok(IrDef {
         name,
         params,
@@ -194,14 +281,18 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
             // `lower-name-normal` strips the quantifiers off BOTH answers,
             // the recorded one included -- a `(forall 39 ...)` on a name is
             // the signature's binder and not part of what the name is here.
+            //
+            // The NAME is `bound-name`'s: a reference to a binder that was
+            // re-spelled has to be re-spelled with it.
+            let rn = cx.bound_name(*n);
             let t = match cx.at(*s) {
                 Some(t) => crate::check::strip_forall(&t),
-                None => match cx.bindings.get(n) {
-                    Some(raw) => crate::check::strip_forall(&cx.st.deep_resolve(raw)),
+                None => match cx.overlay_ty(rn).or_else(|| cx.bindings.get(n).cloned()) {
+                    Some(raw) => crate::check::strip_forall(&cx.st.deep_resolve(&raw)),
                     None => want.clone(),
                 },
             };
-            Ok(IrExpr::Name(*n, t, *s))
+            Ok(IrExpr::Name(rn, t, *s))
         }
         // `lower-apply-normal` (Lowering.codex:612). **THE CALLEE'S PARAMETER
         // IS THE ARGUMENT'S EXPECTATION**, and the return is then INSTANTIATED
@@ -288,7 +379,7 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
                     Ty::Boolean => (IrBinOp::And, Ty::Boolean),
                     Ty::Text => (IrBinOp::AppendText, lty.clone()),
                     Ty::List(_) => (IrBinOp::AppendList, lty.clone()),
-                    other => return Err(format!("`&` on `{}`", render_ty(cx.syms, other))),
+                    other => return Err(format!("`&` on `{}`", render_ty(&cx.syms.borrow(), other))),
                 },
                 // `binary-result-type`: the EXPECTATION when it is a list,
                 // and a list of the left operand otherwise.
@@ -367,12 +458,20 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
         // let's own type is the BODY's -- a let evaluates to its body. The
         // bound values get no expectation; the body inherits the let's.
         Expr::Let(binds, body, s) => {
+            // **THE BINDINGS ARE SEQUENTIAL.** `lower-let-rest` binds each one
+            // before lowering the next, so the second value sees the first --
+            // and each name is `bind-local`'d, which is where a shadowing
+            // `let __seq` becomes `__seq_1`.
+            let mark = cx.mark();
             let mut heads = Vec::new();
             for b in binds {
                 let v = expr(&b.value, &Ty::NoExpect, cx)?;
-                heads.push((b.name, v.ty(), v));
+                let ty = cx.st.deep_resolve(&v.ty());
+                let emitted = cx.bind_local(b.name, ty.clone());
+                heads.push((emitted, ty, v));
             }
             let mut out = expr(body, want, cx)?;
+            cx.release(mark);
             for (n, ty, v) in heads.into_iter().rev() {
                 out = IrExpr::Let(n, ty, Box::new(v), Box::new(out), *s);
             }
@@ -383,28 +482,37 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
         // a let evaluates to its body. Upstream's row arithmetic decides what
         // the EFFECT of the block is; this is the value side.
         Expr::Act(stmts, s) => {
+            // **EVERY STATEMENT IS HANDED THE BLOCK'S OWN EXPECTATION.**
+            // `lower-act-stmts-loop body ty ctx` passes `ty` down to each one,
+            // which reads oddly and is what upstream does.
+            let mark = cx.mark();
             let mut parts = Vec::new();
             let mut last = Ty::Nothing;
             for st in stmts {
                 match st {
                     crate::ast::ActStmt::Exec(e, sp2) => {
-                        let x = expr(e, &Ty::NoExpect, cx)?;
+                        let x = expr(e, want, cx)?;
                         last = x.ty();
                         parts.push(IrActStmt::Exec(x, *sp2));
                     }
+                    // A `<-` binds for the rest of the block, and the type it
+                    // binds is what is INSIDE the effect.
                     crate::ast::ActStmt::Bind(n, e, sp2) => {
-                        let x = expr(e, &Ty::NoExpect, cx)?;
+                        let x = expr(e, want, cx)?;
                         last = x.ty();
-                        parts.push(IrActStmt::Bind(*n, x.ty(), x, *sp2));
+                        let vt = peel_effectful(&x.ty());
+                        let emitted = cx.bind_local(*n, vt.clone());
+                        parts.push(IrActStmt::Bind(emitted, vt, x, *sp2));
                     }
                 }
             }
+            cx.release(mark);
             Ok(IrExpr::Act(parts, last, *s))
         }
         Expr::Record(n, fields, s) => {
             let ty = cx
                 .at(*s)
-                .ok_or_else(|| format!("no recorded type for record `{}`", cx.syms.text(*n)))?;
+                .ok_or_else(|| format!("no recorded type for record `{}`", cx.text(*n)))?;
             let mut fs = Vec::new();
             for f in fields {
                 fs.push(IrFieldVal { name: f.name, value: expr(&f.value, &Ty::NoExpect, cx)? });
@@ -421,14 +529,14 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
             else {
                 return Err(format!(
                     "`{}` has no field `{}` here",
-                    cx.syms.text(name),
-                    cx.syms.text(*f)
+                    cx.text(name),
+                    cx.text(*f)
                 ));
             };
             let fty = cx.st.deep_resolve(fty);
             Ok(IrExpr::FieldAccess(
                 Box::new(r),
-                format!("{}/{}", cx.syms.text(*f), slot),
+                format!("{}/{}", cx.text(*f), slot),
                 fty,
                 *s,
             ))
@@ -444,14 +552,14 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
             let Some(slot) = cx.tds.field_index(name, *f) else {
                 return Err(format!(
                     "`{}` has no field `{}` here",
-                    cx.syms.text(name),
-                    cx.syms.text(*f)
+                    cx.text(name),
+                    cx.text(*f)
                 ));
             };
             let v = expr(v, &Ty::NoExpect, cx)?;
             Ok(IrExpr::FieldStore(
                 Box::new(r),
-                format!("{}/{}", cx.syms.text(*f), slot),
+                format!("{}/{}", cx.text(*f), slot),
                 Box::new(v),
                 rty,
                 *s,
@@ -463,11 +571,20 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
         Expr::Match(scrut, arms, s) => {
             let sc = expr(scrut, &Ty::NoExpect, cx)?;
             let sty = sc.ty();
+            // **THE PATTERN BINDS BEFORE THE PATTERN LOWERS.**
+            // `bind-pattern-to-ctx` runs first and the arm's pattern, body and
+            // guard all see it -- which is how a pattern variable that shadows
+            // (`is IrTry (max) ...`, over the builtin `max`) gets re-spelled
+            // consistently in the pattern and in the body that reads it. Each
+            // arm starts from the OUTER scope, not the previous arm's.
             let mut branches = Vec::new();
             for a in arms {
+                let mark = cx.mark();
+                bind_pattern(&a.pattern, &sty, cx);
                 let pat = pattern(&a.pattern, &sty, cx)?;
                 let body = expr(&a.body, want, cx)?;
-                let guard = expr(&a.guard, &Ty::NoExpect, cx)?;
+                let guard = expr(&a.guard, &Ty::Boolean, cx)?;
+                cx.release(mark);
                 branches.push(IrBranch { pattern: pat, body, guard, span: a.span });
             }
             if branches.is_empty() {
@@ -518,13 +635,20 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
             // instead is a different rule, and the one that stopped a
             // `for r in temps -> r` -- whose lambda the desugarer gives a
             // synthetic span, so nothing recorded a type for it.
+            // `bind-lambda-to-ctx` binds each parameter for the body, and
+            // `lower-lambda-params` names them `bound-name` -- so a lambda
+            // parameter that shadows is re-spelled like any other binder.
+            let mark = cx.mark();
             let mut ret = stripped;
             let mut ir_params = Vec::new();
             for p in &params {
-                ir_params.push(IrParam { name: *p, ty: peel_fun_param(&ret), span: *s });
+                let pt = peel_fun_param(&ret);
+                let emitted = cx.bind_local(*p, pt.clone());
+                ir_params.push(IrParam { name: emitted, ty: pt, span: *s });
                 ret = peel_fun_return(&ret);
             }
             let b = expr(inner, &ret, cx)?;
+            cx.release(mark);
             let lam_ty = lambda_recorded(&ret, &b.ty(), &expected);
             Ok(IrExpr::Lambda(ir_params, Box::new(b), lam_ty, *s))
         }
@@ -554,6 +678,14 @@ fn peel_fun_return(t: &Ty) -> Ty {
         Ty::Fun(_, _, r) => (**r).clone(),
         Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => peel_fun_return(b),
         _ => Ty::Error,
+    }
+}
+
+/// `peel-effectful-ty` (subject 54578). What a `[Console] Nothing` computes.
+fn peel_effectful(t: &Ty) -> Ty {
+    match t {
+        Ty::Effectful(_, _, inner) => peel_effectful(inner),
+        other => other.clone(),
     }
 }
 
@@ -623,7 +755,7 @@ fn empty_list(want: &Ty, cx: &Lower, s: crate::ast::Span) -> IrExpr {
 fn record_name(t: &Ty, cx: &Lower, what: &str) -> Result<Sym, String> {
     match t {
         Ty::Record(n, _) | Ty::Constructed(n, _) => Ok(*n),
-        other => Err(format!("{what} `{}`, which is not a record", render_ty(cx.syms, other))),
+        other => Err(format!("{what} `{}`, which is not a record", render_ty(&cx.syms.borrow(), other))),
     }
 }
 
@@ -643,7 +775,7 @@ fn pattern(p: &Pat, scrut: &Ty, cx: &Lower) -> Result<IrPat, String> {
     };
     match p {
         Pat::Wild(s) => Ok(IrPat::Wild(*s)),
-        Pat::Var(n, s) => Ok(IrPat::Var(*n, want(*s), *s)),
+        Pat::Var(n, s) => Ok(IrPat::Var(cx.bound_name(*n), want(*s), *s)),
         Pat::Lit(v, _, s) => Ok(IrPat::Lit(v.clone(), want(*s), *s)),
         Pat::Ctor(n, subs, s) => {
             let mut out = Vec::new();
@@ -653,6 +785,30 @@ fn pattern(p: &Pat, scrut: &Ty, cx: &Lower) -> Result<IrPat, String> {
             Ok(IrPat::Ctor(*n, out, want(*s), *s))
         }
         Pat::Vec_(..) => Err("vector pattern".into()),
+    }
+}
+
+/// `bind-pattern-to-ctx` (subject 55367). Every variable a pattern binds,
+/// into the arm's scope, before anything in the arm is lowered.
+///
+/// The type is the checker's own answer for that position -- `pat_types`,
+/// which upstream cannot reach and rebuilds from the constructor declaration
+/// instead (see `pattern` below). Nothing here depends on which of the two it
+/// is: what the wire carries is the NAME.
+fn bind_pattern(p: &Pat, scrut: &Ty, cx: &Lower) {
+    let at = |sp: crate::ast::Span| -> Ty {
+        cx.st.pat_type_at(sp).map_or_else(|| scrut.clone(), |t| cx.st.deep_resolve(t))
+    };
+    match p {
+        Pat::Var(n, s) => {
+            cx.bind_local(*n, at(*s));
+        }
+        Pat::Ctor(_, subs, _) | Pat::Vec_(subs, _) => {
+            for sub in subs {
+                bind_pattern(sub, &Ty::Error, cx);
+            }
+        }
+        Pat::Wild(_) | Pat::Lit(..) => {}
     }
 }
 
