@@ -181,6 +181,16 @@ pub struct UnifyState {
     /// already equated by an earlier unification look distinct and mint again.
     pub row_subst: Vec<EffectRow>,
     pub expr_types: Vec<(u64, Ty)>,
+    /// The type each PATTERN node was checked against, by span.
+    ///
+    /// **DELIBERATELY NOT `expr_types`.** That table is a graded counter --
+    /// upstream's `expr-types` counts name references and the number is
+    /// compared against `codexcheck` -- so putting patterns in it would break
+    /// the one measurement that says the checker walks what upstream walks.
+    /// This is a second table with no oracle, kept for one reason: lowering
+    /// needs the field types of a destructure, and the checker already worked
+    /// them out. See `bind_pattern`.
+    pub pat_types: Vec<(u64, Ty)>,
     pub errors: usize,
     /// Applications this unifier could not decide. **NOT `errors`:** a `false`
     /// out of a partial unifier is our ignorance and not the program's fault,
@@ -220,6 +230,7 @@ impl Default for UnifyState {
             next_row_id: 0,
             row_subst: Vec::new(),
             expr_types: Vec::new(),
+            pat_types: Vec::new(),
             errors: 0,
             unify_gaps: 0,
         }
@@ -388,11 +399,27 @@ impl UnifyState {
         self.expr_types.push((expr_type_key(sp), t));
     }
 
+    /// What a pattern node was checked against. Unconditional, where
+    /// `record_expr_type` refuses a synthetic span: nothing counts these, and
+    /// a desugarer-derived pattern still has field types worth keeping.
+    pub fn record_pat_type(&mut self, sp: crate::ast::Span, t: Ty) {
+        self.pat_types.push((expr_type_key(sp), t));
+    }
+
+    /// The type a pattern node was checked against, or None. Sorted by
+    /// `sort_expr_types` alongside the expression table.
+    pub fn pat_type_at(&self, sp: crate::ast::Span) -> Option<&Ty> {
+        let k = expr_type_key(sp);
+        let i = self.pat_types.partition_point(|(e, _)| *e < k);
+        self.pat_types.get(i).filter(|(e, _)| *e == k).map(|(_, t)| t)
+    }
+
     /// Sorted ONCE at the check/lower boundary, where upstream sorts it
     /// (`TypeChecker.codex:2343`), so the lookups lowering does are a binary
     /// search rather than a scan per node.
     pub fn sort_expr_types(&mut self) {
         self.expr_types.sort_by_key(|(k, _)| *k);
+        self.pat_types.sort_by_key(|(k, _)| *k);
     }
 
     /// `lookup-expr-type`. Call `sort_expr_types` first -- unsorted, this
@@ -532,9 +559,67 @@ impl UnifyState {
                 let r = self.unify(&r1, &r2);
                 l && rw && r
             }
-            (Ty::List(x), Ty::List(y)) => {
+            (Ty::List(x), Ty::List(y))
+            | (Ty::List(x), Ty::LinkedList(y))
+            | (Ty::LinkedList(x), Ty::List(y))
+            | (Ty::LinkedList(x), Ty::LinkedList(y)) => {
                 let (x, y) = (x.clone(), y.clone());
                 self.unify(&x, &y)
+            }
+            // **A NAMED TYPE UNIFIES ARGUMENT BY ARGUMENT, AND THE THREE
+            // SPELLINGS OF A NAME ARE INTERCHANGEABLE.** `unify-structural`
+            // (Unifier.codex:606) matches `ConstructedTy`, `SumTy` and
+            // `RecordTy` against each other on the NAME and then unifies their
+            // arguments -- a declared `Maybe a` reaches the checker as a sum,
+            // a written `Maybe SignalEntry` as a constructed type, and they
+            // are the same type.
+            //
+            // Without this arm the two fell through to `a == b`, which is
+            // false, and `Just`'s instantiated `a` was never told it stood for
+            // `SignalEntry`. Every field of every destructure over a
+            // parametric type stayed a `(tvar N)`: nothing contradicted it,
+            // and nothing downstream could use it.
+            (Ty::Sum(n1, a1), Ty::Sum(n2, a2))
+            | (Ty::Record(n1, a1), Ty::Record(n2, a2))
+            | (Ty::Constructed(n1, a1), Ty::Constructed(n2, a2))
+            | (Ty::Constructed(n1, a1), Ty::Sum(n2, a2))
+            | (Ty::Sum(n1, a1), Ty::Constructed(n2, a2))
+            | (Ty::Constructed(n1, a1), Ty::Record(n2, a2))
+            | (Ty::Record(n1, a1), Ty::Constructed(n2, a2)) => {
+                if n1 != n2 {
+                    return false;
+                }
+                let (a1, a2) = (a1.clone(), a2.clone());
+                a1.iter().zip(a2.iter()).fold(true, |ok, (x, y)| self.unify(x, y) && ok)
+            }
+            (Ty::Effectful(e1, _, r1), Ty::Effectful(e2, _, r2)) => {
+                if e1 != e2 {
+                    return false;
+                }
+                let (r1, r2) = (r1.clone(), r2.clone());
+                self.unify(&r1, &r2)
+            }
+            (Ty::Unit(n1, x), Ty::Unit(n2, y)) if n1 == n2 => {
+                let (x, y) = (x.clone(), y.clone());
+                self.unify(&x, &y)
+            }
+            (Ty::Vector(w1, x), Ty::Vector(w2, y)) if w1 == w2 || *w1 < 0 || *w2 < 0 => {
+                let (x, y) = (x.clone(), y.clone());
+                self.unify(&x, &y)
+            }
+            (Ty::TypeApply(f1, x1), Ty::TypeApply(f2, x2)) => {
+                let (f1, x1, f2, x2) = (f1.clone(), x1.clone(), f2.clone(), x2.clone());
+                self.unify(&f1, &f2) && self.unify(&x1, &x2)
+            }
+            // A quantifier on either side is transparent to unification --
+            // upstream recurses on the body without instantiating.
+            (Ty::ForAll(_, x), _) | (Ty::ForAllEff(_, x), _) | (Ty::Linear(x), _) => {
+                let (x, b) = (x.clone(), b.clone());
+                self.unify(&x, &b)
+            }
+            (_, Ty::ForAll(_, y)) | (_, Ty::ForAllEff(_, y)) | (_, Ty::Linear(y)) => {
+                let (a, y) = (a.clone(), y.clone());
+                self.unify(&a, &y)
             }
             _ => a == b,
         }
@@ -1441,11 +1526,14 @@ pub fn infer_row(
         // One per MATCH, not per arm and not per pattern variable: a two-field
         // destructure and a three-field one both cost the same one.
         E::Match(scrut, arms, _) | E::Induction(scrut, arms, _) => {
-            let (_, srow) = infer_row(scrut, env, st);
+            let (scrut_ty, srow) = infer_row(scrut, env, st);
             row = srow;
             let result = st.fresh();
             for a in arms {
-                let bound = bind_pattern(&a.pattern, None, env, st);
+                // The SCRUTINEE'S type, not nothing: `infer-plain-arm` passes
+                // `scrut-ty` down, and that is what makes a destructured
+                // field concrete instead of a variable.
+                let bound = bind_pattern(&a.pattern, &scrut_ty, env, st);
                 let (_, grow) = infer_row(&a.guard, env, st);
                 row = st.row_union(&row, &grow);
                 let (arm_ty, arow) = infer_row(&a.body, env, st);
@@ -1589,41 +1677,100 @@ pub fn infer_row(
 ///
 /// `expected` is the type the enclosing pattern decided for this position;
 /// only where there is none does a variable mint one of its own.
+/// `bind-pattern` (TypeCheckerInference.codex:1448).
+///
+/// **THE SCRUTINEE'S TYPE COMES IN**, and that is the whole of it. A variable
+/// pattern binds what it was handed and mints nothing; a constructor pattern
+/// instantiates the constructor and UNIFIES ITS RETURN TYPE WITH THE
+/// SCRUTINEE, which is what teaches the minted variable what it stands for.
+///
+/// Without that unification `Just`'s `a` stays the variable instantiation
+/// minted and every field of every destructure is a `(tvar N)` -- correct in
+/// the sense that nothing contradicts it, and useless to everything
+/// downstream. Lowering then has to work the field type out for itself from
+/// the constructor declaration and the scrutinee (`pattern-type-subst`,
+/// `apply-ctor-subst`, `pair-tvars`, `subst-tvars`), which is upstream's own
+/// answer to a checker that ALSO has this unification -- they need it because
+/// their lowering pass can only look types up by span and a pattern is not an
+/// expression. Ours records what the checker knew, so it does not.
+///
+/// The one place a variable is minted is where the constructor's arrow spine
+/// RUNS OUT before the sub-patterns do -- an arity error in the program, and
+/// upstream still gives each surplus field a variable rather than stopping.
 fn bind_pattern(
     p: &crate::ast::Pat,
-    expected: Option<Ty>,
+    ty: &Ty,
     env: &mut TyEnv<'_>,
     st: &mut UnifyState,
 ) -> usize {
     use crate::ast::Pat as P;
+    st.record_pat_type(pat_span(p), ty.clone());
     match p {
         P::Var(n, _) => {
-            let t = expected.unwrap_or_else(|| st.fresh());
-            env.bind(*n, t);
+            env.bind(*n, ty.clone());
             1
         }
         P::Ctor(name, subs, _) => {
-            // The constructor's arrow spine, instantiated: `Just` is
-            // `forall a. a -> Maybe a`, so this mints the `a` and the field
-            // type falls out of it.
-            let mut spine = env.get(*name).cloned().map(|t| st.instantiate(&t));
+            // `Cons` and `Nil` over the BUILTIN list are not constructors in
+            // the environment -- the list type is not a sum -- so they are
+            // matched against the element type directly.
+            if let Ty::List(elem) = st.deep_resolve(ty) {
+                let n = env.syms.text(*name);
+                if n == "Nil" {
+                    return 0;
+                }
+                if n == "Cons" && subs.len() == 2 {
+                    let tail = Ty::List(elem.clone());
+                    return bind_pattern(&subs[0], &elem, env, st)
+                        + bind_pattern(&subs[1], &tail, env, st);
+                }
+            }
+            let ctor_ty = match env.get(*name).cloned() {
+                Some(bound) => {
+                    let inst = st.instantiate(&bound);
+                    // `strip-fun-args`: what the constructor RETURNS, which is
+                    // the type the scrutinee must have.
+                    let mut ret = inst.clone();
+                    loop {
+                        match ret {
+                            Ty::Fun(_, _, r) => ret = *r,
+                            Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => ret = *b,
+                            _ => break,
+                        }
+                    }
+                    if !st.unify(&ret, ty) {
+                        st.unify_gaps += 1;
+                    }
+                    inst
+                }
+                // Not in scope. Upstream bags a CDX error and binds the
+                // fields against `ErrorTy`, which mints one apiece below.
+                None => Ty::Error,
+            };
+            let mut spine = ctor_ty;
             let mut bound = 0;
             for sub in subs {
                 let field = match spine {
-                    Some(Ty::Fun(a, _, r)) => {
-                        spine = Some(*r);
-                        Some(*a)
+                    Ty::Fun(a, _, r) => {
+                        spine = *r;
+                        *a
                     }
-                    _ => {
-                        spine = None;
-                        None
+                    other => {
+                        spine = other;
+                        st.fresh()
                     }
                 };
-                bound += bind_pattern(sub, field, env, st);
+                bound += bind_pattern(sub, &field, env, st);
             }
             bound
         }
-        P::Vec_(subs, _) => subs.iter().map(|s| bind_pattern(s, None, env, st)).sum(),
+        P::Vec_(subs, _) => {
+            let elem = match st.deep_resolve(ty) {
+                Ty::Vector(_, e) => *e,
+                _ => Ty::Error,
+            };
+            subs.iter().map(|s| bind_pattern(s, &elem, env, st)).sum()
+        }
         P::Lit(..) | P::Wild(_) => 0,
     }
 }
@@ -2110,5 +2257,13 @@ mod tests {
         };
         assert_eq!(counters(&with(1)), (8, 15));
         assert_eq!(counters(&with(2)), (12, 24));
+    }
+}
+
+/// A pattern node's own span.
+fn pat_span(p: &crate::ast::Pat) -> crate::ast::Span {
+    use crate::ast::Pat as P;
+    match p {
+        P::Var(_, s) | P::Lit(_, _, s) | P::Ctor(_, _, s) | P::Wild(s) | P::Vec_(_, s) => *s,
     }
 }

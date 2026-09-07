@@ -759,56 +759,41 @@ fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<(String, Ty), String> {
 /// A wildcard is the bare atom `wild-pat`, with no parentheses and no type.
 fn pattern(p: &crate::ast::Pat, scrut: &Ty, cx: &Lower) -> Result<String, String> {
     use crate::ast::Pat as P;
+    // The type the CHECKER bound this node against, which for a sub-pattern is
+    // the constructor field's type with its variables already resolved.
+    //
+    // **THIS IS WHY THIS FUNCTION IS SHORT.** Upstream's lowering rebuilds the
+    // field type from the constructor declaration and the scrutinee --
+    // `pattern-type-subst`, `apply-ctor-subst`, `ctor-ret-tyargs`,
+    // `pair-tvars`, `subst-tvars`, and a prose block about getting the ORDER
+    // of resolve-then-substitute the wrong way round. It has to: its lowering
+    // pass can look a type up only by span out of `expr-types`, and a pattern
+    // is not an expression, so the checker's answer is not reachable from
+    // there. Ours records it (`bind_pattern`), so the field type is a lookup
+    // and the substitution machinery is never written.
+    let want = |sp: crate::ast::Span| -> Ty {
+        cx.st.pat_type_at(sp).map_or_else(|| scrut.clone(), |t| cx.st.deep_resolve(t))
+    };
     match p {
         P::Wild(_) => Ok("wild-pat".into()),
-        P::Var(n, _) => Ok(format!(
+        P::Var(n, sp) => Ok(format!(
             "(var-pat {:?} {})",
             cx.syms.text(*n),
-            render_ty(cx.syms, scrut)
+            render_ty(cx.syms, &want(*sp))
         )),
-        P::Lit(v, _, _) => {
-            Ok(format!("(lit-pat {:?} {})", v, render_ty(cx.syms, scrut)))
+        P::Lit(v, _, sp) => {
+            Ok(format!("(lit-pat {:?} {})", v, render_ty(cx.syms, &want(*sp))))
         }
-        P::Ctor(name, subs, _) => {
-            let bound = cx
-                .bindings
-                .get(name)
-                .ok_or_else(|| format!("no constructor `{}`", cx.syms.text(*name)))?;
-            // **A POLYMORPHIC CONSTRUCTOR IS REFUSED, NOT GUESSED AT.** Its
-            // field types are quantified, and instantiating one here would
-            // mint -- which lowering must not do. Substituting the scrutinee's
-            // arguments through the quantifier is the way in, and it needs its
-            // own measurement rather than an assumption.
-            let mut spine = match bound {
-                Ty::ForAll(..) | Ty::ForAllEff(..) => {
-                    return Err(format!(
-                        "polymorphic constructor `{}` in a pattern",
-                        cx.syms.text(*name)
-                    ))
-                }
-                other => other.clone(),
-            };
+        P::Ctor(name, subs, sp) => {
             let mut out = String::new();
             for sub in subs {
-                let field = match spine {
-                    Ty::Fun(a, _, r) => {
-                        spine = *r;
-                        cx.st.deep_resolve(&a)
-                    }
-                    _ => {
-                        return Err(format!(
-                            "`{}` takes fewer fields than the pattern binds",
-                            cx.syms.text(*name)
-                        ))
-                    }
-                };
-                out.push_str(&format!(" {}", pattern(sub, &field, cx)?));
+                out.push_str(&format!(" {}", pattern(sub, &Ty::Error, cx)?));
             }
             Ok(format!(
                 "(ctor-pat {:?} (subs{}) {})",
                 cx.syms.text(*name),
                 out,
-                render_ty(cx.syms, scrut)
+                render_ty(cx.syms, &want(*sp))
             ))
         }
         P::Vec_(..) => Err("vector pattern".into()),
