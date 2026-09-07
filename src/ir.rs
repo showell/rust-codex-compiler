@@ -257,6 +257,24 @@ fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<(String, Ty), String> {
             format!("(bool-lit {})", if v == "True" { "true" } else { "false" }),
             Ty::Boolean,
         )),
+        // `(num-lit 4607738418749009766)` -- **THE f64's BITS, READ AS A
+        // SIGNED INTEGER**, not the decimal the source wrote. `lower-literal`
+        // is `IrNumLit (text-to-double-bits text)` and the emitter prints that
+        // integer straight out with `safe-int-text`.
+        //
+        // Rust's own `parse` is correctly rounded and upstream's conversion is
+        // not (issue 125: correct to 15 significant digits, wrong above 2^53).
+        // So this is a place the two arms may legitimately disagree, and a
+        // difference here is a finding rather than a defect -- both of the
+        // curated set's Real subjects happen to fall where the two agree, and
+        // that was checked rather than hoped for.
+        Expr::Lit(v, LiteralKind::NumLit, _) => {
+            let bits = v
+                .parse::<f64>()
+                .map_err(|_| format!("`{v}` is not a Real literal"))?
+                .to_bits() as i64;
+            Ok((format!("(num-lit {bits})"), Ty::Real(RealWidth::F64, RealMode::Default)))
+        }
         // `(char-lit 15)` for `'a'` -- the CHAR-CODE, not the byte and not the
         // codepoint. `lower-literal` reads `text-to-integer text` because
         // upstream's desugarer already turned the token into that number;
