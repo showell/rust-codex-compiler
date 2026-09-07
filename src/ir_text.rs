@@ -126,13 +126,11 @@ pub fn emit_expr(syms: &SymTab, e: &IrExpr) -> String {
         // `(int-lit 1 int-default)`.
         E::IntLit(v, _) => format!("(int-lit {v})"),
         E::NumLit(v, _) => format!("(num-lit {v})"),
-        // **THE SOURCE'S OWN SPELLING, QUOTES INCLUDED.** Upstream's desugarer
-        // DECODES a text literal and `ir-quote` re-encodes it at this end; we
-        // carry the raw token and hand it through. The two agree on every
-        // escape the corpus uses, which `string-escape-quote` measures, and
-        // they would part company on an escape that re-encodes differently
-        // from how it was written. Recorded rather than relied on.
-        E::TextLit(v, _) => format!("(text-lit {v})"),
+        // `ir-quote` (line 71). The literal arrives DECODED, and only three
+        // characters are escaped on the way back out -- backslash, quote and
+        // newline. A tab does not appear in the list because a tab cannot
+        // reach here: `\t` decoded to two spaces.
+        E::TextLit(v, _) => format!("(text-lit {})", ir_quote(v)),
         // **`true`, NOT `True`.** The source spells the constructor and the
         // wire spells the value.
         E::BoolLit(b, _) => format!("(bool-lit {})", if *b { "true" } else { "false" }),
@@ -209,7 +207,7 @@ pub fn emit_pat(syms: &SymTab, p: &IrPat) -> String {
         IrPat::Var(n, ty, _) => {
             format!("(var-pat {:?} {})", syms.text(*n), render_ty(syms, ty))
         }
-        IrPat::Lit(v, ty, _) => format!("(lit-pat {:?} {})", v, render_ty(syms, ty)),
+        IrPat::Lit(v, ty, _) => format!("(lit-pat {} {})", ir_quote(v), render_ty(syms, ty)),
         IrPat::Ctor(n, subs, ty, _) => format!(
             "(ctor-pat {:?} (subs{}) {})",
             syms.text(*n),
@@ -246,4 +244,23 @@ pub fn emit_def(syms: &SymTab, d: &IrDef) -> String {
 /// The `(defs ...)` body: every definition, in order.
 pub fn emit_defs(syms: &SymTab, defs: &[IrDef]) -> String {
     defs.iter().map(|d| emit_def(syms, d)).collect()
+}
+
+/// `ir-quote` (IRTextEmitter.codex:71). **THREE ESCAPES AND NO MORE.** Rust's
+/// own `{:?}` is close but not the same -- it also escapes tabs, carriage
+/// returns and every non-printable as `\u{..}` -- so this is written out
+/// rather than borrowed.
+fn ir_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
 }

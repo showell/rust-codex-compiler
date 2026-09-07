@@ -129,8 +129,7 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
         Expr::Lit(v, LiteralKind::IntLit, s) => {
             Ok(IrExpr::IntLit(crate::token::lit_text_to_integer(v), *s))
         }
-        // The literal AS WRITTEN, quotes and all -- see `ir_text::emit_expr`
-        // for why that is not the same thing upstream carries.
+        // Decoded by the desugarer; `ir-quote` re-encodes it at the wire.
         Expr::Lit(v, LiteralKind::TextLit, s) => Ok(IrExpr::TextLit(v.clone(), *s)),
         Expr::Lit(v, LiteralKind::BoolLit, s) => Ok(IrExpr::BoolLit(v == "True", *s)),
         // **THE f64's BITS, READ AS A SIGNED INTEGER**, not the decimal the
@@ -143,11 +142,10 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
                 v.parse::<f64>().map_err(|_| format!("`{v}` is not a Real literal"))?.to_bits();
             Ok(IrExpr::NumLit(bits as i64, *s))
         }
-        // The CHAR-CODE, not the byte and not the codepoint. Upstream's
-        // desugarer already turned the token into that number; ours keeps the
-        // raw token, so the decode happens at this end.
+        // `lower-literal` is `IrCharLit (text-to-integer text)`, and the
+        // text IS the char-code by now -- the desugarer put it there.
         Expr::Lit(v, LiteralKind::CharLit, s) => {
-            Ok(IrExpr::CharLit(crate::charcode::char_literal_code(v), *s))
+            Ok(IrExpr::CharLit(crate::token::lit_text_to_integer(v), *s))
         }
         // `(negate X TYPE)`, and the type is the OPERAND's -- negating does
         // not change it. `-n` is this; `0 - n` is a `binary sub-int`, and the

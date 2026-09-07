@@ -463,6 +463,44 @@ pub fn tokenize_into(src: &[u8], prose_mode: bool) -> Lexed {
                     len: 1,
                 });
             }
+            // **CCE HAS NO TAB AND NO CARRIAGE RETURN, IN A TEXT LITERAL
+            // EITHER.** `validate-escapes-into` (Lexer.codex:285) runs over
+            // the raw body of every text literal, and a `\t` there is a lexer
+            // ERROR -- which is why `decode_escapes`' arms for those two never
+            // fire on a program upstream accepts. We refused them in a CHAR
+            // literal and not in a text one, so `"a\tb"` compiled here and
+            // was rejected by the oracle.
+            let body = &src[entry as usize..stop.min(src.len() as u32) as usize];
+            let body = body.strip_suffix(b"\"").unwrap_or(body);
+            let mut i = 0usize;
+            while i + 1 < body.len() {
+                if body[i] != b'\\' {
+                    i += 1;
+                    continue;
+                }
+                let refusal = match body[i + 1] {
+                    b't' => Some((
+                        "cdx-invalid-tab-escape",
+                        "\\t escape is not valid in CCE; use spaces directly",
+                    )),
+                    b'r' => Some((
+                        "cdx-invalid-carriage-return-escape",
+                        "\\r escape is not valid in CCE; use \\n for newlines",
+                    )),
+                    _ => None,
+                };
+                if let Some((code, msg)) = refusal {
+                    lx.errors.push(Diag {
+                        code,
+                        msg,
+                        line: at.1,
+                        col: at.2 + 1 + i as u32,
+                        offset: entry + i as u32,
+                        len: 2,
+                    });
+                }
+                i += 2;
+            }
             out.push(lx.tok(Kind::TextLiteral, at, lx.off - at.0));
             continue;
         }
@@ -793,5 +831,67 @@ mod tests {
         let eof = lexed.tokens.last().unwrap();
         assert_eq!(eof.kind, Kind::EndOfFile);
         assert_eq!((eof.offset, eof.len, eof.col), (4, 0, 5));
+    }
+}
+
+/// `decode-escapes` (Lexer.codex:301): a TEXT literal's body, escapes
+/// resolved. The caller passes the body WITHOUT its quotes.
+///
+/// **THREE OF THESE ARE NOT WHAT A C PROGRAMMER WOULD GUESS, and one of them
+/// is not even what the CHAR literal decoder does:**
+///
+/// * **`\t` is TWO SPACES.** The alphabet has no tab, and upstream spends two
+///   characters rather than one on it.
+/// * **`\r` VANISHES.** Not a carriage return, not a newline -- nothing is
+///   pushed at all, so `"a\rb"` is two characters.
+/// * a lone backslash at the very end is kept as a backslash.
+///
+/// `charcode::char_literal_code` decodes the same two escapes DIFFERENTLY for
+/// a char literal -- one space, and a newline. That is upstream's asymmetry,
+/// not ours, which is why the two live apart and each says so.
+pub fn decode_escapes(body: &str) -> String {
+    let cs: Vec<char> = body.chars().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < cs.len() {
+        if cs[i] != '\\' {
+            out.push(cs[i]);
+            i += 1;
+            continue;
+        }
+        if i + 1 >= cs.len() {
+            out.push('\\');
+            break;
+        }
+        match cs[i + 1] {
+            'n' => out.push('\n'),
+            't' => out.push_str("  "),
+            'r' => {}
+            '\\' => out.push('\\'),
+            '"' => out.push('"'),
+            other => out.push(other),
+        }
+        i += 2;
+    }
+    out
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::decode_escapes;
+
+    /// **Every one of these was read off `decode-escapes-loop`**, because
+    /// three of them are surprising and a plausible guess is wrong about all
+    /// three.
+    #[test]
+    fn the_escapes_are_upstreams_and_not_c_s() {
+        assert_eq!(decode_escapes("a\\tb"), "a  b", "\\t is TWO spaces");
+        assert_eq!(decode_escapes("a\\rb"), "ab", "\\r vanishes");
+        assert_eq!(decode_escapes("a\\nb"), "a\nb");
+        assert_eq!(decode_escapes("a\\\\b"), "a\\b");
+        assert_eq!(decode_escapes("a\\\"b"), "a\"b");
+        assert_eq!(decode_escapes("a\\qb"), "aqb", "an unknown escape is itself");
+        assert_eq!(decode_escapes("ab\\"), "ab\\", "a trailing lone backslash stays");
+        assert_eq!(decode_escapes(""), "");
     }
 }

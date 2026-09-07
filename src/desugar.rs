@@ -70,6 +70,38 @@ impl<'a> Desugar<'a> {
         String::from_utf8_lossy(t.text(self.src)).into_owned()
     }
 
+    /// `literal-value-text` (Desugarer.codex:113): a literal token's VALUE,
+    /// which for two kinds is not its source spelling.
+    ///
+    /// **THIS IS THE ONE PLACE A LITERAL IS DECODED.** Everything downstream --
+    /// the interpreter, the checker, lowering, the IR emitter, constant
+    /// folding -- reads the value, so none of them owns an escape rule and no
+    /// two of them can disagree about one. They did: three copies of the text
+    /// decode and two of the char decode, and `interp`'s answered `t` for
+    /// `\t` where upstream answers two spaces.
+    ///
+    /// * a TEXT literal becomes its body with escapes resolved, NO QUOTES;
+    /// * a CHAR literal becomes its CHAR-CODE, in decimal, as text -- so `'a'`
+    ///   arrives downstream as `"15"`;
+    /// * everything else keeps the token's own text, because an integer's
+    ///   `#` and `_` and a Real's digits are read by the consumer that needs
+    ///   them.
+    fn literal_value(&self, t: &Token) -> String {
+        match t.kind {
+            Kind::TextLiteral => {
+                let raw = self.text(t);
+                let body = raw
+                    .strip_prefix('"')
+                    .map_or(raw.as_str(), |s| s.strip_suffix('"').unwrap_or(s));
+                crate::lexer::decode_escapes(body)
+            }
+            Kind::CharLiteral => {
+                crate::charcode::char_literal_code(&self.text(t)).to_string()
+            }
+            _ => self.text(t),
+        }
+    }
+
     /// A token's text as an interned name. This is the one that runs 6.19
     /// million times over the corpus; `text` above still serves the places
     /// that want an owned string, which is literals and chapter metadata.
@@ -146,7 +178,7 @@ impl<'a> Desugar<'a> {
         let sp = head_span(n);
         match n.kind {
             NodeKind::Lit => match head_token(n) {
-                Some(t) => Expr::Lit(self.text(t), literal_kind(t.kind), span_of(t)),
+                Some(t) => Expr::Lit(self.literal_value(t), literal_kind(t.kind), span_of(t)),
                 None => Expr::Error("lit".into(), sp),
             },
             NodeKind::Name | NodeKind::Selector => Expr::NameRef(self.leading(n), sp),
@@ -1002,7 +1034,7 @@ impl<'a> Desugar<'a> {
         match n.kind {
             NodeKind::VarPat => Pat::Var(self.leading(n), sp),
             NodeKind::LitPat => match head_token(n) {
-                Some(t) => Pat::Lit(self.text(t), literal_kind(t.kind), sp),
+                Some(t) => Pat::Lit(self.literal_value(t), literal_kind(t.kind), sp),
                 None => Pat::Wild(sp),
             },
             NodeKind::CtorPat => Pat::Ctor(

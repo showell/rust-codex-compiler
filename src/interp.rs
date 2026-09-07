@@ -21,6 +21,7 @@
 //! flat, so nothing here resolves a name or parses a literal while the program
 //! is running.
 
+use crate::charcode::{char_code, code_to_char};
 use crate::ast::*;
 use crate::code::{Arm, Code, Compiler, Names, PatCode, Stmt};
 use crate::symbol::{Sym, SymTab};
@@ -2001,36 +2002,6 @@ fn ordinal(f: f64) -> i64 {
 /// say that. The old signature forced every caller to write `c as u8`, which
 /// silently truncates every non-ASCII character to a byte the table does not
 /// describe and answers 0 -- the same 0 that means "not in the alphabet".
-fn char_code(c: char) -> i64 {
-    if (c as u32) < crate::charcode::CHAR_CODE.len() as u32 {
-        return crate::charcode::CHAR_CODE[c as usize] as i64;
-    }
-    crate::charcode::CHAR_CODE_HIGH
-        .iter()
-        .position(|h| *h == c)
-        .map(|i| crate::charcode::HIGH_BASE + i as i64)
-        .unwrap_or(0)
-}
-
-/// The character a code names, or NUL when the alphabet does not name one.
-///
-/// The NUL is still here and is still a real answer -- code 0 is "not in the
-/// alphabet" and the compiler answers nothing for it either. What changed is
-/// that it is no longer reached by codes 97..=127, which ARE in the alphabet
-/// and used to fall through to it.
-fn code_to_char(code: i64) -> char {
-    if (crate::charcode::HIGH_BASE..crate::charcode::HIGH_BASE
-        + crate::charcode::CHAR_CODE_HIGH.len() as i64)
-        .contains(&code)
-    {
-        return crate::charcode::CHAR_CODE_HIGH[(code - crate::charcode::HIGH_BASE) as usize];
-    }
-    crate::charcode::CHAR_CODE
-        .iter()
-        .position(|c| *c as i64 == code && code != 0)
-        .map(|b| b as u8 as char)
-        .unwrap_or('\0')
-}
 
 fn apply_bound(v: i64, b: &FieldBound) -> i64 {
     match b.mode {
@@ -2076,38 +2047,21 @@ pub(crate) fn literal(text: &str, kind: LiteralKind) -> R<Value> {
             .map(Value::Real)
             .map_err(|_| Error(format!("bad number literal `{text}`"))),
         LiteralKind::BoolLit => Ok(Value::Bool(text == "True")),
+        // **ALREADY DECODED.** The desugarer resolved the escapes and stripped
+        // the quotes (`Desugar::literal_value`), so there is no escape rule
+        // here to get out of step with the one upstream uses.
         LiteralKind::TextLit => {
-            let s = unescape(text);
-            let addr = crate::bump::intern_literal(s.len() as i64);
-            Ok(Value::Text(Rc::new(Str::new(addr, s))))
+            let addr = crate::bump::intern_literal(text.len() as i64);
+            Ok(Value::Text(Rc::new(Str::new(addr, text.to_string()))))
         }
-        LiteralKind::CharLit => Ok(Value::Char(unescape(text).chars().next().unwrap_or('\0'))),
+        // A char literal arrives as its CHAR-CODE in decimal, which is what
+        // `lower-literal` reads too.
+        LiteralKind::CharLit => {
+            Ok(Value::Char(code_to_char(text.parse().unwrap_or(0))))
+        }
     }
 }
 
-/// A text literal arrives with its quotes and escapes as written.
-fn unescape(raw: &str) -> String {
-    let body = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or_else(|| {
-        raw.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')).unwrap_or(raw)
-    });
-    let mut out = String::with_capacity(body.len());
-    let mut it = body.chars();
-    while let Some(c) = it.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match it.next() {
-            Some('n') => out.push('\n'),
-            Some('\\') => out.push('\\'),
-            Some('"') => out.push('"'),
-            Some('\'') => out.push('\''),
-            Some(other) => out.push(other),
-            None => {}
-        }
-    }
-    out
-}
 
 /// **CONCATENATION ALLOCATES, so this needs the allocator.** `&` on two texts
 /// is a fresh block at the cursor upstream -- bare metal's two str-concat

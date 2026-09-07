@@ -125,9 +125,10 @@ fn fold_apply(
     let unfolded = |f: IrExpr, a: IrExpr| IrExpr::Apply(Box::new(f), Box::new(a), t.clone(), s);
     match &f {
         IrExpr::Name(n, _, _) if !defined.contains(n) => match (syms.text(*n), &a) {
-            // One unit per CHARACTER, not per byte.
+            // One unit per CHARACTER, not per byte -- a Codex `Text` is CCE
+            // units. The literal is decoded already, so this is a count.
             ("text-length", IrExpr::TextLit(v, _)) => {
-                IrExpr::IntLit(crate::token::text_literal_chars(v).len() as i64, s)
+                IrExpr::IntLit(v.chars().count() as i64, s)
             }
             // A char literal already IS its char-code by the time it is here.
             ("char-code", IrExpr::CharLit(v, _)) => IrExpr::IntLit(*v, s),
@@ -139,15 +140,8 @@ fn fold_apply(
             (IrExpr::Name(n, _, _), IrExpr::TextLit(v, _), IrExpr::IntLit(i, _))
                 if syms.text(*n) == "char-code-at" && !defined.contains(n) =>
             {
-                let chars = crate::token::text_literal_chars(v);
-                match usize::try_from(*i).ok().and_then(|i| chars.get(i)) {
-                    Some(c) => IrExpr::IntLit(
-                        crate::charcode::CHAR_CODE
-                            .get(*c as usize)
-                            .copied()
-                            .unwrap_or(0) as i64,
-                        s,
-                    ),
+                match usize::try_from(*i).ok().and_then(|i| v.chars().nth(i)) {
+                    Some(c) => IrExpr::IntLit(crate::charcode::char_code(c), s),
                     None => unfolded(f, a),
                 }
             }

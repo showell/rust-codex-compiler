@@ -161,6 +161,42 @@ pub const CHAR_CODE_HIGH: [char; 31] = [
 pub const HIGH_BASE: i64 = 97;
 
 
+
+/// `char-code`: the code the alphabet gives this character, or 0.
+pub fn char_code(c: char) -> i64 {
+    if (c as u32) < CHAR_CODE.len() as u32 {
+        return CHAR_CODE[c as usize] as i64;
+    }
+    CHAR_CODE_HIGH
+        .iter()
+        .position(|h| *h == c)
+        .map(|i| HIGH_BASE + i as i64)
+        .unwrap_or(0)
+}
+
+/// The character a code names, or NUL when the alphabet does not name one.
+///
+/// The NUL is still here and is still a real answer -- code 0 is "not in the
+/// alphabet" and the compiler answers nothing for it either. What changed is
+/// that it is no longer reached by codes 97..=127, which ARE in the alphabet
+/// and used to fall through to it.
+
+/// `code-to-char`: the character a code names, or NUL where the alphabet
+/// names none.
+pub fn code_to_char(code: i64) -> char {
+    if (HIGH_BASE..HIGH_BASE
+        + CHAR_CODE_HIGH.len() as i64)
+        .contains(&code)
+    {
+        return CHAR_CODE_HIGH[(code - HIGH_BASE) as usize];
+    }
+    CHAR_CODE
+        .iter()
+        .position(|c| *c as i64 == code && code != 0)
+        .map(|b| b as u8 as char)
+        .unwrap_or('\0')
+}
+
 /// A char literal's VALUE, which is its char-code and not its byte --
 /// `decode-char-literal-value` (Desugarer.codex:96).
 ///
@@ -168,10 +204,14 @@ pub const HIGH_BASE: i64 = 97;
 /// time anything downstream sees `ALitExpr` the token `'a'` has become the
 /// text `"15"`. Ours keeps the raw token, so the decode happens here instead.
 ///
-/// **`\t` IS A SPACE AND `\r` IS A NEWLINE.** The alphabet has no code for
-/// either, and rather than answer 0 the desugarer folds them onto the nearest
-/// code that exists. Anything else after a backslash is its own char-code, so
-/// `\q` is `q`.
+/// **`\t` IS ONE SPACE AND `\r` IS A NEWLINE HERE**, and that is NOT what the
+/// same two escapes mean inside a TEXT literal, where `lexer::decode_escapes`
+/// gives `\t` two spaces and drops `\r` entirely. The two decoders are
+/// genuinely different upstream -- this one is `decode-char-literal-value` in
+/// `Ast/Desugarer.codex`, that one is `decode-escapes` in `Syntax/Lexer.codex`
+/// -- so they are written apart rather than shared.
+///
+/// Anything else after a backslash is its own char-code, so `\q` is `q`.
 pub fn char_literal_code(raw: &str) -> i64 {
     let body = raw.strip_prefix('\'').map_or(raw, |s| s.strip_suffix('\'').unwrap_or(s));
     let b = body.as_bytes();
