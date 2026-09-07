@@ -29,7 +29,7 @@
 //! own body and the checker recorded a different row id at each occurrence, so
 //! a lookup by name would have to pick one and would be wrong about the other.
 
-use crate::ast::{BinaryOp, Chapter, Expr, LiteralKind, Pat};
+use crate::ast::{BinaryOp, Expr, LiteralKind, Pat};
 use crate::check::{Binding, Ty, TypeDefs, UnifyState};
 use crate::ir_chapter::{
     IrActStmt, IrBinOp, IrBranch, IrDef, IrExpr, IrFieldVal, IrParam, IrPat,
@@ -191,8 +191,11 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
         // checker's own answer for the name, and the expectation is what the
         // caller of this node already committed to.
         Expr::NameRef(n, s) => {
+            // `lower-name-normal` strips the quantifiers off BOTH answers,
+            // the recorded one included -- a `(forall 39 ...)` on a name is
+            // the signature's binder and not part of what the name is here.
             let t = match cx.at(*s) {
-                Some(t) => t,
+                Some(t) => crate::check::strip_forall(&t),
                 None => match cx.bindings.get(n) {
                     Some(raw) => crate::check::strip_forall(&cx.st.deep_resolve(raw)),
                     None => want.clone(),
@@ -200,17 +203,27 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
             };
             Ok(IrExpr::Name(*n, t, *s))
         }
+        // `lower-apply-normal` (Lowering.codex:612). **THE CALLEE'S PARAMETER
+        // IS THE ARGUMENT'S EXPECTATION**, and the return is then INSTANTIATED
+        // by matching that parameter against what the argument turned out to
+        // be. Both halves were missing: every argument was lowered with no
+        // expectation at all, so a lambda handed to `map-list` had nothing to
+        // peel its parameters from and reached the wire with `error` in each
+        // slot -- seventy lifted lambdas in the compiler.
+        //
+        // Upstream never refuses here. A callee whose type is not an arrow
+        // peels to `ErrorTy` and the node takes the expectation, or the
+        // checker's recorded answer, instead.
         Expr::Apply(f, a, s) => {
             let f = expr(f, &Ty::NoExpect, cx)?;
-            let a = expr(a, &Ty::NoExpect, cx)?;
-            // The result of applying one argument is the arrow's right half. A
-            // non-arrow here is an over-application, a real error and not
-            // something to paper over with the same type back.
-            let res = match f.ty() {
-                Ty::Fun(_, _, r) => *r,
-                other => {
-                    return Err(format!("applying a non-arrow `{}`", render_ty(cx.syms, &other)))
-                }
+            let fty = f.ty();
+            let arg_ty = peel_fun_param(&fty);
+            let ret_ty = peel_fun_return(&fty);
+            let a = expr(a, &arg_ty, cx)?;
+            let resolved = lt::subst_from_arg(&arg_ty, &a.ty(), &ret_ty);
+            let res = match resolved {
+                Ty::Error | Ty::NoExpect => expected_or_recorded(want, cx, *s),
+                other => other,
             };
             Ok(IrExpr::Apply(Box::new(f), Box::new(a), res, *s))
         }
@@ -487,11 +500,13 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
             }
             // `expected-or-recorded-ty`: what the context wants, and only
             // where it wants nothing does the recorded type answer.
-            let lam_ty = if lt::has_error(want) {
-                cx.recorded(*s)
-            } else {
-                cx.st.deep_resolve(want)
-            };
+            //
+            // **THE PARAMETERS PEEL OFF THE STRIPPED TYPE AND THE NODE KEEPS
+            // THE UNSTRIPPED ONE.** A polymorphic callee's parameter arrives
+            // still inside its `forall`, and peeling that as if it were an
+            // arrow answers `error` for every slot.
+            let expected = expected_or_recorded(want, cx, *s);
+            let stripped = crate::check::strip_forall(&expected);
             // **`peel-fun-param` ANSWERS `ErrorTy` FOR ANYTHING THAT IS NOT AN
             // ARROW**, and `get-lambda-return` does the same
             // (IR/Lowering.codex:55108). Upstream says why in its own prose:
@@ -503,17 +518,14 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
             // instead is a different rule, and the one that stopped a
             // `for r in temps -> r` -- whose lambda the desugarer gives a
             // synthetic span, so nothing recorded a type for it.
-            let mut ret = lam_ty.clone();
+            let mut ret = stripped;
             let mut ir_params = Vec::new();
             for p in &params {
-                let (a, r) = match ret {
-                    Ty::Fun(a, _, r) => (*a, *r),
-                    _ => (Ty::Error, Ty::Error),
-                };
-                ir_params.push(IrParam { name: *p, ty: a, span: *s });
-                ret = r;
+                ir_params.push(IrParam { name: *p, ty: peel_fun_param(&ret), span: *s });
+                ret = peel_fun_return(&ret);
             }
             let b = expr(inner, &ret, cx)?;
+            let lam_ty = lambda_recorded(&ret, &b.ty(), &expected);
             Ok(IrExpr::Lambda(ir_params, Box::new(b), lam_ty, *s))
         }
         // **A PROOF IS ERASED TO `0`.** `lower-expr-at`'s own arm
@@ -526,7 +538,52 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
     }
 }
 
-/// The record or constructed type's name, or the reason this is neither.
+/// `peel-fun-param` (Types/CodexTypeHelpers.codex:4). The argument side of an
+/// arrow, LOOKING THROUGH quantifiers, and `ErrorTy` for anything else.
+fn peel_fun_param(t: &Ty) -> Ty {
+    match t {
+        Ty::Fun(p, _, _) => (**p).clone(),
+        Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => peel_fun_param(b),
+        _ => Ty::Error,
+    }
+}
+
+/// `peel-fun-return` (Types/CodexTypeHelpers.codex:12).
+fn peel_fun_return(t: &Ty) -> Ty {
+    match t {
+        Ty::Fun(_, _, r) => (**r).clone(),
+        Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => peel_fun_return(b),
+        _ => Ty::Error,
+    }
+}
+
+/// `expected-or-recorded-ty` (Lowering.codex:748). The context's expectation,
+/// and only where there is none does the checker's own answer at this span
+/// stand in.
+///
+/// The test is on the type ITSELF being the sentinel, not on
+/// `ty-has-error` -- a `List <error>` is an expectation upstream keeps.
+fn expected_or_recorded(ty: &Ty, cx: &Lower, sp: crate::ast::Span) -> Ty {
+    match ty {
+        Ty::Error | Ty::NoExpect => cx.recorded(sp),
+        other => other.clone(),
+    }
+}
+
+/// `lambda-recorded-ty` (Lowering.codex:767).
+///
+/// A lambda records the type it was HANDED, which at a polymorphic call still
+/// carries the callee's variables. Where the body came out concrete, those
+/// variables are the ones the body just answered: `\t -> copy-sx-text b t`
+/// handed `(fn (tvar 39) (tvar 40))` records `(fn (tvar 39) text)`, and the
+/// call site's `subst-type-vars-from-arg` can then learn something from it.
+fn lambda_recorded(declared_ret: &Ty, body_ty: &Ty, ty: &Ty) -> Ty {
+    if !lt::has_typevars(ty) || lt::has_typevars(body_ty) {
+        return ty.clone();
+    }
+    lt::subst_from_arg(declared_ret, body_ty, ty)
+}
+
 /// `lower-empty-list` (Lowering.codex:1359). **`[]` IS NOT ALWAYS A LIST.**
 ///
 /// Its type is the bare variable the checker minted, so what it stands for is
@@ -562,6 +619,7 @@ fn empty_list(want: &Ty, cx: &Lower, s: crate::ast::Span) -> IrExpr {
     }
 }
 
+/// The record or constructed type's name, or the reason this is neither.
 fn record_name(t: &Ty, cx: &Lower, what: &str) -> Result<Sym, String> {
     match t {
         Ty::Record(n, _) | Ty::Constructed(n, _) => Ok(*n),

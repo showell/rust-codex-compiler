@@ -557,6 +557,25 @@ mod tests {
         assert!(def_line(src, "p").contains("(list-expr (elems) text)"), "{}", def_line(src, "p"));
     }
 
+    /// **THE CALLEE'S PARAMETER IS THE ARGUMENT'S EXPECTATION.** A lambda has
+    /// nowhere else to get its parameter types from: nothing above a `for ...
+    /// in` comprehension's synthetic span recorded one. Lowering the argument
+    /// with no expectation left `error` in every slot -- seventy lifted
+    /// lambdas of the compiler's own IR.
+    ///
+    /// At a POLYMORPHIC callee the parameter keeps the callee's own variable
+    /// and the return is instantiated by what the body turned out to be --
+    /// `lambda-recorded-ty` doing its half. This case is the concrete one,
+    /// which needs no chapter but the test's own.
+    #[test]
+    fn a_lambda_peels_its_parameters_from_the_callee() {
+        let src = "Chapter: T\n\nSection: S\n  twice : (Text -> Integer), Text -> Integer\n  twice (f) (s) = f s + f s\n\nSection: E\n  opening : Integer\n  opening = twice (\\t -> text-length t) \"ab\"\n";
+        assert_eq!(
+            def_line(src, "__lam_0"),
+            r#"(def "__lam_0" "" (params (param "t" text)) (fn text int-default) (apply (name "text-length" (fn text int-default)) (name "t" text) int-default) 0 0)"#
+        );
+    }
+
     /// A pure definition still renders exactly as it did, which is the thing
     /// these changes must not disturb: it is already byte-identical to the
     /// oracle and that is the only verified ground the native road stands on.
