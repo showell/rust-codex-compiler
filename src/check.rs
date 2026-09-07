@@ -1228,7 +1228,18 @@ pub fn section(syms: &SymTab, bindings: &[Binding], st: &UnifyState) -> String {
     s.push_str(&format!("check-errors {}\n", st.errors));
     s.push_str(&format!("type-bindings {}\n", bindings.len()));
     for b in bindings {
-        s.push_str(&format!("tb {} {}\n", syms.text(b.name), type_kind(syms, &b.ty)));
+        // **RESOLVED, because the binding is not the answer.** A definition
+        // that declares no type is registered with a fresh variable and
+        // unification binds it afterwards -- `zig-p-cx-poke-32` is a list, and
+        // printing the raw binding called it `tvar`. That made the two
+        // definitions in `ringplug-source` that declare no type look like
+        // checker disagreements when the checker had them right and only this
+        // line was behind.
+        s.push_str(&format!(
+            "tb {} {}\n",
+            syms.text(b.name),
+            type_kind(syms, &st.deep_resolve(&b.ty))
+        ));
     }
     s.push_str(".\n");
     s.push_str(&format!("substitutions {}\n", st.substitutions.len()));
