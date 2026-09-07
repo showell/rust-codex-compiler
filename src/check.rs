@@ -1485,18 +1485,48 @@ pub fn infer_row(
             row = st.row_union(&halves, &EffectRow { id: call_row, ..Default::default() });
             ret
         }
+        // **A `<-` BINDS ITS NAME, AND THE REST OF THE BLOCK CAN SEE IT.**
+        // `infer-act-loop`'s `AActBindStmt` arm (TypeChecker.codex:53555) is
+        // `env-bind-local env (name.value) (deep-resolve acc-st
+        // (er.inferred-type))` -- the same rule `let` follows, and for the same
+        // reason: bound raw, the name is a variable nothing can read a record
+        // or an arrow out of.
+        //
+        // Discarding the name cost seven variables on the self-host, all of
+        // them a field access whose object was bound this way: `here <-
+        // fat16-cluster-entry-sectors ...` then `here.li-entries`. The object
+        // resolved to nothing, so `AFieldAccess` fell to its `fresh-and-advance`
+        // branch where upstream looked the field up and minted nothing. That
+        // was the whole of the 3.44 MB unit's remaining `next-id` gap.
+        //
+        // `er.inferred-type` is already the VALUE side -- `infer-name` hands an
+        // effectful name's row up separately -- so there is no row to peel here.
         E::Act(stmts, _) => {
             let mut last = Ty::Nothing;
+            let mut bound = 0;
             for s in stmts {
                 match s {
-                    crate::ast::ActStmt::Exec(x, _) | crate::ast::ActStmt::Bind(_, x, _) => {
+                    crate::ast::ActStmt::Exec(x, _) => {
                         let (t, srow) = infer_row(x, env, st);
                         last = t;
                         row = st.row_union(&row, &srow);
                     }
+                    crate::ast::ActStmt::Bind(n, x, _) => {
+                        let (t, srow) = infer_row(x, env, st);
+                        row = st.row_union(&row, &srow);
+                        let resolved = st.deep_resolve(&t);
+                        env.bind(*n, resolved);
+                        bound += 1;
+                        last = t;
+                    }
                 }
             }
-            last
+            // The block's names are the block's: `infer-act-loop` threads `env2`
+            // through its own loop and hands the caller none of it.
+            for _ in 0..bound {
+                env.scope.pop();
+            }
+            st.deep_resolve(&last)
         }
         E::Let(binds, body, _) => {
             for b in binds {
@@ -2412,5 +2442,27 @@ mod undeclared_definition_cost {
     #[test]
     fn a_declared_definition_costs_nothing_beyond_its_registration() {
         assert_eq!(counts("Chapter: P\nSection: S\n  a : Integer\n  a = 7\n"), (2, 0));
+    }
+}
+
+/// A `<-` bind is visible to the rest of its block.
+///
+/// The subject is `Fat16`: `here <- fat16-cluster-entry-sectors ...` followed
+/// by `here.li-entries`. Discarding the name left the object unresolved, so
+/// the field access minted where upstream looked the field up.
+#[cfg(test)]
+mod act_bind_is_in_scope {
+    const SRC: &str = "Chapter: P\nSection: S\n  R = record { ra : Integer, rb : Integer }\n  mkr : Integer -> [Console] R\n  mkr (x) = act\n    print-line-uni \"hi\"\n    R { ra = x, rb = x }\n  end\n  f : Integer -> [Console] Integer\n  f (x) = act\n    r <- mkr x\n    r.ra\n  end\n";
+
+    #[test]
+    fn a_field_access_on_a_bound_name_mints_nothing() {
+        let bytes = SRC.as_bytes().to_vec();
+        let parsed = crate::parser::parse(&bytes);
+        let mut dg = crate::desugar::Desugar::new(&bytes);
+        let ch = dg.chapter(&parsed.tree);
+        let (_, st) = super::check_chapter(&ch);
+        // `codexcheck` on this unit: next-id 4, next-row-id 6, expr-types 7.
+        // It was 5 while the bind was discarded.
+        assert_eq!((st.next_id, st.next_row_id, st.expr_types.len()), (4, 6, 7));
     }
 }
