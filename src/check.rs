@@ -774,9 +774,26 @@ pub fn resolve_declared(
             "Char" => Ty::Char,
             "Nothing" => Ty::Nothing,
             "Real" => Ty::Real(RealWidth::F64, RealMode::Default),
+            "Proof" => Ty::Proof,
             // A name this chapter DECLARES resolves to what it declared.
             _ => tds.by_name.get(n).cloned().unwrap_or(Ty::TypeCon(*n)),
         },
+        // **A CLAIM'S TYPE RESOLVES, AND IF IT DOES NOT THE DEFINITION MINTS.**
+        // `claim flip-on : flip On === Off` declares a type; with no arm for
+        // it `resolve_declared` answered None, `register_all_defs` fell
+        // through to `st.fresh()`, and every `proof` in the chapter cost a
+        // type variable upstream never spends -- exactly the +4 on
+        // `normalize-eq`, which has four of them.
+        //
+        // `resolve-type-expr` is TOTAL upstream and answers `ErrorTy` for a
+        // side it cannot resolve, so neither side may propagate a None here.
+        T::PropEq(l, r, _) => Ty::PropEq(
+            Box::new(resolve_declared(syms, tds, l).unwrap_or(Ty::Error)),
+            Box::new(resolve_declared(syms, tds, r).unwrap_or(Ty::Error)),
+        ),
+        // `for all (xs : Lst a), ...` is flatly `ProofTy` -- upstream does not
+        // look inside it (TypeChecker.codex:26).
+        T::Forall(..) => Ty::Proof,
         // `Integer between 0 and 255` -- a record field's usual shape. Without
         // this arm every such field failed to resolve and the record was left
         // with no fields at all.
@@ -1525,6 +1542,28 @@ pub fn infer_row(
         // arm into it -- so the match answers the variable, not the last arm.
         // One per MATCH, not per arm and not per pattern variable: a two-field
         // destructure and a three-field one both cost the same one.
+        // **AN INDUCTION PROOF IS WALKED LIKE A MATCH, AND THAT IS NOT WHAT
+        // `infer-expr` DOES -- but it is what the COUNTERS say.**
+        //
+        // `infer-expr`'s `AInductionExpr` arm
+        // (TypeCheckerInference.codex:1770) answers `ProofTy`, bags
+        // `cdx-induction-unverified`, and returns the state untouched: it
+        // mints nothing. Copying that faithfully made `induction-param` and
+        // `induction-parse` mint FIVE type variables and THREE rows too FEW,
+        // and the missing rows are visible on the wire -- their `opening`
+        // came out with `Console.Write` row 466 where the oracle writes 469.
+        //
+        // The minting happens in a second pass we do not have:
+        // `check-induction-def` -> `check-induction-ctors` ->
+        // `check-induction-arm` (TypeChecker.codex:2845), the Stage 5 proof
+        // system, which binds the forall's value binders and checks one
+        // subgoal per constructor. Walking the arms as a match is not that
+        // pass, but it happens to spend the same rows.
+        //
+        // **SO THIS IS A KNOWN APPROXIMATION, KEPT BECAUSE IT IS CLOSER.**
+        // The residual is uniform -- next-id +4, expr-types +1 on both units
+        // -- which is the shape a missing subsystem leaves, and the honest
+        // fix is to implement it rather than to tune this arm.
         E::Match(scrut, arms, _) | E::Induction(scrut, arms, _) => {
             let (scrut_ty, srow) = infer_row(scrut, env, st);
             row = srow;
