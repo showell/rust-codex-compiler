@@ -46,6 +46,7 @@
 use crate::symbol::{Sym, SymTab};
 use crate::ast::{BinaryOp, Chapter, Expr, LiteralKind};
 use crate::check::{Binding, Overflow, RealMode, RealWidth, Ty, TypeDefs, UnifyState};
+use crate::lowering_types as lt;
 use std::collections::BTreeMap;
 
 /// A CHECKED type, as the IR spells it -- `ir-emit-type`
@@ -240,7 +241,7 @@ impl<'a> Lower<'a> {
 /// corpus refused 1,008 of 1,012 units and nothing about which missing piece
 /// would buy the most, so the next node form got picked by guessing. A reason
 /// turns that into a histogram.
-fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
+fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<(String, Ty), String> {
     match e {
         // Literals carry no type of their own in the IR -- `(int-lit 1)`, not
         // `(int-lit 1 int-default)` -- but their type is needed by whatever
@@ -270,7 +271,7 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
         // two are different nodes on the wire even where a reader would call
         // them the same expression.
         Expr::Unary(x, _) => {
-            let (xt, xty) = expr(x, cx)?;
+            let (xt, xty) = expr(x, &Ty::NoExpect, cx)?;
             let rendered = render_ty(cx.syms, &xty);
             Ok((format!("(negate {xt} {rendered})"), xty))
         }
@@ -283,8 +284,8 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
             None => Err(format!("the checker recorded no type at `{}`", cx.syms.text(*n))),
         },
         Expr::Apply(f, a, _) => {
-            let (ft, fty) = expr(f, cx)?;
-            let (at, _aty) = expr(a, cx)?;
+            let (ft, fty) = expr(f, &Ty::NoExpect, cx)?;
+            let (at, _aty) = expr(a, &Ty::NoExpect, cx)?;
             // The result of applying one argument is the arrow's right half.
             // A non-arrow here is an over-application, which is a real error
             // and not something to paper over with the same type back.
@@ -302,8 +303,8 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
         // where it cannot tell. A comparison answers `boolean` whatever it
         // compared; arithmetic answers what it was given.
         Expr::Binary(l, op, r, _) => {
-            let (lt, lty) = expr(l, cx)?;
-            let (rt, rty) = expr(r, cx)?;
+            let (lt, lty) = expr(l, &Ty::NoExpect, cx)?;
+            let (rt, rty) = expr(r, &Ty::NoExpect, cx)?;
             // **THE RESULT IS THE LEFT OPERAND'S TYPE, AND TWO INTEGERS OF
             // DIFFERENT BOUNDS ARE COMPATIBLE.** `b + 1` over
             // `Integer between 0 and 255` answers `(int 0 255 ov-error)` and
@@ -365,18 +366,41 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
         // `(if C T E <type>)`. The type is the BRANCHES', and both must agree
         // -- if they do not, this is not a place to pick one and move on.
         Expr::If(c, th, el, _) => {
-            let (ct, _) = expr(c, cx)?;
-            let (tt, tty) = expr(th, cx)?;
-            let (et, ety) = expr(el, cx)?;
-            if tty != ety {
-                return Err(format!(
-                    "if branches disagree: `{}` vs `{}`",
-                    render_ty(cx.syms, &tty),
-                    render_ty(cx.syms, &ety)
-                ));
-            }
-            let rendered = render_ty(cx.syms, &tty);
-            Ok((format!("(if {ct} {tt} {et} {rendered})"), tty))
+            let (ct, _) = expr(c, &Ty::NoExpect, cx)?;
+            let resolved = cx.st.deep_resolve(want);
+            let mark = cx.lifted.borrow().len();
+            let (tt, tty) = expr(th, &resolved, cx)?;
+            let then_lifted = cx.lifted.borrow().len() - mark;
+            // The then-branch's type becomes the else-branch's expectation
+            // only when nothing above had one to give.
+            let hint = if lt::has_error(&resolved) { tty.clone() } else { resolved };
+            let (et, ety) = expr(el, &hint, cx)?;
+            // **THE BRANCHES DO NOT HAVE TO AGREE, AND USUALLY DO NOT.** The
+            // checker unified them; the wire did not. `guarded-field` is
+            // `(int 0 15 ov-error)` then, `(int-lit 0)` else and `int-default`
+            // around them, and that is the expectation speaking, not a
+            // reconciliation of the two.
+            let ty = lt::branch_recorded(&lt::merge(&hint, &ety), &lt::if_witness(&tty, &ety));
+            // A then-branch lowered against an expectation that turned out to
+            // be an error is lowered AGAIN, now that there is a real one.
+            //
+            // **LOWERING HERE IS NOT IDEMPOTENT**, because lifting happens
+            // during it rather than after: a second pass over the same branch
+            // pushes the same `__lam_N` definitions a second time. Upstream
+            // has no such hazard -- it lowers to a tree and lifts the tree
+            // afterwards -- so the branch's lifted definitions are withdrawn
+            // and re-taken here, and the else-branch's are put back after them
+            // to keep the emitted order the tree would have had.
+            let tt = if lt::has_error(&tty) && !lt::has_error(&ty) {
+                let tail: Vec<String> = cx.lifted.borrow_mut().drain(mark..).collect();
+                let redone = expr(th, &ty, cx)?.0;
+                cx.lifted.borrow_mut().extend(tail.into_iter().skip(then_lifted));
+                redone
+            } else {
+                tt
+            };
+            let rendered = render_ty(cx.syms, &ty);
+            Ok((format!("(if {ct} {tt} {et} {rendered})"), ty))
         }
         // `(list-expr (elems ...) ELEM)` -- the trailing type is the ELEMENT's,
         // not the list's, checked against golds carrying text and nested-list
@@ -400,7 +424,7 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
             let mut parts = Vec::new();
             let mut elem: Option<Ty> = None;
             for x in xs {
-                let (xt, xty) = expr(x, cx)?;
+                let (xt, xty) = expr(x, &Ty::NoExpect, cx)?;
                 match &elem {
                     None => elem = Some(xty),
                     Some(e) if *e == xty => {}
@@ -427,14 +451,16 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
             let scope = Scope::open(cx);
             let mut heads = Vec::new();
             for b in binds {
-                let (vt, vty) = expr(&b.value, cx)?;
+                let (vt, vty) = expr(&b.value, &Ty::NoExpect, cx)?;
                 // `lift-expr`'s `IrLet` arm adds the name for the BODY only,
                 // and the golds nest one let per binding -- so binding i's
                 // value sees 0..i and not itself.
                 scope.bind(b.name);
                 heads.push((b.name, vty, vt));
             }
-            let (bt, bty) = expr(body, cx)?;
+            // `lower-let`: the bound values get no expectation and the
+            // body inherits the let's own -- a let evaluates to its body.
+            let (bt, bty) = expr(body, want, cx)?;
             let mut out = bt;
             for (n, ty, v) in heads.into_iter().rev() {
                 out = format!(
@@ -462,12 +488,12 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
             for st in stmts {
                 match st {
                     crate::ast::ActStmt::Exec(e, _) => {
-                        let (t, ty) = expr(e, cx)?;
+                        let (t, ty) = expr(e, &Ty::NoExpect, cx)?;
                         parts.push(format!("(do-exec {t})"));
                         last = ty;
                     }
                     crate::ast::ActStmt::Bind(n, e, _) => {
-                        let (t, ty) = expr(e, cx)?;
+                        let (t, ty) = expr(e, &Ty::NoExpect, cx)?;
                         // `lift-act-stmts` binds the name for the statements
                         // AFTER this one, not for its own value.
                         scope.bind(*n);
@@ -494,7 +520,7 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
                 .ok_or_else(|| format!("no recorded type for record `{}`", cx.syms.text(*n)))?;
             let mut parts = String::new();
             for f in fields {
-                let (v, _) = expr(&f.value, cx)?;
+                let (v, _) = expr(&f.value, &Ty::NoExpect, cx)?;
                 parts.push_str(&format!(" (field-val {:?} {v})", cx.syms.text(f.name)));
             }
             let rendered = render_ty(cx.syms, &ty);
@@ -507,7 +533,7 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
         // the declaration. The checker records no type here, so both the type
         // and the slot are read back out of the type declarations.
         Expr::FieldAccess(r, f, _) => {
-            let (rt, rty) = expr(r, cx)?;
+            let (rt, rty) = expr(r, &Ty::NoExpect, cx)?;
             let name = match &rty {
                 Ty::Record(n, _) | Ty::Constructed(n, _) => *n,
                 other => {
@@ -559,7 +585,13 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
             // is what `lower-lambda` falls back to when nothing above expects
             // a type. Where the two disagree this will show as a diff rather
             // than as a wrong answer that reads right.
-            let lam_ty = cx.at(*sp).ok_or("the checker recorded no type for this lambda")?;
+            // `expected-or-recorded-ty`: what the context wants, and only
+            // where it wants nothing does the recorded type answer.
+            let lam_ty = if lt::has_error(want) {
+                cx.at(*sp).ok_or("the checker recorded no type for this lambda")?
+            } else {
+                cx.st.deep_resolve(want)
+            };
             // `infer-lambda-return-ty` peels one arrow per parameter, and
             // `lower-lambda-params` reads the parameter types off the same
             // spine.
@@ -584,7 +616,7 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
             let body_text = {
                 let scope = Scope::open(cx);
                 params.iter().for_each(|p| scope.bind(*p));
-                expr(inner, cx)?.0
+                expr(inner, &ret, cx)?.0
             };
             // `collect-free-vars body-expr param-names enclosing []`: bound is
             // the lambda's OWN parameters, capturable is the scope outside it.
@@ -647,7 +679,7 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
         // read: the emitter calls `ir-resolve-field-index (ir-expr-type r) f`
         // on the OBJECT's type in both cases.
         Expr::FieldAssign(r, f, v, _) => {
-            let (rt, rty) = expr(r, cx)?;
+            let (rt, rty) = expr(r, &Ty::NoExpect, cx)?;
             let name = match &rty {
                 Ty::Record(n, _) | Ty::Constructed(n, _) => *n,
                 other => {
@@ -664,7 +696,7 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
                     cx.syms.text(*f)
                 ));
             };
-            let (vt, _) = expr(v, cx)?;
+            let (vt, _) = expr(v, &Ty::NoExpect, cx)?;
             let rendered = render_ty(cx.syms, &rty);
             Ok((
                 format!(
@@ -679,9 +711,9 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
         // the desugarer put there -- and the arms have already been unified
         // into one type, so the first body's is the match's.
         Expr::Match(scrut, arms, _) => {
-            let (st_, sty) = expr(scrut, cx)?;
+            let (st_, sty) = expr(scrut, &Ty::NoExpect, cx)?;
             let mut parts = String::new();
-            let mut ty: Option<Ty> = None;
+            let mut bodies: Vec<Ty> = Vec::new();
             for a in arms {
                 let pat = pattern(&a.pattern, &sty, cx)?;
                 // The names the pattern binds are in scope for the body AND
@@ -691,12 +723,28 @@ fn expr(e: &Expr, cx: &Lower) -> Result<(String, Ty), String> {
                 let mut names = Vec::new();
                 pat_names(&a.pattern, &mut names);
                 names.into_iter().for_each(|n| scope.bind(n));
-                let (body, bty) = expr(&a.body, cx)?;
-                let (guard, _) = expr(&a.guard, cx)?;
+                let (body, bty) = expr(&a.body, want, cx)?;
+                let (guard, _) = expr(&a.guard, &Ty::NoExpect, cx)?;
                 parts.push_str(&format!(" (branch {pat} {body} {guard})"));
-                ty.get_or_insert(bty);
+                bodies.push(bty);
             }
-            let ty = ty.ok_or("a match with no arms")?;
+            if bodies.is_empty() {
+                return Err("a match with no arms".into());
+            }
+            // `lower-match`: with an expectation, the match is that -- taught
+            // whatever its type variables by the first arm that can speak
+            // (`match-witness-ty`). Without one, `infer-match-type` takes the
+            // first arm body that has an answer at all, which is a WEAKER
+            // test: a bounded integer is no witness but it is an answer.
+            let ty = if lt::has_error(want) {
+                bodies
+                    .iter()
+                    .find(|b| !lt::has_error(b))
+                    .cloned()
+                    .unwrap_or(Ty::Error)
+            } else {
+                lt::branch_recorded(want, &lt::match_witness(bodies.iter()))
+            };
             let rendered = render_ty(cx.syms, &ty);
             Ok((format!("(match {st_} (branches{parts}) {rendered})"), ty))
         }
@@ -916,7 +964,7 @@ pub fn emit_defs_checked(
             rest = res;
         }
         let (body, _bty) =
-            expr(body_expr, &cx).map_err(|r| format!("{}: {r}", ch.syms.text(d.name)))?;
+            expr(body_expr, &rest, &cx).map_err(|r| format!("{}: {r}", ch.syms.text(d.name)))?;
         drop(scope);
         out.push_str(&format!(
             "\n  (def {:?} {:?} (params{}) {} {} 0 0)",

@@ -20,6 +20,7 @@ pub mod heapwatch;
 pub mod interp;
 pub mod ir;
 pub mod lexer;
+pub mod lowering_types;
 pub mod parser;
 pub mod preamble;
 pub mod scope;
