@@ -731,7 +731,12 @@ impl TypeDefs {
                     continue;
                 }
             };
-            let args: Vec<Ty> = params.iter().map(|p| Ty::TypeCon(*p)).collect();
+            // `build-type-def-map`'s `ty-args` are `ConstructedTy p []`, not
+            // `TypeCon`. The two are the same thing to `param_walk`, and only
+            // one of them is what the wire spells for an UNparameterised
+            // reference to a generic record: `qsort-by` said `(tycon "a")`
+            // where the oracle says the substituted variable.
+            let args: Vec<Ty> = params.iter().map(|p| Ty::Constructed(*p, Vec::new())).collect();
             td.by_name
                 .insert(*n, if is_record { Ty::Record(*n, args) } else { Ty::Sum(*n, args) });
         }
@@ -744,6 +749,12 @@ impl TypeDefs {
             td.fields.insert(*n, fields);
         }
         td
+    }
+
+    /// The chapter's type declarations by name -- `build-type-def-map`, which
+    /// the RESOLVE pass reads.
+    pub fn declared(&self) -> &std::collections::BTreeMap<Sym, Ty> {
+        &self.by_name
     }
 
     /// The type of one field of one record, or None where the name is not a

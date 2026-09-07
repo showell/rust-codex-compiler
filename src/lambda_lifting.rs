@@ -221,7 +221,7 @@ fn lift_one(
 
     // `collect-free-vars body-expr param-names enclosing []`: bound is the
     // lambda's OWN parameters, capturable is the scope outside it.
-    let mut caps: BTreeMap<String, (Sym, Ty)> = BTreeMap::new();
+    let mut caps: BTreeMap<Vec<u8>, (Sym, Ty)> = BTreeMap::new();
     let mut bound: Vec<Sym> = ps.iter().map(|p| p.name).collect();
     free_vars(&body, &mut bound, enclosing, syms, &mut caps);
 
@@ -292,13 +292,21 @@ fn free_vars(
     bound: &mut Vec<Sym>,
     capturable: &[Sym],
     syms: &SymTab,
-    out: &mut BTreeMap<String, (Sym, Ty)>,
+    out: &mut BTreeMap<Vec<u8>, (Sym, Ty)>,
 ) {
     use IrExpr as E;
     match e {
         E::Name(n, t, _) => {
             if capturable.contains(n) && !bound.contains(n) {
-                out.entry(syms.text(*n).to_string()).or_insert((*n, t.clone()));
+                // **THE ORDER IS `text-compare`'s, WHICH IS NOT ASCII.**
+                // `collect-free-vars` keeps its list sorted by
+                // `bsearch-freevar-pos`, and a Codex Text compares as CCE
+                // units on a frequency-ordered alphabet: `o` is 16 and `n` is
+                // 18, so `old-id` sorts BEFORE `new-id` and the lifted
+                // definition takes them in that order. Sorting the bytes put
+                // three of the compiler's lifted lambdas' parameters the
+                // other way round.
+                out.entry(crate::preamble::cce_key(syms.text(*n))).or_insert((*n, t.clone()));
             }
         }
         E::Lambda(ps, b, _, _) => {

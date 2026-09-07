@@ -134,6 +134,13 @@ pub fn emit_defs_checked(
     // disappears: that is where the `mcopy-*-node` family and
     // `copy-sx-ctordef` went, five definitions the oracle keeps.
     let defs = crate::ir_passes::pipeline(defs, &syms);
+    // RESOLVE, between the pipeline and the lift (subject 65624). The table is
+    // the chapter's type declarations OVER every name the checker typed, which
+    // is `sort-bindings (type-map & all-bindings)` -- the declaration wins.
+    let mut type_map: crate::resolve_types::TypeMap =
+        bindings.iter().map(|b| (b.name, b.ty.clone())).collect();
+    type_map.extend(tds.declared().iter().map(|(n, t)| (*n, t.clone())));
+    let defs = crate::resolve_types::resolve_defs(defs, &syms, &type_map);
     let defs = crate::lambda_lifting::lift_lambdas(defs, &mut syms);
     let defs = crate::ir_passes::prune_unreachable_roots(defs, roots, &syms);
     Ok(crate::ir_text::emit_defs(&syms, &defs))
@@ -628,6 +635,34 @@ mod tests {
         let all = ir(src);
         assert!(all.contains(r#"(def "node" "T""#), "node was inlined away:\n{all}");
         assert!(all.contains(r#"(name "node" ("#), "the call to node went too:\n{all}");
+    }
+
+    /// **A BARE CONSTRUCTED TYPE IS A NAME, NOT AN ANSWER**, and the RESOLVE
+    /// phase is what turns it into one. `__self-type-defs` is declared
+    /// `List TypeBinding` in the builtin table and reaches lowering as
+    /// `(list (ctd "TypeBinding" (args)))`; what it MEANS is whatever this
+    /// unit declares `TypeBinding` to be.
+    ///
+    /// The three answers were read off `codexir` with this program, a record
+    /// declaration, and a variant declaration. Only two are here: the
+    /// undeclared case needs `TypeBinding` interned to reach the builtin
+    /// table at all, so `resolve_types`' own tests carry that one.
+    #[test]
+    fn a_bare_constructed_type_resolves_to_what_the_unit_declares() {
+        let head = "Chapter: T\n\nSection: S\n";
+        let tail = "  count : Integer -> Integer\n  count (n) = let defs = __self-type-defs in list-length defs\n\nSection: E\n  opening : Integer\n  opening = count 1\n";
+        let record = format!("{head}  TypeBinding = record {{\n   tb-name : Text\n  }}\n\n{tail}");
+        let variant = format!("{head}  TypeBinding = | TbA | TbB\n\n{tail}");
+        assert!(
+            def_line(&record, "count").contains(r#"(list (record-ty "TypeBinding" (args)))"#),
+            "{}",
+            def_line(&record, "count")
+        );
+        assert!(
+            def_line(&variant, "count").contains(r#"(list (sum "TypeBinding" (args)))"#),
+            "{}",
+            def_line(&variant, "count")
+        );
     }
 
     /// A pure definition still renders exactly as it did, which is the thing

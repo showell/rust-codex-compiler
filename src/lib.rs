@@ -28,6 +28,7 @@ pub mod lowering;
 pub mod lowering_types;
 pub mod parser;
 pub mod preamble;
+pub mod resolve_types;
 pub mod scope;
 pub mod seams;
 pub mod symbol;
