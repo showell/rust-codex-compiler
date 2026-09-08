@@ -1118,6 +1118,19 @@ fn flatten_app(t: &crate::ast::TypeExpr) -> (&crate::ast::TypeExpr, Vec<&crate::
 /// from the LAST one backwards -- `build-fun-type-loop` wraps the spine
 /// outward with empty rows. The ids reach the wire as `(tvar N)`, so the order
 /// is as load-bearing as the count.
+/// `last-arrow-row`: the row on the arrow that RETURNS THE BODY, which for an
+/// undeclared definition is the only arrow carrying an open row -- the ones
+/// wrapped around it carry `empty-row`.
+fn last_arrow_row(t: &Ty) -> EffectRow {
+    match t {
+        Ty::Fun(_, row, r) => match r.as_ref() {
+            Ty::Fun(..) => last_arrow_row(r),
+            _ => row.clone(),
+        },
+        _ => EffectRow::default(),
+    }
+}
+
 fn build_undeclared_fun_type(st: &mut UnifyState, pcount: usize) -> Ty {
     let body = st.fresh();
     if pcount == 0 {
@@ -1574,7 +1587,7 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
             // is why stripping here costs that pass nothing.
             env.bind(p.name, strip_linear(arg));
         }
-        let body_ty = infer(&d.body, &mut env, &mut st);
+        let (body_ty, body_row) = infer_row(&d.body, &mut env, &mut st);
         // **THE BODY MEETS THE DECLARED RESULT.** Without this a definition's
         // own signature decides nothing about what it computes, and an
         // inferred variable never learns what it is: `f : Integer -> List
@@ -1602,11 +1615,29 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
         // row are two OPEN rows with different tails, and equating them is the
         // third row such a signature costs. Its position matters: it lands
         // after everything the body minted, not before.
-        if let (Some(Ty::ForAll(..) | Ty::ForAllEff(..)), Some(inst)) = (own.clone(), instantiated)
+        if let (Some(Ty::ForAll(..) | Ty::ForAllEff(..)), Some(inst)) =
+            (own.clone(), instantiated.clone())
         {
             let bare = strip_forall(&own.unwrap());
             if !st.unify(&inst, &bare) {
                 st.unify_gaps += 1;
+            }
+        }
+        // **`row-tied`: AN UNDECLARED DEFINITION LEARNS ITS EFFECT ROW FROM ITS
+        // BODY** (`check-def-normal`). The arrow `build_undeclared_fun_type`
+        // built carries an OPEN row variable and nothing had ever told it what
+        // the body performs, so it stayed unbound -- and `unify_row` mints
+        // when it has to give an open row a tail. One row short per undeclared
+        // definition whose body performs an application; `f (x) = show x` was
+        // 4 rows against the oracle's 5, and it needed BOTH a parameter (or
+        // there is no arrow to carry a row) and a call (or the body's row is
+        // empty and binding it costs nothing).
+        if d.declared_type.is_empty() {
+            if let Some(t) = &instantiated {
+                let lr = last_arrow_row(t);
+                if !st.unify_row(&lr, &body_row) {
+                    st.unify_gaps += 1;
+                }
             }
         }
         // `check-all-defs`'s `lin-st = check-linearity-def def fresh-env
@@ -3044,6 +3075,40 @@ mod a_let_does_not_outlive_its_definition {
             Some("(list text)".to_string())
         );
         let _ = bindings;
+    }
+}
+
+/// What an UNDECLARED definition's arrow learns from its body.
+#[cfg(test)]
+mod an_undeclared_definition_learns_its_row_from_its_body {
+    fn rows(src: &str) -> i32 {
+        let bytes = src.as_bytes();
+        let parsed = crate::parser::parse(bytes);
+        let mut dg = crate::desugar::Desugar::new(bytes);
+        let ch = dg.chapter(&parsed.tree);
+        super::check_chapter_full(&ch).1.next_row_id
+    }
+
+    /// **THE ARROW `build_undeclared_fun_type` BUILDS CARRIES AN OPEN ROW, AND
+    /// SOMETHING HAS TO TELL IT WHAT THE BODY PERFORMS.** `check-def-normal`'s
+    /// `row-tied` unifies that row with the body's; without it the row stayed
+    /// unbound and `unify_row` never had to mint it a tail.
+    ///
+    /// It takes BOTH a parameter -- or there is no arrow to carry a row -- and
+    /// a call, or the body's row is empty and binding it is free. Those are the
+    /// oracle's numbers, one probe each.
+    #[test]
+    fn it_takes_a_parameter_and_a_call_together() {
+        let chapter = |d: &str| {
+            format!("Chapter: R\n\nSection: S\n\n  {d}\n\n  opening : Text = \"z\"\n")
+        };
+        // Neither alone moves a row.
+        assert_eq!(rows(&chapter("f (x) = x")), 1);
+        assert_eq!(rows(&chapter("f = show 1")), 3);
+        // Together they do, and this is the one that was short.
+        assert_eq!(rows(&chapter("f (x) = show x")), 5);
+        // A DECLARED definition is unaffected: its row is its author's.
+        assert_eq!(rows(&chapter("g : Integer -> Text\n  g (x) = show x")), 3);
     }
 }
 
