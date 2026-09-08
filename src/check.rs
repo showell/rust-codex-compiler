@@ -1189,7 +1189,25 @@ fn register_ctors(ch: &crate::ast::Chapter, tds: &TypeDefs, st: &mut UnifyState)
                 out.push(Binding { name: *n, ty: parameterize(&ty, &ch.syms, st) });
                 continue;
             }
-            TypeDef::Unit(..) => continue,
+            // **A UNIT'S NAME IS ITS CONSTRUCTOR ARROW TOO**, and unlike a
+            // record's it is NOT parameterised: `register-one-type-def`'s
+            // `AUnitTypeDef` arm (subject 51788) is one `FunTy` and no
+            // `parameterize-type`, so it mints nothing. Skipping it left
+            // `Spot (Point { .. })` typing as a fresh variable, which is why
+            // no field access through a unit wrapper could be recognised.
+            TypeDef::Unit(n, base, _) => {
+                if let Some(inner) = resolve_declared(&ch.syms, tds, base) {
+                    out.push(Binding {
+                        name: *n,
+                        ty: Ty::Fun(
+                            Box::new(inner.clone()),
+                            EffectRow::default(),
+                            Box::new(Ty::Unit(*n, Box::new(inner))),
+                        ),
+                    });
+                }
+                continue;
+            }
         };
         // **A VARIANT WITH NO TYPE PARAMETERS ANSWERS THE SUM ITSELF.**
         // `register-one-type-def`: `result-ty = if list-length type-params == 0
@@ -2194,9 +2212,19 @@ pub fn infer_row(
         E::FieldAssign(r, f, v, _) => {
             let obj = infer(r, env, st);
             let vt = infer(v, env, st);
+            let name = env.syms.text(*f).to_string();
+            // The assign side asks the same question of the receiver as the
+            // access side (subject 53722): a UNIT wrapper is a distinct type
+            // with no fields, and the field cannot be reached through it.
             let field_ty = match st.deep_resolve(&obj) {
                 Ty::Record(n, _) => env.type_defs.field(n, *f).cloned(),
                 Ty::Constructed(n, cargs) => constructed_field(env, n, &cargs, *f),
+                Ty::Unit(n, _) => {
+                    st.error(Cdx::FIELD_ON_UNIT_TYPE, format!(
+                        "'{}' is a unit type, not a record: the wrapper is a distinct type of its own and has no field '{name}'. A unit over a record has no accessor and is not accepted where the record is expected, so the field cannot be reached through it -- use the record directly, or declare the unit over a primitive",
+                        env.syms.text(n)));
+                    None
+                }
                 _ => None,
             };
             if let Some(ft) = field_ty {
