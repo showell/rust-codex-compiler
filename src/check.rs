@@ -191,7 +191,12 @@ pub struct UnifyState {
     /// needs the field types of a destructure, and the checker already worked
     /// them out. See `bind_pattern`.
     pub pat_types: Vec<(u64, Ty)>,
-    pub errors: usize,
+    /// **A COUNT THAT CANNOT SAY WHAT IT COUNTED IS THE WEAKER THING.**
+    /// `check-errors` is graded as a number, but a number that matches with the
+    /// wrong diagnosis behind it is not agreement -- so the code travels with
+    /// it. Upstream carries a whole bag (`add-unify-error st cdx-... "msg"
+    /// span`); this is its two load-bearing fields.
+    pub diags: Vec<Diag>,
     /// Applications this unifier could not decide. **NOT `errors`:** a `false`
     /// out of a partial unifier is our ignorance and not the program's fault,
     /// and `check-errors` is graded against the oracle. Counted so the gap is
@@ -217,6 +222,29 @@ pub fn expr_type_key(sp: crate::ast::Span) -> u64 {
     (1u64 << 48) + (sp.offset as u64) * 65536 + (sp.len.min(65535) as u64)
 }
 
+/// One diagnostic: upstream's code, and what it says.
+#[derive(Clone, Debug)]
+pub struct Diag {
+    pub code: u16,
+    pub message: String,
+}
+
+/// The `CdxCodes.codex` numbers we raise. **These are upstream's, not ours** --
+/// a diagnostic is part of the wire a user reads, and inventing a number would
+/// make two compilers disagree about what a program's problem IS while
+/// agreeing that it has one.
+pub struct Cdx;
+
+impl Cdx {
+    pub const INFINITE_TYPE: u16 = 2010;
+    pub const USE_AFTER_CONSUME: u16 = 2061;
+    pub const MUTABLE_ALIAS: u16 = 2062;
+    pub const LINEAR_UNUSED: u16 = 2063;
+    pub const LINEAR_ESCAPE: u16 = 2065;
+    pub const LINEAR_RETURN: u16 = 2066;
+    pub const LINEAR_CAPTURE: u16 = 2067;
+}
+
 impl Default for UnifyState {
     /// `empty-unification-state` (Unifier.codex:41) is NOT empty. It starts
     /// with two substitution slots and `next-id = 2`, so every id we hand out
@@ -231,7 +259,7 @@ impl Default for UnifyState {
             row_subst: Vec::new(),
             expr_types: Vec::new(),
             pat_types: Vec::new(),
-            errors: 0,
+            diags: Vec::new(),
             unify_gaps: 0,
         }
     }
@@ -560,6 +588,16 @@ impl UnifyState {
         }
     }
 
+    /// `add-unify-error`. The code is `Cdx::*`, which is upstream's own number.
+    pub fn error(&mut self, code: u16, message: impl Into<String>) {
+        self.diags.push(Diag { code, message: message.into() });
+    }
+
+    /// What `check-errors` publishes.
+    pub fn errors(&self) -> usize {
+        self.diags.len()
+    }
+
     fn bind_var(&mut self, id: u32, t: Ty) {
         if let Some(slot) = self.substitutions.get_mut(id as usize) {
             *slot = t;
@@ -607,7 +645,7 @@ impl UnifyState {
             // -- an error the program earned, not a gap in this file.
             (Ty::Var(i), _) => {
                 if self.occurs_in(*i, &b, 0) {
-                    self.errors += 1;
+                    self.error(Cdx::INFINITE_TYPE, "Infinite type");
                     return false;
                 }
                 self.bind_var(*i, b.clone());
@@ -615,7 +653,7 @@ impl UnifyState {
             }
             (_, Ty::Var(j)) => {
                 if self.occurs_in(*j, &a, 0) {
-                    self.errors += 1;
+                    self.error(Cdx::INFINITE_TYPE, "Infinite type");
                     return false;
                 }
                 self.bind_var(*j, a.clone());
@@ -1527,7 +1565,12 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
 /// diffed against `$CODEX_GOLDS/rungs/check.truth` directly.
 pub fn section(syms: &SymTab, bindings: &[Binding], st: &UnifyState) -> String {
     let mut s = String::from("--- check ---\n");
-    s.push_str(&format!("check-errors {}\n", st.errors));
+    s.push_str(&format!("check-errors {}\n", st.errors()));
+    // The code travels with the count: a gate comparing only the number cannot
+    // tell a right answer from a right total with the wrong diagnosis in it.
+    for d in &st.diags {
+        s.push_str(&format!("CDX{} {}\n", d.code, d.message));
+    }
     s.push_str(&format!("type-bindings {}\n", bindings.len()));
     for b in bindings {
         // **RESOLVED, because the binding is not the answer.** A definition
@@ -2978,7 +3021,7 @@ mod unification_stays_acyclic {
             let wrapped = Ty::Linear(Box::new(v.clone()));
             let ok = if flip { st.unify(&wrapped, &v) } else { st.unify(&v, &wrapped) };
             assert!(ok, "linear should be transparent (flip={flip})");
-            assert_eq!(st.errors, 0, "and it is not an infinite type (flip={flip})");
+            assert_eq!(st.errors(), 0, "and it is not an infinite type (flip={flip})");
         }
     }
 
@@ -2994,7 +3037,8 @@ mod unification_stays_acyclic {
             let cyclic = Ty::List(Box::new(v.clone()));
             let ok = if flip { st.unify(&cyclic, &v) } else { st.unify(&v, &cyclic) };
             assert!(!ok, "an infinite type is refused (flip={flip})");
-            assert_eq!(st.errors, 1, "and it is reported (flip={flip})");
+            assert_eq!(st.errors(), 1, "and it is reported (flip={flip})");
+            assert_eq!(st.diags[0].code, super::Cdx::INFINITE_TYPE, "as CDX2010");
             // The substitution is still walkable, which is the point.
             assert_eq!(st.deep_resolve(&v), v);
         }
@@ -3008,6 +3052,6 @@ mod unification_stays_acyclic {
         let v = st.fresh();
         let n = crate::symbol::SymTab::default().intern("");
         assert!(st.unify(&v, &Ty::Constructed(n, vec![v.clone()])));
-        assert_eq!(st.errors, 0);
+        assert_eq!(st.errors(), 0);
     }
 }
