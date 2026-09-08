@@ -413,6 +413,11 @@ mod tests {
         let line = def_line(src, "run");
         assert!(line.contains(r#"(handle-clause "apply-op" (params "x") "resume""#), "{line}");
         assert!(line.contains("__lam_0"), "the wrapping lambda was not lifted: {line}");
+        // **AND `x` LEARNED IT WAS AN INTEGER FROM `x * n`.** Arithmetic
+        // unifies its operands before it answers; without that the clause
+        // parameter stayed a fresh variable and `resume` reached the wire as
+        // `(fn (tvar N) ..)` where the oracle says `(fn int-default ..)`.
+        assert!(!line.contains("(fn (tvar"), "an operand never resolved: {line}");
     }
 
     /// **A NESTED RECORD LITERAL'S FIELDS ARE NOT THE RECEIVER'S.** `revised`

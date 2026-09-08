@@ -1859,7 +1859,20 @@ pub fn infer_row(
                 OpEq | OpNotEq | OpLt | OpGt | OpLtEq | OpGtEq | OpBoolAnd | OpOr => Ty::Boolean,
                 // **ARITHMETIC ANSWERS THE TIGHTER OF THE TWO**, which is not
                 // the same as answering the left. `arith-result-ty`.
+                // **AND THE TWO OPERANDS MEET FIRST.** `infer-arithmetic`
+                // unifies before it answers, and we answered without
+                // unifying -- so `x * 7` with `x` a fresh variable stayed a
+                // variable instead of learning it was an Integer. That
+                // reached the wire: a handler clause's `resume` spelled
+                // `(fn (tvar 271) (tvar 273))` where the oracle says
+                // `(fn int-default (tvar 273))`.
+                //
+                // The `UnitTy` arms of `infer-arithmetic`, which unify
+                // through the wrapper, are not modelled here yet.
                 OpAdd | OpSub | OpMul | OpDiv | OpPow => {
+                    if !st.unify(&lt, &_rt) {
+                        st.unify_gaps += 1;
+                    }
                     arith_result_ty(&st.resolve(&lt), &st.resolve(&_rt))
                 }
                 _ => lt,
