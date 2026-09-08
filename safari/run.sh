@@ -52,15 +52,27 @@ declare -A MUST_DIFFER=(
 # defects we expect to be fixed, so agreement here is the good news and the
 # right response is to delete the line.
 #
-# Both are finding 74 / issue 125, which is finding 1B's routine seen at
-# ordinary precision: Cobblestone builds a Real literal's significand as an
-# integer and scales it, rounding twice, so about 8% of ordinary doubles land an
-# ULP out. These two specs grade computed Reals against written-down ones at
-# tolerance 0.0, which is the shape that sees it.
-declare -A KNOWN_DIFFER=(
-  [bikespec]="issue 125: a Real literal is one ULP out in Cobblestone's front end"
-  [viewyawspec]="issue 125: as above, on 0.012500000000000011"
-)
+# **THE LIST IS SAFARI'S AND IS NOT COPIED HERE.** `spec/arm-gaps.tsv` over
+# there is where a divergence is filed, with the issue number and what differs;
+# this reads it. A second copy is a list that drifts, and it did: TreesSpec was
+# filed there on 2026-09-05 as a third instance of issue 125 and the array that
+# used to sit here still named two, so this gate called it "wrong" for three
+# days while the answer was already written down one repo over.
+#
+# All three are finding 74 / issue 125 -- Cobblestone builds a Real literal's
+# significand as an integer and scales it, rounding twice, so about 8% of
+# ordinary doubles land an ULP out. These specs grade computed Reals against
+# written-down ones at tolerance 0.0, which is the shape that sees it.
+GAPS="$SAFARI/spec/arm-gaps.tsv"
+[ -r "$GAPS" ] || { echo "no $GAPS; that file is the list of filed divergences and this gate cannot grade without it"; exit 2; }
+declare -A KNOWN_DIFFER=()
+while IFS=$'\t' read -r spec issue what; do
+    case "$spec" in ''|'#'*) continue;; esac
+    # The file names a spec (`TreesSpec`); the units are named for the module
+    # (`treesspec`).
+    KNOWN_DIFFER["$(printf '%s' "$spec" | tr '[:upper:]' '[:lower:]')"]="issue $issue: $what"
+done < "$GAPS"
+[ ${#KNOWN_DIFFER[@]} -gt 0 ] || { echo "$GAPS parsed to nothing; it is TAB-separated and this gate read no rows"; exit 2; }
 
 # HELD BACK BY DEFAULT, and each one has to earn that too.
 #

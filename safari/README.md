@@ -20,6 +20,22 @@ makes a disagreement attributable -- and it is the only oracle in this repo
 that sees MEANING rather than shape. Five byte-comparison oracles are one
 oracle, and `and` failed to short-circuit under all of them.
 
+## The filed divergences are safari's list, not a copy
+
+Three specs disagree for a reason that is filed and is not ours, all of them
+issue 125. **`spec/arm-gaps.tsv` over there is the list** -- spec name, issue
+number, what differs -- and `run.sh` reads it rather than keeping its own.
+
+That is not tidiness. The array that used to sit in `run.sh` named two while
+safari's file named three, so this gate reported `treesspec` as WRONG for three
+days after the answer had been written down one repo over. A gate that carries
+its own copy of somebody else's list is a gate that will eventually be wrong
+about it.
+
+`run.sh` REFUSES if the file is missing or parses to no rows, because a
+divergence list that silently reads as empty turns every filed defect back into
+a failure.
+
 ## `literal_main` MUST differ
 
 `run.sh` **fails if the two arms ever agree** on it. It is FINDINGS 1B's repro:
