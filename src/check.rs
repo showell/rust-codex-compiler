@@ -237,6 +237,8 @@ pub struct Cdx;
 
 impl Cdx {
     pub const INFINITE_TYPE: u16 = 2010;
+    pub const UNKNOWN_RECORD_FIELD: u16 = 2005;
+    pub const FIELD_ON_UNIT_TYPE: u16 = 2095;
     pub const USE_AFTER_CONSUME: u16 = 2061;
     pub const MUTABLE_ALIAS: u16 = 2062;
     pub const LINEAR_UNUSED: u16 = 2063;
@@ -834,8 +836,16 @@ impl TypeDefs {
             let (n, params, is_record) = match d {
                 TypeDef::Record(n, ps, ..) => (n, ps, true),
                 TypeDef::Variant(n, ps, ..) => (n, ps, false),
-                TypeDef::Unit(n, _, _) => {
-                    td.by_name.insert(*n, Ty::TypeCon(*n));
+                // `build-type-def-map`'s `AUnitTypeDef` arm (subject 51723)
+                // binds `UnitTy name <resolved base>`. **A UNIT IS NOT ITS
+                // BASE AND IT IS NOT A BARE NAME**: binding `TypeCon` lost the
+                // base entirely, so a field access through a unit wrapper
+                // could not be told from one through a record, and CDX2095 had
+                // nothing to fire on. Resolved against the map SO FAR, which
+                // is upstream's partial accumulator.
+                TypeDef::Unit(n, base, _) => {
+                    let inner = resolve_declared(&ch.syms, &td, base).unwrap_or(Ty::Error);
+                    td.by_name.insert(*n, Ty::Unit(*n, Box::new(inner)));
                     continue;
                 }
             };
@@ -2135,15 +2145,44 @@ pub fn infer_row(
             // A `RecordTy` receiver already carries its own arguments and
             // upstream reads the field straight out of it, with no
             // substitution -- the two arms are not the same rule.
+            //
+            // **A FIELD THE RECORD DOES NOT HAVE IS AN ERROR, NOT A FRESH
+            // VARIABLE.** Upstream answers `ErrorTy` and raises CDX2005; we
+            // minted, which both hid the defect and moved `next-id` by one per
+            // occurrence. Same for a UNIT receiver, which has no fields at all
+            // -- the wrapper is a distinct type -- and answers CDX2095.
+            // Everything else, a bare type variable and a variant included,
+            // still falls to `fresh-and-advance`.
+            let name = env.syms.text(*f).to_string();
             match st.deep_resolve(&obj) {
                 Ty::Record(n, _) => match env.type_defs.field(n, *f).cloned() {
                     Some(t) => t,
-                    None => st.fresh(),
+                    None => {
+                        st.error(Cdx::UNKNOWN_RECORD_FIELD, format!(
+                            "Record type has no field '{name}'"));
+                        Ty::Error
+                    }
                 },
-                Ty::Constructed(n, cargs) => match constructed_field(env, n, &cargs, *f) {
-                    Some(t) => t,
-                    None => st.fresh(),
+                // A CONSTRUCTED RECEIVER THAT IS NOT A RECORD IS NOT AN ERROR:
+                // the two failures look alike from `constructed_field` and are
+                // not the same, so the record has to be resolved first.
+                Ty::Constructed(n, cargs) => match env.type_defs.declared().get(&n) {
+                    Some(Ty::Record(..)) => match constructed_field(env, n, &cargs, *f) {
+                        Some(t) => t,
+                        None => {
+                            st.error(Cdx::UNKNOWN_RECORD_FIELD, format!(
+                                "Record type '{}' has no field '{name}'", env.syms.text(n)));
+                            Ty::Error
+                        }
+                    },
+                    _ => st.fresh(),
                 },
+                Ty::Unit(n, _) => {
+                    st.error(Cdx::FIELD_ON_UNIT_TYPE, format!(
+                        "'{}' is a unit type, not a record: the wrapper is a distinct type of its own and has no field '{name}'. A unit over a record has no accessor and is not accepted where the record is expected, so the field cannot be reached through it -- use the record directly, or declare the unit over a primitive",
+                        env.syms.text(n)));
+                    Ty::Error
+                }
                 _ => st.fresh(),
             }
         }
@@ -2977,6 +3016,35 @@ mod a_let_does_not_outlive_its_definition {
             Some("(list text)".to_string())
         );
         let _ = bindings;
+    }
+}
+
+/// A field the record does not have.
+#[cfg(test)]
+mod a_missing_field_is_diagnosed_not_minted {
+    fn diags(src: &str) -> (Vec<u16>, u32) {
+        let bytes = src.as_bytes();
+        let parsed = crate::parser::parse(bytes);
+        let mut dg = crate::desugar::Desugar::new(bytes);
+        let ch = dg.chapter(&parsed.tree);
+        let (_, st, _) = super::check_chapter_full(&ch);
+        (st.diags.iter().map(|d| d.code).collect(), st.next_id)
+    }
+
+    /// **A MISSING FIELD IS AN ERROR, AND ERRORS DO NOT MINT.** We answered
+    /// `fresh-and-advance` and said nothing, which both hid the defect and
+    /// moved `next-id` by one per occurrence; upstream answers `ErrorTy` and
+    /// raises CDX2005 (subject 53637). The `next_id` half is the half a
+    /// diagnostics-only test would miss.
+    #[test]
+    fn a_missing_field_raises_cdx2005_and_mints_nothing() {
+        let good = "Chapter: T\n\nSection: S\n  Pt = record {\n    x : Integer\n  }\n\n  f : Pt -> Integer\n  f (p) = p.x\n";
+        let bad = "Chapter: T\n\nSection: S\n  Pt = record {\n    x : Integer\n  }\n\n  f : Pt -> Integer\n  f (p) = p.z\n";
+        let (gc, gid) = diags(good);
+        let (bc, bid) = diags(bad);
+        assert_eq!(gc, Vec::<u16>::new());
+        assert_eq!(bc, vec![super::Cdx::UNKNOWN_RECORD_FIELD]);
+        assert_eq!(gid, bid, "the error path minted a variable the good path did not");
     }
 }
 

@@ -513,14 +513,34 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
         // and the slot are read back out of the type declarations.
         Expr::FieldAccess(r, f, s) => {
             let r = expr(r, &Ty::NoExpect, cx)?;
-            let rty = r.ty();
-            let name = record_name(&rty, cx, "field access on")?;
+            // `deep-resolve` then strip the wrappers that are not part of the
+            // shape (subject 54312-54317): an effect row, a `forall`, and the
+            // linear marker all sit OVER a record without changing whether it
+            // is one.
+            let rty = strip_receiver(&cx.st.deep_resolve(&r.ty()), cx);
+            // **LOWERING NEVER REFUSES A FIELD ACCESS.** Upstream answers the
+            // EXPECTATION twice over -- `is otherwise -> ty` at 54334 and
+            // again at 54339 -- and spells the field bare, because
+            // `ir-resolve-field-index` answers -1 for a non-record receiver
+            // and `ir-field-with-index` then omits the `/N`. A receiver whose
+            // type did not resolve is the checker's diagnostic to raise
+            // (CDX2005, CDX2095); refusing here loses the whole chapter and
+            // says nothing the checker did not already know.
+            let Some(name) = record_sym(&rty) else {
+                return Ok(IrExpr::FieldAccess(
+                    Box::new(r),
+                    cx.text(*f),
+                    want.clone(),
+                    *s,
+                ));
+            };
             let (Some(fty), Some(slot)) = (cx.tds.field(name, *f), cx.tds.field_index(name, *f))
             else {
-                return Err(format!(
-                    "`{}` has no field `{}` here",
-                    cx.text(name),
-                    cx.text(*f)
+                return Ok(IrExpr::FieldAccess(
+                    Box::new(r),
+                    cx.text(*f),
+                    want.clone(),
+                    *s,
                 ));
             };
             // **A CONSTRUCTED RECEIVER INSTANTIATES THE FIELD HERE TOO.** The
@@ -856,6 +876,25 @@ fn empty_list(want: &Ty, cx: &Lower, s: crate::ast::Span) -> IrExpr {
         }
         Ty::List(e) => IrExpr::List(Vec::new(), *e, s),
         _ => IrExpr::List(Vec::new(), Ty::Error, s),
+    }
+}
+
+/// `stripped-rec-ty` (subject 54313): the wrappers a receiver may wear that do
+/// not change whether it is a record.
+fn strip_receiver(t: &Ty, cx: &Lower) -> Ty {
+    match t {
+        Ty::Effectful(_, _, ret) => cx.st.deep_resolve(ret),
+        Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => cx.st.deep_resolve(b),
+        Ty::Linear(inner) => cx.st.deep_resolve(inner),
+        other => other.clone(),
+    }
+}
+
+/// The record or constructed type's name, if it is one.
+fn record_sym(t: &Ty) -> Option<Sym> {
+    match t {
+        Ty::Record(n, _) | Ty::Constructed(n, _) => Some(*n),
+        _ => None,
     }
 }
 
