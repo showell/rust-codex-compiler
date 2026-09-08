@@ -1098,6 +1098,43 @@ struct ParamEntry {
     is_row: bool,
 }
 
+/// `lint-record-set` / `bind-record-set-value` (subject 52828), value side.
+///
+/// `f` is the applied function -- for the value argument that is
+/// `__record-set obj "field"` -- and `ret` is the whole application's type,
+/// which is the record's.
+fn bind_record_set_value(
+    f: &crate::ast::Expr,
+    value_ty: &Ty,
+    ret: &Ty,
+    env: &TyEnv<'_>,
+    st: &mut UnifyState,
+) {
+    use crate::ast::Expr as E;
+    let E::Apply(inner, field_arg, _) = f else { return };
+    let E::Apply(head, _, _) = &**inner else { return };
+    let E::NameRef(n, _) = &**head else { return };
+    if env.syms.text(*n) != "__record-set" {
+        return;
+    }
+    let E::Lit(field, crate::ast::LiteralKind::TextLit, _) = &**field_arg else { return };
+    let Some(fname) = env.syms.find(field) else { return };
+    // `lookup-field-ty-for-lint`, over the RETURN type: the record being
+    // written into.
+    let field_ty = match st.deep_resolve(ret) {
+        Ty::Record(rn, _) => env.type_defs.field(rn, fname).cloned(),
+        Ty::Constructed(cn, cargs) => constructed_field(env, cn, &cargs, fname),
+        _ => None,
+    };
+    let Some(ft) = field_ty else { return };
+    if !crate::lowering_types::has_typevars(&st.deep_resolve(value_ty)) {
+        return;
+    }
+    if !st.unify(&ft, value_ty) {
+        st.unify_gaps += 1;
+    }
+}
+
 /// `resolve-constructed-to-record` + `lookup-record-field` +
 /// `apply-type-args-subst` (subject 53644), as one lookup.
 ///
@@ -1575,7 +1612,7 @@ pub fn infer_row(
             // -- and THIS is what decides an inferred type. `show`'s
             // instantiated variable meets the argument here and nowhere else.
             let want = Ty::Fun(
-                Box::new(at),
+                Box::new(at.clone()),
                 EffectRow { id: call_row, ..Default::default() },
                 Box::new(ret.clone()),
             );
@@ -1590,6 +1627,15 @@ pub fn infer_row(
             // **AN APPLICATION'S ROW IS OPEN, AND THAT IS WHY A LAMBDA OVER ONE
             // MINTS NOTHING.** The call row goes into the union last, exactly
             // as `infer-application` (line 644) does it.
+            // **`__record-set obj "field" value` NAMES ITS FIELD WITH A TEXT
+            // LITERAL**, so ordinary application inference has nothing to
+            // unify an undetermined value against -- the builtin's own type is
+            // `R -> Text -> a -> R` and `a` meets only the value itself.
+            // `bind-record-set-value` (subject 52869) ties them, and ONLY
+            // while the value still carries variables: a bounded-integer field
+            // handed a wider integer is the narrowing lint's business and
+            // unification would refuse it.
+            bind_record_set_value(f, &at, &ret, env, st);
             let halves = st.row_union(&frow, &arow);
             row = st.row_union(&halves, &EffectRow { id: call_row, ..Default::default() });
             ret
