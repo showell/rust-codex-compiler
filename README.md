@@ -19,9 +19,24 @@ that sees MEANING rather than shape: see "Running a program" below, and
    walk -- and would foreclose ever improving on it. Compare with ids renumbered in first-appearance order; count
    byte-identical programs separately and ratchet that up, never down.
 2. **Lossless CST from day one.** Trivia -- spaces, skipped prose, exact spans
-   -- is kept and the AST is lowered from it. The one place we deliberately do not copy Cobblestone, which throws
-   trivia away: retrofitting a CST later is a rewrite, and the linting goal
-   wants one.
+   -- is kept and the AST is lowered from it. The one place we deliberately do
+   not copy Cobblestone, which throws trivia away: retrofitting a CST later is
+   a rewrite, and the linting goal wants one.
+
+   **This is CARRYING EARNED KNOWLEDGE FORWARD, and it is the rule the others
+   serve.** The lexer earned the exact bytes; the parser earned the structure.
+   A layer that discards either forces a later one to re-derive it from less,
+   and re-derivation from less is where the defects live. Every layering bug
+   found in this repo so far has that shape -- a fact known upstream, dropped,
+   and then reconstructed badly downstream: the `punctual` flag read three
+   times and used none, `unit family` members parsed and thrown away, an
+   `InstanceDef` whose methods the parser read and the desugarer discarded, a
+   `for` comprehension recovering its loop variable by comparing a token's TEXT
+   to `"for"` when the lexer had already declared a keyword for it.
+
+   The asset is still underused. We can answer any question of the form "where
+   in the source did this come from" and Cobblestone structurally cannot.
+   Nothing in the release protocol exploits that yet, and something should.
 3. **Golds come from `master-plus-outbound`**, not plain master -- two of our
    PRs move front-end output, and golds cut against unpatched master would
    encode bugs we reported. Reach them through `$CODEX_GOLDS`.
@@ -32,6 +47,23 @@ that sees MEANING rather than shape: see "Running a program" below, and
    the work is done; a cargo cache spans commits by design, which is the whole
    point of it. Putting one in `~/runs` makes a directory that looks like a
    measurement, is not, and survives every cleanup.
+
+## Using this compiler to verify an Update
+
+**[Verifying an Update with a second front
+end](http://143.244.172.148:9100/notes/verifying-an-update-with-a-second-front-end.md)**,
+drafted **2026-09-08**, before this repo had met its first Update.
+
+Why a second implementation is a release instrument at all (a regression suite
+cannot tell you whether a change was *intended*; we can, because we were never
+told what the Update was trying to do), the protocol -- bank a baseline, repin
+and change nothing else, attribute every delta before closing any of it -- and
+the four instruments with what each is blind to.
+
+**Read the date.** The general argument is meant to last. The second half is a
+watch-list for Update 56 specifically, and it is expected to go stale the day
+that Update lands; the enduring principles will be lifted into their own
+document then.
 
 ## Building
 
