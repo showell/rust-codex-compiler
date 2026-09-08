@@ -1098,6 +1098,35 @@ struct ParamEntry {
     is_row: bool,
 }
 
+/// `arith-result-ty` (subject 52402). **THE RIGHT TYPE WINS WHEN IT IS
+/// CONTAINED IN THE LEFT**, and otherwise the left does.
+///
+/// Upstream's own reason, and it is a good one: an arithmetic result used to
+/// be the left operand's type verbatim, which made the judgement depend on the
+/// order the author wrote the operands in. `b.val + 1` over a 0..255 byte kept
+/// 0..255 and compiled; `1 + b.val` -- the same sum -- took the literal's type,
+/// which is the full i64 range, and was rejected. Reporting that a byte plus
+/// one might be nine quintillion is not a judgement anyone can act on.
+///
+/// **THIS IS THE CHECKER'S ANSWER, NOT THE IR NODE'S.** `binary-result-ty` in
+/// lowering still answers the LEFT operand's type, and the two disagreeing is
+/// deliberate: `let slot = spill-base + st.spill-count` emits `(let "slot"
+/// int-default ...)` and every reference to `slot` inside it carries
+/// `(int 0 65535 ov-error)`. Read off `codexir` over a six-case matrix.
+fn arith_result_ty(lt: &Ty, rt: &Ty) -> Ty {
+    let (Ty::Integer(l_lo, l_hi, _), Ty::Integer(r_lo, r_hi, _)) = (lt, rt) else {
+        return lt.clone();
+    };
+    if r_lo == l_lo && r_hi == l_hi {
+        return lt.clone();
+    }
+    if r_lo >= l_lo && r_hi <= l_hi {
+        rt.clone()
+    } else {
+        lt.clone()
+    }
+}
+
 /// `lint-record-set` / `bind-record-set-value` (subject 52828), value side.
 ///
 /// `f` is the applied function -- for the value argument that is
@@ -1582,6 +1611,11 @@ pub fn infer_row(
                 // `and` the KEYWORD is only ever logical, and so is `or`.
                 OpAnd => st.resolve(&lt),
                 OpEq | OpNotEq | OpLt | OpGt | OpLtEq | OpGtEq | OpBoolAnd | OpOr => Ty::Boolean,
+                // **ARITHMETIC ANSWERS THE TIGHTER OF THE TWO**, which is not
+                // the same as answering the left. `arith-result-ty`.
+                OpAdd | OpSub | OpMul | OpDiv | OpPow => {
+                    arith_result_ty(&st.resolve(&lt), &st.resolve(&_rt))
+                }
                 _ => lt,
             }
         }
@@ -2784,5 +2818,46 @@ mod a_let_does_not_outlive_its_definition {
             Some("(list text)".to_string())
         );
         let _ = bindings;
+    }
+}
+
+/// The tighter of the two operand types, and the order-independence it buys.
+///
+/// The six cases are `codexir`'s answers, not ours: a record with two bounded
+/// fields, `let slot = <a op b> in ...`, read off the emitted IR.
+#[cfg(test)]
+mod arithmetic_answers_the_tighter_type {
+    use super::{arith_result_ty, Overflow, Ty};
+
+    fn int(lo: i64, hi: i64) -> Ty {
+        Ty::Integer(lo, hi, Overflow::Error)
+    }
+    const FULL: fn() -> Ty = || Ty::Integer(i64::MIN, i64::MAX, Overflow::Error);
+
+    #[test]
+    fn the_right_wins_only_when_it_is_contained_in_the_left() {
+        // Nested either way round: the tighter one, whichever side it is on.
+        assert_eq!(arith_result_ty(&int(0, 65535), &int(10, 20)), int(10, 20));
+        assert_eq!(arith_result_ty(&int(10, 20), &int(0, 65535)), int(10, 20));
+        assert_eq!(arith_result_ty(&int(0, 100), &int(0, 50)), int(0, 50));
+        assert_eq!(arith_result_ty(&int(0, 50), &int(0, 100)), int(0, 50));
+        // OVERLAPPING BUT NOT NESTED: the left, both ways. This is the case
+        // that says the rule is containment and not width.
+        assert_eq!(arith_result_ty(&int(0, 100), &int(50, 200)), int(0, 100));
+        assert_eq!(arith_result_ty(&int(50, 200), &int(0, 100)), int(50, 200));
+    }
+
+    #[test]
+    fn a_literal_does_not_widen_the_byte_it_is_added_to() {
+        // Upstream's own example: `b.val + 1` and `1 + b.val` must agree, and
+        // an integer literal carries the FULL i64 range.
+        assert_eq!(arith_result_ty(&int(0, 255), &FULL()), int(0, 255));
+        assert_eq!(arith_result_ty(&FULL(), &int(0, 255)), int(0, 255));
+    }
+
+    #[test]
+    fn anything_that_is_not_two_integers_is_the_left() {
+        assert_eq!(arith_result_ty(&Ty::Text, &int(0, 5)), Ty::Text);
+        assert_eq!(arith_result_ty(&int(0, 5), &Ty::Text), int(0, 5));
     }
 }
