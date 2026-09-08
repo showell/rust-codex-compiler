@@ -1098,6 +1098,42 @@ struct ParamEntry {
     is_row: bool,
 }
 
+/// `resolve-constructed-to-record` + `lookup-record-field` +
+/// `apply-type-args-subst` (subject 53644), as one lookup.
+///
+/// The record's own type arguments and its field types have to be the SAME
+/// variables for the substitution to mean anything, and the only place they
+/// are is the record CONSTRUCTOR the environment holds: `parameterize-type`
+/// walked the whole arrow at registration, so its i-th argument is the i-th
+/// field's type and its result carries the matching arguments.
+pub fn instantiate_field(ctor: &Ty, idx: usize, cargs: &[Ty]) -> Option<Ty> {
+    let mut spine = strip_forall(ctor);
+    let mut field = None;
+    let mut i = 0;
+    while let Ty::Fun(a, _, r) = spine {
+        if i == idx {
+            field = Some(*a);
+        }
+        spine = *r;
+        i += 1;
+    }
+    let Ty::Record(_, rargs) = spine else { return None };
+    let mut out = field?;
+    // `apply-type-args-subst`: only where the declaration's argument is a
+    // variable is there anything to substitute.
+    for (g, c) in rargs.iter().zip(cargs) {
+        if let Ty::Var(id) = g {
+            out = subst_type_var(&out, *id, c);
+        }
+    }
+    Some(out)
+}
+
+fn constructed_field(env: &TyEnv<'_>, n: Name, cargs: &[Ty], f: Name) -> Option<Ty> {
+    let idx = env.type_defs.field_index(n, f)?;
+    instantiate_field(env.get(n)?, idx, cargs)
+}
+
 /// `parameterize-type` (TypeChecker.codex:569): a signature's free names become
 /// bound variables, and the type is wrapped in one quantifier per DISTINCT one.
 ///
@@ -1836,13 +1872,27 @@ pub fn infer_row(
             // `fresh-and-advance` in every other case; minting either way put
             // 88 extra variables on `encode-qoi`'s unit, one per field access
             // in the two chapters that declare records.
-            let name = match st.deep_resolve(&obj) {
-                Ty::Record(n, _) | Ty::Constructed(n, _) => Some(n),
-                _ => None,
-            };
-            match name.and_then(|n| env.type_defs.field(n, *f)).cloned() {
-                Some(t) => t,
-                None => st.fresh(),
+            // **A CONSTRUCTED RECEIVER INSTANTIATES THE FIELD.**
+            // `SortPartition a` reached here as a `ConstructedTy` carrying the
+            // caller's own argument, and reading the DECLARED field type past
+            // it answered `List a` with `a` still the declaration's name --
+            // which then unified with the enclosing definition's type variable
+            // and pinned it. `qsort-by`'s four parameters spelled
+            // `(tycon "a")` where the oracle spells `(tvar 28)`.
+            //
+            // A `RecordTy` receiver already carries its own arguments and
+            // upstream reads the field straight out of it, with no
+            // substitution -- the two arms are not the same rule.
+            match st.deep_resolve(&obj) {
+                Ty::Record(n, _) => match env.type_defs.field(n, *f).cloned() {
+                    Some(t) => t,
+                    None => st.fresh(),
+                },
+                Ty::Constructed(n, cargs) => match constructed_field(env, n, &cargs, *f) {
+                    Some(t) => t,
+                    None => st.fresh(),
+                },
+                _ => st.fresh(),
             }
         }
         E::FieldAssign(r, _, v, _) => {

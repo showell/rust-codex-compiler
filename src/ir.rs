@@ -665,6 +665,24 @@ mod tests {
         );
     }
 
+    /// **A CONSTRUCTED RECEIVER INSTANTIATES THE FIELD**, and the node under
+    /// the access is retyped to the record.
+    ///
+    /// `SortPartition a` arrives as a `ConstructedTy` carrying the caller's
+    /// own argument. Reading the DECLARED field type past it answers `List a`
+    /// with `a` still the declaration's own name, which then unifies with the
+    /// enclosing definition's variable and pins it -- `qsort-by`'s four
+    /// parameters spelled `(tycon "a")` where the oracle spells `(tvar 28)`.
+    #[test]
+    fn a_field_read_off_a_generic_record_is_instantiated() {
+        let src = "Chapter: T\n\nSection: S\n  Box (a) = record {{ bx : List a, n : Integer }}\n\n  wrap : List a, Integer -> Box a\n  wrap (xs) (i) = Box {{ bx = xs, n = i }}\n\n  pick : List a, Integer -> List a\n  pick (xs) (n) = (wrap xs n).bx\n\nSection: E\n  opening : Integer\n  opening = list-length (pick [\"x\"] 1)\n".replace("{{", "{").replace("}}", "}");
+        let line = def_line(&src, "pick");
+        assert!(!line.contains("tycon"), "{line}");
+        // The receiver is retyped to the record, carrying the caller's own
+        // argument -- `(ctd "Box" ...)` is what it says without that step.
+        assert!(line.contains(r#"(record-ty "Box" (args (tvar"#), "{line}");
+    }
+
     /// A pure definition still renders exactly as it did, which is the thing
     /// these changes must not disturb: it is already byte-identical to the
     /// oracle and that is the only verified ground the native road stands on.

@@ -142,6 +142,26 @@ pub enum IrActStmt {
     Exec(IrExpr, Span),
 }
 
+impl IrExpr {
+    /// `set-ir-expr-type` (subject 36797). **AN ALLOW-LIST, NOT A WALK.**
+    /// Half the IR cannot hold a type -- a literal has no field for one -- so
+    /// the arms that can are named and everything else is returned unchanged.
+    pub fn with_ty(self, new: Ty) -> IrExpr {
+        use IrExpr as E;
+        match self {
+            E::Name(n, _, s) => E::Name(n, new, s),
+            E::Apply(f, a, _, s) => E::Apply(f, a, new, s),
+            E::Let(n, _, v, b, s) => E::Let(n, new, v, b, s),
+            E::If(c, t, e, _, s) => E::If(c, t, e, new, s),
+            E::Match(sc, bs, _, s) => E::Match(sc, bs, new, s),
+            E::Act(ss, _, s) => E::Act(ss, new, s),
+            E::Record(n, fs, _, s) => E::Record(n, fs, new, s),
+            E::FieldAccess(r, f, _, s) => E::FieldAccess(r, f, new, s),
+            other => other,
+        }
+    }
+}
+
 impl IrActStmt {
     pub fn expr(&self) -> &IrExpr {
         match self {

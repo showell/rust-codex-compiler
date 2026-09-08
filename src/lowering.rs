@@ -482,32 +482,11 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
         // a let evaluates to its body. Upstream's row arithmetic decides what
         // the EFFECT of the block is; this is the value side.
         Expr::Act(stmts, s) => {
-            // **EVERY STATEMENT IS HANDED THE BLOCK'S OWN EXPECTATION.**
-            // `lower-act-stmts-loop body ty ctx` passes `ty` down to each one,
-            // which reads oddly and is what upstream does.
             let mark = cx.mark();
-            let mut parts = Vec::new();
-            let mut last = Ty::Nothing;
-            for st in stmts {
-                match st {
-                    crate::ast::ActStmt::Exec(e, sp2) => {
-                        let x = expr(e, want, cx)?;
-                        last = x.ty();
-                        parts.push(IrActStmt::Exec(x, *sp2));
-                    }
-                    // A `<-` binds for the rest of the block, and the type it
-                    // binds is what is INSIDE the effect.
-                    crate::ast::ActStmt::Bind(n, e, sp2) => {
-                        let x = expr(e, want, cx)?;
-                        last = x.ty();
-                        let vt = peel_effectful(&x.ty());
-                        let emitted = cx.bind_local(*n, vt.clone());
-                        parts.push(IrActStmt::Bind(emitted, vt, x, *sp2));
-                    }
-                }
-            }
+            let parts = act_stmts(stmts, 0, want, cx)?;
             cx.release(mark);
-            Ok(IrExpr::Act(parts, last, *s))
+            let ty = act_block_type(&parts, want);
+            Ok(IrExpr::Act(parts, ty, *s))
         }
         Expr::Record(n, fields, s) => {
             let ty = cx
@@ -524,7 +503,8 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
         // and the slot are read back out of the type declarations.
         Expr::FieldAccess(r, f, s) => {
             let r = expr(r, &Ty::NoExpect, cx)?;
-            let name = record_name(&r.ty(), cx, "field access on")?;
+            let rty = r.ty();
+            let name = record_name(&rty, cx, "field access on")?;
             let (Some(fty), Some(slot)) = (cx.tds.field(name, *f), cx.tds.field_index(name, *f))
             else {
                 return Err(format!(
@@ -533,7 +513,32 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
                     cx.text(*f)
                 ));
             };
-            let fty = cx.st.deep_resolve(fty);
+            // **A CONSTRUCTED RECEIVER INSTANTIATES THE FIELD HERE TOO.** The
+            // declared type says `List a` and the receiver says which `a`;
+            // taking the declaration alone left `qsort-by`'s recursive call
+            // reading `(list (tycon "a"))`.
+            let fty = match &rty {
+                Ty::Constructed(_, cargs) if !cargs.is_empty() => cx
+                    .bindings
+                    .get(&name)
+                    .and_then(|c| crate::check::instantiate_field(c, slot, cargs))
+                    .unwrap_or_else(|| fty.clone()),
+                _ => fty.clone(),
+            };
+            let fty = cx.st.deep_resolve(&fty);
+            // `instantiate-receiver-ty` + `set-ir-expr-type` (subject 54331).
+            // **THE NODE UNDER A FIELD ACCESS IS RETYPED TO THE RECORD**, with
+            // the constructed type's own arguments carried onto it. A receiver
+            // that already IS a record is left alone.
+            let r = match &rty {
+                Ty::Constructed(n, cargs)
+                    if matches!(cx.tds.declared().get(n),
+                                Some(Ty::Record(_, ra)) if ra.len() == cargs.len()) =>
+                {
+                    r.with_ty(Ty::Record(*n, cargs.clone()))
+                }
+                _ => r,
+            };
             Ok(IrExpr::FieldAccess(
                 Box::new(r),
                 format!("{}/{}", cx.text(*f), slot),
@@ -678,6 +683,99 @@ fn peel_fun_return(t: &Ty) -> Ty {
         Ty::Fun(_, _, r) => (**r).clone(),
         Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => peel_fun_return(b),
         _ => Ty::Error,
+    }
+}
+
+/// `lower-act-stmts-acc` (subject 55787), from `i` to the end.
+///
+/// **EVERY STATEMENT IS HANDED THE BLOCK'S OWN EXPECTATION.** That reads
+/// oddly and is what upstream passes down.
+///
+/// **A `let` STATEMENT SWALLOWS THE REST OF THE BLOCK.** It is not one
+/// statement among several: the binding has to be in scope for what follows,
+/// so the remaining statements become an `act` inside the let's body. Leaving
+/// them as siblings puts the same expressions in the same order and gives the
+/// binding nowhere to live.
+fn act_stmts(
+    stmts: &[crate::ast::ActStmt],
+    from: usize,
+    want: &Ty,
+    cx: &Lower,
+) -> Result<Vec<IrActStmt>, String> {
+    let mut parts = Vec::new();
+    for (k, st) in stmts.iter().enumerate().skip(from) {
+        match st {
+            crate::ast::ActStmt::Exec(Expr::Let(binds, body, ls), sp2) => {
+                parts.push(IrActStmt::Exec(
+                    act_let(binds, 0, body, stmts, k, want, cx, *ls)?,
+                    *sp2,
+                ));
+                return Ok(parts);
+            }
+            crate::ast::ActStmt::Exec(e, sp2) => {
+                parts.push(IrActStmt::Exec(expr(e, want, cx)?, *sp2));
+            }
+            // A `<-` binds for the rest of the block, and the type it binds is
+            // what is INSIDE the effect.
+            crate::ast::ActStmt::Bind(n, e, sp2) => {
+                let x = expr(e, want, cx)?;
+                let vt = peel_effectful(&x.ty());
+                let emitted = cx.bind_local(*n, vt.clone());
+                parts.push(IrActStmt::Bind(emitted, vt, x, *sp2));
+            }
+        }
+    }
+    Ok(parts)
+}
+
+/// `lower-act-let` (subject 55821): the let, then the rest of the block as an
+/// `act` inside it -- or just the let's own body where nothing follows.
+fn act_let(
+    binds: &[crate::ast::LetBind],
+    j: usize,
+    body: &Expr,
+    stmts: &[crate::ast::ActStmt],
+    i: usize,
+    want: &Ty,
+    cx: &Lower,
+    sp: crate::ast::Span,
+) -> Result<IrExpr, String> {
+    let Some(b) = binds.get(j) else {
+        // A let whose body is another let keeps going: the whole chain binds
+        // before the block's remainder is reached.
+        if let Expr::Let(binds2, body2, ls2) = body {
+            return act_let(binds2, 0, body2, stmts, i, want, cx, *ls2);
+        }
+        let body_ir = expr(body, want, cx)?;
+        let rest = act_stmts(stmts, i + 1, want, cx)?;
+        if rest.is_empty() {
+            return Ok(body_ir);
+        }
+        let bsp = body_ir.span();
+        let bty = body_ir.ty();
+        let mut inner = vec![IrActStmt::Exec(body_ir, bsp)];
+        inner.extend(rest);
+        let ty = act_block_type(&inner, &bty);
+        return Ok(IrExpr::Act(inner, ty, sp));
+    };
+    let v = expr(&b.value, &Ty::NoExpect, cx)?;
+    let ty = cx.st.deep_resolve(&v.ty());
+    let emitted = cx.bind_local(b.name, ty.clone());
+    Ok(IrExpr::Let(
+        emitted,
+        ty,
+        Box::new(v),
+        Box::new(act_let(binds, j + 1, body, stmts, i, want, cx, sp)?),
+        sp,
+    ))
+}
+
+/// `act-block-type` (subject 55775): what the block ENDS with.
+fn act_block_type(stmts: &[IrActStmt], fallback: &Ty) -> Ty {
+    match stmts.last() {
+        Some(IrActStmt::Exec(e, _)) => e.ty(),
+        Some(IrActStmt::Bind(_, t, _, _)) => t.clone(),
+        None => fallback.clone(),
     }
 }
 
