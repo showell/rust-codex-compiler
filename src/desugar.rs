@@ -679,6 +679,10 @@ impl<'a> Desugar<'a> {
         // `desugar-document` (Ast/Desugarer.codex:610) appends family-member,
         // conversion and DERIVED defs after the chapter's own, in type-
         // declaration order.
+        // **FAMILY MEMBERS COME BEFORE THE DERIVED DEFINITIONS.**
+        // `desugar-document` appends family-member, conversion and derived
+        // defs in that order, and registration order is what `next-id` counts.
+        self.synth_family_defs(tree, &mut ch);
         self.synth_derived_defs(&mut ch);
         ch.syms = std::mem::take(&mut *self.syms.borrow_mut());
         ch
@@ -697,6 +701,97 @@ impl<'a> Desugar<'a> {
     /// `deriving Show` and `deriving Ord` synthesise two more. Those are NOT
     /// here: our parser does not capture the `deriving` clause at all, so they
     /// need a parser change first. Fifteen files in the depot carry one.
+    /// `synth-family-members` (subject 43215). **A `unit family` IS TWO
+    /// DEFINITIONS PER MEMBER**, and we wrote none of them:
+    ///
+    /// ```text
+    /// Duration = unit family Nanosecond
+    ///   Microsecond = 1000
+    ///
+    /// Microsecond : Integer -> Duration
+    /// Microsecond (__fv) = Duration (__fv * 1000)
+    /// Duration-to-Microsecond : Duration -> Integer
+    /// Duration-to-Microsecond (__fv) = __fv / 1000
+    /// ```
+    ///
+    /// A factor of 1 is the base member and drops the arithmetic on both
+    /// sides. Every span is synthetic, so none of these names reaches
+    /// `expr-types` -- which is exactly why `expr-types` already agreed with
+    /// the oracle on programs whose `next-id` did not.
+    fn synth_family_defs(&self, tree: &Node, ch: &mut Chapter) {
+        let sp = Span::default();
+        let int = |me: &Self| TypeExpr::Named(me.sym_str("Integer"), sp);
+        let mut out = Vec::new();
+        for td in tree.descendants(NodeKind::TypeDef) {
+            let Some(fam) = td.children_of(NodeKind::UnitFamilyBody).next() else { continue };
+            let family = self.leading(td);
+            let fam_text = self.syms.borrow().text(family).to_string();
+            let fam_ty = TypeExpr::Named(family, sp);
+            for m in fam.children_of(NodeKind::UnitFamilyMember) {
+                // **THE CST IS LOSSLESS, SO THE FIRST TOKEN IS USUALLY
+                // WHITESPACE.** Taking it named every member `"    "`, which
+                // the counters could not see: the synthesised definitions are
+                // unreachable in most units and get pruned before emission, so
+                // only their MINTS showed, and those were right.
+                let Some(name_tok) = m.own_tokens().find(|t| t.kind == Kind::TypeIdentifier)
+                else { continue };
+                let member = self.sym(name_tok);
+                let factor: i64 = m
+                    .own_tokens()
+                    .find(|t| t.kind == Kind::IntegerLiteral)
+                    .and_then(|t| self.text(t).parse().ok())
+                    .unwrap_or(1);
+                let fv = self.sym_str("__fv");
+                let param = || vec![Param { name: fv, span: sp }];
+                let var = || Expr::NameRef(fv, sp);
+                let lit = || Expr::Lit(factor.to_string(), LiteralKind::IntLit, sp);
+
+                // `synth-family-ctor`: Integer in, the family out.
+                let scaled = if factor == 1 {
+                    var()
+                } else {
+                    Expr::Binary(Rc::new(var()), BinaryOp::OpMul, Rc::new(lit()), sp)
+                };
+                out.push(Def {
+                    name: member,
+                    params: param(),
+                    declared_type: vec![TypeExpr::Fun(Rc::new(int(self)), Rc::new(fam_ty.clone()), sp)],
+                    body: Expr::Apply(
+                        Rc::new(Expr::NameRef(family, sp)),
+                        Rc::new(scaled),
+                        sp,
+                    ),
+                    chapter_slug: String::new(),
+                    span: sp,
+                    is_claim: false,
+                    is_punctual: false,
+                    wcet_budget: 0,
+                });
+
+                // `synth-family-extract`: the family in, Integer out.
+                let member_text = self.syms.borrow().text(member).to_string();
+                let extract = self.sym_str(&format!("{fam_text}-to-{member_text}"));
+                let divided = if factor == 1 {
+                    var()
+                } else {
+                    Expr::Binary(Rc::new(var()), BinaryOp::OpDiv, Rc::new(lit()), sp)
+                };
+                out.push(Def {
+                    name: extract,
+                    params: param(),
+                    declared_type: vec![TypeExpr::Fun(Rc::new(fam_ty.clone()), Rc::new(int(self)), sp)],
+                    body: divided,
+                    chapter_slug: String::new(),
+                    span: sp,
+                    is_claim: false,
+                    is_punctual: false,
+                    wcet_budget: 0,
+                });
+            }
+        }
+        ch.defs.extend(out);
+    }
+
     fn synth_derived_defs(&self, ch: &mut Chapter) {
         let mut out = Vec::new();
         for td in &ch.type_defs {
@@ -1317,5 +1412,37 @@ mod full_range_integer_bound {
     fn an_ordinary_bound_is_unchanged() {
         let src = "Chapter: P\nSection: S\n  f : Integer between 0 and 255 -> Integer\n  f (b) = b\n";
         assert_eq!(bounds(src), (0, 255, OverflowMode::Error));
+    }
+}
+
+/// What a `unit family` declaration is worth in definitions.
+#[cfg(test)]
+mod a_unit_family_is_definitions_not_just_a_type {
+
+    /// **A `unit family` IS TWO DEFINITIONS PER MEMBER**, and we synthesised
+    /// none: the constructor `M : Integer -> F` and the extractor
+    /// `F-to-M : F -> Integer` (subject 43215). They mint at REGISTRATION, so
+    /// the whole corpus's unit-bearing programs were short one type variable
+    /// and three effect rows per member -- 169 ids and 507 rows on a single
+    /// unit, every one of them ahead of code that then numbered differently.
+    #[test]
+    fn a_unit_family_synthesises_a_ctor_and_an_extractor_per_member() {
+        let src = "Chapter: U\n\nSection: S\n  Duration = unit family Nanosecond\n    Nanosecond = 1\n    Microsecond = 1000\n\n  opening : Integer = 7\n";
+        let bytes = src.as_bytes().to_vec();
+        let parsed = crate::parser::parse(&bytes);
+        let mut dg = super::Desugar::new(&bytes);
+        let ch = dg.chapter(&parsed.tree);
+        let names: Vec<String> = ch.defs.iter().map(|d| ch.syms.text(d.name).to_string()).collect();
+        for want in [
+            "Nanosecond",
+            "Duration-to-Nanosecond",
+            "Microsecond",
+            "Duration-to-Microsecond",
+        ] {
+            assert!(names.iter().any(|n| n == want), "missing {want}: {names:?}");
+        }
+        // The base member's factor is 1, and both sides drop the arithmetic.
+        let base = ch.defs.iter().find(|d| ch.syms.text(d.name) == "Duration-to-Nanosecond").unwrap();
+        assert!(matches!(base.body, crate::ast::Expr::NameRef(..)), "{:?}", base.body);
     }
 }
