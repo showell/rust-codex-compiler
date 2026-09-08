@@ -1895,10 +1895,25 @@ pub fn infer_row(
                 _ => st.fresh(),
             }
         }
-        E::FieldAssign(r, _, v, _) => {
-            let _ = infer(r, env, st);
-            let _ = infer(v, env, st);
-            Ty::Nothing
+        // **A STORE EVALUATES TO THE RECORD IT WROTE INTO**, and the value is
+        // MET AGAINST THE FIELD'S DECLARED TYPE. Answering `Nothing` and
+        // unifying nothing left a polymorphic value uninstantiated:
+        // `st.dirty-slots = __list-with-capacity 4096` reached the wire as
+        // `(list (tvar 84988))` where the field says `List Integer`.
+        E::FieldAssign(r, f, v, _) => {
+            let obj = infer(r, env, st);
+            let vt = infer(v, env, st);
+            let field_ty = match st.deep_resolve(&obj) {
+                Ty::Record(n, _) => env.type_defs.field(n, *f).cloned(),
+                Ty::Constructed(n, cargs) => constructed_field(env, n, &cargs, *f),
+                _ => None,
+            };
+            if let Some(ft) = field_ty {
+                if !st.unify(&vt, &ft) {
+                    st.unify_gaps += 1;
+                }
+            }
+            obj
         }
         E::Handle(h) => {
             let t = infer(&h.body, env, st);
