@@ -403,6 +403,158 @@ fn lin_clauses(env: &LinEnv, v: Sym, clauses: &[crate::ast::HandleClause]) -> Li
 }
 
 // ---------------------------------------------------------------------------
+// Minted owners
+// ---------------------------------------------------------------------------
+
+/// `return-is-linear-after` (subject 51195). Does applying `k` arguments to
+/// this type yield a `linear`?
+///
+/// **A PARTIAL APPLICATION IS NOT A MINT**: the `FunTy` arm answers False the
+/// moment `k` runs out, because what you are holding is still a function.
+fn returns_linear_after(t: &Ty, k: usize) -> bool {
+    match t {
+        Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => returns_linear_after(b, k),
+        Ty::Fun(_, _, r) => k > 0 && returns_linear_after(r, k - 1),
+        Ty::Effectful(_, _, ret) => k == 0 && returns_linear_after(ret, 0),
+        Ty::Linear(_) => k == 0,
+        _ => false,
+    }
+}
+
+/// `expr-is-mint`: this expression CREATES a linear owner, so the name it is
+/// bound to carries the discipline even though no parameter declared it.
+fn expr_is_mint(env: &LinEnv, e: &Expr) -> bool {
+    let Expr::Apply(..) = e else { return false };
+    head_name(e)
+        .and_then(|h| env.bindings.get(&h))
+        .is_some_and(|t| returns_linear_after(t, arg_count(e)))
+}
+
+/// `report-minted-owner` (subject 51331). The same six questions as a declared
+/// parameter, and the same order -- only the value's provenance differs, and
+/// the message says so.
+fn report_minted_owner(def: &Def, env: &LinEnv, v: Sym, r: &LinResult, st: &mut UnifyState) {
+    let name = env.syms.text(v);
+    let owner = env.syms.text(def.name);
+    let minted = "minted by a linear-returning call";
+    let bad_ret = r.ret && !return_sanctioned(env.syms, def);
+
+    if r.dead > 0 {
+        st.error(Cdx::USE_AFTER_CONSUME, format!(
+            "Linear value '{name}', {minted}, was moved to a new owner by a let binding and then mentioned again; after a move the original name is dead"));
+    } else if !r.cap.is_empty() {
+        st.error(Cdx::LINEAR_CAPTURE, format!(
+            "Linear value '{name}', {minted}, is captured by {}, which may run zero or many times; a linear value may be captured only by a let-bound closure, which is then called exactly once", r.cap));
+    } else if !r.esc.is_empty() {
+        st.error(Cdx::LINEAR_ESCAPE, format!(
+            "Linear value '{name}', {minted}, is passed to a plain (non-linear) parameter of '{}'; a linear value moves only through parameters declared linear. Use freeze to exit the discipline deliberately", r.esc));
+    } else if bad_ret {
+        st.error(Cdx::LINEAR_RETURN, format!(
+            "Linear value '{name}', {minted}, is returned from '{owner}', whose return type is not declared linear; declare the return linear, or consume the value with freeze"));
+    } else if !r.ok {
+        st.error(Cdx::USE_AFTER_CONSUME, format!(
+            "Linear value '{name}', {minted}, is used a different number of times across branches; each branch must use it exactly once"));
+    } else if r.count > 1 {
+        st.error(Cdx::USE_AFTER_CONSUME, format!(
+            "Linear value '{name}', {minted}, is used {} times; a linear value must be used exactly once", r.count));
+    } else if r.count == 0 {
+        st.error(Cdx::LINEAR_UNUSED, format!(
+            "Linear value '{name}', {minted}, is never used; a linear value must be used exactly once"));
+    }
+}
+
+/// `check-mints` (subject 51350). A walk looking for BINDINGS, not for uses:
+/// every `let` and every `<-` is asked whether the value it binds was minted,
+/// and if so the name is followed for the rest of its scope with the same
+/// `lin_of` machinery a declared parameter gets.
+///
+/// The TAIL flag rides along for the same reason it does there.
+pub fn check_mints(def: &Def, env: &LinEnv, tail: bool, e: &Expr, st: &mut UnifyState) {
+    match e {
+        Expr::Let(binds, body, _) => check_mints_binds(def, env, tail, binds, body, 0, st),
+        Expr::If(c, t, el, _) => {
+            check_mints(def, env, false, c, st);
+            check_mints(def, env, tail, t, st);
+            check_mints(def, env, tail, el, st);
+        }
+        Expr::Apply(f, a, _) => {
+            check_mints(def, env, false, f, st);
+            check_mints(def, env, false, a, st);
+        }
+        Expr::Binary(l, _, r, _) => {
+            check_mints(def, env, false, l, st);
+            check_mints(def, env, false, r, st);
+        }
+        Expr::Unary(x, _) => check_mints(def, env, false, x, st),
+        Expr::Lambda(_, body, _) => check_mints(def, env, false, body, st),
+        Expr::Handle(h) => {
+            check_mints(def, env, false, &h.body, st);
+            for cl in &h.clauses {
+                check_mints(def, env, false, &cl.body, st);
+            }
+        }
+        Expr::WithTimeout(w) => check_mints(def, env, tail, &w.body, st),
+        Expr::Match(scrut, arms, _) => {
+            check_mints(def, env, false, scrut, st);
+            for arm in arms {
+                check_mints(def, env, false, &arm.guard, st);
+                check_mints(def, env, tail, &arm.body, st);
+            }
+        }
+        Expr::List(xs, _) => {
+            for x in xs {
+                check_mints(def, env, false, x, st);
+            }
+        }
+        Expr::Record(_, fs, _) => {
+            for f in fs {
+                check_mints(def, env, false, &f.value, st);
+            }
+        }
+        Expr::FieldAccess(obj, _, _) => check_mints(def, env, false, obj, st),
+        Expr::Act(stmts, _) => check_mints_stmts(def, env, stmts, 0, st),
+        Expr::Try(t) => {
+            check_mints_stmts(def, env, &t.body, 0, st);
+            check_mints_stmts(def, env, &t.fallback, 0, st);
+            check_mints_stmts(def, env, &t.failure, 0, st);
+        }
+        Expr::FieldAssign(rec, _, val, _) => {
+            check_mints(def, env, false, rec, st);
+            check_mints(def, env, false, val, st);
+        }
+        Expr::Lazy(inner, _) => check_mints(def, env, false, inner, st),
+        _ => {}
+    }
+}
+
+fn check_mints_binds(def: &Def, env: &LinEnv, tail: bool, binds: &[crate::ast::LetBind], body: &Expr, i: usize, st: &mut UnifyState) {
+    let Some(b) = binds.get(i) else {
+        return check_mints(def, env, tail, body, st);
+    };
+    check_mints(def, env, false, &b.value, st);
+    if expr_is_mint(env, &b.value) {
+        let r = lin_let(env, b.name, tail, binds, body, i + 1);
+        report_minted_owner(def, env, b.name, &r, st);
+    }
+    check_mints_binds(def, env, tail, binds, body, i + 1, st);
+}
+
+fn check_mints_stmts(def: &Def, env: &LinEnv, stmts: &[ActStmt], i: usize, st: &mut UnifyState) {
+    let Some(s) = stmts.get(i) else { return };
+    match s {
+        ActStmt::Exec(e, _) => check_mints(def, env, false, e, st),
+        ActStmt::Bind(n, e, _) => {
+            check_mints(def, env, false, e, st);
+            if expr_is_mint(env, e) {
+                let r = lin_stmts(env, *n, stmts, i + 1);
+                report_minted_owner(def, env, *n, &r, st);
+            }
+        }
+    }
+    check_mints_stmts(def, env, stmts, i + 1, st);
+}
+
+// ---------------------------------------------------------------------------
 // The entry point
 // ---------------------------------------------------------------------------
 
@@ -482,6 +634,9 @@ pub fn check_def(def: &Def, env: &LinEnv, st: &mut UnifyState) {
         check_one_param(def, env, pty, p, st);
         ty = rest;
     }
+    // Parameters first, then the values the body MINTS -- upstream's order, and
+    // it decides which diagnostic a definition with both reports first.
+    check_mints(def, env, true, &def.body, st);
 }
 
 fn check_one_param(def: &Def, env: &LinEnv, pty: &TypeExpr, p: &crate::ast::Param, st: &mut UnifyState) {
@@ -593,5 +748,40 @@ mod the_discipline {
     #[test]
     fn an_undeclared_definition_is_not_checked() {
         assert_eq!(codes("  f (n) = 7\n"), vec![]);
+    }
+
+    /// A value MINTED by a linear-returning call carries the discipline even
+    /// though no parameter declared it.
+    fn minted(body: &str) -> Vec<u16> {
+        codes(&format!(
+            "  acquire : Integer -> linear Integer\n  acquire (n) = n\n\n  release : linear Integer -> Integer\n  release (g) = g + 0\n\n{body}"
+        ))
+    }
+
+    #[test]
+    fn a_minted_owner_is_bound_by_the_same_rules() {
+        assert_eq!(
+            minted("  f : Integer -> Integer\n  f (n) = let g = acquire n in release g\n"),
+            vec![]
+        );
+        assert_eq!(
+            minted("  f : Integer -> Integer\n  f (n) = let g = acquire n in release g + release g\n"),
+            vec![crate::check::Cdx::USE_AFTER_CONSUME]
+        );
+        assert_eq!(
+            minted("  f : Integer -> Integer\n  f (n) = let g = acquire n in n + 1\n"),
+            vec![crate::check::Cdx::LINEAR_UNUSED]
+        );
+    }
+
+    /// **A PARTIAL APPLICATION IS NOT A MINT.** `acquire` with no argument is
+    /// still a function, and binding it mints nothing -- so the name it is
+    /// bound to is not under the discipline and using it twice is fine.
+    #[test]
+    fn a_partial_application_mints_nothing() {
+        assert_eq!(
+            minted("  f : Integer -> Integer\n  f (n) = let mk = acquire in release (mk n) + release (mk n)\n"),
+            vec![]
+        );
     }
 }
