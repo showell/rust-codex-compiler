@@ -28,6 +28,7 @@
 use crate::ast::{ActStmt, Def, Expr, MatchArm, Pat, TypeExpr};
 use crate::check::{Cdx, Ty, TypeDefs, UnifyState};
 use crate::symbol::{Sym, SymTab};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// `LinResult` (subject 50622). Six answers from one walk.
@@ -489,95 +490,254 @@ fn report_minted_owner(def: &Def, env: &LinEnv, v: Sym, r: &LinResult, st: &mut 
 /// `lin_of` machinery a declared parameter gets.
 ///
 /// The TAIL flag rides along for the same reason it does there.
-pub fn check_mints(def: &Def, env: &LinEnv, tail: bool, e: &Expr, st: &mut UnifyState) {
+pub fn check_mints(def: &Def, env: &LinEnv, tup: &TupEnv, tail: bool, e: &Expr, st: &mut UnifyState) {
     match e {
-        Expr::Let(binds, body, _) => check_mints_binds(def, env, tail, binds, body, 0, st),
+        Expr::Let(binds, body, _) => check_mints_binds(def, env, tup, tail, binds, body, 0, st),
         Expr::If(c, t, el, _) => {
-            check_mints(def, env, false, c, st);
-            check_mints(def, env, tail, t, st);
-            check_mints(def, env, tail, el, st);
+            check_mints(def, env, tup, false, c, st);
+            check_mints(def, env, tup, tail, t, st);
+            check_mints(def, env, tup, tail, el, st);
         }
         Expr::Apply(f, a, _) => {
-            check_mints(def, env, false, f, st);
-            check_mints(def, env, false, a, st);
+            check_mints(def, env, tup, false, f, st);
+            check_mints(def, env, tup, false, a, st);
         }
         Expr::Binary(l, _, r, _) => {
-            check_mints(def, env, false, l, st);
-            check_mints(def, env, false, r, st);
+            check_mints(def, env, tup, false, l, st);
+            check_mints(def, env, tup, false, r, st);
         }
-        Expr::Unary(x, _) => check_mints(def, env, false, x, st),
-        Expr::Lambda(_, body, _) => check_mints(def, env, false, body, st),
+        Expr::Unary(x, _) => check_mints(def, env, tup, false, x, st),
+        Expr::Lambda(_, body, _) => check_mints(def, env, tup, false, body, st),
         Expr::Handle(h) => {
-            check_mints(def, env, false, &h.body, st);
+            check_mints(def, env, tup, false, &h.body, st);
             for cl in &h.clauses {
-                check_mints(def, env, false, &cl.body, st);
+                check_mints(def, env, tup, false, &cl.body, st);
             }
         }
-        Expr::WithTimeout(w) => check_mints(def, env, tail, &w.body, st),
+        Expr::WithTimeout(w) => check_mints(def, env, tup, tail, &w.body, st),
         Expr::Match(scrut, arms, _) => {
-            check_mints(def, env, false, scrut, st);
+            check_mints(def, env, tup, false, scrut, st);
+            // `check-mints-arms` carries ONE tuple type for every arm: it is
+            // the scrutinee's, and the arms only decide where its linear
+            // components land.
+            let tt = tuple_mint_type(env, tup, scrut);
             for arm in arms {
-                check_mints(def, env, false, &arm.guard, st);
-                check_mints(def, env, tail, &arm.body, st);
+                check_mints(def, env, tup, false, &arm.guard, st);
+                match &tt {
+                    Some(t) => check_tuple_arm(def, env, tup, tail, t, arm, st),
+                    None => check_mints(def, env, tup, tail, &arm.body, st),
+                }
             }
         }
         Expr::List(xs, _) => {
             for x in xs {
-                check_mints(def, env, false, x, st);
+                check_mints(def, env, tup, false, x, st);
             }
         }
         Expr::Record(_, fs, _) => {
             for f in fs {
-                check_mints(def, env, false, &f.value, st);
+                check_mints(def, env, tup, false, &f.value, st);
             }
         }
-        Expr::FieldAccess(obj, _, _) => check_mints(def, env, false, obj, st),
-        Expr::Act(stmts, _) => check_mints_stmts(def, env, stmts, 0, st),
+        Expr::FieldAccess(obj, _, _) => check_mints(def, env, tup, false, obj, st),
+        Expr::Act(stmts, _) => check_mints_stmts(def, env, tup, stmts, 0, st),
         Expr::Try(t) => {
-            check_mints_stmts(def, env, &t.body, 0, st);
-            check_mints_stmts(def, env, &t.fallback, 0, st);
-            check_mints_stmts(def, env, &t.failure, 0, st);
+            check_mints_stmts(def, env, tup, &t.body, 0, st);
+            check_mints_stmts(def, env, tup, &t.fallback, 0, st);
+            check_mints_stmts(def, env, tup, &t.failure, 0, st);
         }
         Expr::FieldAssign(rec, _, val, _) => {
-            check_mints(def, env, false, rec, st);
-            check_mints(def, env, false, val, st);
+            check_mints(def, env, tup, false, rec, st);
+            check_mints(def, env, tup, false, val, st);
         }
-        Expr::Lazy(inner, _) => check_mints(def, env, false, inner, st),
+        Expr::Lazy(inner, _) => check_mints(def, env, tup, false, inner, st),
         _ => {}
     }
 }
 
-fn check_mints_binds(def: &Def, env: &LinEnv, tail: bool, binds: &[crate::ast::LetBind], body: &Expr, i: usize, st: &mut UnifyState) {
+fn check_mints_binds(def: &Def, env: &LinEnv, tup: &TupEnv, tail: bool, binds: &[crate::ast::LetBind], body: &Expr, i: usize, st: &mut UnifyState) {
     let Some(b) = binds.get(i) else {
-        return check_mints(def, env, tail, body, st);
+        return check_mints(def, env, tup, tail, body, st);
     };
-    check_mints(def, env, false, &b.value, st);
-    if expr_is_mint(env, &b.value) {
+    check_mints(def, env, tup, false, &b.value, st);
+    let tt = tuple_mint_type(env, tup, &b.value);
+    if expr_is_mint(env, &b.value) || tt.is_some() {
+        // A tuple carrying a linear component makes its NAME an owner too:
+        // dropping the pair drops the component inside it.
         let r = lin_let(env, b.name, tail, binds, body, i + 1);
         report_minted_owner(def, env, b.name, &r, st);
     } else if let Some(mtn) = expr_mut_mint_name(env, &b.value) {
         let r = consume_let(env, mtn, b.name, binds, body, i + 1);
         report_minted_mutable(def, env, b.name, &r, st);
     }
-    check_mints_binds(def, env, tail, binds, body, i + 1, st);
+    let next = after_tuple_bind(tup, b.name, tt.as_ref());
+    check_mints_binds(def, env, &next, tail, binds, body, i + 1, st);
 }
 
-fn check_mints_stmts(def: &Def, env: &LinEnv, stmts: &[ActStmt], i: usize, st: &mut UnifyState) {
+fn check_mints_stmts(def: &Def, env: &LinEnv, tup: &TupEnv, stmts: &[ActStmt], i: usize, st: &mut UnifyState) {
     let Some(s) = stmts.get(i) else { return };
     match s {
-        ActStmt::Exec(e, _) => check_mints(def, env, false, e, st),
+        ActStmt::Exec(e, _) => check_mints(def, env, tup, false, e, st),
         ActStmt::Bind(n, e, _) => {
-            check_mints(def, env, false, e, st);
-            if expr_is_mint(env, e) {
+            check_mints(def, env, tup, false, e, st);
+            let tt = tuple_mint_type(env, tup, e);
+            if expr_is_mint(env, e) || tt.is_some() {
                 let r = lin_stmts(env, *n, stmts, i + 1);
                 report_minted_owner(def, env, *n, &r, st);
             } else if let Some(mtn) = expr_mut_mint_name(env, e) {
                 let r = consume_stmts(env, mtn, *n, stmts, i + 1);
                 report_minted_mutable(def, env, *n, &r, st);
             }
+            let next = after_tuple_bind(tup, *n, tt.as_ref());
+            return check_mints_stmts(def, env, &next, stmts, i + 1, st);
         }
     }
-    check_mints_stmts(def, env, stmts, i + 1, st);
+    check_mints_stmts(def, env, tup, stmts, i + 1, st);
+}
+
+// ---------------------------------------------------------------------------
+// A tuple that carries a linear component
+// ---------------------------------------------------------------------------
+
+/// Which names currently hold a tuple with a linear component in it, and what
+/// that tuple's type is -- upstream's `"__tupmint-" & v` bindings. It is scoped
+/// to one definition's `check_mints` walk and rebound the way upstream rebinds,
+/// so it is threaded by value rather than living on `LinEnv`.
+type TupEnv = BTreeMap<Sym, Ty>;
+
+/// `tuple-linear-positions`: the argument slots of a `TupN` that were declared
+/// `linear`. **THE ARITY MUST MATCH THE NAME**: `Tup2` with three arguments is
+/// not a tuple, and answering positions for it would put the discipline on a
+/// value that never had it.
+fn tuple_linear_positions(syms: &SymTab, t: &Ty) -> Vec<usize> {
+    let (n, args) = match t {
+        Ty::Constructed(n, args) | Ty::Sum(n, args) => (n, args),
+        _ => return Vec::new(),
+    };
+    if syms.text(*n) != format!("Tup{}", args.len()) {
+        return Vec::new();
+    }
+    args.iter()
+        .enumerate()
+        .filter(|(_, a)| matches!(a, Ty::Linear(_)))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// `return-type-after`: what applying `k` arguments yields. Unlike
+/// `peel_returns_n`, running out of arrow before running out of arguments is a
+/// failure rather than the type itself -- a partial application is not a value
+/// of the return type.
+fn return_type_after(t: &Ty, k: usize) -> Option<&Ty> {
+    match t {
+        Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => return_type_after(b, k),
+        Ty::Fun(_, _, r) => {
+            if k == 0 { None } else { return_type_after(r, k - 1) }
+        }
+        Ty::Effectful(_, _, ret) => {
+            if k == 0 { return_type_after(ret, 0) } else { None }
+        }
+        other => {
+            if k == 0 { Some(other) } else { None }
+        }
+    }
+}
+
+/// `expr-tuple-mint-type` + `tuple-mint-only`: the tuple type this expression
+/// yields, kept ONLY when some component of it is linear. A name answers from
+/// what it was bound to, which is how the discipline survives
+/// `let p = acquire2 n in let (g, k) = p`.
+fn tuple_mint_type(env: &LinEnv, tup: &TupEnv, e: &Expr) -> Option<Ty> {
+    let t = match e {
+        Expr::Apply(..) => {
+            let reg = env.bindings.get(&head_name(e)?)?;
+            return_type_after(reg, arg_count(e))?.clone()
+        }
+        Expr::NameRef(n, _) => tup.get(n)?.clone(),
+        _ => return None,
+    };
+    (!tuple_linear_positions(env.syms, &t).is_empty()).then_some(t)
+}
+
+/// `env-after-tuple-bind`. Binding a name to a tuple-mint records it; binding
+/// it to anything else must ERASE an older record under the same name, or a
+/// shadowed binding keeps the discipline of a value it no longer holds.
+fn after_tuple_bind<'a>(tup: &'a TupEnv, v: Sym, tt: Option<&Ty>) -> Cow<'a, TupEnv> {
+    match tt {
+        Some(t) => {
+            let mut m = tup.clone();
+            m.insert(v, t.clone());
+            Cow::Owned(m)
+        }
+        None if tup.contains_key(&v) => {
+            let mut m = tup.clone();
+            m.remove(&v);
+            Cow::Owned(m)
+        }
+        None => Cow::Borrowed(tup),
+    }
+}
+
+/// `check-tuple-arm` (subject 51283). The scrutinee yielded a tuple with a
+/// linear component, so the pattern that takes it apart decides where the
+/// discipline lands.
+fn check_tuple_arm(
+    def: &Def,
+    env: &LinEnv,
+    tup: &TupEnv,
+    tail: bool,
+    tt: &Ty,
+    arm: &MatchArm,
+    st: &mut UnifyState,
+) {
+    match &arm.pattern {
+        Pat::Ctor(_, subs, _) => {
+            for pos in tuple_linear_positions(env.syms, tt) {
+                if let Some(sub) = subs.get(pos) {
+                    check_tuple_component(def, env, tail, sub, pos, &arm.body, st);
+                }
+            }
+            check_mints(def, env, tup, tail, &arm.body, st);
+        }
+        // The whole tuple is bound to one name: that NAME carries the
+        // discipline, and it carries the tuple type into the body so a later
+        // destructuring still finds it.
+        Pat::Var(n, _) => {
+            let r = lin_of(env, *n, tail, &arm.body);
+            report_minted_owner(def, env, *n, &r, st);
+            let inner = after_tuple_bind(tup, *n, Some(tt));
+            check_mints(def, env, &inner, tail, &arm.body, st);
+        }
+        Pat::Wild(_) => {
+            st.error(Cdx::LINEAR_UNUSED,
+                "A tuple carrying a linear component is discarded by a wildcard pattern; bind each linear component and use it exactly once".to_string());
+            check_mints(def, env, tup, tail, &arm.body, st);
+        }
+        _ => check_mints(def, env, tup, tail, &arm.body, st),
+    }
+}
+
+/// `check-tuple-component`: one linear slot of the tuple, and only the slots
+/// the TYPE says are linear -- a plain component beside a linear one is an
+/// ordinary binding and is not walked.
+fn check_tuple_component(
+    def: &Def,
+    env: &LinEnv,
+    tail: bool,
+    sub: &Pat,
+    pos: usize,
+    body: &Expr,
+    st: &mut UnifyState,
+) {
+    match sub {
+        Pat::Var(n, _) => {
+            let r = lin_of(env, *n, tail, body);
+            report_minted_owner(def, env, *n, &r, st);
+        }
+        Pat::Wild(_) => st.error(Cdx::LINEAR_UNUSED, format!(
+            "Linear component {pos} of a tuple is discarded by a wildcard pattern; bind it and use it exactly once")),
+        _ => {}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,7 +1173,7 @@ pub fn check_def(def: &Def, env: &LinEnv, st: &mut UnifyState) {
     }
     // Parameters first, then the values the body MINTS -- upstream's order, and
     // it decides which diagnostic a definition with both reports first.
-    check_mints(def, env, true, &def.body, st);
+    check_mints(def, env, &TupEnv::new(), true, &def.body, st);
 }
 
 fn check_one_param(def: &Def, env: &LinEnv, pty: &TypeExpr, p: &crate::ast::Param, st: &mut UnifyState) {
@@ -1196,6 +1356,64 @@ mod the_discipline {
         assert_eq!(
             mutable("  f : Cell -> Integer\n  f (c) = (thread c).n + (thread c).n\n"),
             vec![crate::check::Cdx::MUTABLE_ALIAS]
+        );
+    }
+
+    /// A tuple carrying a linear component, and the pattern that takes it
+    /// apart. `Tup2` has to be declared here because the discipline is keyed on
+    /// the NAME matching the arity.
+    fn tupled(body: &str) -> Vec<u16> {
+        codes(&format!(
+            "  Tup2 (a) (b) =\n    | MkTup2 (a) (b)\n\n  acquire2 : Integer -> (linear Integer, Integer)\n  acquire2 (n) = MkTup2 n n\n\n  release : linear Integer -> Integer\n  release (g) = g + 0\n\n{body}"
+        ))
+    }
+
+    /// **THE COMPONENT INSIDE THE TUPLE CARRIES THE DISCIPLINE, NOT THE TUPLE.**
+    /// Destructuring is where it lands, and the plain component beside it is an
+    /// ordinary binding.
+    #[test]
+    fn a_linear_component_of_a_tuple_must_still_be_used_once() {
+        assert_eq!(
+            tupled("  f : Integer -> Integer\n  f (n) = let (g, k) = acquire2 n in release g + k\n"),
+            vec![]
+        );
+        assert_eq!(
+            tupled("  f : Integer -> Integer\n  f (n) = let (g, k) = acquire2 n in k\n"),
+            vec![crate::check::Cdx::LINEAR_UNUSED]
+        );
+        assert_eq!(
+            tupled("  f : Integer -> Integer\n  f (n) = let (g, k) = acquire2 n in release g + release g + k\n"),
+            vec![crate::check::Cdx::USE_AFTER_CONSUME]
+        );
+    }
+
+    /// A wildcard is not a way out: it is reported against the POSITION, since
+    /// there is no name to report against.
+    #[test]
+    fn a_wildcard_cannot_discard_a_linear_component() {
+        assert_eq!(
+            tupled("  f : Integer -> Integer\n  f (n) = let (_, k) = acquire2 n in k\n"),
+            vec![crate::check::Cdx::LINEAR_UNUSED]
+        );
+    }
+
+    /// **THE TUPLE TYPE SURVIVES A REBINDING.** `let p = ... in let (g, k) = p`
+    /// destructures a NAME, so the walk has to remember what that name holds --
+    /// and the name itself is an owner while it holds it.
+    #[test]
+    fn a_tuple_bound_to_a_name_keeps_its_discipline() {
+        assert_eq!(
+            tupled("  f : Integer -> Integer\n  f (n) = let p = acquire2 n in let (g, k) = p in release g + k\n"),
+            vec![]
+        );
+        assert_eq!(
+            tupled("  f : Integer -> Integer\n  f (n) = let p = acquire2 n in let (g, k) = p in k\n"),
+            vec![crate::check::Cdx::LINEAR_UNUSED]
+        );
+        // Never taken apart at all: the pair itself is the dropped owner.
+        assert_eq!(
+            tupled("  f : Integer -> Integer\n  f (n) = let p = acquire2 n in 7\n"),
+            vec![crate::check::Cdx::LINEAR_UNUSED]
         );
     }
 

@@ -1626,9 +1626,11 @@ pub fn section(syms: &SymTab, bindings: &[Binding], st: &UnifyState) -> String {
     s.push_str(".\n");
     s.push_str(&format!("substitutions {}\n", st.substitutions.len()));
     s.push_str(&format!("next-id {}\n", st.next_id));
-    // `CheckHarness.codex` prints this and `$CODEX_GOLDS/rungs/check.truth`
-    // does not: the bank predates the row counter. `codexcheck` is the control
-    // now, so the section is shaped to IT.
+    // THIS LINE ONLY: `CheckHarness.codex` prints it and
+    // `$CODEX_GOLDS/rungs/check.truth` does not, because the bank predates the
+    // row counter. `codexcheck` is the control for it. Nothing else in this
+    // section is shaped to the oracle over the gold -- `type-bindings` above
+    // disagrees with BOTH today, and that is a defect, not a choice.
     s.push_str(&format!("next-row-id {}\n", st.next_row_id));
     s.push_str(&format!("expr-types {}\n", st.expr_types.len()));
     // The harness closes the section, and the gold's last line is this.
@@ -2105,18 +2107,9 @@ pub fn infer_row(
             st.record_expr_type(*sp, result.clone());
             return (result, row);
         }
-        // **A FIELD ACCESS ON A TYPE THAT IS NOT A RECORD MINTS A FRESH
-        // VARIABLE**, which is most of them here: the field's type comes from
-        // the chapter's type definitions and this does not carry them yet.
         // `infer-expr`'s `AFieldAccess` arm (TypeCheckerInference.codex:1629)
-        // looks the field up when the object resolves to a `RecordTy` or to a
-        // `ConstructedTy` over one, and falls to `fresh-and-advance` in every
-        // other case -- including a bare type variable and a variant.
-        //
-        // Minting unconditionally is right only while no field type can be
-        // looked up. **When record fields are carried, the successful lookup
-        // must mint NOTHING** or every record access in the depot moves the
-        // counter by one.
+        // falls to `fresh-and-advance` for a receiver that is not a record --
+        // including a bare type variable and a variant.
         E::FieldAccess(r, f, _) => {
             let obj = infer(r, env, st);
             // **A SUCCESSFUL LOOKUP MINTS NOTHING.** The arm looks the field up
