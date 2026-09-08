@@ -647,14 +647,13 @@ impl<'a> Desugar<'a> {
                 NodeKind::ClassDef => ch.class_defs.push(ClassDef {
                     name: self.name_of(child),
                     methods: self.ops(child),
+                    superclass: child
+                        .children_of(NodeKind::Superclass)
+                        .next()
+                        .map(|s| self.leading(s)),
                     span: head_span(child),
                 }),
-                NodeKind::InstanceDef => ch.instance_defs.push(InstanceDef {
-                    class_name: self.name_of(child),
-                    type_name: Name::default(),
-                    methods: Vec::new(),
-                    span: head_span(child),
-                }),
+                NodeKind::InstanceDef => ch.instance_defs.push(self.instance_def(child)),
                 NodeKind::Cites => ch.citations.push(CitesDecl {
                     quire: self.name_of(child),
                     chapter_name: Name::default(),
@@ -684,6 +683,10 @@ impl<'a> Desugar<'a> {
         // defs in that order, and registration order is what `next-id` counts.
         self.synth_family_defs(tree, &mut ch);
         self.synth_derived_defs(&mut ch);
+        // The dictionary TYPE before the definitions that build one, and both
+        // after the derived defs -- `desugar-document`'s order (subject 43290).
+        self.synth_class_type_defs(&mut ch);
+        self.synth_instance_defs(&mut ch);
         ch.syms = std::mem::take(&mut *self.syms.borrow_mut());
         ch
     }
@@ -701,6 +704,170 @@ impl<'a> Desugar<'a> {
     /// `deriving Show` and `deriving Ord` synthesise two more. Those are NOT
     /// here: our parser does not capture the `deriving` clause at all, so they
     /// need a parser change first. Fifteen files in the depot carry one.
+    /// `instance <Class> <Type> where <methods>`. The parser bumps the class
+    /// and the type straight into the node, so they are the first two
+    /// significant tokens; everything after is `where` and the methods.
+    fn instance_def(&self, n: &Node) -> InstanceDef {
+        let sig: Vec<&Token> = n
+            .own_tokens()
+            .filter(|t| matches!(t.kind, Kind::Identifier | Kind::TypeIdentifier))
+            .collect();
+        let class_name = sig.first().map(|t| self.sym(t)).unwrap_or_default();
+        // `instance-head-key` (subject 43?): a bare name is itself, and an
+        // applied head is `List[Integer]`. It is a KEY, not a type -- it names
+        // the synthesised definitions and nothing reads it as a type.
+        let head: Vec<String> =
+            sig.iter().skip(1).map(|t| self.text(t).to_string()).collect();
+        let key = match head.len() {
+            0 => String::new(),
+            1 => head[0].clone(),
+            _ => format!("{}[{}]", head[0], head[1..].join(",")),
+        };
+        InstanceDef {
+            class_name,
+            type_name: self.sym_str(&key),
+            methods: n
+                .children_of(NodeKind::InstanceMethod)
+                .map(|m| InstanceMethodDef {
+                    name: self.leading(m),
+                    params: m
+                        .children_of(NodeKind::ParamGroup)
+                        .map(|g| self.leading(g))
+                        .collect(),
+                    body: m
+                        .child_nodes()
+                        .iter()
+                        .rev()
+                        .find(|k| k.kind != NodeKind::ParamGroup)
+                        .map_or(Expr::Error(String::new(), Span::default()), |b| self.expr(b)),
+                    span: head_span(m),
+                })
+                .collect(),
+            span: head_span(n),
+        }
+    }
+
+    /// `synth-class-type-defs` (subject 43678). **A CLASS IS A RECORD TYPE**:
+    /// `class C where m : T` declares `CDict (a) = record { m-impl : T }`, and
+    /// a superclass adds a `__super-<S> : <S>Dict` field in FRONT of the
+    /// methods. The single type parameter is always named `a`.
+    ///
+    /// It costs one fresh variable per class, because a record with one type
+    /// parameter parameterises to one -- which is the whole of the `class`
+    /// line's divergence.
+    fn synth_class_type_defs(&self, ch: &mut Chapter) {
+        let sp = Span::default();
+        let mut out = Vec::new();
+        for cd in &ch.class_defs {
+            let dict = self.sym_str(&format!("{}Dict", self.syms.borrow().text(cd.name)));
+            let mut fields: Vec<RecordFieldDef> = Vec::new();
+            if let Some(sup) = cd.superclass {
+                let sup_text = self.syms.borrow().text(sup).to_string();
+                fields.push(RecordFieldDef {
+                    name: self.sym_str(&format!("__super-{sup_text}")),
+                    type_expr: TypeExpr::Named(self.sym_str(&format!("{sup_text}Dict")), sp),
+                    span: sp,
+                });
+            }
+            for m in &cd.methods {
+                let mname = self.syms.borrow().text(m.name).to_string();
+                fields.push(RecordFieldDef {
+                    name: self.sym_str(&format!("{mname}-impl")),
+                    type_expr: m.type_expr.clone(),
+                    span: sp,
+                });
+            }
+            out.push(TypeDef::Record(dict, vec![self.sym_str("a")], fields, false, sp));
+        }
+        ch.type_defs.extend(out);
+    }
+
+    /// `synth-instance-defs` (subject 44113). One `instance` is up to three
+    /// kinds of definition:
+    ///
+    /// ```text
+    /// C-dict-Integer = CDict { m-impl = \x -> <body> }   the dictionary
+    /// m-Integer (x) = <body>                             the specialisation
+    /// m (x) = <body>                                     only when the class
+    ///                                                    has ONE instance
+    /// ```
+    ///
+    /// The bare method exists only for a single-instance class because with
+    /// two instances the name is ambiguous and the call site takes a
+    /// dictionary instead. **A METHOD WITH NO PARAMETERS IS NOT WRAPPED IN A
+    /// LAMBDA** in the dictionary field; one with parameters is.
+    fn synth_instance_defs(&self, ch: &mut Chapter) {
+        let sp = Span::default();
+        let mut out = Vec::new();
+        for id in &ch.instance_defs {
+            let class_text = self.syms.borrow().text(id.class_name).to_string();
+            let key = self.syms.borrow().text(id.type_name).to_string();
+            let instances = ch
+                .instance_defs
+                .iter()
+                .filter(|o| o.class_name == id.class_name)
+                .count();
+            let superclass = ch
+                .class_defs
+                .iter()
+                .find(|c| c.name == id.class_name)
+                .and_then(|c| c.superclass);
+
+            let mut fields: Vec<FieldExpr> = Vec::new();
+            if let Some(sup) = superclass {
+                let sup_text = self.syms.borrow().text(sup).to_string();
+                fields.push(FieldExpr {
+                    name: self.sym_str(&format!("__super-{sup_text}")),
+                    value: Expr::NameRef(self.sym_str(&format!("{sup_text}-dict-{key}")), sp),
+                    span: sp,
+                });
+            }
+            for m in &id.methods {
+                let mname = self.syms.borrow().text(m.name).to_string();
+                let value = if m.params.is_empty() {
+                    m.body.clone()
+                } else {
+                    Expr::Lambda(m.params.clone(), Rc::new(m.body.clone()), sp)
+                };
+                fields.push(FieldExpr {
+                    name: self.sym_str(&format!("{mname}-impl")),
+                    value,
+                    span: sp,
+                });
+            }
+            let mk = |name: Name, params: Vec<Name>, body: Expr| Def {
+                name,
+                params: params.into_iter().map(|n| Param { name: n, span: sp }).collect(),
+                declared_type: Vec::new(),
+                body,
+                chapter_slug: String::new(),
+                span: sp,
+                is_claim: false,
+                is_punctual: false,
+                wcet_budget: 0,
+            };
+            out.push(mk(
+                self.sym_str(&format!("{class_text}-dict-{key}")),
+                Vec::new(),
+                Expr::Record(self.sym_str(&format!("{class_text}Dict")), fields, sp),
+            ));
+            for m in &id.methods {
+                let mname = self.syms.borrow().text(m.name).to_string();
+                out.push(mk(
+                    self.sym_str(&format!("{mname}-{key}")),
+                    m.params.clone(),
+                    m.body.clone(),
+                ));
+            }
+            if instances == 1 {
+                for m in &id.methods {
+                    out.push(mk(m.name, m.params.clone(), m.body.clone()));
+                }
+            }
+        }
+        ch.defs.extend(out);
+    }
+
     /// `synth-family-members` (subject 43215). **A `unit family` IS TWO
     /// DEFINITIONS PER MEMBER**, and we wrote none of them:
     ///

@@ -499,9 +499,18 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
             Ok(IrExpr::Act(parts, ty, *s))
         }
         Expr::Record(n, fields, s) => {
+            // The checker's recorded answer first -- it is the better one, and
+            // it is what makes this arm short. But `record-expr-type` SKIPS A
+            // SYNTHETIC SPAN, so a record the desugarer built has none, and
+            // refusing there took six type-class chapters with it.
+            //
+            // `lower-record` (subject) never reads a span: it looks the
+            // constructor up and strips its arrows, and falls back to the
+            // expectation. That is the fallback, not a refusal.
             let ty = cx
                 .at(*s)
-                .ok_or_else(|| format!("no recorded type for record `{}`", cx.text(*n)))?;
+                .or_else(|| cx.bindings.get(n).map(strip_fun_args))
+                .unwrap_or_else(|| want.clone());
             let mut fs = Vec::new();
             for f in fields {
                 fs.push(IrFieldVal { name: f.name, value: expr(&f.value, &Ty::NoExpect, cx)? });
@@ -876,6 +885,16 @@ fn empty_list(want: &Ty, cx: &Lower, s: crate::ast::Span) -> IrExpr {
         }
         Ty::List(e) => IrExpr::List(Vec::new(), *e, s),
         _ => IrExpr::List(Vec::new(), Ty::Error, s),
+    }
+}
+
+/// `strip-fun-args`: the type a constructor arrow ANSWERS, which for a record
+/// constructor is the record.
+fn strip_fun_args(t: &Ty) -> Ty {
+    match t {
+        Ty::Fun(_, _, r) => strip_fun_args(r),
+        Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => strip_fun_args(b),
+        other => other.clone(),
     }
 }
 

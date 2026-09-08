@@ -267,6 +267,9 @@ pub struct EffectDef {
 pub struct ClassDef {
     pub name: Name,
     pub methods: Vec<EffectOpDef>,
+    /// `class Eq => Ord where` -- the dictionary carries the superclass's
+    /// dictionary in a `__super-<S>` field, so the name has to survive.
+    pub superclass: Option<Name>,
     pub span: Span,
 }
 
