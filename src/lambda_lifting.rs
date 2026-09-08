@@ -260,6 +260,9 @@ fn lift_one(
         body,
         chapter_slug: String::new(),
         span: sp,
+        // A lifted lambda is nobody's `punctual` definition.
+        is_punctual: false,
+        wcet_budget: 0,
     });
 
     // `build-partial-app`: the name, then one apply per capture, each typed

@@ -321,9 +321,7 @@ impl IrExpr {
     }
 }
 
-/// `IRDef`. `is-punctual` and `wcet-budget` are upstream's and are emitted as
-/// the trailing `0 0` of every `(def ...)`; nothing here sets them, so they are
-/// not carried as fields that would only ever hold zero.
+/// `IRDef`.
 #[derive(Clone, Debug)]
 pub struct IrDef {
     pub name: Sym,
@@ -332,6 +330,11 @@ pub struct IrDef {
     pub body: IrExpr,
     pub chapter_slug: String,
     pub span: Span,
+    /// The trailing two fields of the emitted `(def ...)`. They come off the
+    /// `punctual` modifier the parser read; upstream recovers them at lowering
+    /// by looking the definition's NAME up in the chapter's `rt-names`.
+    pub is_punctual: bool,
+    pub wcet_budget: i64,
 }
 
 /// The overflow mode is part of the operator's NAME.

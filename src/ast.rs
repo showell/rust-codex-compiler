@@ -216,6 +216,15 @@ pub struct Def {
     /// is entered by the checker, never called, so nothing reads it and it is
     /// alive anyway -- the one fact that separates a proposition from a corpse.
     pub is_claim: bool,
+    /// `punctual f : T` -- the definition is hard-real-time, and the IR def
+    /// line publishes it. Read from the `Punctual` node the parser already
+    /// wraps, for the same reason `is_claim` is: the modifier sits inside the
+    /// definition it modifies, so the association is structural.
+    pub is_punctual: bool,
+    /// `punctual 400 f : T` -- the declared instruction budget, 0 when the
+    /// author wrote none. **ZERO MEANS UNDECLARED, NOT ZERO INSTRUCTIONS**;
+    /// upstream's `emit-wcet-check` substitutes a default of 256 and warns.
+    pub wcet_budget: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -379,8 +388,11 @@ pub struct Chapter {
     pub prose_blocks: Vec<String>,
     pub annotations: Vec<(String, String, String)>,
     pub section_titles: Vec<String>,
+    /// The names of this chapter's `punctual` definitions. Upstream tags the
+    /// IR def by looking a name up in here; we read the flag off the
+    /// definition instead, so this survives only because `a-rt-names` is a
+    /// graded line of the desugar dump.
     pub rt_names: Vec<String>,
-    pub rt_budgets: Vec<i64>,
     pub conversions: Vec<String>,
     pub span: Span,
 }

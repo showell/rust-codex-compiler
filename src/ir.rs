@@ -367,6 +367,24 @@ mod tests {
         );
     }
 
+    /// **THE TWO NUMBERS AT THE END OF A DEF LINE ARE NOT ALWAYS ZERO.** They
+    /// are `is-punctual` and `wcet-budget` (`ir-emit-def`, subject 58000), and
+    /// they were hardcoded here until the oracle was read: `punctual` defs
+    /// spell `1`, and the budget is whatever the author declared. Twenty-one
+    /// def lines in `punctual-quire` alone were wrong by these two bytes.
+    #[test]
+    fn a_punctual_def_publishes_its_flag_and_its_budget() {
+        // `f` is SELF-RECURSIVE so that it survives to the wire: a constant
+        // call to a straight-line function is folded and the definition pruned.
+        let chapter = |modifier: &str| {
+            format!("Chapter: T\n\nSection: S\n  {modifier}f : Integer -> Integer\n  f (n) =\n   if n <= 1 then n\n   else f (n - 1)\n\nSection: Main\n  opening : [Console] Nothing = act\n   print-line-uni (show (f 9))\n  end\n")
+        };
+        assert!(def_line(&chapter(""), "f").ends_with("int-default) 0 0)"), "{}", def_line(&chapter(""), "f"));
+        assert!(def_line(&chapter("punctual "), "f").ends_with("int-default) 1 0)"), "{}", def_line(&chapter("punctual "), "f"));
+        // The budget is OPTIONAL and separate: a declared one reaches the wire.
+        assert!(def_line(&chapter("punctual 64 "), "f").ends_with("int-default) 1 64)"), "{}", def_line(&chapter("punctual 64 "), "f"));
+    }
+
     /// **A DOTTED EFFECT IS ONE NAME, AND A SCOPE BELONGS TO THE EFFECT IT
     /// FOLLOWS.** `[Device.Block]` is one effect; taking the identifiers and
     /// dropping the dots makes it two, pads `(scopes)` to match, and produces

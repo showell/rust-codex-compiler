@@ -249,16 +249,18 @@ fn emit_params(syms: &SymTab, ps: &[crate::ir_chapter::IrParam]) -> String {
         .collect()
 }
 
-/// One definition line. The trailing `0 0` is `is-punctual` and
-/// `wcet-budget`, neither of which this front end sets.
+/// One definition line. The two trailing numbers are `is-punctual` and
+/// `wcet-budget` (`ir-emit-def`, subject 58000).
 pub fn emit_def(syms: &SymTab, d: &IrDef) -> String {
     format!(
-        "\n  (def {:?} {:?} (params{}) {} {} 0 0)",
+        "\n  (def {:?} {:?} (params{}) {} {} {} {})",
         syms.text(d.name),
         d.chapter_slug,
         emit_params(syms, &d.params),
         render_ty(syms, &d.ty),
-        emit_expr(syms, &d.body)
+        emit_expr(syms, &d.body),
+        i32::from(d.is_punctual),
+        d.wcet_budget
     )
 }
 

@@ -733,6 +733,8 @@ impl<'a> Desugar<'a> {
             chapter_slug: String::new(),
             span: sp,
             is_claim: false,
+            is_punctual: false,
+            wcet_budget: 0,
         }
     }
 
@@ -789,6 +791,7 @@ impl<'a> Desugar<'a> {
             })
             .map(|b| self.expr(b))
             .unwrap_or_else(|| Expr::Error("no body".into(), Span::default()));
+        let punct = d.children_of(NodeKind::Punctual).next();
         Def {
             name: name_tok.map(|t| self.sym(&t)).unwrap_or_default(),
             params,
@@ -800,6 +803,14 @@ impl<'a> Desugar<'a> {
             // is what makes the association structural rather than "the next
             // sibling". That is also what makes it readable here.
             is_claim: d.child_nodes().iter().any(|k| k.kind == NodeKind::Claim),
+            is_punctual: punct.is_some(),
+            // The budget is the literal the author wrote after the keyword,
+            // and it is OPTIONAL: `punctual f` declares the discipline without
+            // a number.
+            wcet_budget: punct
+                .and_then(|p| p.tokens().find(|t| t.kind == Kind::IntegerLiteral))
+                .and_then(|t| self.text(t).parse().ok())
+                .unwrap_or(0),
         }
     }
 
