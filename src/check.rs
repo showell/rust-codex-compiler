@@ -2284,10 +2284,33 @@ pub fn infer_row(
             }
             obj
         }
+        // `infer-handle-clauses` (subject). **A CLAUSE BINDS ITS PARAMETERS
+        // AND ITS RESUME**, and both mint: `bind-lambda-params` one per
+        // parameter, then one more for the resume continuation. Binding
+        // nothing left `resume` an unknown name, so the wire spelled its type
+        // as whatever the enclosing expression suggested rather than the
+        // `(fn <op result> <handle result>)` it is -- the resume's type is
+        // learned by UNIFICATION at the call sites inside the clause body,
+        // which is why a bare fresh variable is the right thing to bind.
+        //
+        // The handle answers the BODY's type; the clauses only contribute
+        // their effect rows.
         E::Handle(h) => {
-            let t = infer(&h.body, env, st);
+            let (t, body_row) = infer_row(&h.body, env, st);
+            row = body_row;
             for c in &h.clauses {
-                let _ = infer(&c.body, env, st);
+                let mark = env.scope.len();
+                for p in &c.params {
+                    let a = st.fresh();
+                    env.bind(*p, a);
+                }
+                let rs = st.fresh();
+                env.bind(c.resume_name, rs);
+                let (_, crow) = infer_row(&c.body, env, st);
+                while env.scope.len() > mark {
+                    env.scope.pop();
+                }
+                row = st.row_union(&row, &crow);
             }
             t
         }

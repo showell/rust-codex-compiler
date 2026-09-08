@@ -367,6 +367,43 @@ mod tests {
         );
     }
 
+    /// `with <Effect> <body>` and its clauses, which lowering REFUSED until
+    /// now -- six corpus chapters produced no IR at all for a program the
+    /// oracle compiles.
+    ///
+    /// **THE LAST PARAMETER OF A CLAUSE IS THE RESUME NAME**, not a parameter:
+    /// `tick (resume) = ...` spells `(params)` and a resume of `"resume"`.
+    /// The ones before it are the operation's own, and they are spelled TWICE
+    /// -- in `(params ...)` and again in the lambda
+    /// `wrap-clause-body-in-lambda` makes of the body. That is upstream's
+    /// shape, and a clause with no operation parameters is not wrapped.
+    ///
+    /// The `let .. in` matters: a handler block has no `end`, so without it
+    /// the clause list swallows whatever follows.
+    #[test]
+    fn a_handler_lowers_to_handle_with_its_clauses() {
+        let src = "Chapter: H\n\nSection: E\n\n  effect Counter where\n    tick : [Counter] Integer\n\nSection: B\n  run : Integer -> Integer\n  run (n) = let r = with Counter tick\n      tick (resume) = resume n\n    in r\n\nSection: Main\n  opening : [Console] Nothing = act\n   print-line-uni (show (run 1))\n  end\n";
+        let line = def_line(src, "run");
+        assert!(line.contains(r#"(handle "Counter""#), "{line}");
+        assert!(line.contains(r#"(handle-clause "tick" (params) "resume""#), "{line}");
+        // No operation parameters, so the body is NOT wrapped in a lambda.
+        assert!(!line.contains("(lambda"), "{line}");
+        // Nothing after the clause list was swallowed.
+        assert!(!line.contains(r#""Section""#), "{line}");
+    }
+
+    /// An operation parameter appears in `(params ...)`, and the lambda the
+    /// body is wrapped in is then LIFTED like any other -- upstream's own
+    /// output for `handler-smoke` spells the clause body as an apply of
+    /// `__lam_0`, so the wrap is real even though it is not visible here.
+    #[test]
+    fn an_operation_parameter_is_spelled_and_its_wrap_is_lifted() {
+        let src = "Chapter: H\n\nSection: E\n\n  effect Transform where\n    apply-op : Integer -> [Transform] Integer\n\nSection: B\n  run : Integer -> Integer\n  run (n) = let r = with Transform (apply-op 6)\n      apply-op (x) (resume) = resume (x * n)\n    in r\n\nSection: Main\n  opening : [Console] Nothing = act\n   print-line-uni (show (run 1))\n  end\n";
+        let line = def_line(src, "run");
+        assert!(line.contains(r#"(handle-clause "apply-op" (params "x") "resume""#), "{line}");
+        assert!(line.contains("__lam_0"), "the wrapping lambda was not lifted: {line}");
+    }
+
     /// **A NESTED RECORD LITERAL'S FIELDS ARE NOT THE RECEIVER'S.** `revised`
     /// collected them with a DEEP walk, so `o revised { ob = Inner { ia = 5 } }`
     /// asked `Outer` for a field `ia` and the chapter was refused. Four corpus

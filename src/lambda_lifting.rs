@@ -160,6 +160,25 @@ fn lift_expr(
             let v = go(v, enclosing, syms, lifted);
             E::FieldStore(r, f, v, t, s)
         }
+        // **A CLAUSE'S PARAMETERS AND ITS RESUME NAME ARE IN SCOPE FOR ITS
+        // BODY.** They are not written anywhere a pattern walk would find, so
+        // a lambda inside a clause would capture them as free variables and
+        // lift them into its own parameter list.
+        E::Handle(eff, b, cs, t, s) => {
+            let b = go(b, enclosing, syms, lifted);
+            let cs = cs
+                .into_iter()
+                .map(|mut c| {
+                    let mark = enclosing.len();
+                    enclosing.extend(c.params.iter().copied());
+                    enclosing.push(c.resume_name);
+                    c.body = lift_expr(c.body, enclosing, names, syms, lifted);
+                    enclosing.truncate(mark);
+                    c
+                })
+                .collect();
+            E::Handle(eff, b, cs, t, s)
+        }
         // A branch's pattern names are in scope for the BODY AND THE GUARD,
         // and the body is lifted first.
         E::Match(sc, bs, t, s) => {
@@ -325,6 +344,16 @@ fn free_vars(
             bound.push(*n);
             free_vars(b, bound, capturable, syms, out);
             bound.pop();
+        }
+        E::Handle(_, b, cs, _, _) => {
+            free_vars(b, bound, capturable, syms, out);
+            for c in cs {
+                let mark = bound.len();
+                bound.extend(c.params.iter().copied());
+                bound.push(c.resume_name);
+                free_vars(&c.body, bound, capturable, syms, out);
+                bound.truncate(mark);
+            }
         }
         E::Match(sc, bs, _, _) => {
             free_vars(sc, bound, capturable, syms, out);

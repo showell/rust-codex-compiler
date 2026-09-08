@@ -498,6 +498,28 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
             let ty = act_block_type(&parts, want);
             Ok(IrExpr::Act(parts, ty, *s))
         }
+        // `lower-handle` (subject). **THE HANDLE'S TYPE IS THE EXPECTATION,
+        // falling back to the body's** -- `chain-ret-or` -- because a handler
+        // discharges an effect without changing the value the body computes.
+        Expr::Handle(h) => {
+            let body = expr(&h.body, want, cx)?;
+            let ty = match want {
+                Ty::Error | Ty::NoExpect => body.ty(),
+                other => other.clone(),
+            };
+            let mut cs = Vec::new();
+            for c in &h.clauses {
+                let b = expr(&c.body, want, cx)?;
+                cs.push(crate::ir_chapter::IrHandleClause {
+                    op_name: cx.text(c.op_name),
+                    params: c.params.clone(),
+                    resume_name: c.resume_name,
+                    body: wrap_clause_body(&c.params, b, c.span),
+                    span: c.span,
+                });
+            }
+            Ok(IrExpr::Handle(cx.text(h.effect), Box::new(body), cs, ty, h.span))
+        }
         Expr::Record(n, fields, s) => {
             // The checker's recorded answer first -- it is the better one, and
             // it is what makes this arm short. But `record-expr-type` SKIPS A
@@ -886,6 +908,27 @@ fn empty_list(want: &Ty, cx: &Lower, s: crate::ast::Span) -> IrExpr {
         Ty::List(e) => IrExpr::List(Vec::new(), *e, s),
         _ => IrExpr::List(Vec::new(), Ty::Error, s),
     }
+}
+
+/// `wrap-clause-body-in-lambda` (subject). **A CLAUSE WITH PARAMETERS IS A
+/// LAMBDA OVER THEM, and its parameters are spelled TWICE** -- once in the
+/// clause's own `(params ...)` and once in the lambda the body becomes. That
+/// is upstream's shape, not a redundancy we introduced. A clause with no
+/// parameters is not wrapped at all.
+///
+/// Every parameter is typed `int-default`, which is upstream's placeholder
+/// here and not an inference: the clause's real parameter types live in the
+/// effect declaration.
+fn wrap_clause_body(params: &[Sym], body: IrExpr, sp: crate::ast::Span) -> IrExpr {
+    if params.is_empty() {
+        return body;
+    }
+    let int = Ty::Integer(i64::MIN, i64::MAX, crate::check::Overflow::Error);
+    let ty = params.iter().fold(body.ty(), |acc, _| {
+        Ty::Fun(Box::new(int.clone()), crate::check::EffectRow::default(), Box::new(acc))
+    });
+    let ps = params.iter().map(|p| crate::ir_chapter::IrParam { name: *p, ty: int.clone(), span: sp }).collect();
+    IrExpr::Lambda(ps, Box::new(body), ty, sp)
 }
 
 /// `strip-fun-args`: the type a constructor arrow ANSWERS, which for a record

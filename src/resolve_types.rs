@@ -117,6 +117,18 @@ fn expr(syms: &SymTab, m: &TypeMap, e: &IrExpr) -> IrExpr {
         E::List(xs, ty, s) => {
             E::List(xs.iter().map(|x| expr(syms, m, x)).collect(), t(ty), *s)
         }
+        E::Handle(eff, b, cs, ty, s) => E::Handle(
+            eff.clone(),
+            go(b),
+            cs.iter()
+                .map(|c| crate::ir_chapter::IrHandleClause {
+                    body: expr(syms, m, &c.body),
+                    ..c.clone()
+                })
+                .collect(),
+            t(ty),
+            *s,
+        ),
         E::Match(sc, bs, ty, s) => E::Match(
             go(sc),
             bs.iter()

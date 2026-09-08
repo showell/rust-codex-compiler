@@ -85,6 +85,18 @@ fn fold_expr(e: &IrExpr, defined: &BTreeSet<Sym>, syms: &SymTab) -> IrExpr {
             t.clone(),
             *s,
         ),
+        E::Handle(eff, b, cs, t, s) => E::Handle(
+            eff.clone(),
+            go(b),
+            cs.iter()
+                .map(|c| crate::ir_chapter::IrHandleClause {
+                    body: fold_expr(&c.body, defined, syms),
+                    ..c.clone()
+                })
+                .collect(),
+            t.clone(),
+            *s,
+        ),
         E::Match(sc, bs, t, s) => E::Match(
             go(sc),
             bs.iter()
@@ -562,6 +574,22 @@ fn rewrite(
             E::Lambda(ps.clone(), Box::new(b), t.clone(), *s)
         }
         E::Negate(x, t, s) => E::Negate(Box::new(rewrite(x, cands, bound, site)), t.clone(), *s),
+        E::Handle(eff, b, cs, t, s) => E::Handle(
+            eff.clone(),
+            Box::new(rewrite(b, cands, bound, site)),
+            cs.iter()
+                .map(|c| {
+                    let mark = bound.len();
+                    bound.extend(c.params.iter().copied());
+                    bound.push(c.resume_name);
+                    let body = rewrite(&c.body, cands, bound, site);
+                    bound.truncate(mark);
+                    crate::ir_chapter::IrHandleClause { body, ..c.clone() }
+                })
+                .collect(),
+            t.clone(),
+            *s,
+        ),
         E::Match(sc, bs, t, s) => E::Match(
             Box::new(rewrite(sc, cands, bound, site)),
             bs.iter()

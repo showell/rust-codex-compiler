@@ -177,6 +177,35 @@ pub fn emit_expr(syms: &SymTab, e: &IrExpr) -> String {
             xs.iter().map(|x| format!(" {}", sub(x))).collect::<String>(),
             t(elem)
         ),
+        // `(handle EFF BODY (clauses (handle-clause OP (params ..) RESUME
+        // BODY) ..) TYPE)`. The effect and the operation are NAMES on the
+        // wire, quoted, not types.
+        E::Handle(eff, body, cs, ty, _) => {
+            let clauses: String = cs
+                .iter()
+                .map(|c| {
+                    let ps: String = c
+                        .params
+                        .iter()
+                        .map(|p| format!(" {:?}", syms.text(*p)))
+                        .collect();
+                    format!(
+                        " (handle-clause {:?} (params{}) {:?} {})",
+                        c.op_name,
+                        ps,
+                        syms.text(c.resume_name),
+                        emit_expr(syms, &c.body)
+                    )
+                })
+                .collect();
+            format!(
+                "(handle {:?} {} (clauses{}) {})",
+                eff,
+                emit_expr(syms, body),
+                clauses,
+                render_ty(syms, ty)
+            )
+        }
         E::Match(sc, bs, ty, _) => format!(
             "(match {} (branches{}) {})",
             sub(sc),

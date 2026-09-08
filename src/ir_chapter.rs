@@ -21,11 +21,11 @@
 //!
 //! ## What is here and what is not
 //!
-//! The variants lowering can actually build. `IrHandle`, `IrWithTimeout`,
-//! `IrFork`, `IrAwait` and `IrTry` are upstream's and are NOT here, because
-//! lowering refuses those forms today -- a pass cannot mishandle a node that
-//! cannot exist, and a variant nothing constructs is a floor nobody is
-//! standing on. They come back with the lowering that builds them.
+//! The variants lowering can actually build. `IrWithTimeout`, `IrFork`,
+//! `IrAwait` and `IrTry` are upstream's and are NOT here, because lowering
+//! refuses those forms today -- a pass cannot mishandle a node that cannot
+//! exist, and a variant nothing constructs is a floor nobody is standing on.
+//! They come back with the lowering that builds them, as `IrHandle` did.
 //!
 //! ## The type is ON the node
 //!
@@ -119,6 +119,19 @@ impl IrBinOp {
 pub struct IrParam {
     pub name: Sym,
     pub ty: Ty,
+    pub span: Span,
+}
+
+/// `IRHandleClause`. **THE PARAMETER NAMES ARE CARRIED TWICE ON PURPOSE**:
+/// once as `params`, which the wire spells, and once inside `body`, which
+/// `wrap-clause-body-in-lambda` wraps in an `IrLambda` over the same names.
+/// A clause with no parameters is not wrapped.
+#[derive(Clone, Debug)]
+pub struct IrHandleClause {
+    pub op_name: String,
+    pub params: Vec<Sym>,
+    pub resume_name: Sym,
+    pub body: IrExpr,
     pub span: Span,
 }
 
@@ -219,6 +232,9 @@ pub enum IrExpr {
     FieldAccess(Box<IrExpr>, String, Ty, Span),
     /// **The type is the RECORD's**: a store evaluates to what it wrote into.
     FieldStore(Box<IrExpr>, String, Box<IrExpr>, Ty, Span),
+    /// `(handle EFF BODY (clauses ...) TYPE)`. The effect is a NAME on the
+    /// wire, not a type.
+    Handle(String, Box<IrExpr>, Vec<IrHandleClause>, Ty, Span),
 }
 
 impl IrExpr {
@@ -245,7 +261,8 @@ impl IrExpr {
             | E::Act(_, t, _)
             | E::Record(_, _, t, _)
             | E::FieldAccess(_, _, t, _)
-            | E::FieldStore(_, _, _, t, _) => t.clone(),
+            | E::FieldStore(_, _, _, t, _)
+            | E::Handle(_, _, _, t, _) => t.clone(),
             // **A LIST'S NODE TYPE IS NOT THE TYPE IT CARRIES.** The wire
             // spells the ELEMENT type after `(list-expr (elems ...) T)`, so
             // the node's own type is one `list` around it.
@@ -275,7 +292,8 @@ impl IrExpr {
             | E::Act(_, _, s)
             | E::Record(_, _, _, s)
             | E::FieldAccess(_, _, _, s)
-            | E::FieldStore(_, _, _, _, s) => *s,
+            | E::FieldStore(_, _, _, _, s)
+            | E::Handle(_, _, _, _, s) => *s,
         }
     }
 
@@ -307,6 +325,11 @@ impl IrExpr {
                     v.push(&b.body);
                     v.push(&b.guard);
                 }
+                v
+            }
+            E::Handle(_, b, cs, _, _) => {
+                let mut v = vec![&**b];
+                v.extend(cs.iter().map(|c| &c.body));
                 v
             }
         }
