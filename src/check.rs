@@ -524,6 +524,42 @@ impl UnifyState {
         }
     }
 
+    /// `occurs-in` (subject 46189). **THE CHECK THAT KEEPS THE SUBSTITUTION
+    /// ACYCLIC**, and the reason `deep_resolve` terminates.
+    ///
+    /// Without it, `unify` will happily bind `Var(3) := List (Var 3)`.
+    /// `resolve` survives that -- it is bounded and follows one chain -- but
+    /// `deep_resolve` walks STRUCTURE, so it resolves the element, finds
+    /// `Var(3)`, resolves it to `List (Var 3)` again, and runs until the stack
+    /// ends. Nineteen corpus units aborted this way, sixteen of them
+    /// `linear-*`, and the one named `infinite-type` is what the name says.
+    ///
+    /// **THE ARM LIST IS DELIBERATELY NARROW.** An arrow, a list, a type
+    /// application and a linear wrapper are walked; a sum, a record, a
+    /// constructed type, a vector and a unit are NOT. That is upstream's list
+    /// and not an omission here -- a cycle through a named type's arguments
+    /// is not built by the arms that bind.
+    ///
+    /// `max-recursion-depth` is 1024 and exhausting it answers TRUE: the
+    /// budget is spent refusing, not accepting.
+    fn occurs_in(&self, var_id: u32, t: &Ty, depth: usize) -> bool {
+        if depth >= 1024 {
+            return true;
+        }
+        match self.resolve(t) {
+            Ty::Var(id) => id == var_id,
+            Ty::Fun(p, _, r) => {
+                self.occurs_in(var_id, &p, depth + 1) || self.occurs_in(var_id, &r, depth + 1)
+            }
+            Ty::List(e) | Ty::LinkedList(e) => self.occurs_in(var_id, &e, depth + 1),
+            Ty::TypeApply(f, a) => {
+                self.occurs_in(var_id, &f, depth + 1) || self.occurs_in(var_id, &a, depth + 1)
+            }
+            Ty::Linear(i) => self.occurs_in(var_id, &i, depth + 1),
+            _ => false,
+        }
+    }
+
     fn bind_var(&mut self, id: u32, t: Ty) {
         if let Some(slot) = self.substitutions.get_mut(id as usize) {
             *slot = t;
@@ -536,18 +572,52 @@ impl UnifyState {
     /// argument here.
     ///
     pub fn unify(&mut self, a: &Ty, b: &Ty) -> bool {
-        let a = self.resolve(a);
-        let b = self.resolve(b);
+        // **`linear` IS TRANSPARENT TO UNIFICATION, ON BOTH SIDES.**
+        // `unify-at` (subject 46401) strips it after resolving and before it
+        // looks at anything, so `Var(269)` meeting `Linear (Var 269)` is two
+        // equal variables rather than a variable meeting a type that contains
+        // it. Without the strip the occurs check reads that as an infinite
+        // type and refuses -- two false `Infinite type` errors on
+        // `linear-smoke` and two on `serial-line`, which the oracle reports
+        // clean.
+        let a = strip_linear(self.resolve(a));
+        let b = strip_linear(self.resolve(b));
         match (&a, &b) {
             // An error type has already been reported once. Unifying against
             // it succeeds so one unknown name does not cascade.
             (Ty::Error, _) | (_, Ty::Error) => true,
             (Ty::Var(i), Ty::Var(j)) if i == j => true,
+            // **THE HIGHER ID BINDS TO THE LOWER**, and two variables need no
+            // occurs check because neither can contain the other yet
+            // (subject 46410). Binding left-to-right instead builds chains
+            // upstream never has, and a later unify reads one of them as a
+            // cycle: `linear-smoke` and `serial-line` each reported two
+            // `Infinite type` errors the oracle does not, with every mint
+            // counter already matching.
+            (Ty::Var(i), Ty::Var(j)) => {
+                if i < j {
+                    self.bind_var(*j, a.clone());
+                } else {
+                    self.bind_var(*i, b.clone());
+                }
+                true
+            }
+            // **AN INFINITE TYPE IS REFUSED, NOT BUILT.** Both binding arms ask
+            // first (subject 46415 and 46518), and a hit is `cdx-infinite-type`
+            // -- an error the program earned, not a gap in this file.
             (Ty::Var(i), _) => {
+                if self.occurs_in(*i, &b, 0) {
+                    self.errors += 1;
+                    return false;
+                }
                 self.bind_var(*i, b.clone());
                 true
             }
             (_, Ty::Var(j)) => {
+                if self.occurs_in(*j, &a, 0) {
+                    self.errors += 1;
+                    return false;
+                }
                 self.bind_var(*j, a.clone());
                 true
             }
@@ -942,6 +1012,15 @@ fn resolve_real_quals(
         Ty::Real(w, m)
     } else {
         Ty::Constructed(n, rendered)
+    }
+}
+
+/// `strip-linear-ty` (subject 36545). The type under any number of `linear`
+/// wrappers.
+fn strip_linear(t: Ty) -> Ty {
+    match t {
+        Ty::Linear(inner) => strip_linear(*inner),
+        other => other,
     }
 }
 
@@ -2859,5 +2938,76 @@ mod arithmetic_answers_the_tighter_type {
     fn anything_that_is_not_two_integers_is_the_left() {
         assert_eq!(arith_result_ty(&Ty::Text, &int(0, 5)), Ty::Text);
         assert_eq!(arith_result_ty(&int(0, 5), &Ty::Text), int(0, 5));
+    }
+}
+
+/// The three rules that keep unification from building a type it cannot print.
+///
+/// Written after the fact and they should not have been: the var-var
+/// orientation was changed on a reading of the source with no test behind it,
+/// and it turned out not to be the fix for anything. It is upstream's rule and
+/// it stays, but pinned rather than assumed.
+#[cfg(test)]
+mod unification_stays_acyclic {
+    use super::{Ty, UnifyState};
+
+    /// `unify-resolved` (subject 46410): `if id-a < id-b then add-subst id-b a
+    /// else add-subst id-a b` -- the HIGHER id binds to the lower, whichever
+    /// side it arrived on.
+    #[test]
+    fn the_higher_variable_binds_to_the_lower() {
+        for (l, r) in [(5u32, 2u32), (2, 5)] {
+            let mut st = UnifyState::default();
+            while st.next_id <= 5 {
+                let _ = st.fresh();
+            }
+            assert!(st.unify(&Ty::Var(l), &Ty::Var(r)));
+            assert_eq!(st.resolve(&Ty::Var(5)), Ty::Var(2), "5 should follow to 2 ({l} ~ {r})");
+            assert_eq!(st.resolve(&Ty::Var(2)), Ty::Var(2), "2 stays the representative");
+        }
+    }
+
+    /// `unify-at` (subject 46401) strips `linear` from BOTH sides before it
+    /// looks at anything, so a variable meeting itself under the wrapper is
+    /// two equal variables and not a cycle.
+    #[test]
+    fn linear_is_transparent_to_unification() {
+        for flip in [false, true] {
+            let mut st = UnifyState::default();
+            let v = st.fresh();
+            let wrapped = Ty::Linear(Box::new(v.clone()));
+            let ok = if flip { st.unify(&wrapped, &v) } else { st.unify(&v, &wrapped) };
+            assert!(ok, "linear should be transparent (flip={flip})");
+            assert_eq!(st.errors, 0, "and it is not an infinite type (flip={flip})");
+        }
+    }
+
+    /// `occurs-in` (subject 46189). A variable inside the type it is being
+    /// bound to is `CDX2010 Infinite type` -- refused, not built. Building it
+    /// does not fail here; it fails in `deep_resolve`, which walks structure
+    /// and never terminates.
+    #[test]
+    fn a_variable_inside_its_own_binding_is_refused() {
+        for flip in [false, true] {
+            let mut st = UnifyState::default();
+            let v = st.fresh();
+            let cyclic = Ty::List(Box::new(v.clone()));
+            let ok = if flip { st.unify(&cyclic, &v) } else { st.unify(&v, &cyclic) };
+            assert!(!ok, "an infinite type is refused (flip={flip})");
+            assert_eq!(st.errors, 1, "and it is reported (flip={flip})");
+            // The substitution is still walkable, which is the point.
+            assert_eq!(st.deep_resolve(&v), v);
+        }
+    }
+
+    /// The arm list is narrow ON PURPOSE: a sum, a record, a constructed type,
+    /// a vector and a unit are not walked. Upstream's list, not an omission.
+    #[test]
+    fn a_named_types_arguments_are_not_walked() {
+        let mut st = UnifyState::default();
+        let v = st.fresh();
+        let n = crate::symbol::SymTab::default().intern("");
+        assert!(st.unify(&v, &Ty::Constructed(n, vec![v.clone()])));
+        assert_eq!(st.errors, 0);
     }
 }
