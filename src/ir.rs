@@ -367,6 +367,17 @@ mod tests {
         );
     }
 
+    /// **`^` IS ALWAYS `pow-int`**, whatever the operands: `lower-binary` has
+    /// no Real arm for it, and the oracle spells `pow-int` for `pow-on-real`
+    /// too. Lowering refused the operator outright until now.
+    #[test]
+    fn exponentiation_is_always_pow_int() {
+        let ints = "Chapter: P\n\nSection: S\n  f : Integer -> Integer\n  f (n) = n ^ 2\n\nSection: M\n  opening : [Console] Nothing = act\n   print-line-uni (show (f 3))\n  end\n";
+        assert!(def_line(ints, "f").contains("(binary pow-int"), "{}", def_line(ints, "f"));
+        let reals = "Chapter: P\n\nSection: S\n  f : Real -> Real\n  f (n) = n ^ 2.0\n\nSection: M\n  opening : [Console] Nothing = act\n   print-line-uni (show (f 3.0))\n  end\n";
+        assert!(def_line(reals, "f").contains("(binary pow-int"), "{}", def_line(reals, "f"));
+    }
+
     /// `with <Effect> <body>` and its clauses, which lowering REFUSED until
     /// now -- six corpus chapters produced no IR at all for a program the
     /// oracle compiles.

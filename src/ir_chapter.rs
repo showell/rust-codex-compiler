@@ -53,6 +53,11 @@ pub enum IrBinOp {
     SubNum,
     MulNum,
     DivNum,
+    /// **ALWAYS `pow-int`, WHATEVER THE OPERANDS.** `lower-binary`'s `is OpPow
+    /// -> IrPowInt` has no Real arm, and the oracle spells `pow-int` for
+    /// `pow-on-real` too. The refusal a float exponent deserves is raised at
+    /// x86 emit (`cdx-pow-on-float`), not here.
+    PowInt,
     Eq,
     NotEq,
     Lt,
@@ -98,6 +103,7 @@ impl IrBinOp {
             IrBinOp::SubNum => "sub-num",
             IrBinOp::MulNum => "mul-num",
             IrBinOp::DivNum => "div-num",
+            IrBinOp::PowInt => "pow-int",
             IrBinOp::Eq => "eq",
             IrBinOp::NotEq => "ne",
             IrBinOp::Lt => "lt",
@@ -235,6 +241,11 @@ pub enum IrExpr {
     /// `(handle EFF BODY (clauses ...) TYPE)`. The effect is a NAME on the
     /// wire, not a type.
     Handle(String, Box<IrExpr>, Vec<IrHandleClause>, Ty, Span),
+    /// `(with-timeout SECS (effs ..) (scopes ..) BODY TYPE)`.
+    WithTimeout(i64, Vec<String>, Vec<String>, Box<IrExpr>, Ty, Span),
+    /// `(try MAX (body ..) (fallback ..) (fail ..) TYPE)`. Three statement
+    /// lists, all of them real program.
+    Try(i64, Vec<IrActStmt>, Vec<IrActStmt>, Vec<IrActStmt>, Ty, Span),
 }
 
 impl IrExpr {
@@ -262,7 +273,9 @@ impl IrExpr {
             | E::Record(_, _, t, _)
             | E::FieldAccess(_, _, t, _)
             | E::FieldStore(_, _, _, t, _)
-            | E::Handle(_, _, _, t, _) => t.clone(),
+            | E::Handle(_, _, _, t, _)
+            | E::WithTimeout(_, _, _, _, t, _)
+            | E::Try(_, _, _, _, t, _) => t.clone(),
             // **A LIST'S NODE TYPE IS NOT THE TYPE IT CARRIES.** The wire
             // spells the ELEMENT type after `(list-expr (elems ...) T)`, so
             // the node's own type is one `list` around it.
@@ -293,7 +306,9 @@ impl IrExpr {
             | E::Record(_, _, _, s)
             | E::FieldAccess(_, _, _, s)
             | E::FieldStore(_, _, _, _, s)
-            | E::Handle(_, _, _, _, s) => *s,
+            | E::Handle(_, _, _, _, s)
+            | E::WithTimeout(_, _, _, _, _, s)
+            | E::Try(_, _, _, _, _, s) => *s,
         }
     }
 
@@ -332,6 +347,13 @@ impl IrExpr {
                 v.extend(cs.iter().map(|c| &c.body));
                 v
             }
+            E::WithTimeout(_, _, _, b, _, _) => vec![b],
+            E::Try(_, b, fb, fl, _, _) => b
+                .iter()
+                .chain(fb)
+                .chain(fl)
+                .map(|s| s.expr())
+                .collect(),
         }
     }
 

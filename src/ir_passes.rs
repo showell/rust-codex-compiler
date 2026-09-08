@@ -85,6 +85,24 @@ fn fold_expr(e: &IrExpr, defined: &BTreeSet<Sym>, syms: &SymTab) -> IrExpr {
             t.clone(),
             *s,
         ),
+        E::WithTimeout(secs, effs, sc, b, t, s) => {
+            E::WithTimeout(*secs, effs.clone(), sc.clone(), go(b), t.clone(), *s)
+        }
+        E::Try(max, b, fb, fl, t, s) => {
+            let f = |ss: &Vec<IrActStmt>| -> Vec<IrActStmt> {
+                ss.iter()
+                    .map(|st| match st {
+                        IrActStmt::Exec(v, sp) => {
+                            IrActStmt::Exec(fold_expr(v, defined, syms), *sp)
+                        }
+                        IrActStmt::Bind(n, bt, v, sp) => {
+                            IrActStmt::Bind(*n, bt.clone(), fold_expr(v, defined, syms), *sp)
+                        }
+                    })
+                    .collect()
+            };
+            E::Try(*max, f(b), f(fb), f(fl), t.clone(), *s)
+        }
         E::Handle(eff, b, cs, t, s) => E::Handle(
             eff.clone(),
             go(b),
@@ -574,6 +592,35 @@ fn rewrite(
             E::Lambda(ps.clone(), Box::new(b), t.clone(), *s)
         }
         E::Negate(x, t, s) => E::Negate(Box::new(rewrite(x, cands, bound, site)), t.clone(), *s),
+        E::WithTimeout(secs, effs, sc, b, t, s) => E::WithTimeout(
+            *secs,
+            effs.clone(),
+            sc.clone(),
+            Box::new(rewrite(b, cands, bound, site)),
+            t.clone(),
+            *s,
+        ),
+        E::Try(max, b, fb, fl, t, s) => {
+            let mut f = |ss: &Vec<IrActStmt>| -> Vec<IrActStmt> {
+                let mark = bound.len();
+                let out: Vec<_> = ss
+                    .iter()
+                    .map(|st| match st {
+                        IrActStmt::Exec(v, sp) => {
+                            IrActStmt::Exec(rewrite(v, cands, bound, site), *sp)
+                        }
+                        IrActStmt::Bind(n, bt, v, sp) => {
+                            let v = rewrite(v, cands, bound, site);
+                            bound.push(*n);
+                            IrActStmt::Bind(*n, bt.clone(), v, *sp)
+                        }
+                    })
+                    .collect();
+                bound.truncate(mark);
+                out
+            };
+            E::Try(*max, f(b), f(fb), f(fl), t.clone(), *s)
+        }
         E::Handle(eff, b, cs, t, s) => E::Handle(
             eff.clone(),
             Box::new(rewrite(b, cands, bound, site)),

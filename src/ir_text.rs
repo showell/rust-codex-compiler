@@ -206,6 +206,27 @@ pub fn emit_expr(syms: &SymTab, e: &IrExpr) -> String {
                 render_ty(syms, ty)
             )
         }
+        E::WithTimeout(secs, effs, scopes, body, ty, _) => {
+            let q = |xs: &[String]| -> String {
+                xs.iter().map(|x| format!(" {x:?}")).collect()
+            };
+            format!(
+                "(with-timeout {} (effs{}) (scopes{}) {} {})",
+                secs,
+                q(effs),
+                q(scopes),
+                emit_expr(syms, body),
+                render_ty(syms, ty)
+            )
+        }
+        E::Try(max, b, fb, fl, ty, _) => format!(
+            "(try {} (body{}) (fallback{}) (fail{}) {})",
+            max,
+            emit_act_stmts(syms, b),
+            emit_act_stmts(syms, fb),
+            emit_act_stmts(syms, fl),
+            render_ty(syms, ty)
+        ),
         E::Match(sc, bs, ty, _) => format!(
             "(match {} (branches{}) {})",
             sub(sc),
@@ -219,17 +240,9 @@ pub fn emit_expr(syms: &SymTab, e: &IrExpr) -> String {
                 .collect::<String>(),
             t(ty)
         ),
-        E::Act(ss, ty, _) => format!(
-            "(act (stmts{}) {})",
-            ss.iter()
-                .map(|s| match s {
-                    IrActStmt::Exec(x, _) => format!(" (do-exec {})", sub(x)),
-                    IrActStmt::Bind(n, bty, x, _) =>
-                        format!(" (do-bind {} {} {})", q(*n), t(bty), sub(x)),
-                })
-                .collect::<String>(),
-            t(ty)
-        ),
+        E::Act(ss, ty, _) => {
+            format!("(act (stmts{}) {})", emit_act_stmts(syms, ss), t(ty))
+        }
         // The fields are emitted IN THE ORDER THE EXPRESSION WRITES THEM, not
         // the order the record declares them -- measured, because the reverse
         // is the obvious guess and it is wrong.
@@ -287,6 +300,22 @@ fn unique(syms: &SymTab, ns: &[Sym]) -> String {
     }
     let names: String = ns.iter().map(|n| format!(" {:?}", syms.text(*n))).collect();
     format!(" (unique{names})")
+}
+
+/// A `(stmts ...)` / `(body ...)` list. Shared by `act` and by `try`'s three
+/// blocks, which spell their statements identically.
+fn emit_act_stmts(syms: &SymTab, ss: &[IrActStmt]) -> String {
+    ss.iter()
+        .map(|s| match s {
+            IrActStmt::Exec(x, _) => format!(" (do-exec {})", emit_expr(syms, x)),
+            IrActStmt::Bind(n, bty, x, _) => format!(
+                " (do-bind {:?} {} {})",
+                syms.text(*n),
+                render_ty(syms, bty),
+                emit_expr(syms, x)
+            ),
+        })
+        .collect()
 }
 
 /// One definition line. The two trailing numbers are `is-punctual` and

@@ -403,16 +403,20 @@ impl<'a> Desugar<'a> {
                     .find(|t| t.kind == Kind::IntegerLiteral)
                     .map(|t| self.text(t))
                     .unwrap_or_default();
-                let effs: Vec<Name> = n
+                // **THE SAME ROW READER THE TYPE PATH USES.** This arm had
+                // its own, which took the identifiers alone -- so
+                // `Device.Block` became two effects and every SCOPE was
+                // dropped. `effect_row` already knew both, and the wire spells
+                // one scope per effect whether or not the author wrote it.
+                let (effects, labels, _tail) = n
                     .children_of(NodeKind::EffectRow)
-                    .flat_map(|r| r.tokens())
-                    .filter(|t| matches!(t.kind, Kind::Identifier | Kind::TypeIdentifier))
-                    .map(|t| self.sym(t))
-                    .collect();
+                    .next()
+                    .map(|r| self.effect_row(r))
+                    .unwrap_or_default();
                 Expr::WithTimeout(Box::new(WithTimeoutExpr {
                     timeout,
-                    effects: effs,
-                    labels: Vec::new(),
+                    effects,
+                    labels,
                     body: Rc::new(
                         kids.iter()
                             .find(|k| k.kind != NodeKind::EffectRow)

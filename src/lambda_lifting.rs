@@ -164,6 +164,36 @@ fn lift_expr(
         // BODY.** They are not written anywhere a pattern walk would find, so
         // a lambda inside a clause would capture them as free variables and
         // lift them into its own parameter list.
+        E::WithTimeout(secs, effs, sc, b, t, s) => {
+            let b = go(b, enclosing, syms, lifted);
+            E::WithTimeout(secs, effs, sc, b, t, s)
+        }
+        // Each block gets its own scope; a bind is visible to the statements
+        // after it within the SAME block and no further.
+        E::Try(max, b, fb, fl, t, s) => {
+            let mut one = |ss: Vec<IrActStmt>, enclosing: &mut Vec<Sym>| -> Vec<IrActStmt> {
+                let mark = enclosing.len();
+                let out = ss
+                    .into_iter()
+                    .map(|st| match st {
+                        IrActStmt::Exec(v, sp) => {
+                            IrActStmt::Exec(lift_expr(v, enclosing, names, syms, lifted), sp)
+                        }
+                        IrActStmt::Bind(n, bt, v, sp) => {
+                            let v = lift_expr(v, enclosing, names, syms, lifted);
+                            enclosing.push(n);
+                            IrActStmt::Bind(n, bt, v, sp)
+                        }
+                    })
+                    .collect();
+                enclosing.truncate(mark);
+                out
+            };
+            let b = one(b, enclosing);
+            let fb = one(fb, enclosing);
+            let fl = one(fl, enclosing);
+            E::Try(max, b, fb, fl, t, s)
+        }
         E::Handle(eff, b, cs, t, s) => {
             let b = go(b, enclosing, syms, lifted);
             let cs = cs
@@ -344,6 +374,21 @@ fn free_vars(
             bound.push(*n);
             free_vars(b, bound, capturable, syms, out);
             bound.pop();
+        }
+        E::WithTimeout(_, _, _, b, _, _) => free_vars(b, bound, capturable, syms, out),
+        E::Try(_, b, fb, fl, _, _) => {
+            for ss in [b, fb, fl] {
+                let mark = bound.len();
+                for st in ss {
+                    if let crate::ir_chapter::IrActStmt::Bind(n, _, _, _) = st {
+                        free_vars(st.expr(), bound, capturable, syms, out);
+                        bound.push(*n);
+                    } else {
+                        free_vars(st.expr(), bound, capturable, syms, out);
+                    }
+                }
+                bound.truncate(mark);
+            }
         }
         E::Handle(_, b, cs, _, _) => {
             free_vars(b, bound, capturable, syms, out);

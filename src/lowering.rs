@@ -375,6 +375,8 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
                 BinaryOp::OpSub => (arith(IrBinOp::SubInt, IrBinOp::SubNum), lty.clone()),
                 BinaryOp::OpMul => (arith(IrBinOp::MulInt, IrBinOp::MulNum), lty.clone()),
                 BinaryOp::OpDiv => (arith(IrBinOp::DivInt, IrBinOp::DivNum), lty.clone()),
+                // NOT `arith`: upstream has no Real arm for `^`.
+                BinaryOp::OpPow => (IrBinOp::PowInt, lty.clone()),
                 BinaryOp::OpEq => (IrBinOp::Eq, Ty::Boolean),
                 BinaryOp::OpNotEq => (IrBinOp::NotEq, Ty::Boolean),
                 BinaryOp::OpLt => (IrBinOp::Lt, Ty::Boolean),
@@ -519,6 +521,33 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
                 });
             }
             Ok(IrExpr::Handle(cx.text(h.effect), Box::new(body), cs, ty, h.span))
+        }
+        // `(with-timeout SECS (effs ..) (scopes ..) BODY TYPE)`. The scopes
+        // list is always empty today, as it is in the AST.
+        Expr::WithTimeout(w) => {
+            let body = expr(&w.body, want, cx)?;
+            let ty = match want {
+                Ty::Error | Ty::NoExpect => body.ty(),
+                other => other.clone(),
+            };
+            Ok(IrExpr::WithTimeout(
+                w.timeout.parse().unwrap_or(0),
+                w.effects.iter().map(|e| cx.text(*e)).collect(),
+                w.labels.clone(),
+                Box::new(body),
+                ty,
+                w.span,
+            ))
+        }
+        // **THE TRY'S TYPE COMES FROM ITS BODY BLOCK**, not from the fallback
+        // or the failure arm: `act-block-type body-ir ty`, the same rule an
+        // ordinary act block follows.
+        Expr::Try(t) => {
+            let body = act_stmts(&t.body, 0, want, cx)?;
+            let fb = act_stmts(&t.fallback, 0, want, cx)?;
+            let fail = act_stmts(&t.failure, 0, want, cx)?;
+            let ty = act_block_type(&body, want);
+            Ok(IrExpr::Try(t.count, body, fb, fail, ty, t.span))
         }
         Expr::Record(n, fields, s) => {
             // The checker's recorded answer first -- it is the better one, and

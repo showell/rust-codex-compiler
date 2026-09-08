@@ -117,6 +117,22 @@ fn expr(syms: &SymTab, m: &TypeMap, e: &IrExpr) -> IrExpr {
         E::List(xs, ty, s) => {
             E::List(xs.iter().map(|x| expr(syms, m, x)).collect(), t(ty), *s)
         }
+        E::WithTimeout(secs, effs, sc, b, ty, s) => {
+            E::WithTimeout(*secs, effs.clone(), sc.clone(), go(b), t(ty), *s)
+        }
+        E::Try(max, b, fb, fl, ty, s) => {
+            let go_stmts = |ss: &Vec<IrActStmt>| {
+                ss.iter()
+                    .map(|st| match st {
+                        IrActStmt::Bind(n, bt, v, sp) => {
+                            IrActStmt::Bind(*n, t(bt), expr(syms, m, v), *sp)
+                        }
+                        IrActStmt::Exec(v, sp) => IrActStmt::Exec(expr(syms, m, v), *sp),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            E::Try(*max, go_stmts(b), go_stmts(fb), go_stmts(fl), t(ty), *s)
+        }
         E::Handle(eff, b, cs, ty, s) => E::Handle(
             eff.clone(),
             go(b),
