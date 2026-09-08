@@ -20,6 +20,7 @@ pub mod heapwatch;
 pub mod interp;
 pub mod ir;
 pub mod lexer;
+pub mod linearity;
 pub mod ir_chapter;
 pub mod ir_passes;
 pub mod ir_text;

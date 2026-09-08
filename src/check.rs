@@ -1436,6 +1436,12 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
     let mut env = builtin_env(&ch.syms, &tds);
     // Collected during the walk and appended after it, so a lookup by name
     // finds the instantiated type rather than the generalised one.
+    // The registry the linear walk asks one question of: is the callee's k-th
+    // parameter declared linear? It wants the REGISTERED type -- the one that
+    // still carries the `linear` wrapper the author wrote -- so it is built
+    // before the loop appends the instantiated ones.
+    let lin_bindings: std::collections::BTreeMap<Sym, Ty> =
+        bindings.iter().map(|b| (b.name, b.ty.clone())).collect();
     let mut per_def: Vec<Binding> = Vec::new();
     for b in &bindings {
         env.bind(b.name, b.ty.clone());
@@ -1549,6 +1555,13 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
                 st.unify_gaps += 1;
             }
         }
+        // `check-all-defs`'s `lin-st = check-linearity-def def fresh-env
+        // (r.state)` -- after the body is checked, before the params come off.
+        crate::linearity::check_def(
+            d,
+            &crate::linearity::LinEnv { syms: &ch.syms, bindings: &lin_bindings },
+            &mut st,
+        );
         for _ in saved {
             env.scope.pop();
         }
