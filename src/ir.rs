@@ -683,6 +683,21 @@ mod tests {
         assert!(line.contains(r#"(record-ty "Box" (args (tvar"#), "{line}");
     }
 
+    /// **THE TWO ARMS OF AN `if` MEET.** Without that, a polymorphic
+    /// constructor in one of them never learns what it stands for.
+    ///
+    /// Read off `codexir` on a ten-line unit: `if n > 0 then Just "x" else
+    /// None` types the `None` as `Maybe Text`, and ours said
+    /// `Maybe (tvar 307)`.
+    #[test]
+    fn the_arms_of_an_if_meet() {
+        // `Maybe` is declared here rather than cited, so the test needs no
+        // checkout.
+        let src = "Chapter: T\n\nSection: S\n  Maybe (a) = | None | Just (a)\n\n  pick : Integer -> Maybe Text\n  pick (n) = if n > 0 then Just \"x\" else None\n\n  use2 : Integer -> Integer\n  use2 (n) = when pick n is Just (t) -> text-length t is None -> 0\n\nSection: E\n  opening : Integer\n  opening = use2 1 + use2 2\n";
+        let all = ir(src);
+        assert!(all.contains(r#"(name "None" (ctd "Maybe" (args text)))"#), "{all}");
+    }
+
     /// A pure definition still renders exactly as it did, which is the thing
     /// these changes must not disturb: it is already byte-identical to the
     /// oracle and that is the only verified ground the native road stands on.

@@ -1585,10 +1585,23 @@ pub fn infer_row(
                 _ => lt,
             }
         }
+        // **THE TWO ARMS MEET, AND THE CONDITION MEETS `Boolean`.**
+        // `infer-if` (subject 52454) unifies both, and neither mints -- but
+        // without the arms meeting, a polymorphic constructor in one of them
+        // never learns what it stands for: `if n > 0 then Just "x" else None`
+        // left `None` as `Maybe (tvar 307)` where the oracle says `Maybe Text`.
+        //
+        // The answer is the THEN arm's, not the union.
         E::If(c, a, b, _) => {
-            let (_, crow) = infer_row(c, env, st);
+            let (ct, crow) = infer_row(c, env, st);
+            if !st.unify(&ct, &Ty::Boolean) {
+                st.unify_gaps += 1;
+            }
             let (ta, arow) = infer_row(a, env, st);
-            let (_tb, brow) = infer_row(b, env, st);
+            let (tb, brow) = infer_row(b, env, st);
+            if !st.unify(&ta, &tb) {
+                st.unify_gaps += 1;
+            }
             let both = st.row_union(&crow, &arow);
             row = st.row_union(&both, &brow);
             ta
