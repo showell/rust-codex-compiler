@@ -204,7 +204,11 @@ pub fn lower_def(d: &crate::ast::Def, cx: &Lower) -> Result<IrDef, String> {
     cx.release((0, 0));
     let mut rest = bound.clone();
     let mut params = Vec::new();
-    for p in &own {
+    // `linear-param-names` (subject 55885) walks the DECLARED parameters only:
+    // a lambda's own parameters are not the definition's, and cannot be
+    // declared linear.
+    let mut unique_params: Vec<Sym> = Vec::new();
+    for (i, p) in own.iter().enumerate() {
         let (arg, res) = match rest {
             Ty::Fun(a, _, r) => (*a, *r),
             _ => {
@@ -214,6 +218,9 @@ pub fn lower_def(d: &crate::ast::Def, cx: &Lower) -> Result<IrDef, String> {
                 ))
             }
         };
+        if i < d.params.len() && matches!(arg, Ty::Linear(_)) {
+            unique_params.push(*p);
+        }
         cx.bind_param(*p, arg.clone());
         params.push(IrParam { name: *p, ty: arg, span: d.span });
         rest = res;
@@ -228,6 +235,7 @@ pub fn lower_def(d: &crate::ast::Def, cx: &Lower) -> Result<IrDef, String> {
         span: d.span,
         is_punctual: d.is_punctual,
         wcet_budget: d.wcet_budget,
+        unique_params,
     })
 }
 

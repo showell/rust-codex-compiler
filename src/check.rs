@@ -1537,7 +1537,14 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
                 }
             };
             saved.push(p.name.clone());
-            env.bind(p.name, arg);
+            // `bind-def-params`' `bound-ty = strip-linear-ty param-ty`
+            // (subject 48817). **THE DISCIPLINE IS NOT PART OF THE TYPE.**
+            // `linear Point` binds as `Point`, so every later question about
+            // the value -- is it a record, what is this field -- is asked of
+            // the type it actually has. Whether the parameter was declared
+            // linear is read from the SYNTAX by `linearity::check_def`, which
+            // is why stripping here costs that pass nothing.
+            env.bind(p.name, strip_linear(arg));
         }
         let body_ty = infer(&d.body, &mut env, &mut st);
         // **THE BODY MEETS THE DECLARED RESULT.** Without this a definition's

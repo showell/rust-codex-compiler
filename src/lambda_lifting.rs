@@ -260,9 +260,11 @@ fn lift_one(
         body,
         chapter_slug: String::new(),
         span: sp,
-        // A lifted lambda is nobody's `punctual` definition.
+        // A lifted lambda is nobody's `punctual` definition, and a lambda
+        // parameter cannot be declared linear.
         is_punctual: false,
         wcet_budget: 0,
+        unique_params: Vec::new(),
     });
 
     // `build-partial-app`: the name, then one apply per capture, each typed

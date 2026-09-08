@@ -10,7 +10,8 @@
 //! not x               ->  x == False
 //! a |> f              ->  f a                 -- the operands SWAP
 //! s in rest           ->  let __seq = s in rest
-//! e revised { f = v } ->  let __rev = e in ... a chain of field assignments
+//! e revised { f = v } ->  let __rev = e in let __rv0 = v in
+//!                         __record-set __rev "f" __rv0
 //! ```
 //!
 //! Two are easy to get subtly wrong and neither is caught by a
@@ -425,26 +426,77 @@ impl<'a> Desugar<'a> {
                 Span::default(),
             ),
             NodeKind::Revised => {
-                // `e revised { f = v }` becomes a `__rev` binding and a chain
-                // of field assignments over it.
-                let base =
-                    kids.first().map_or(Expr::Error(String::new(), sp), |b| self.expr(b));
+                // `e revised { f = v }` (subject 42753). The receiver is bound
+                // once, EVERY field value is bound once before any of them is
+                // written, and the writes are a `__record-set` spine:
+                //
+                //     let __rev = e in let __rv0 = v in
+                //       __record-set __rev "f" __rv0
+                //
+                // **THE VALUES ARE HOISTED ABOVE THE WRITES** because a value
+                // may read the receiver, and `__record-set` writes into a
+                // shared template -- evaluating `v` after the first write
+                // would read a record that had already changed.
+                //
+                // **DIRECT CHILDREN, NOT `descendants`.** A nested record
+                // literal in a field's value has `RecordField` children of its
+                // own, and a deep walk claimed them for the receiver: `o
+                // revised { ob = Inner { ia = 5 } }` asked `Outer` for a field
+                // `ia`. That was four of the corpus's refusals.
+                let base = kids.first().map_or(Expr::Error(String::new(), sp), |b| self.expr(b));
+                let fields: Vec<(Name, Expr, bool)> = n
+                    .children_of(NodeKind::RecordField)
+                    .map(|f| {
+                        let v = f
+                            .child_nodes()
+                            .last()
+                            .map_or(Expr::Error(String::new(), sp), |v| self.expr(v));
+                        // `is-narrow-app`: a narrowing conversion is hoisted
+                        // by its ARGUMENT and re-applied at the use, so the
+                        // binding holds the wide value.
+                        match v {
+                            Expr::Apply(ref h, ref a, _)
+                                if matches!(**h, Expr::NameRef(n, _) if self.str_of(n) == "__narrow") =>
+                            {
+                                (self.leading(f), (**a).clone(), true)
+                            }
+                            other => (self.leading(f), other, false),
+                        }
+                    })
+                    .collect();
+                let rv = |i: usize| self.sym_str(&format!("__rv{i}"));
                 let mut chain = Expr::NameRef(self.sym_str("__rev"), Span::default());
-                for f in n.descendants(NodeKind::RecordField) {
-                    let value = f
-                        .child_nodes()
-                        .last()
-                        .map_or(Expr::Error(String::new(), sp), |v| self.expr(v));
-                    chain = Expr::FieldAssign(
-                        Rc::new(chain),
-                        self.leading(f),
-                        Rc::new(value),
+                for (i, (fname, _, narrow)) in fields.iter().enumerate() {
+                    let mut val = Expr::NameRef(rv(i), Span::default());
+                    if *narrow {
+                        val = Expr::Apply(
+                            Rc::new(Expr::NameRef(self.sym_str("__narrow"), Span::default())),
+                            Rc::new(val),
+                            Span::default(),
+                        );
+                    }
+                    let set = Expr::NameRef(self.sym_str("__record-set"), Span::default());
+                    let a1 = Expr::Apply(Rc::new(set), Rc::new(chain), Span::default());
+                    let lit = Expr::Lit(
+                        self.str_of(*fname),
+                        LiteralKind::TextLit,
+                        Span::default(),
+                    );
+                    let a2 = Expr::Apply(Rc::new(a1), Rc::new(lit), Span::default());
+                    chain = Expr::Apply(Rc::new(a2), Rc::new(val), Span::default());
+                }
+                // One `let` per value, innermost last, then the receiver's.
+                let mut body = chain;
+                for (i, (_, value, _)) in fields.into_iter().enumerate().rev() {
+                    body = Expr::Let(
+                        vec![LetBind { name: rv(i), value, span: Span::default() }],
+                        Rc::new(body),
                         Span::default(),
                     );
                 }
                 Expr::Let(
                     vec![LetBind { name: self.sym_str("__rev"), value: base, span: Span::default() }],
-                    Rc::new(chain),
+                    Rc::new(body),
                     sp,
                 )
             }

@@ -367,6 +367,21 @@ mod tests {
         );
     }
 
+    /// **A NESTED RECORD LITERAL'S FIELDS ARE NOT THE RECEIVER'S.** `revised`
+    /// collected them with a DEEP walk, so `o revised { ob = Inner { ia = 5 } }`
+    /// asked `Outer` for a field `ia` and the chapter was refused. Four corpus
+    /// units died of this.
+    #[test]
+    fn revised_reads_its_own_fields_and_not_a_nested_literals() {
+        let src = "Chapter: T\n\nSection: S\n  Inner = record {\n    ia : Integer\n  }\n\n  Outer = record {\n    oa : Integer,\n    ob : Inner\n  }\n\n  bump : Outer -> Outer\n  bump (o) = o revised { ob = Inner { ia = 5 } }\n\n  opening : Integer = (bump (Outer { oa = 1, ob = Inner { ia = 2 } })).oa\n";
+        let out = ir(src);
+        assert!(!out.contains("REFUSED"), "{out}");
+        // The write is a `__record-set` spine, not a field store: upstream's
+        // shape, and the value is hoisted above the write.
+        assert!(out.contains("__record-set"), "{out}");
+        assert!(out.contains("__rv0"), "{out}");
+    }
+
     /// **THE TWO NUMBERS AT THE END OF A DEF LINE ARE NOT ALWAYS ZERO.** They
     /// are `is-punctual` and `wcet-budget` (`ir-emit-def`, subject 58000), and
     /// they were hardcoded here until the oracle was read: `punctual` defs

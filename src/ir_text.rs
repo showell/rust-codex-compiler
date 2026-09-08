@@ -249,18 +249,30 @@ fn emit_params(syms: &SymTab, ps: &[crate::ir_chapter::IrParam]) -> String {
         .collect()
 }
 
+/// `ir-emit-unique`: OMITTED WHEN EMPTY, so a definition with no linear
+/// parameter keeps its exact previous spelling and a reader taking elements 1
+/// through 7 is unaffected.
+fn unique(syms: &SymTab, ns: &[Sym]) -> String {
+    if ns.is_empty() {
+        return String::new();
+    }
+    let names: String = ns.iter().map(|n| format!(" {:?}", syms.text(*n))).collect();
+    format!(" (unique{names})")
+}
+
 /// One definition line. The two trailing numbers are `is-punctual` and
 /// `wcet-budget` (`ir-emit-def`, subject 58000).
 pub fn emit_def(syms: &SymTab, d: &IrDef) -> String {
     format!(
-        "\n  (def {:?} {:?} (params{}) {} {} {} {})",
+        "\n  (def {:?} {:?} (params{}) {} {} {} {}{})",
         syms.text(d.name),
         d.chapter_slug,
         emit_params(syms, &d.params),
         render_ty(syms, &d.ty),
         emit_expr(syms, &d.body),
         i32::from(d.is_punctual),
-        d.wcet_budget
+        d.wcet_budget,
+        unique(syms, &d.unique_params)
     )
 }
 

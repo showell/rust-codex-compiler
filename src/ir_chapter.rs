@@ -335,6 +335,11 @@ pub struct IrDef {
     /// by looking the definition's NAME up in the chapter's `rt-names`.
     pub is_punctual: bool,
     pub wcet_budget: i64,
+    /// The parameters declared `linear`, by name. **THIS IS THE ONLY PLACE
+    /// LINEARITY REACHES THE WIRE**: it is carried the length of the pipeline
+    /// and consumed at x86 emit for noalias slots, and until upstream printed
+    /// it `linear T` and `T` produced byte-identical IR (subject 57984).
+    pub unique_params: Vec<Sym>,
 }
 
 /// The overflow mode is part of the operator's NAME.
