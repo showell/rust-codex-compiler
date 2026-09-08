@@ -871,6 +871,13 @@ impl TypeDefs {
         self.fields.get(&rec)?.iter().find(|(n, _)| *n == field).map(|(_, t)| t)
     }
 
+    /// A record's fields in declaration order -- the mutable walk asks whether
+    /// any of them reaches a mutable record, and `Ty::Record` does not carry
+    /// them.
+    pub fn record_fields(&self, rec: Sym) -> Option<&[(Sym, Ty)]> {
+        self.fields.get(&rec).map(|f| f.as_slice())
+    }
+
     /// Its SLOT, which the wire spells alongside the name: a field access is
     /// `(field-access OBJ "py/1" text)`, and the number is the field's position
     /// in the DECLARATION -- not in the expression that built the record.
@@ -1442,6 +1449,18 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
     // before the loop appends the instantiated ones.
     let lin_bindings: std::collections::BTreeMap<Sym, Ty> =
         bindings.iter().map(|b| (b.name, b.ty.clone())).collect();
+    // `register-mutable-markers`: the `mutable` keyword the author wrote is on
+    // the type declaration and nowhere else, so the walk that needs it has to
+    // be handed it. Upstream binds a `"__mutable-" & name` marker into the type
+    // environment; a set of names is the same fact without the string surgery.
+    let mutables: std::collections::BTreeSet<Sym> = ch
+        .type_defs
+        .iter()
+        .filter_map(|d| match d {
+            crate::ast::TypeDef::Record(n, _, _, true, _) => Some(*n),
+            _ => None,
+        })
+        .collect();
     let mut per_def: Vec<Binding> = Vec::new();
     for b in &bindings {
         env.bind(b.name, b.ty.clone());
@@ -1559,7 +1578,12 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
         // (r.state)` -- after the body is checked, before the params come off.
         crate::linearity::check_def(
             d,
-            &crate::linearity::LinEnv { syms: &ch.syms, bindings: &lin_bindings },
+            &crate::linearity::LinEnv {
+                syms: &ch.syms,
+                bindings: &lin_bindings,
+                tds: &tds,
+                mutables: &mutables,
+            },
             &mut st,
         );
         for _ in saved {

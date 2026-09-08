@@ -26,9 +26,9 @@
 //! return type says so.
 
 use crate::ast::{ActStmt, Def, Expr, MatchArm, Pat, TypeExpr};
-use crate::check::{Cdx, Ty, UnifyState};
+use crate::check::{Cdx, Ty, TypeDefs, UnifyState};
 use crate::symbol::{Sym, SymTab};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// `LinResult` (subject 50622). Six answers from one walk.
 #[derive(Clone, Debug, PartialEq)]
@@ -93,6 +93,20 @@ fn branch(a: LinResult, b: LinResult) -> LinResult {
     }
 }
 
+/// `lin-path-max`: two paths of which one is taken, where they are allowed to
+/// disagree. The mutable rule counts the WORST path rather than demanding the
+/// arms match, which is what separates it from `branch`.
+fn path_max(a: LinResult, b: LinResult) -> LinResult {
+    LinResult {
+        count: if a.count >= b.count { a.count } else { b.count },
+        ok: a.ok && b.ok,
+        dead: a.dead + b.dead,
+        ret: a.ret || b.ret,
+        esc: first(&a.esc, &b.esc),
+        cap: first(&a.cap, &b.cap),
+    }
+}
+
 /// `lin-move-join`: the value was rebound to `h` and this name is now dead, so
 /// everything the old name still does counts as `dead`.
 fn move_join(moved: LinResult, dead: LinResult) -> LinResult {
@@ -124,6 +138,12 @@ pub struct LinEnv<'a> {
     /// Every name the chapter registered, by the type it declared. Used for one
     /// question only: is the callee's k-th parameter declared linear?
     pub bindings: &'a BTreeMap<Sym, Ty>,
+    /// The chapter's type declarations. The mutable walk reads record FIELDS,
+    /// which `Ty::Record` does not carry.
+    pub tds: &'a TypeDefs,
+    /// The record types declared `mutable` -- upstream's `"__mutable-" & name`
+    /// markers.
+    pub mutables: &'a BTreeSet<Sym>,
 }
 
 impl LinEnv<'_> {
@@ -535,6 +555,9 @@ fn check_mints_binds(def: &Def, env: &LinEnv, tail: bool, binds: &[crate::ast::L
     if expr_is_mint(env, &b.value) {
         let r = lin_let(env, b.name, tail, binds, body, i + 1);
         report_minted_owner(def, env, b.name, &r, st);
+    } else if let Some(mtn) = expr_mut_mint_name(env, &b.value) {
+        let r = consume_let(env, mtn, b.name, binds, body, i + 1);
+        report_minted_mutable(def, env, b.name, &r, st);
     }
     check_mints_binds(def, env, tail, binds, body, i + 1, st);
 }
@@ -548,10 +571,364 @@ fn check_mints_stmts(def: &Def, env: &LinEnv, stmts: &[ActStmt], i: usize, st: &
             if expr_is_mint(env, e) {
                 let r = lin_stmts(env, *n, stmts, i + 1);
                 report_minted_owner(def, env, *n, &r, st);
+            } else if let Some(mtn) = expr_mut_mint_name(env, e) {
+                let r = consume_stmts(env, mtn, *n, stmts, i + 1);
+                report_minted_mutable(def, env, *n, &r, st);
             }
         }
     }
     check_mints_stmts(def, env, stmts, i + 1, st);
+}
+
+// ---------------------------------------------------------------------------
+// The mutable discipline
+// ---------------------------------------------------------------------------
+
+/// `peel-fun-return`.
+fn peel_fun_return(t: &Ty) -> Option<&Ty> {
+    match t {
+        Ty::Fun(_, _, r) => Some(r),
+        Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => peel_fun_return(b),
+        _ => None,
+    }
+}
+
+/// `peel-returns-n`: the type left after `k` arguments. An effect row is peeled
+/// WITHOUT spending an argument -- it wraps the result, it is not one.
+fn peel_returns_n(t: &Ty, k: usize) -> Option<&Ty> {
+    if k == 0 {
+        return Some(t);
+    }
+    match t {
+        Ty::Effectful(_, _, inner) => peel_returns_n(inner, k),
+        other => peel_returns_n(peel_fun_return(other)?, k - 1),
+    }
+}
+
+/// `type-mentions-mut` (subject 50906). Fuel-bounded because a record's fields
+/// can reach the record again, and a self-referential type would otherwise
+/// walk forever.
+fn type_mentions_mut(env: &LinEnv, t: &Ty, target: Sym, fuel: i32) -> bool {
+    if fuel <= 0 {
+        return false;
+    }
+    match t {
+        Ty::Record(n, args) => {
+            *n == target
+                || args.iter().any(|a| type_mentions_mut(env, a, target, fuel - 1))
+                || env.tds.record_fields(*n).is_some_and(|fs| {
+                    fs.iter().any(|(_, ft)| type_mentions_mut(env, ft, target, fuel - 1))
+                })
+        }
+        Ty::Constructed(n, args) => {
+            *n == target
+                || args.iter().any(|a| type_mentions_mut(env, a, target, fuel - 1))
+                || env
+                    .tds
+                    .declared()
+                    .get(n)
+                    .is_some_and(|r| type_mentions_mut(env, r, target, fuel - 1))
+        }
+        Ty::Fun(_, _, r) => type_mentions_mut(env, r, target, fuel - 1),
+        Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => type_mentions_mut(env, b, target, fuel - 1),
+        Ty::Effectful(_, _, inner) => type_mentions_mut(env, inner, target, fuel - 1),
+        Ty::Linear(inner) => type_mentions_mut(env, inner, target, fuel - 1),
+        _ => false,
+    }
+}
+
+/// `return-mentions-mut`: does the value this call HANDS BACK still hold the
+/// mutable record? A `List Counter` does, and so does a `(Integer, Counter)` --
+/// which is why laundering it through a container is not an escape from the
+/// rule.
+fn return_mentions_mut(env: &LinEnv, t: &Ty, target: Sym, fuel: i32) -> bool {
+    if fuel <= 0 {
+        return false;
+    }
+    match t {
+        Ty::List(e) | Ty::LinkedList(e) => return_mentions_mut(env, e, target, fuel - 1),
+        Ty::Sum(_, args) => args.iter().any(|a| type_mentions_mut(env, a, target, fuel - 1)),
+        Ty::Fun(_, _, r) => return_mentions_mut(env, r, target, fuel - 1),
+        Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => return_mentions_mut(env, b, target, fuel - 1),
+        Ty::Effectful(_, _, inner) => return_mentions_mut(env, inner, target, fuel - 1),
+        Ty::Linear(inner) => return_mentions_mut(env, inner, target, fuel - 1),
+        other => type_mentions_mut(env, other, target, fuel),
+    }
+}
+
+/// `apply-threads`: does this call pass the mutable record ON to a new owner?
+/// A callee we cannot find answers FALSE -- the opposite of the linear rule's
+/// safe direction, because here an unknown callee is assumed to consume and
+/// discard rather than to thread.
+fn apply_threads(env: &LinEnv, target: Sym, e: &Expr) -> bool {
+    let Some(h) = head_name(e) else { return false };
+    let Some(t) = env.bindings.get(&h) else { return false };
+    peel_returns_n(t, arg_count(e))
+        .is_some_and(|r| return_mentions_mut(env, r, target, 8))
+}
+
+/// `arg-is-bare` + `spine-has-bare`: is the name passed to this call DIRECTLY,
+/// rather than inside an expression?
+fn spine_has_bare(v: Sym, e: &Expr) -> bool {
+    match e {
+        Expr::Apply(f, a, _) => {
+            matches!(a.as_ref(), Expr::NameRef(n, _) if *n == v) || spine_has_bare(v, f)
+        }
+        _ => false,
+    }
+}
+
+/// `consume-of` (subject 50974). **A DIFFERENT RULE FROM `lin_of`, WALKED THE
+/// SAME WAY.** A mutable record may be handed to a new owner at most once, and
+/// only a hand-off counts: reading a field of it is free, and passing it to a
+/// call that does not give it back is a consumption that ends there. So the
+/// walk carries the mutable TYPE name as well as the variable -- the type is
+/// what tells it whether a callee threads the record onward.
+fn consume_of(env: &LinEnv, target: Sym, v: Sym, e: &Expr) -> LinResult {
+    match e {
+        Expr::NameRef(n, _) => {
+            if *n == v { LinResult::one() } else { LinResult::zero() }
+        }
+        Expr::FieldAccess(obj, _, _) => consume_read(env, target, v, obj),
+        Expr::Apply(..) => {
+            let threads = spine_has_bare(v, e) && apply_threads(env, target, e);
+            consume_spine(env, target, v, threads, e)
+        }
+        Expr::Binary(l, _, r, _) => {
+            seq(consume_of(env, target, v, l), consume_of(env, target, v, r))
+        }
+        Expr::Unary(x, _) => consume_of(env, target, v, x),
+        Expr::If(c, t, el, _) => seq(
+            consume_of(env, target, v, c),
+            path_max(consume_of(env, target, v, t), consume_of(env, target, v, el)),
+        ),
+        Expr::Let(binds, body, _) => consume_let(env, target, v, binds, body, 0),
+        Expr::Lambda(ps, body, _) => {
+            if ps.contains(&v) { LinResult::zero() } else { consume_of(env, target, v, body) }
+        }
+        Expr::Handle(h) => seq(
+            consume_of(env, target, v, &h.body),
+            consume_clauses(env, target, v, &h.clauses),
+        ),
+        Expr::WithTimeout(w) => consume_of(env, target, v, &w.body),
+        Expr::Match(scrut, arms, _) => seq(
+            consume_of(env, target, v, scrut),
+            consume_arms(env, target, v, arms, 0),
+        ),
+        Expr::List(xs, _) => xs
+            .iter()
+            .fold(LinResult::zero(), |a, x| seq(a, consume_of(env, target, v, x))),
+        Expr::Record(_, fs, _) => fs
+            .iter()
+            .fold(LinResult::zero(), |a, f| seq(a, consume_of(env, target, v, &f.value))),
+        Expr::Act(stmts, _) => consume_stmts(env, target, v, stmts, 0),
+        Expr::Try(t) => seq(
+            consume_stmts(env, target, v, &t.body, 0),
+            path_max(
+                consume_stmts(env, target, v, &t.fallback, 0),
+                consume_stmts(env, target, v, &t.failure, 0),
+            ),
+        ),
+        Expr::FieldAssign(rec, _, val, _) => seq(
+            consume_read(env, target, v, rec),
+            consume_of(env, target, v, val),
+        ),
+        Expr::Lazy(inner, _) => consume_of(env, target, v, inner),
+        _ => LinResult::zero(),
+    }
+}
+
+/// `consume-read`: **READING A FIELD IS NOT A HAND-OFF.** `p.left` mentions
+/// `p` and consumes nothing; only a compound receiver is walked further.
+fn consume_read(env: &LinEnv, target: Sym, v: Sym, obj: &Expr) -> LinResult {
+    match obj {
+        Expr::NameRef(..) => LinResult::zero(),
+        other => consume_of(env, target, v, other),
+    }
+}
+
+fn consume_spine(env: &LinEnv, target: Sym, v: Sym, threads: bool, e: &Expr) -> LinResult {
+    match e {
+        Expr::Apply(f, a, _) => seq(
+            consume_spine(env, target, v, threads, f),
+            consume_arg(env, target, v, threads, a),
+        ),
+        other => consume_of(env, target, v, other),
+    }
+}
+
+/// `consume-arg`: the bare name costs one ONLY where the call threads it back
+/// out. A call that swallows the record is the last owner, and there is nothing
+/// left to alias.
+fn consume_arg(env: &LinEnv, target: Sym, v: Sym, threads: bool, a: &Expr) -> LinResult {
+    match a {
+        Expr::NameRef(n, _) => {
+            if *n == v && threads { LinResult::one() } else { LinResult::zero() }
+        }
+        other => consume_of(env, target, v, other),
+    }
+}
+
+fn consume_let(
+    env: &LinEnv,
+    target: Sym,
+    v: Sym,
+    binds: &[crate::ast::LetBind],
+    body: &Expr,
+    i: usize,
+) -> LinResult {
+    let Some(b) = binds.get(i) else { return consume_of(env, target, v, body) };
+    if matches!(&b.value, Expr::NameRef(n, _) if *n == v) {
+        return consume_let_moved(env, target, v, b.name, binds, body, i + 1);
+    }
+    let here = consume_of(env, target, v, &b.value);
+    if b.name == v {
+        return here;
+    }
+    seq(here, consume_let(env, target, v, binds, body, i + 1))
+}
+
+/// `consume-let-moved`: `let m2 = m` renames the record. The new name carries
+/// the rule from here on, and every later mention of the OLD one is dead --
+/// which is the whole of `mutable-launder-alias`.
+fn consume_let_moved(
+    env: &LinEnv,
+    target: Sym,
+    v: Sym,
+    h: Sym,
+    binds: &[crate::ast::LetBind],
+    body: &Expr,
+    i: usize,
+) -> LinResult {
+    if h == v {
+        return consume_let(env, target, v, binds, body, i);
+    }
+    move_join(
+        consume_let(env, target, h, binds, body, i),
+        lin_let(env, v, false, binds, body, i),
+    )
+}
+
+fn consume_stmts(env: &LinEnv, target: Sym, v: Sym, stmts: &[ActStmt], i: usize) -> LinResult {
+    let Some(s) = stmts.get(i) else { return LinResult::zero() };
+    match s {
+        ActStmt::Exec(e, _) => seq(
+            consume_of(env, target, v, e),
+            consume_stmts(env, target, v, stmts, i + 1),
+        ),
+        ActStmt::Bind(n, e, _) => {
+            if *n == v {
+                consume_of(env, target, v, e)
+            } else {
+                seq(
+                    consume_of(env, target, v, e),
+                    consume_stmts(env, target, v, stmts, i + 1),
+                )
+            }
+        }
+    }
+}
+
+fn consume_arms(env: &LinEnv, target: Sym, v: Sym, arms: &[MatchArm], i: usize) -> LinResult {
+    let Some(arm) = arms.get(i) else { return LinResult::zero() };
+    let this = if pat_binds(&arm.pattern, v) {
+        LinResult::zero()
+    } else {
+        seq(
+            consume_of(env, target, v, &arm.guard),
+            consume_of(env, target, v, &arm.body),
+        )
+    };
+    if i + 1 >= arms.len() {
+        this
+    } else {
+        path_max(this, consume_arms(env, target, v, arms, i + 1))
+    }
+}
+
+fn consume_clauses(
+    env: &LinEnv,
+    target: Sym,
+    v: Sym,
+    clauses: &[crate::ast::HandleClause],
+) -> LinResult {
+    clauses.iter().fold(LinResult::zero(), |acc, cl| {
+        let here = if cl.params.contains(&v) || cl.resume_name == v {
+            LinResult::zero()
+        } else {
+            consume_of(env, target, v, &cl.body)
+        };
+        seq(acc, here)
+    })
+}
+
+/// `mutable-name-of` + `return-mutable-name-after`: applying `k` arguments to
+/// this type yields a mutable record -- which one?
+fn return_mutable_name_after(env: &LinEnv, t: &Ty, k: usize) -> Option<Sym> {
+    match t {
+        Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => return_mutable_name_after(env, b, k),
+        Ty::Fun(_, _, r) => {
+            if k == 0 { None } else { return_mutable_name_after(env, r, k - 1) }
+        }
+        Ty::Effectful(_, _, ret) => {
+            if k == 0 { return_mutable_name_after(env, ret, 0) } else { None }
+        }
+        Ty::Record(n, _) | Ty::Constructed(n, _) => {
+            if k == 0 && env.mutables.contains(n) { Some(*n) } else { None }
+        }
+        _ => None,
+    }
+}
+
+/// `expr-mut-mint-name`: this expression BUILDS a mutable record, so the name
+/// it is bound to carries the rule even though no parameter declared it.
+fn expr_mut_mint_name(env: &LinEnv, e: &Expr) -> Option<Sym> {
+    match e {
+        Expr::Apply(..) => {
+            let t = env.bindings.get(&head_name(e)?)?;
+            return_mutable_name_after(env, t, arg_count(e))
+        }
+        Expr::NameRef(n, _) => return_mutable_name_after(env, env.bindings.get(n)?, 0),
+        _ => None,
+    }
+}
+
+/// `report-minted-mutable` (subject 51323).
+fn report_minted_mutable(def: &Def, env: &LinEnv, v: Sym, r: &LinResult, st: &mut UnifyState) {
+    let name = env.syms.text(v);
+    let owner = env.syms.text(def.name);
+    let minted = "minted by a call";
+    if r.dead > 0 {
+        st.error(Cdx::MUTABLE_ALIAS, format!(
+            "In '{owner}', mutable record '{name}', {minted}, was moved to a new owner by a let binding and then mentioned again; after a move the original name is dead"));
+    } else if r.count > 1 {
+        st.error(Cdx::MUTABLE_ALIAS, format!(
+            "In '{owner}', mutable record '{name}', {minted}, is consumed {} times on a single path; a mutable record may be handed to a new owner at most once",
+            r.count));
+    }
+}
+
+/// `check-one-mutable-param` (subject 51115). Two questions, not six: the
+/// mutable rule is about ALIASING, so it has nothing to say about escape,
+/// capture or return.
+fn check_one_mutable_param(
+    def: &Def,
+    env: &LinEnv,
+    tn: Sym,
+    p: &crate::ast::Param,
+    st: &mut UnifyState,
+) {
+    let r = consume_of(env, tn, p.name, &def.body);
+    let name = env.syms.text(p.name);
+    let owner = env.syms.text(def.name);
+    if r.dead > 0 {
+        st.error(Cdx::MUTABLE_ALIAS, format!(
+            "In '{owner}', mutable record '{name}' was moved to a new owner by a let binding and then mentioned again; after a move the original name is dead"));
+    } else if r.count > 1 {
+        st.error(Cdx::MUTABLE_ALIAS, format!(
+            "In '{owner}', mutable record '{name}' is consumed {} times on a single path; a mutable record may be handed to a new owner at most once",
+            r.count));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -640,6 +1017,14 @@ pub fn check_def(def: &Def, env: &LinEnv, st: &mut UnifyState) {
 }
 
 fn check_one_param(def: &Def, env: &LinEnv, pty: &TypeExpr, p: &crate::ast::Param, st: &mut UnifyState) {
+    // The mutable rule is asked FIRST, and a mutable parameter never reaches
+    // the linear one: the two disciplines are disjoint, and upstream's order is
+    // what decides that for a type that somehow declared both.
+    if let Some(tn) = core_name(pty) {
+        if env.mutables.contains(&tn) {
+            return check_one_mutable_param(def, env, tn, p, st);
+        }
+    }
     if !is_linear_atype(pty) {
         return;
     }
@@ -781,6 +1166,51 @@ mod the_discipline {
     fn a_partial_application_mints_nothing() {
         assert_eq!(
             minted("  f : Integer -> Integer\n  f (n) = let mk = acquire in release (mk n) + release (mk n)\n"),
+            vec![]
+        );
+    }
+
+    /// A chapter with a mutable record, a call that hands it on (`thread`) and
+    /// one that does not (`peek`).
+    fn mutable(body: &str) -> Vec<u16> {
+        codes(&format!(
+            "  mutable Cell = record {{\n    n : Integer\n  }}\n\n  thread : Cell -> Cell\n  thread (c) = c\n\n  peek : Cell -> Integer\n  peek (c) = c.n\n\n{body}"
+        ))
+    }
+
+    /// **READING IS NOT OWNING.** The mutable rule counts hand-offs, so a
+    /// record read twice is clean where a linear value read twice is not --
+    /// the two disciplines disagree here on purpose.
+    #[test]
+    fn reading_a_mutable_record_twice_is_clean() {
+        assert_eq!(mutable("  f : Cell -> Integer\n  f (c) = c.n + c.n\n"), vec![]);
+        assert_eq!(mutable("  f : Cell -> Integer\n  f (c) = peek c + peek c\n"), vec![]);
+    }
+
+    /// **ONLY A CALL THAT GIVES IT BACK IS A HAND-OFF.** `peek` swallows the
+    /// record and is the last owner; `thread` returns it, so calling `thread`
+    /// twice makes two owners of one record.
+    #[test]
+    fn handing_a_mutable_record_on_twice_is_an_alias() {
+        assert_eq!(mutable("  f : Cell -> Integer\n  f (c) = (thread c).n\n"), vec![]);
+        assert_eq!(
+            mutable("  f : Cell -> Integer\n  f (c) = (thread c).n + (thread c).n\n"),
+            vec![crate::check::Cdx::MUTABLE_ALIAS]
+        );
+    }
+
+    /// **RENAMING IT DOES NOT LAUNDER IT.** `let d = c` moves the record to a
+    /// new owner, and the old name is dead from there on -- reported as the
+    /// MOVE, not as a count, because that is the reason the count is wrong.
+    #[test]
+    fn a_let_alias_moves_the_record_and_kills_the_old_name() {
+        assert_eq!(
+            mutable("  f : Cell -> Integer\n  f (c) = let d = c in (thread d).n + (thread c).n\n"),
+            vec![crate::check::Cdx::MUTABLE_ALIAS]
+        );
+        // The old name is not mentioned again: one owner, and clean.
+        assert_eq!(
+            mutable("  f : Cell -> Integer\n  f (c) = let d = c in (thread d).n\n"),
             vec![]
         );
     }
