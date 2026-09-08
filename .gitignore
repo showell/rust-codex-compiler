@@ -4,3 +4,6 @@
 target/
 Cargo.lock
 ladder/__pycache__/
+
+# Cold-review scratch: an agent writes here, then it is renamed into docs/.
+scratch-*.md
