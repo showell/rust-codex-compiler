@@ -1152,6 +1152,25 @@ pub fn register_defs(
     st: &mut UnifyState,
 ) -> Vec<Binding> {
     let mut out = register_ctors(ch, tds, st);
+    // `register-effect-ops-of` (subject 50004). **AN EFFECT OPERATION IS A
+    // NAME LIKE ANY OTHER**, and we bound none of them: `ch.effect_defs` was
+    // read by nothing in this file, so `read-text d` in a chapter that
+    // declares its own effect typed as an unknown name and minted nothing --
+    // two rows short per call, across ten corpus units. The subject's effects
+    // are builtins, which is why the self-host never showed it.
+    //
+    // **A NAME ALREADY BOUND WINS**, and the operation is skipped rather than
+    // overwriting it; upstream raises CDX3001 for that collision elsewhere.
+    for ed in &ch.effect_defs {
+        for op in &ed.ops {
+            if out.iter().any(|b| b.name == op.name) {
+                continue;
+            }
+            if let Some(t) = resolve_declared(&ch.syms, tds, &op.type_expr) {
+                out.push(Binding { name: op.name, ty: parameterize(&t, &ch.syms, st) });
+            }
+        }
+    }
     for d in &ch.defs {
         let ty = match d.declared_type.first().and_then(|t| resolve_declared(&ch.syms, tds, t)) {
             Some(t) => parameterize(&t, &ch.syms, st),
