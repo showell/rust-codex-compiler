@@ -14,7 +14,11 @@ so a front end that folds it to 65 differs from the golds on every program
 containing a character literal.
 
 `src/charcode.rs` carries the table. The ladder's `charcode_probe.py` derives
-it from the compiler and checks it structurally. **Do not hand-edit it.**
+it from `native/codexir` in about 0.05 s and checks it STRUCTURALLY; `--rust`
+emits the table this repo commits by hand. **Do not hand-edit it.**
+
+The diff a wrong table produces lands far from its cause: every program with a
+character literal differs, and none of them mentions `char-code`.
 
 ## Two pieces of Cobblestone that read as bugs and are correct
 
