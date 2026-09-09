@@ -352,8 +352,19 @@ pub fn local_quires(near: &Path) -> Option<PathBuf> {
 ///
 /// The registry is read LAZILY, only when something actually needs resolving,
 /// so a resolved unit runs with no checkout in sight and `CODEX_ROOT` unset.
+///
+/// **`CODEXC_RAW=1` READS THE BYTES AS THEY ARE AND RESOLVES NOTHING**, which
+/// is what `codexcheck` and `codexir` do with their stdin. A tool that
+/// truncates a resolved unit -- `tools/whodunit.sh`, `tools/mintprofile.sh`
+/// -- cuts implicit and cited chapters out of the prefix, and without this
+/// switch the prefix is quietly re-resolved against the ambient checkout,
+/// on whatever branch it is on, while the oracle sees the truncated bytes.
+/// Both sides must see the same program or the comparison compares nothing.
 pub fn load(path: &Path) -> Result<Vec<u8>, String> {
     let src = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if std::env::var_os("CODEXC_RAW").is_some() {
+        return Ok(src);
+    }
     let present = present_chapters(&src);
     let wanted: Vec<(String, String)> = IMPLICIT
         .iter()
