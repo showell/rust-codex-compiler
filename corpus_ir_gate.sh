@@ -20,10 +20,13 @@
 # `CODEGEN-HALTED` line on stderr means it refused. Getting that backwards
 # compares a refusal message against a program and calls it a difference.
 set -u
-UNITS="${UNITS:-$HOME/units-u56}"
+UNITS="${UNITS:-$HOME/units-current}"
 IRDUMP="${IRDUMP:-$HOME/build/rust-target/release/irdump}"
 CODEXIR="${CODEXIR:-$HOME/showell_repos/codex-zig-transpiler/generated/local/codexir}"
 OUT="${OUT:-$(mktemp -d)}"
+
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gate_provenance.sh"
+gate_provenance "$UNITS"
 
 [ -x "$IRDUMP" ]  || { echo "no irdump at $IRDUMP"; exit 2; }
 [ -x "$CODEXIR" ] || { echo "no codexir at $CODEXIR"; exit 2; }

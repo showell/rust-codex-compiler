@@ -19,13 +19,16 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-UNITS="${UNITS:-$HOME/units-u56}"
+UNITS="${UNITS:-$HOME/units-current}"
 BIN="${CHECKDUMP:-$ROOT/target/release/checkdump}"
 ORACLE="${CODEXCHECK:-$HOME/showell_repos/codex-zig-transpiler/generated/local/codexcheck}"
 
 [ -x "$BIN" ]    || { echo "no checkdump at $BIN; cargo build --release"; exit 2; }
 [ -x "$ORACLE" ] || { echo "no codexcheck at $ORACLE"; exit 2; }
 [ -d "$UNITS" ]  || { echo "no units at $UNITS"; exit 2; }
+
+. "$ROOT/gate_provenance.sh"
+gate_provenance "$UNITS"
 
 # `mutable-launder-sum-return` refuses for CDX2002 Unknown name: Some -- a
 # different subsystem, and counting it here would make this gate lie about

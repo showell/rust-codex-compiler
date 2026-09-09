@@ -19,7 +19,10 @@
 # `tools/whodunit.sh <unit>` for one too big to profile linearly.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-UNITS="${UNITS:-$HOME/units-u56}"
+UNITS="${UNITS:-$HOME/units-current}"
+
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gate_provenance.sh"
+gate_provenance "$UNITS"
 same=0; diff=0; halt=0
 for u in "$UNITS"/*.codex; do
     out="$("$ROOT/tools/counters.sh" "$u")"
