@@ -276,12 +276,17 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
         // fallback, and only the first level was here.
         //
         // **THE RECORDED ANSWER IS ABSENT FOR A SYNTHETIC SPAN, AND THE
-        // DESUGARER MAKES THOSE.** `for r in temps -> r` becomes a `map-list`
-        // application whose name node the checker never saw a source position
-        // for, so `record-expr-type` skipped it -- `lookup-expr-type`'s own
-        // first line is `if is-synthetic-span sp then ErrorTy`. Refusing here
-        // is what stopped the whole 3.44 MB self-host from lowering, on one
+        // DESUGARER MAKES THOSE** -- `MkTupN`, `__rev`, `__narrow`,
+        // `__record-set`, the lambda and applications around a
+        // comprehension's `map-list`. `lookup-expr-type`'s own first line is
+        // `if is-synthetic-span sp then ErrorTy`. Refusing here is what
+        // stopped the whole 3.44 MB self-host from lowering, on one
         // comprehension in `tco-ensure-temps`.
+        //
+        // The `map-list` NAME is not one of them: upstream stamps it with the
+        // loop variable's span, so the checker records it and the first
+        // level answers. Our desugarer stamped it synthetic until 1354fec,
+        // which is why this fallback used to carry every comprehension.
         //
         // Upstream falls back to the name's BINDING, stripped of its forall,
         // and then to the expectation. Neither is a guess: the binding is the
