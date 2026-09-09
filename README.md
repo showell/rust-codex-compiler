@@ -137,6 +137,7 @@ clock is what the front end cost.
     irdump defs <units-dir>                 every gold definition present, by name and arity
     codexrun --check <unit.codex> <expected>
     codexrun sweep <units-dir> <codex-test-dir>
+    ./selfhost_gate.sh                      the compiler on itself, counters and wire
     cargo test                              65 unit tests; needs no checkout at all
 
 **Every gate here has something it cannot see, and each one is worth knowing
