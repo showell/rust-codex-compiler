@@ -2847,22 +2847,29 @@ mod tests {
     /// the two it measures. A variant with no type parameters costs nothing at
     /// all, however many constructors it declares.
     ///
-    /// Read off `codexcheck` at `u56-candidate-sunday`, against a chapter whose
-    /// only definition is monomorphic so the difference is the type
+    /// Re-read off `codexcheck` at `8570fba1` (Update 57), against a chapter
+    /// whose only definition is monomorphic so the difference is the type
     /// declaration alone.
+    ///
+    /// **EVERY ROW ROSE AT U56 AND THE DECLARATION RULE DID NOT CHANGE.** The
+    /// `td-eq-safe` guard means each of these variants now also carries a
+    /// generated `__eq_<T>`, and that definition mints on its own account. The
+    /// rule above still reads off the DIFFERENCES: `Box` over the bare
+    /// chapter is 7, `Pair` 12, `Trip` 17 -- still one more per type parameter
+    /// per constructor, on top of a constant the equality costs.
     #[test]
     fn a_variant_mints_once_per_type_parameter_per_constructor() {
         let f = "\n  f : Integer -> Integer\n  f (n) = n\n";
         let with = |decl: &str| counters(&chapter(&format!("{decl}{f}")));
 
         assert_eq!(with(""), (2, 0));
-        assert_eq!(with("  Box (a) =\n    | MkBox (a)\n"), (3, 0));
-        assert_eq!(with("  Pair (a) (b) =\n    | MkPair (a) (b)\n"), (4, 0));
-        assert_eq!(with("  Trip (a) (b) (c) =\n    | MkTrip (a) (b) (c)\n"), (5, 0));
+        assert_eq!(with("  Box (a) =\n    | MkBox (a)\n"), (9, 0));
+        assert_eq!(with("  Pair (a) (b) =\n    | MkPair (a) (b)\n"), (14, 0));
+        assert_eq!(with("  Trip (a) (b) (c) =\n    | MkTrip (a) (b) (c)\n"), (19, 0));
         // Once per CONSTRUCTOR, so two arms naming the same parameter cost two.
-        assert_eq!(with("  Two (a) =\n    | MkL (a)\n    | MkR (a)\n"), (4, 0));
-        // No parameters, no mint -- the constructors are still declared.
-        assert_eq!(with("  Mono =\n    | MkA\n    | MkB\n"), (2, 0));
+        assert_eq!(with("  Two (a) =\n    | MkL (a)\n    | MkR (a)\n"), (13, 0));
+        // No parameters, no mint of its own -- but the generated equality costs.
+        assert_eq!(with("  Mono =\n    | MkA\n    | MkB\n"), (5, 0));
     }
 
     /// **A CONSTRUCTOR PATTERN INSTANTIATES THE CONSTRUCTOR, NOT ITS
@@ -2875,7 +2882,9 @@ mod tests {
     /// `Maybe (a)`), and `Left (x)` on `Either (a) (b)` binds one and mints
     /// two. A wildcard arm mints nothing at all.
     ///
-    /// Read off `codexcheck` at `u56-candidate-sunday`.
+    /// Re-read off `codexcheck` at `8570fba1` (Update 57). Every row rose by
+    /// the constant `Maybe`'s or `Either`'s generated `__eq_` costs under
+    /// `td-eq-safe`; the DIFFERENCES the rule is about are unchanged.
     #[test]
     fn a_constructor_pattern_instantiates_the_constructor() {
         let maybe = "  Maybe (a) =\n    | Just (a)\n    | None\n\n";
@@ -2887,15 +2896,15 @@ mod tests {
             )))
         };
         // `Just (x)` mints one and binds one; `None` mints one and binds none.
-        assert_eq!(f(maybe, "    is Just (x) -> True\n    is None -> False\n"), (9, 0));
+        assert_eq!(f(maybe, "    is Just (x) -> True\n    is None -> False\n"), (18, 0));
         // A wildcard is not a constructor and costs nothing.
-        assert_eq!(f(maybe, "    is Just (x) -> True\n    is otherwise -> False\n"), (8, 0));
+        assert_eq!(f(maybe, "    is Just (x) -> True\n    is otherwise -> False\n"), (17, 0));
         // Two quantifiers, one bound variable, twice.
-        assert_eq!(f(either, "    is Left (x) -> True\n    is Right (y) -> False\n"), (15, 0));
+        assert_eq!(f(either, "    is Left (x) -> True\n    is Right (y) -> False\n"), (30, 0));
         // The same constructor twice costs the same twice.
         assert_eq!(
             f(maybe, "    is Just (x) -> True\n    is Just (y) -> False\n    is None -> False\n"),
-            (10, 0)
+            (19, 0)
         );
     }
 
@@ -2910,17 +2919,22 @@ mod tests {
     /// map, and `N` now looks up to the finished `SumTy` with every constructor
     /// and every field type in it.
     ///
-    /// Read off `codexcheck` at `u56-candidate-sunday`, against a chapter whose
-    /// only definition is monomorphic so the difference is the declaration.
+    /// Re-read off `codexcheck` at `8570fba1` (Update 57). Only the two
+    /// non-recursive controls moved: under `td-eq-safe` they now get a derived
+    /// definition too, so they are no longer controls for "no derived
+    /// definition" -- they are controls for "derived WITHOUT a self-reference
+    /// to pull the constructor list back in". Every self-recursive row below
+    /// is unchanged, because those already had one at U55.
     #[test]
     fn a_recursive_sum_pulls_its_own_constructor_list_in() {
         let f = "\n  f : Integer -> Integer\n  f (n) = n\n";
         let with = |decl: &str| counters(&chapter(&format!("{decl}{f}"))).0;
 
-        // The non-recursive controls: a variant that never names itself gets
-        // no derived definition, so only its constructors parameterise.
-        assert_eq!(with("  N a =\n    | E\n    | L (a)\n"), 4);
-        assert_eq!(with("  N =\n    | E\n    | L (Integer)\n"), 2);
+        // The non-recursive controls. These DO get a derived definition now,
+        // but no self-reference, so the constructor list is not pulled back in
+        // and the cost stays far below the recursive rows of the same shape.
+        assert_eq!(with("  N a =\n    | E\n    | L (a)\n"), 13);
+        assert_eq!(with("  N =\n    | E\n    | L (Integer)\n"), 5);
 
         // One self-naming arm, and a whole `__eq_N` appears. With no type
         // parameters the cost is exactly the matches it contains: one over

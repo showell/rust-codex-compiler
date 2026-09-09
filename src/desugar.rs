@@ -695,15 +695,27 @@ impl<'a> Desugar<'a> {
         ch
     }
 
-    /// `synth-derived-defs`: one `__eq_<T>` per variant that NAMES ITSELF.
+    /// `synth-derived-defs`: one `__eq_<T>` per variant that is EQ-SAFE.
     ///
-    /// **A SELF-RECURSIVE VARIANT GETS STRUCTURAL EQUALITY WHETHER IT ASKS OR
-    /// NOT** -- `push-derived-for-type` fires on `deriving-has "Eq" |
-    /// td-self-recursive td`, and a constructor field naming the type is
-    /// enough. It is a REAL definition, two parameters and a nested `when`, so
-    /// it registers, checks and can be lowered like any other; a chapter
-    /// missing it reports a smaller `next-id` than upstream for the same
-    /// source and can emit a `(defs ...)` short of a definition.
+    /// **EVERY SUM GETS STRUCTURAL EQUALITY WHETHER IT ASKS OR NOT**, unless a
+    /// constructor field names `Real`. `push-derived-for-type` fires on
+    /// `deriving-has "Eq" | td-eq-safe td`, and `td-eq-safe` is exactly "a
+    /// variant body, and no constructor field names Real" -- float equality is
+    /// excluded because NaN is not equal to itself, so a generated structural
+    /// comparison would be quietly wrong.
+    ///
+    /// It is a REAL definition, two parameters and a nested `when`, so it
+    /// registers, checks and can be lowered like any other; a chapter missing
+    /// it reports a smaller `next-id` than upstream for the same source and
+    /// can emit a `(defs ...)` short of a definition.
+    ///
+    /// The guard was `td-self-recursive` through U55 and widened to
+    /// `td-eq-safe` at U56, which is why every corpus unit went from agreeing
+    /// on the counters to diverging by about 64 substitutions at once.
+    ///
+    /// STILL MISSING: the `deriving Eq` half of the guard. Our parser does not
+    /// capture the clause, so a type that carries a `Real` AND asks for Eq
+    /// gets one upstream and none here.
     ///
     /// `deriving Show` and `deriving Ord` synthesise two more. Those are NOT
     /// here: our parser does not capture the `deriving` clause at all, so they
@@ -965,12 +977,20 @@ impl<'a> Desugar<'a> {
 
     fn synth_derived_defs(&self, ch: &mut Chapter) {
         let mut out = Vec::new();
+        // `find`, not `intern`: upstream compares the field type's TEXT to
+        // "Real", so asking the question must not add a symbol that the
+        // chapter never mentioned. A chapter with no `Real` anywhere cannot
+        // have a field naming one, so the absent symbol answers eq-safe.
+        let real = self.syms.borrow().find("Real");
         for td in &ch.type_defs {
             let TypeDef::Variant(name, _, ctors, _) = td else { continue };
-            let names_itself = ctors.iter().any(|c| {
-                c.fields.iter().any(|f| type_names(f, *name))
-            });
-            if names_itself {
+            let eq_safe = match real {
+                None => true,
+                Some(r) => !ctors
+                    .iter()
+                    .any(|c| c.fields.iter().any(|f| type_names(f, r))),
+            };
+            if eq_safe {
                 out.push(self.eq_def(*name, ctors));
             }
         }
