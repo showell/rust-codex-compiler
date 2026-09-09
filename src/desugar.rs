@@ -46,6 +46,17 @@ pub struct Desugar<'a> {
     /// have been a worse trade than one borrow flag per name. The table moves
     /// into the `Chapter` when the walk finishes.
     syms: RefCell<SymTab>,
+    /// **A SYNTHETIC NODE GETS AN IDENTITY, NOT A POSITION.** Every node this
+    /// desugarer invents -- a derived `__eq_<T>`, a comprehension's `map-list`
+    /// spine, a `MkTupN` pattern -- has no source position, and upstream
+    /// stamps them all with one span whose file id is 0 and records nothing
+    /// for them. That is fine for upstream, whose lowering rebuilds every
+    /// type it needs from declarations. Ours carries the checker's answers
+    /// forward BY SPAN, so two invented nodes sharing one span shared one
+    /// answer, and `Red` in `__eq_Color` read back the prelude's `Tup2`.
+    /// Each invented node now gets the next offset in file 0; the line stays
+    /// 0, which is what `is_synthetic` reads.
+    synth: std::cell::Cell<u32>,
 }
 
 fn span_of(t: &Token) -> Span {
@@ -64,7 +75,20 @@ fn head_span(n: &Node) -> Span {
 
 impl<'a> Desugar<'a> {
     pub fn new(src: &'a [u8]) -> Self {
-        Desugar { src, slug: String::new(), syms: RefCell::new(SymTab::default()) }
+        Desugar {
+            src,
+            slug: String::new(),
+            syms: RefCell::new(SymTab::default()),
+            synth: std::cell::Cell::new(0),
+        }
+    }
+
+    /// The next synthetic span: line 0, and an offset no other invented node
+    /// has. Offsets start at 1 so no synthetic node is ever `self.synth()`.
+    fn synth(&self) -> Span {
+        let n = self.synth.get() + 1;
+        self.synth.set(n);
+        Span { line: 0, col: 0, offset: n, len: 0 }
     }
 
     fn text(&self, t: &Token) -> String {
@@ -223,7 +247,7 @@ impl<'a> Desugar<'a> {
                         let arm = MatchArm {
                             pattern: dp,
                             body: inner,
-                            guard: Expr::Lit("True".into(), LiteralKind::BoolLit, Span::default()),
+                            guard: Expr::Lit("True".into(), LiteralKind::BoolLit, self.synth()),
                             span: head_span(pn),
                             alt_group: head_span(pn).offset,
                         };
@@ -305,7 +329,7 @@ impl<'a> Desugar<'a> {
             NodeKind::Tuple => {
                 // `(a, b)` is `MkTup2 a b`, applied one argument at a time.
                 let elems: Vec<Expr> = kids.iter().map(|k| self.expr(k)).collect();
-                let base = Expr::NameRef(self.sym_str(&format!("MkTup{}", elems.len())), Span::default());
+                let base = Expr::NameRef(self.sym_str(&format!("MkTup{}", elems.len())), self.synth());
                 elems.into_iter().fold(base, |f, a| Expr::Apply(Rc::new(f), Rc::new(a), sp))
             }
             NodeKind::ForExpr => {
@@ -320,13 +344,13 @@ impl<'a> Desugar<'a> {
                         let lam = Expr::Lambda(
                             vec![var],
                             Rc::new(self.expr(body)),
-                            Span::default(),
+                            self.synth(),
                         );
-                        let map_fn = Expr::NameRef(self.sym_str("map-list"), Span::default());
+                        let map_fn = Expr::NameRef(self.sym_str("map-list"), self.synth());
                         Expr::Apply(
-                            Rc::new(Expr::Apply(Rc::new(map_fn), Rc::new(lam), Span::default())),
+                            Rc::new(Expr::Apply(Rc::new(map_fn), Rc::new(lam), self.synth())),
                             Rc::new(self.expr(list)),
-                            Span::default(),
+                            self.synth(),
                         )
                     }
                     _ => Expr::Error("for".into(), sp),
@@ -427,7 +451,7 @@ impl<'a> Desugar<'a> {
             }
             NodeKind::LazyExpr => Expr::Lazy(
                 Rc::new(kids.first().map_or(Expr::Error(String::new(), sp), |i| self.expr(i))),
-                Span::default(),
+                self.synth(),
             ),
             NodeKind::Revised => {
                 // `e revised { f = v }` (subject 42753). The receiver is bound
@@ -469,37 +493,37 @@ impl<'a> Desugar<'a> {
                     })
                     .collect();
                 let rv = |i: usize| self.sym_str(&format!("__rv{i}"));
-                let mut chain = Expr::NameRef(self.sym_str("__rev"), Span::default());
+                let mut chain = Expr::NameRef(self.sym_str("__rev"), self.synth());
                 for (i, (fname, _, narrow)) in fields.iter().enumerate() {
-                    let mut val = Expr::NameRef(rv(i), Span::default());
+                    let mut val = Expr::NameRef(rv(i), self.synth());
                     if *narrow {
                         val = Expr::Apply(
-                            Rc::new(Expr::NameRef(self.sym_str("__narrow"), Span::default())),
+                            Rc::new(Expr::NameRef(self.sym_str("__narrow"), self.synth())),
                             Rc::new(val),
-                            Span::default(),
+                            self.synth(),
                         );
                     }
-                    let set = Expr::NameRef(self.sym_str("__record-set"), Span::default());
-                    let a1 = Expr::Apply(Rc::new(set), Rc::new(chain), Span::default());
+                    let set = Expr::NameRef(self.sym_str("__record-set"), self.synth());
+                    let a1 = Expr::Apply(Rc::new(set), Rc::new(chain), self.synth());
                     let lit = Expr::Lit(
                         self.str_of(*fname),
                         LiteralKind::TextLit,
-                        Span::default(),
+                        self.synth(),
                     );
-                    let a2 = Expr::Apply(Rc::new(a1), Rc::new(lit), Span::default());
-                    chain = Expr::Apply(Rc::new(a2), Rc::new(val), Span::default());
+                    let a2 = Expr::Apply(Rc::new(a1), Rc::new(lit), self.synth());
+                    chain = Expr::Apply(Rc::new(a2), Rc::new(val), self.synth());
                 }
                 // One `let` per value, innermost last, then the receiver's.
                 let mut body = chain;
                 for (i, (_, value, _)) in fields.into_iter().enumerate().rev() {
                     body = Expr::Let(
-                        vec![LetBind { name: rv(i), value, span: Span::default() }],
+                        vec![LetBind { name: rv(i), value, span: self.synth() }],
                         Rc::new(body),
-                        Span::default(),
+                        self.synth(),
                     );
                 }
                 Expr::Let(
-                    vec![LetBind { name: self.sym_str("__rev"), value: base, span: Span::default() }],
+                    vec![LetBind { name: self.sym_str("__rev"), value: base, span: self.synth() }],
                     Rc::new(body),
                     sp,
                 )
@@ -589,7 +613,7 @@ impl<'a> Desugar<'a> {
                 .next()
                 .and_then(|g| g.child_nodes().first().map(|e| self.expr(e)))
                 .unwrap_or_else(|| {
-                    Expr::Lit("True".into(), LiteralKind::BoolLit, Span::default())
+                    Expr::Lit("True".into(), LiteralKind::BoolLit, self.synth())
                 });
             let body = kids
                 .iter()
@@ -755,7 +779,7 @@ impl<'a> Desugar<'a> {
                         .iter()
                         .rev()
                         .find(|k| k.kind != NodeKind::ParamGroup)
-                        .map_or(Expr::Error(String::new(), Span::default()), |b| self.expr(b)),
+                        .map_or(Expr::Error(String::new(), self.synth()), |b| self.expr(b)),
                     span: head_span(m),
                 })
                 .collect(),
@@ -772,7 +796,6 @@ impl<'a> Desugar<'a> {
     /// parameter parameterises to one -- which is the whole of the `class`
     /// line's divergence.
     fn synth_class_type_defs(&self, ch: &mut Chapter) {
-        let sp = Span::default();
         let mut out = Vec::new();
         for cd in &ch.class_defs {
             let dict = self.sym_str(&format!("{}Dict", self.syms.borrow().text(cd.name)));
@@ -781,8 +804,8 @@ impl<'a> Desugar<'a> {
                 let sup_text = self.syms.borrow().text(sup).to_string();
                 fields.push(RecordFieldDef {
                     name: self.sym_str(&format!("__super-{sup_text}")),
-                    type_expr: TypeExpr::Named(self.sym_str(&format!("{sup_text}Dict")), sp),
-                    span: sp,
+                    type_expr: TypeExpr::Named(self.sym_str(&format!("{sup_text}Dict")), self.synth()),
+                    span: self.synth(),
                 });
             }
             for m in &cd.methods {
@@ -790,10 +813,10 @@ impl<'a> Desugar<'a> {
                 fields.push(RecordFieldDef {
                     name: self.sym_str(&format!("{mname}-impl")),
                     type_expr: m.type_expr.clone(),
-                    span: sp,
+                    span: self.synth(),
                 });
             }
-            out.push(TypeDef::Record(dict, vec![self.sym_str("a")], fields, false, sp));
+            out.push(TypeDef::Record(dict, vec![self.sym_str("a")], fields, false, self.synth()));
         }
         ch.type_defs.extend(out);
     }
@@ -813,7 +836,6 @@ impl<'a> Desugar<'a> {
     /// dictionary instead. **A METHOD WITH NO PARAMETERS IS NOT WRAPPED IN A
     /// LAMBDA** in the dictionary field; one with parameters is.
     fn synth_instance_defs(&self, ch: &mut Chapter) {
-        let sp = Span::default();
         let mut out = Vec::new();
         for id in &ch.instance_defs {
             let class_text = self.syms.borrow().text(id.class_name).to_string();
@@ -834,8 +856,8 @@ impl<'a> Desugar<'a> {
                 let sup_text = self.syms.borrow().text(sup).to_string();
                 fields.push(FieldExpr {
                     name: self.sym_str(&format!("__super-{sup_text}")),
-                    value: Expr::NameRef(self.sym_str(&format!("{sup_text}-dict-{key}")), sp),
-                    span: sp,
+                    value: Expr::NameRef(self.sym_str(&format!("{sup_text}-dict-{key}")), self.synth()),
+                    span: self.synth(),
                 });
             }
             for m in &id.methods {
@@ -843,21 +865,21 @@ impl<'a> Desugar<'a> {
                 let value = if m.params.is_empty() {
                     m.body.clone()
                 } else {
-                    Expr::Lambda(m.params.clone(), Rc::new(m.body.clone()), sp)
+                    Expr::Lambda(m.params.clone(), Rc::new(m.body.clone()), self.synth())
                 };
                 fields.push(FieldExpr {
                     name: self.sym_str(&format!("{mname}-impl")),
                     value,
-                    span: sp,
+                    span: self.synth(),
                 });
             }
             let mk = |name: Name, params: Vec<Name>, body: Expr| Def {
                 name,
-                params: params.into_iter().map(|n| Param { name: n, span: sp }).collect(),
+                params: params.into_iter().map(|n| Param { name: n, span: self.synth() }).collect(),
                 declared_type: Vec::new(),
                 body,
                 chapter_slug: String::new(),
-                span: sp,
+                span: self.synth(),
                 is_claim: false,
                 is_punctual: false,
                 wcet_budget: 0,
@@ -865,7 +887,7 @@ impl<'a> Desugar<'a> {
             out.push(mk(
                 self.sym_str(&format!("{class_text}-dict-{key}")),
                 Vec::new(),
-                Expr::Record(self.sym_str(&format!("{class_text}Dict")), fields, sp),
+                Expr::Record(self.sym_str(&format!("{class_text}Dict")), fields, self.synth()),
             ));
             for m in &id.methods {
                 let mname = self.syms.borrow().text(m.name).to_string();
@@ -902,14 +924,13 @@ impl<'a> Desugar<'a> {
     /// `expr-types` -- which is exactly why `expr-types` already agreed with
     /// the oracle on programs whose `next-id` did not.
     fn synth_family_defs(&self, tree: &Node, ch: &mut Chapter) {
-        let sp = Span::default();
-        let int = |me: &Self| TypeExpr::Named(me.sym_str("Integer"), sp);
+        let int = |me: &Self| TypeExpr::Named(me.sym_str("Integer"), self.synth());
         let mut out = Vec::new();
         for td in tree.descendants(NodeKind::TypeDef) {
             let Some(fam) = td.children_of(NodeKind::UnitFamilyBody).next() else { continue };
             let family = self.leading(td);
             let fam_text = self.syms.borrow().text(family).to_string();
-            let fam_ty = TypeExpr::Named(family, sp);
+            let fam_ty = TypeExpr::Named(family, self.synth());
             for m in fam.children_of(NodeKind::UnitFamilyMember) {
                 // **THE CST IS LOSSLESS, SO THE FIRST TOKEN IS USUALLY
                 // WHITESPACE.** Taking it named every member `"    "`, which
@@ -925,27 +946,27 @@ impl<'a> Desugar<'a> {
                     .and_then(|t| self.text(t).parse().ok())
                     .unwrap_or(1);
                 let fv = self.sym_str("__fv");
-                let param = || vec![Param { name: fv, span: sp }];
-                let var = || Expr::NameRef(fv, sp);
-                let lit = || Expr::Lit(factor.to_string(), LiteralKind::IntLit, sp);
+                let param = || vec![Param { name: fv, span: self.synth() }];
+                let var = || Expr::NameRef(fv, self.synth());
+                let lit = || Expr::Lit(factor.to_string(), LiteralKind::IntLit, self.synth());
 
                 // `synth-family-ctor`: Integer in, the family out.
                 let scaled = if factor == 1 {
                     var()
                 } else {
-                    Expr::Binary(Rc::new(var()), BinaryOp::OpMul, Rc::new(lit()), sp)
+                    Expr::Binary(Rc::new(var()), BinaryOp::OpMul, Rc::new(lit()), self.synth())
                 };
                 out.push(Def {
                     name: member,
                     params: param(),
-                    declared_type: vec![TypeExpr::Fun(Rc::new(int(self)), Rc::new(fam_ty.clone()), sp)],
+                    declared_type: vec![TypeExpr::Fun(Rc::new(int(self)), Rc::new(fam_ty.clone()), self.synth())],
                     body: Expr::Apply(
-                        Rc::new(Expr::NameRef(family, sp)),
+                        Rc::new(Expr::NameRef(family, self.synth())),
                         Rc::new(scaled),
-                        sp,
+                        self.synth(),
                     ),
                     chapter_slug: String::new(),
-                    span: sp,
+                    span: self.synth(),
                     is_claim: false,
                     is_punctual: false,
                     wcet_budget: 0,
@@ -957,15 +978,15 @@ impl<'a> Desugar<'a> {
                 let divided = if factor == 1 {
                     var()
                 } else {
-                    Expr::Binary(Rc::new(var()), BinaryOp::OpDiv, Rc::new(lit()), sp)
+                    Expr::Binary(Rc::new(var()), BinaryOp::OpDiv, Rc::new(lit()), self.synth())
                 };
                 out.push(Def {
                     name: extract,
                     params: param(),
-                    declared_type: vec![TypeExpr::Fun(Rc::new(fam_ty.clone()), Rc::new(int(self)), sp)],
+                    declared_type: vec![TypeExpr::Fun(Rc::new(fam_ty.clone()), Rc::new(int(self)), self.synth())],
                     body: divided,
                     chapter_slug: String::new(),
-                    span: sp,
+                    span: self.synth(),
                     is_claim: false,
                     is_punctual: false,
                     wcet_budget: 0,
@@ -1006,70 +1027,69 @@ impl<'a> Desugar<'a> {
     /// That is why `expr-types` already matched on units whose `next-id` did
     /// not -- the missing definitions mint variables and record nothing.
     fn eq_def(&self, tname: Name, ctors: &[VariantCtorDef]) -> Def {
-        let sp = Span::default();
         // **THE LIVE TABLE, NOT THE CHAPTER'S.** `ch.syms` is filled by the
         // `take` on the line after this runs, so reading a name out of it here
         // answers `<not this table>` -- which is what every derived definition
         // was called, and would have collided them all onto one name.
         let eq_name = format!("__eq_{}", self.syms.borrow().text(tname));
         let (xn, yn) = (self.sym_str("__ex"), self.sym_str("__ey"));
-        let tref = TypeExpr::Named(tname, sp);
-        let boolean = TypeExpr::Named(self.sym_str("Boolean"), sp);
+        let tref = TypeExpr::Named(tname, self.synth());
+        let boolean = TypeExpr::Named(self.sym_str("Boolean"), self.synth());
         let arms = ctors
             .iter()
             .map(|c| {
                 let n = c.fields.len();
                 let xv: Vec<Name> = (0..n).map(|i| self.sym_str(&format!("__exf{i}"))).collect();
                 let yv: Vec<Name> = (0..n).map(|i| self.sym_str(&format!("__eyf{i}"))).collect();
-                let pats = |vs: &[Name]| vs.iter().map(|v| Pat::Var(*v, sp)).collect::<Vec<_>>();
+                let pats = |vs: &[Name]| vs.iter().map(|v| Pat::Var(*v, self.synth())).collect::<Vec<_>>();
                 // Field equality, folded left with `&`; no fields is `True`.
                 let body = xv.iter().zip(&yv).fold(None::<Expr>, |acc, (x, y)| {
                     let one = Expr::Binary(
-                        Rc::new(Expr::NameRef(*x, sp)),
+                        Rc::new(Expr::NameRef(*x, self.synth())),
                         BinaryOp::OpEq,
-                        Rc::new(Expr::NameRef(*y, sp)),
-                        sp,
+                        Rc::new(Expr::NameRef(*y, self.synth())),
+                        self.synth(),
                     );
                     Some(match acc {
                         None => one,
-                        Some(a) => Expr::Binary(Rc::new(a), BinaryOp::OpAnd, Rc::new(one), sp),
+                        Some(a) => Expr::Binary(Rc::new(a), BinaryOp::OpAnd, Rc::new(one), self.synth()),
                     })
                 })
-                .unwrap_or_else(|| Expr::Lit("True".into(), LiteralKind::BoolLit, sp));
+                .unwrap_or_else(|| Expr::Lit("True".into(), LiteralKind::BoolLit, self.synth()));
                 let yes = MatchArm {
-                    pattern: Pat::Ctor(c.name, pats(&yv), sp),
+                    pattern: Pat::Ctor(c.name, pats(&yv), self.synth()),
                     body,
-                    guard: Expr::Lit("True".into(), LiteralKind::BoolLit, sp),
-                    span: sp,
+                    guard: Expr::Lit("True".into(), LiteralKind::BoolLit, self.synth()),
+                    span: self.synth(),
                     alt_group: NO_ALT_GROUP,
                 };
                 let no = MatchArm {
-                    pattern: Pat::Wild(sp),
-                    body: Expr::Lit("False".into(), LiteralKind::BoolLit, sp),
-                    guard: Expr::Lit("True".into(), LiteralKind::BoolLit, sp),
-                    span: sp,
+                    pattern: Pat::Wild(self.synth()),
+                    body: Expr::Lit("False".into(), LiteralKind::BoolLit, self.synth()),
+                    guard: Expr::Lit("True".into(), LiteralKind::BoolLit, self.synth()),
+                    span: self.synth(),
                     alt_group: NO_ALT_GROUP,
                 };
                 MatchArm {
-                    pattern: Pat::Ctor(c.name, pats(&xv), sp),
-                    body: Expr::Match(Rc::new(Expr::NameRef(yn, sp)), vec![yes, no], sp),
-                    guard: Expr::Lit("True".into(), LiteralKind::BoolLit, sp),
-                    span: sp,
+                    pattern: Pat::Ctor(c.name, pats(&xv), self.synth()),
+                    body: Expr::Match(Rc::new(Expr::NameRef(yn, self.synth())), vec![yes, no], self.synth()),
+                    guard: Expr::Lit("True".into(), LiteralKind::BoolLit, self.synth()),
+                    span: self.synth(),
                     alt_group: NO_ALT_GROUP,
                 }
             })
             .collect();
         Def {
             name: self.sym_str(&eq_name),
-            params: vec![Param { name: xn, span: sp }, Param { name: yn, span: sp }],
+            params: vec![Param { name: xn, span: self.synth() }, Param { name: yn, span: self.synth() }],
             declared_type: vec![TypeExpr::Fun(
                 Rc::new(tref.clone()),
-                Rc::new(TypeExpr::Fun(Rc::new(tref), Rc::new(boolean), sp)),
-                sp,
+                Rc::new(TypeExpr::Fun(Rc::new(tref), Rc::new(boolean), self.synth())),
+                self.synth(),
             )],
-            body: Expr::Match(Rc::new(Expr::NameRef(xn, sp)), arms, sp),
+            body: Expr::Match(Rc::new(Expr::NameRef(xn, self.synth())), arms, self.synth()),
             chapter_slug: String::new(),
-            span: sp,
+            span: self.synth(),
             is_claim: false,
             is_punctual: false,
             wcet_budget: 0,
@@ -1128,7 +1148,7 @@ impl<'a> Desugar<'a> {
                 )
             })
             .map(|b| self.expr(b))
-            .unwrap_or_else(|| Expr::Error("no body".into(), Span::default()));
+            .unwrap_or_else(|| Expr::Error("no body".into(), self.synth()));
         let punct = d.children_of(NodeKind::Punctual).next();
         Def {
             name: name_tok.map(|t| self.sym(&t)).unwrap_or_default(),
@@ -1160,7 +1180,7 @@ impl<'a> Desugar<'a> {
                     .child_nodes()
                     .first()
                     .map(|t| self.type_expr(t))
-                    .unwrap_or(TypeExpr::Named(Name::default(), Span::default())),
+                    .unwrap_or(TypeExpr::Named(Name::default(), self.synth())),
                 span: head_span(o),
             })
             .collect()
@@ -1185,7 +1205,7 @@ impl<'a> Desugar<'a> {
                         .child_nodes()
                         .first()
                         .map(|t| self.type_expr(t))
-                        .unwrap_or(TypeExpr::Named(Name::default(), Span::default())),
+                        .unwrap_or(TypeExpr::Named(Name::default(), self.synth())),
                     span: head_span(f),
                 })
                 .collect();

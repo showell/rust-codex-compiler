@@ -685,7 +685,6 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
         // the desugarer put there.
         Expr::Match(scrut, arms, s) => {
             let sc = expr(scrut, &Ty::NoExpect, cx)?;
-            let sty = sc.ty();
             // **THE PATTERN BINDS BEFORE THE PATTERN LOWERS.**
             // `bind-pattern-to-ctx` runs first and the arm's pattern, body and
             // guard all see it -- which is how a pattern variable that shadows
@@ -695,8 +694,8 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
             let mut branches = Vec::new();
             for a in arms {
                 let mark = cx.mark();
-                bind_pattern(&a.pattern, &sty, cx);
-                let pat = pattern(&a.pattern, &sty, cx)?;
+                bind_pattern(&a.pattern, cx)?;
+                let pat = pattern(&a.pattern, cx)?;
                 let body = expr(&a.body, want, cx)?;
                 let guard = expr(&a.guard, &Ty::Boolean, cx)?;
                 cx.release(mark);
@@ -1164,112 +1163,57 @@ fn record_name(t: &Ty, cx: &Lower, what: &str) -> Result<Sym, String> {
     }
 }
 
-/// One pattern.
-///
-/// **THE TYPE ON A PATTERN NODE IS THE TYPE IT WAS MATCHED AGAINST**: the
-/// scrutinee's for the top pattern and the constructor's field type for a
-/// sub-pattern, which is what upstream's `lower-pattern` threads down. Where
-/// the checker recorded an answer for the position, `pat_types`, that answer
-/// is used; it is the same type, read from the same substitution table. Where
-/// it recorded nothing -- every pattern the desugarer invented, since a
-/// synthetic span is not a key -- the field type is rebuilt from the
-/// constructor's binding and the scrutinee, `ctor-field-type-in-ctx`.
-fn pattern(p: &Pat, scrut: &Ty, cx: &Lower) -> Result<IrPat, String> {
-    let want = |sp: crate::ast::Span| -> Ty {
-        cx.st.pat_type_at(sp).map_or_else(|| scrut.clone(), |t| cx.st.deep_resolve(t))
-    };
+/// One pattern. **THE TYPE ON A PATTERN NODE IS THE CHECKER'S ANSWER FOR
+/// THAT NODE**, read by span, for every pattern including the ones the
+/// desugarer invented. Upstream's `lower-pattern` rebuilds it instead -- the
+/// scrutinee's type for the top pattern, `ctor-field-type-in-ctx` for a
+/// sub-pattern -- because its checker keeps no answer a pattern can be
+/// looked up by. Ours does (`check::bind_pattern` records one per node), so
+/// rebuilding would be a second derivation of a fact already in hand, and it
+/// went wrong the one time it was tried here: the reconstruction was written
+/// to cover invented patterns, which had no answer only because they shared
+/// one span. A pattern with no answer is a refusal, not a fallback.
+fn pattern(p: &Pat, cx: &Lower) -> Result<IrPat, String> {
     match p {
         Pat::Wild(s) => Ok(IrPat::Wild(*s)),
-        Pat::Var(n, s) => Ok(IrPat::Var(cx.bound_name(*n), want(*s), *s)),
-        Pat::Lit(v, _, s) => Ok(IrPat::Lit(v.clone(), want(*s), *s)),
+        Pat::Var(n, s) => Ok(IrPat::Var(cx.bound_name(*n), pat_ty(*s, cx)?, *s)),
+        Pat::Lit(v, _, s) => Ok(IrPat::Lit(v.clone(), pat_ty(*s, cx)?, *s)),
         Pat::Ctor(n, subs, s) => {
-            let fields = ctor_field_types(*n, scrut, subs.len(), cx);
             let mut out = Vec::new();
-            for (sub, fty) in subs.iter().zip(fields.iter()) {
-                out.push(pattern(sub, fty, cx)?);
+            for sub in subs {
+                out.push(pattern(sub, cx)?);
             }
-            Ok(IrPat::Ctor(*n, out, want(*s), *s))
+            Ok(IrPat::Ctor(*n, out, pat_ty(*s, cx)?, *s))
         }
         Pat::Vec_(..) => Err("vector pattern".into()),
     }
 }
 
-/// `resolved-ctor-field-type` (IR/Lowering.codex:1231): the constructor's
-/// binding, quantifiers stripped, its return's arguments paired POSITIONALLY
-/// with the scrutinee's, and the `i`th parameter read through that pairing
-/// and the substitution table. A constructor that is not bound answers
-/// `error` for every field, as upstream's `ErrorTy` does.
-///
-/// `Cons` and `Nil` over the builtin list are not constructors in the
-/// environment, and the checker's `bind_pattern` matches them against the
-/// element type directly; the same rule here keeps the two in step.
-fn ctor_field_types(ctor: Sym, scrut: &Ty, n: usize, cx: &Lower) -> Vec<Ty> {
-    let resolved = cx.st.deep_resolve(scrut);
-    if let Ty::List(elem) = &resolved {
-        let name = cx.text(ctor);
-        if name == "Cons" && n == 2 {
-            return vec![(**elem).clone(), resolved.clone()];
-        }
-        if name == "Nil" {
-            return Vec::new();
-        }
-    }
-    let bound = cx.overlay_ty(ctor).or_else(|| cx.bindings.get(&ctor).cloned());
-    let mut spine = crate::check::strip_forall(&bound.unwrap_or(Ty::Error));
-    let mut params = Vec::new();
-    while let Ty::Fun(a, _, r) = spine {
-        params.push(*a);
-        spine = *r;
-    }
-    let ret_args = type_args(&spine);
-    let scrut_args = type_args(&resolved);
-    (0..n)
-        .map(|i| match params.get(i) {
-            None => Ty::Error,
-            Some(p) => {
-                let mut t = p.clone();
-                for (r, s) in ret_args.iter().zip(scrut_args.iter()) {
-                    t = lt::subst_from_arg(r, s, &t);
-                }
-                cx.st.deep_resolve(&t)
-            }
-        })
-        .collect()
-}
-
-/// `ctor-ret-tyargs` and `extract-scrut-args`: a sum, record or constructed
-/// type's arguments, in declaration order.
-fn type_args(t: &Ty) -> Vec<Ty> {
-    match t {
-        Ty::Sum(_, a) | Ty::Record(_, a) | Ty::Constructed(_, a) => a.clone(),
-        _ => Vec::new(),
+/// The checker's answer for a pattern node, resolved. A HALF-resolved type
+/// reaches the wire as `(tvar 4)` where the oracle spells `int-default`.
+fn pat_ty(sp: crate::ast::Span, cx: &Lower) -> Result<Ty, String> {
+    match cx.st.pat_type_at(sp) {
+        Some(t) => Ok(cx.st.deep_resolve(t)),
+        None => Err(format!("no checker answer for the pattern at {}:{}", sp.line, sp.col)),
     }
 }
 
 /// `bind-pattern-to-ctx` (subject 55367). Every variable a pattern binds,
-/// into the arm's scope, before anything in the arm is lowered. The type is
-/// the one `pattern` will put on the node, by the same rule.
-fn bind_pattern(p: &Pat, scrut: &Ty, cx: &Lower) {
-    let at = |sp: crate::ast::Span| -> Ty {
-        cx.st.pat_type_at(sp).map_or_else(|| scrut.clone(), |t| cx.st.deep_resolve(t))
-    };
+/// into the arm's scope, before anything in the arm is lowered, with the
+/// type `pattern` will put on the node.
+fn bind_pattern(p: &Pat, cx: &Lower) -> Result<(), String> {
     match p {
         Pat::Var(n, s) => {
-            cx.bind_local(*n, at(*s));
+            cx.bind_local(*n, pat_ty(*s, cx)?);
         }
-        Pat::Ctor(n, subs, _) => {
-            let fields = ctor_field_types(*n, scrut, subs.len(), cx);
-            for (sub, fty) in subs.iter().zip(fields.iter()) {
-                bind_pattern(sub, fty, cx);
-            }
-        }
-        Pat::Vec_(subs, _) => {
+        Pat::Ctor(_, subs, _) | Pat::Vec_(subs, _) => {
             for sub in subs {
-                bind_pattern(sub, &Ty::Error, cx);
+                bind_pattern(sub, cx)?;
             }
         }
         Pat::Wild(_) | Pat::Lit(..) => {}
     }
+    Ok(())
 }
 
 /// The variant's name, for the refusal histogram.

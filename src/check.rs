@@ -218,8 +218,13 @@ pub fn is_synthetic(sp: crate::ast::Span) -> bool {
     sp.line == 0
 }
 
+/// Upstream's key: the file id in the high bits, then offset and length. The
+/// source is file 1. **A synthetic span is file 0**, as it is upstream, and
+/// the desugarer numbers its invented nodes within that file, so a synthetic
+/// key can never collide with a source one or with another synthetic one.
 pub fn expr_type_key(sp: crate::ast::Span) -> u64 {
-    (1u64 << 48) + (sp.offset as u64) * 65536 + (sp.len.min(65535) as u64)
+    let file = if is_synthetic(sp) { 0u64 } else { 1u64 << 48 };
+    file + (sp.offset as u64) * 65536 + (sp.len.min(65535) as u64)
 }
 
 /// One diagnostic: upstream's code, and what it says.
@@ -429,17 +434,12 @@ impl UnifyState {
         self.expr_types.push((expr_type_key(sp), t));
     }
 
-    /// What a pattern node was checked against. **A SYNTHETIC SPAN IS NOT A
-    /// KEY**: every pattern in every desugarer-derived definition carries the
-    /// same one, so an entry recorded there answers for all of them and is
-    /// right for at most one. `__eq_Color`'s `Red` read back the first
-    /// helper's type, `Tup2`, the moment a helper was reachable enough to be
-    /// emitted. Lowering rebuilds those from the constructor's binding
-    /// instead, as upstream does for every pattern.
+    /// What a pattern node was checked against. Recorded for EVERY pattern,
+    /// where `record_expr_type` refuses a synthetic span: nothing counts
+    /// these, and lowering reads them for every pattern node, the
+    /// desugarer's invented ones included -- each of which has a span of its
+    /// own for exactly this reason.
     pub fn record_pat_type(&mut self, sp: crate::ast::Span, t: Ty) {
-        if is_synthetic(sp) {
-            return;
-        }
         self.pat_types.push((expr_type_key(sp), t));
     }
 
