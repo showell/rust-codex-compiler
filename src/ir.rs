@@ -493,6 +493,33 @@ mod tests {
         );
     }
 
+    /// **AN ORPHAN EMPTY LIST DEFAULTS ITS ELEMENT.** A monomorphic
+    /// definition's unconstrained `[]` -- used only where the element is never
+    /// observed -- has an element type no context and no generic binds. Left a
+    /// bare variable it reaches the zig plug as "no element type for this empty
+    /// list"; a provably-empty list's unobserved element defaults to
+    /// int-default so every plug can size it. (roc-alias-empty.)
+    #[test]
+    fn an_orphan_empty_list_defaults_its_element() {
+        let src = "Chapter: T\n\nSection: S\n  ae : Integer -> Integer\n  ae (n) = let x = [] in let y = x in if list-length y == 0 then 42 else 0\n\nSection: E\n  opening : Integer\n  opening = ae 0\n";
+        // The LITERAL's element is what the zig plug sizes; defaulting it is
+        // what makes the program build. The orphan variable may still appear in
+        // erased positions (a name's recorded type), which the plug ignores.
+        let l = def_line(src, "ae");
+        assert!(l.contains("(list-expr (elems) int-default)"), "orphan literal not defaulted: {l}");
+    }
+
+    /// **A DEFINITION'S OWN GENERIC IS NOT AN ORPHAN.** An empty list typed as
+    /// the definition's own type variable must keep that variable -- defaulting
+    /// it would make a generic function monomorphic. The guard defaults only a
+    /// variable the definition's type does not bind.
+    #[test]
+    fn a_generic_empty_lists_variable_is_not_defaulted() {
+        let src = "Chapter: T\n\nSection: S\n  g : List a -> Integer\n  g (xs) = list-length (xs & [])\n\nSection: E\n  opening : Integer\n  opening = g [1, 2, 3]\n";
+        let l = def_line(src, "g");
+        assert!(l.contains("(list (tvar"), "generic element wrongly defaulted: {l}");
+    }
+
     /// **A POLYMORPHIC DEFINITION SPELLS THE TYPE ITS OWN BODY WAS CHECKED
     /// WITH.** `ident : List a -> List a` reaches the wire as
     /// `(fn (list (tvar 2)) (list (tvar 2)))` -- the variable
