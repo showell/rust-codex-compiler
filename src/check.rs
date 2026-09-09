@@ -1835,7 +1835,7 @@ pub fn infer_row(
         // whole of its next-id.
         E::Binary(l, op, r, sp) => {
             let (lt, lrow) = infer_row(l, env, st);
-            let (_rt, rrow) = infer_row(r, env, st);
+            let (rt, rrow) = infer_row(r, env, st);
             row = st.row_union(&lrow, &rrow);
             use crate::ast::BinaryOp::*;
             // **`&` RECORDS AN EXPRESSION TYPE; NO OTHER OPERATOR DOES.**
@@ -1854,35 +1854,78 @@ pub fn infer_row(
                 st.record_expr_type(*sp, resolved);
             }
             match op {
-                // **`&` ANSWERS ITS LEFT OPERAND, BECAUSE IT IS TWO OPERATORS.**
-                // `infer-and` (TypeCheckerInference.codex:414) resolves the left
-                // type and dispatches: Boolean is a logical AND, anything else
-                // is an append. Answering Boolean unconditionally made
-                // `a & b & "!"` see a Boolean meeting a Text at the second `&`,
-                // which is a disagreement that is not in the program.
+                // **EVERY BINARY OPERATOR UNIFIES ITS OPERANDS.** A faithful
+                // port of `infer-binary-op` (TypeCheckerInference), and the
+                // unification is how earned knowledge crosses the operator.
+                // `List Text & (for x in xs -> ...)` binds the comprehension's
+                // element variable to `Text` HERE and nowhere else: the map
+                // builtin instantiated a fresh variable for the hoisted
+                // lambda's return, and only the append meets it against the
+                // left. Answering a type without unifying left that variable
+                // free -- one `map-list` result on the self-host wire spelled
+                // `(tvar N)` where the oracle spells `text`.
                 //
-                // `and` the KEYWORD is only ever logical, and so is `or`.
-                OpAnd => st.resolve(&lt),
-                OpEq | OpNotEq | OpLt | OpGt | OpLtEq | OpGtEq | OpBoolAnd | OpOr => Ty::Boolean,
-                // **ARITHMETIC ANSWERS THE TIGHTER OF THE TWO**, which is not
-                // the same as answering the left. `arith-result-ty`.
-                // **AND THE TWO OPERANDS MEET FIRST.** `infer-arithmetic`
-                // unifies before it answers, and we answered without
-                // unifying -- so `x * 7` with `x` a fresh variable stayed a
-                // variable instead of learning it was an Integer. That
-                // reached the wire: a handler clause's `resume` spelled
-                // `(fn (tvar 271) (tvar 273))` where the oracle says
-                // `(fn int-default (tvar 273))`.
-                //
-                // The `UnitTy` arms of `infer-arithmetic`, which unify
-                // through the wrapper, are not modelled here yet.
-                OpAdd | OpSub | OpMul | OpDiv | OpPow => {
-                    if !st.unify(&lt, &_rt) {
-                        st.unify_gaps += 1;
-                    }
-                    arith_result_ty(&st.resolve(&lt), &st.resolve(&_rt))
+                // Not modelled here, because upstream adds them AROUND these
+                // same functions and the subject exercises none on the wire:
+                // the real-equality and text-ordering bans, `infer-comparison`
+                // 's VectorMask result, and `infer-arithmetic`'s UnitTy arms.
+
+                // `infer-comparison`: the operands MEET, the answer is Boolean.
+                OpEq | OpNotEq | OpLt | OpGt | OpLtEq | OpGtEq | OpDefEq
+                | OpApproxEq | OpApproxEqExact => {
+                    if !st.unify(&lt, &rt) { st.unify_gaps += 1; }
+                    Ty::Boolean
                 }
-                _ => lt,
+                // `infer-logical`: both operands MEET Boolean.
+                OpOr | OpBoolAnd => {
+                    if !st.unify(&lt, &Ty::Boolean) { st.unify_gaps += 1; }
+                    if !st.unify(&rt, &Ty::Boolean) { st.unify_gaps += 1; }
+                    Ty::Boolean
+                }
+                // `infer-arithmetic`: the operands MEET, the answer is the
+                // tighter of the two (`arith-result-ty`). The `UnitTy` arms are
+                // not modelled here yet.
+                OpAdd | OpSub | OpMul | OpDiv | OpPow => {
+                    if !st.unify(&lt, &rt) { st.unify_gaps += 1; }
+                    arith_result_ty(&st.resolve(&lt), &st.resolve(&rt))
+                }
+                // `infer-and`: `&` is three operators, dispatched on the
+                // RESOLVED left type -- Boolean is `infer-logical`, Text and
+                // everything else are `infer-append`. The recorded expression
+                // type above is what separates them for later readers.
+                OpAnd => match st.resolve(&lt) {
+                    Ty::Boolean => {
+                        if !st.unify(&lt, &Ty::Boolean) { st.unify_gaps += 1; }
+                        if !st.unify(&rt, &Ty::Boolean) { st.unify_gaps += 1; }
+                        Ty::Boolean
+                    }
+                    Ty::Text => {
+                        if !st.unify(&rt, &Ty::Text) { st.unify_gaps += 1; }
+                        Ty::Text
+                    }
+                    other => {
+                        if !st.unify(&lt, &rt) { st.unify_gaps += 1; }
+                        other
+                    }
+                },
+                // `infer-append`: the append token minus `&`'s boolean route --
+                // Text unifies the right with Text, a List unifies the two.
+                OpAppend => match st.resolve(&lt) {
+                    Ty::Text => {
+                        if !st.unify(&rt, &Ty::Text) { st.unify_gaps += 1; }
+                        Ty::Text
+                    }
+                    other => {
+                        if !st.unify(&lt, &rt) { st.unify_gaps += 1; }
+                        other
+                    }
+                },
+                // `infer-cons`: `x :: xs` unifies the right with `List lt`.
+                OpCons => {
+                    let list_ty = Ty::List(Box::new(lt.clone()));
+                    if !st.unify(&rt, &list_ty) { st.unify_gaps += 1; }
+                    list_ty
+                }
             }
         }
         // **THE TWO ARMS MEET, AND THE CONDITION MEETS `Boolean`.**
