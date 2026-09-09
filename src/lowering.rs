@@ -336,6 +336,26 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
             let l = expr(l, &Ty::NoExpect, cx)?;
             let r = expr(r, &Ty::NoExpect, cx)?;
             let lty = l.ty();
+            // `lower-binary-maybe-eq` (IR/Lowering.codex:653): `==` and `/=`
+            // ask `lower-eq-dispatch` FIRST, and only an operand type with no
+            // generated helper falls through to the `binary eq` below.
+            let (l, r) = match op {
+                BinaryOp::OpEq | BinaryOp::OpNotEq => match eq_dispatch(&lty, l, r, cx, *s) {
+                    Ok(call) if *op == BinaryOp::OpEq => return Ok(call),
+                    // `/=` is `if call then False else True`, never a `not`.
+                    Ok(call) => {
+                        return Ok(IrExpr::If(
+                            Box::new(call),
+                            Box::new(IrExpr::BoolLit(false, *s)),
+                            Box::new(IrExpr::BoolLit(true, *s)),
+                            Ty::Boolean,
+                            *s,
+                        ))
+                    }
+                    Err(operands) => operands,
+                },
+                _ => (l, r),
+            };
             // **THE RESULT IS THE LEFT OPERAND'S TYPE, AND TWO INTEGERS OF
             // DIFFERENT BOUNDS ARE COMPATIBLE.** `b + 1` over
             // `Integer between 0 and 255` answers `(int 0 255 ov-error)` and
@@ -757,6 +777,153 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
     }
 }
 
+/// `lower-eq-dispatch` (IR/Lowering.codex:664). **AN EQUALITY ON A TYPE THE
+/// DESUGARER GENERATED `__eq_<T>` FOR IS A CALL TO IT**, not a `binary eq`.
+/// The desugarer mints one helper per type NAME; this arm reads its
+/// EXISTENCE -- overlay first, then the checker's bindings, exactly
+/// `lookup-type-split` -- and finding it is the whole proof that the operand
+/// is such a type. Without this arm every generated helper is dead on
+/// arrival: the definition is emitted, nothing names it, and pruning takes it
+/// off the wire. The self-host oracle names `__eq_TokenKind` sixteen times.
+///
+/// A type WITH ARGUMENTS is called by an INSTANTIATED name, `__eq_Box@Integer`,
+/// spelled by `eq-helper-name-inst` from the site's actuals, and its type is
+/// built from the operand rather than read off the helper, whose own field
+/// stays at the declaration's type variable. `codexir` puts that name on the
+/// wire and attaches NO definition for it; matching the wire is the job here.
+///
+/// `eq-site-actuals` reads actuals off a `ConstructedTy` ONLY: a `SumTy` with
+/// arguments still has them, so `has-args` is true and the type is the
+/// operand's, but the name is the bare one.
+///
+/// The answer is `Err` with the operands handed back when there is no helper,
+/// so the caller can still build the `binary` from them.
+fn eq_dispatch(
+    lty: &Ty,
+    l: IrExpr,
+    r: IrExpr,
+    cx: &Lower,
+    s: crate::ast::Span,
+) -> Result<IrExpr, (IrExpr, IrExpr)> {
+    let resolved = cx.st.deep_resolve(lty);
+    let tn = type_name_of(&resolved, cx);
+    if tn.is_empty() {
+        return Err((l, r));
+    }
+    let bare = format!("__eq_{tn}");
+    // `lookup-type-split` answers `ErrorTy` for a name it does not hold, and
+    // the arm reads `ErrorTy | NoExpectTy` as "no helper".
+    let probe = cx
+        .syms
+        .borrow()
+        .find(&bare)
+        .and_then(|n| cx.overlay_ty(n).or_else(|| cx.bindings.get(&n).cloned()))
+        .filter(|t| !matches!(t, Ty::Error | Ty::NoExpect));
+    let Some(probe) = probe else {
+        return Err((l, r));
+    };
+    let stripped = strip_unit(&resolved);
+    let (hname, fty) = if eq_type_has_args(&stripped) {
+        let arrow = |ret: Ty| {
+            Ty::Fun(Box::new(stripped.clone()), crate::check::EffectRow::default(), Box::new(ret))
+        };
+        (eq_helper_name_inst(&tn, &eq_site_actuals(&stripped), cx), arrow(arrow(Ty::Boolean)))
+    } else {
+        (bare, crate::check::strip_forall(&cx.st.deep_resolve(&probe)))
+    };
+    let hsym = cx.syms.borrow_mut().intern(&hname);
+    let inner = IrExpr::Apply(
+        Box::new(IrExpr::Name(hsym, fty.clone(), s)),
+        Box::new(l),
+        peel_fun_return(&fty),
+        s,
+    );
+    Ok(IrExpr::Apply(Box::new(inner), Box::new(r), Ty::Boolean, s))
+}
+
+/// `type-name-of` (IR/Lowering.codex:695): the bare name, arguments DISCARDED,
+/// and `""` for anything without one -- a unit type included, so `==` on a
+/// unit type never reaches its own generated helper.
+fn type_name_of(t: &Ty, cx: &Lower) -> String {
+    match t {
+        Ty::Integer(..) => "Integer".into(),
+        Ty::Real(..) => "Real".into(),
+        Ty::Text => "Text".into(),
+        Ty::Boolean => "Boolean".into(),
+        Ty::Char => "Char".into(),
+        Ty::Nothing => "Nothing".into(),
+        Ty::List(_) | Ty::LinkedList(_) => "List".into(),
+        Ty::Constructed(n, _) | Ty::Record(n, _) | Ty::Sum(n, _) => cx.text(*n),
+        _ => String::new(),
+    }
+}
+
+/// `strip-unit-ty` (Types/CodexType.codex:133).
+fn strip_unit(t: &Ty) -> Ty {
+    match t {
+        Ty::Unit(_, inner) => strip_unit(inner),
+        other => other.clone(),
+    }
+}
+
+/// `eq-type-has-args` (IR/Lowering.codex:684).
+fn eq_type_has_args(t: &Ty) -> bool {
+    match t {
+        Ty::Constructed(_, a) | Ty::Sum(_, a) | Ty::Record(_, a) => !a.is_empty(),
+        _ => false,
+    }
+}
+
+/// `eq-site-actuals` (Emit/X86_64.codex:2954): a `ConstructedTy`'s arguments
+/// and nothing else's.
+fn eq_site_actuals(t: &Ty) -> Vec<Ty> {
+    match t {
+        Ty::Constructed(_, a) => a.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// `eq-helper-name-inst` (Emit/X86_64.codex:2949): `__eq_<T>` with no
+/// actuals, else `__eq_<T>@` and the actuals' keys joined by `,`.
+fn eq_helper_name_inst(tn: &str, actuals: &[Ty], cx: &Lower) -> String {
+    if actuals.is_empty() {
+        return format!("__eq_{tn}");
+    }
+    let keys: Vec<String> = actuals.iter().map(|a| eq_key_of(a, cx)).collect();
+    format!("__eq_{tn}@{}", keys.join(","))
+}
+
+/// `eq-key-of` (Emit/X86_64.codex:2918): the instance key of one actual.
+/// Integers of every bound share one key; a Real's is its WIDTH; a type
+/// variable is `#` and its id; anything else is `?`.
+fn eq_key_of(t: &Ty, cx: &Lower) -> String {
+    let wrap = |a: &[Ty]| -> String {
+        if a.is_empty() {
+            String::new()
+        } else {
+            let keys: Vec<String> = a.iter().map(|x| eq_key_of(x, cx)).collect();
+            format!("[{}]", keys.join(","))
+        }
+    };
+    match strip_unit(t) {
+        Ty::Text => "Text".into(),
+        Ty::Boolean => "Boolean".into(),
+        Ty::Char => "Char".into(),
+        Ty::Integer(..) => "Integer".into(),
+        Ty::Real(w, _) => match w {
+            crate::check::RealWidth::F32 => "Real32".into(),
+            crate::check::RealWidth::F64 => "Real64".into(),
+        },
+        Ty::List(e) => format!("List[{}]", eq_key_of(&e, cx)),
+        Ty::LinkedList(e) => format!("LinkedList[{}]", eq_key_of(&e, cx)),
+        Ty::Sum(n, a) | Ty::Record(n, a) | Ty::Constructed(n, a) => {
+            format!("{}{}", cx.text(n), wrap(&a))
+        }
+        Ty::Var(id) => format!("#{id}"),
+        _ => "?".into(),
+    }
+}
+
 /// `peel-fun-param` (Types/CodexTypeHelpers.codex:4). The argument side of an
 /// arrow, LOOKING THROUGH quantifiers, and `ErrorTy` for anything else.
 fn peel_fun_param(t: &Ty) -> Ty {
@@ -999,14 +1166,14 @@ fn record_name(t: &Ty, cx: &Lower, what: &str) -> Result<Sym, String> {
 
 /// One pattern.
 ///
-/// **THIS IS SHORT BECAUSE THE CHECKER'S ANSWER WAS KEPT.** Upstream's
-/// lowering rebuilds a destructured field's type from the constructor
-/// declaration and the scrutinee -- `pattern-type-subst`, `apply-ctor-subst`,
-/// `ctor-ret-tyargs`, `pair-tvars`, `subst-tvars`. It has to: its lowering
-/// pass reads types only by span out of `expr-types`, and a pattern is not an
-/// expression, so its own checker's answer is unreachable from there. Ours
-/// records it in `pat_types` (see `check::bind_pattern`), so the field type is
-/// a lookup and the substitution machinery is never written.
+/// **THE TYPE ON A PATTERN NODE IS THE TYPE IT WAS MATCHED AGAINST**: the
+/// scrutinee's for the top pattern and the constructor's field type for a
+/// sub-pattern, which is what upstream's `lower-pattern` threads down. Where
+/// the checker recorded an answer for the position, `pat_types`, that answer
+/// is used; it is the same type, read from the same substitution table. Where
+/// it recorded nothing -- every pattern the desugarer invented, since a
+/// synthetic span is not a key -- the field type is rebuilt from the
+/// constructor's binding and the scrutinee, `ctor-field-type-in-ctx`.
 fn pattern(p: &Pat, scrut: &Ty, cx: &Lower) -> Result<IrPat, String> {
     let want = |sp: crate::ast::Span| -> Ty {
         cx.st.pat_type_at(sp).map_or_else(|| scrut.clone(), |t| cx.st.deep_resolve(t))
@@ -1016,9 +1183,10 @@ fn pattern(p: &Pat, scrut: &Ty, cx: &Lower) -> Result<IrPat, String> {
         Pat::Var(n, s) => Ok(IrPat::Var(cx.bound_name(*n), want(*s), *s)),
         Pat::Lit(v, _, s) => Ok(IrPat::Lit(v.clone(), want(*s), *s)),
         Pat::Ctor(n, subs, s) => {
+            let fields = ctor_field_types(*n, scrut, subs.len(), cx);
             let mut out = Vec::new();
-            for sub in subs {
-                out.push(pattern(sub, &Ty::Error, cx)?);
+            for (sub, fty) in subs.iter().zip(fields.iter()) {
+                out.push(pattern(sub, fty, cx)?);
             }
             Ok(IrPat::Ctor(*n, out, want(*s), *s))
         }
@@ -1026,13 +1194,61 @@ fn pattern(p: &Pat, scrut: &Ty, cx: &Lower) -> Result<IrPat, String> {
     }
 }
 
-/// `bind-pattern-to-ctx` (subject 55367). Every variable a pattern binds,
-/// into the arm's scope, before anything in the arm is lowered.
+/// `resolved-ctor-field-type` (IR/Lowering.codex:1231): the constructor's
+/// binding, quantifiers stripped, its return's arguments paired POSITIONALLY
+/// with the scrutinee's, and the `i`th parameter read through that pairing
+/// and the substitution table. A constructor that is not bound answers
+/// `error` for every field, as upstream's `ErrorTy` does.
 ///
-/// The type is the checker's own answer for that position -- `pat_types`,
-/// which upstream cannot reach and rebuilds from the constructor declaration
-/// instead (see `pattern` below). Nothing here depends on which of the two it
-/// is: what the wire carries is the NAME.
+/// `Cons` and `Nil` over the builtin list are not constructors in the
+/// environment, and the checker's `bind_pattern` matches them against the
+/// element type directly; the same rule here keeps the two in step.
+fn ctor_field_types(ctor: Sym, scrut: &Ty, n: usize, cx: &Lower) -> Vec<Ty> {
+    let resolved = cx.st.deep_resolve(scrut);
+    if let Ty::List(elem) = &resolved {
+        let name = cx.text(ctor);
+        if name == "Cons" && n == 2 {
+            return vec![(**elem).clone(), resolved.clone()];
+        }
+        if name == "Nil" {
+            return Vec::new();
+        }
+    }
+    let bound = cx.overlay_ty(ctor).or_else(|| cx.bindings.get(&ctor).cloned());
+    let mut spine = crate::check::strip_forall(&bound.unwrap_or(Ty::Error));
+    let mut params = Vec::new();
+    while let Ty::Fun(a, _, r) = spine {
+        params.push(*a);
+        spine = *r;
+    }
+    let ret_args = type_args(&spine);
+    let scrut_args = type_args(&resolved);
+    (0..n)
+        .map(|i| match params.get(i) {
+            None => Ty::Error,
+            Some(p) => {
+                let mut t = p.clone();
+                for (r, s) in ret_args.iter().zip(scrut_args.iter()) {
+                    t = lt::subst_from_arg(r, s, &t);
+                }
+                cx.st.deep_resolve(&t)
+            }
+        })
+        .collect()
+}
+
+/// `ctor-ret-tyargs` and `extract-scrut-args`: a sum, record or constructed
+/// type's arguments, in declaration order.
+fn type_args(t: &Ty) -> Vec<Ty> {
+    match t {
+        Ty::Sum(_, a) | Ty::Record(_, a) | Ty::Constructed(_, a) => a.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// `bind-pattern-to-ctx` (subject 55367). Every variable a pattern binds,
+/// into the arm's scope, before anything in the arm is lowered. The type is
+/// the one `pattern` will put on the node, by the same rule.
 fn bind_pattern(p: &Pat, scrut: &Ty, cx: &Lower) {
     let at = |sp: crate::ast::Span| -> Ty {
         cx.st.pat_type_at(sp).map_or_else(|| scrut.clone(), |t| cx.st.deep_resolve(t))
@@ -1041,7 +1257,13 @@ fn bind_pattern(p: &Pat, scrut: &Ty, cx: &Lower) {
         Pat::Var(n, s) => {
             cx.bind_local(*n, at(*s));
         }
-        Pat::Ctor(_, subs, _) | Pat::Vec_(subs, _) => {
+        Pat::Ctor(n, subs, _) => {
+            let fields = ctor_field_types(*n, scrut, subs.len(), cx);
+            for (sub, fty) in subs.iter().zip(fields.iter()) {
+                bind_pattern(sub, fty, cx);
+            }
+        }
+        Pat::Vec_(subs, _) => {
             for sub in subs {
                 bind_pattern(sub, &Ty::Error, cx);
             }

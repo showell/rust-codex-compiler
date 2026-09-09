@@ -429,10 +429,17 @@ impl UnifyState {
         self.expr_types.push((expr_type_key(sp), t));
     }
 
-    /// What a pattern node was checked against. Unconditional, where
-    /// `record_expr_type` refuses a synthetic span: nothing counts these, and
-    /// a desugarer-derived pattern still has field types worth keeping.
+    /// What a pattern node was checked against. **A SYNTHETIC SPAN IS NOT A
+    /// KEY**: every pattern in every desugarer-derived definition carries the
+    /// same one, so an entry recorded there answers for all of them and is
+    /// right for at most one. `__eq_Color`'s `Red` read back the first
+    /// helper's type, `Tup2`, the moment a helper was reachable enough to be
+    /// emitted. Lowering rebuilds those from the constructor's binding
+    /// instead, as upstream does for every pattern.
     pub fn record_pat_type(&mut self, sp: crate::ast::Span, t: Ty) {
+        if is_synthetic(sp) {
+            return;
+        }
         self.pat_types.push((expr_type_key(sp), t));
     }
 

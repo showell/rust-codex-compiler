@@ -723,6 +723,40 @@ mod tests {
         assert!(all.contains(r#"(name "node" ("#), "the call to node went too:\n{all}");
     }
 
+    /// **`==` ON A TYPE WITH A GENERATED HELPER IS A CALL TO THE HELPER**,
+    /// `lower-eq-dispatch`, and `/=` is `if call then False else True`. A
+    /// type with arguments is called by its INSTANTIATED name and a list,
+    /// which has no helper, stays a `binary eq`. The generated helper's own
+    /// body is on the wire too, and its sub-patterns carry the FIELD types:
+    /// every pattern in it shares one synthetic span, so those cannot come
+    /// from the checker's table. Read off `codexir` at `8570fba1`.
+    #[test]
+    fn equality_on_a_sum_calls_the_generated_helper() {
+        let src = "Chapter: T\n\nSection: S\n  Color =\n   | Red\n   | Green\n\n  Box a =\n   | Full (a)\n   | Empty\n\n  Pair =\n   | MkPair (Integer) (Box Text)\n\n  same : Color, Color -> Boolean\n  same (a) (b) = a == b\n\n  differ : Color, Color -> Boolean\n  differ (a) (b) = a /= b\n\n  same-box : Box Integer, Box Integer -> Boolean\n  same-box (a) (b) = a == b\n\n  same-list : List Integer, List Integer -> Boolean\n  same-list (a) (b) = a == b\n\n  same-pair : Pair, Pair -> Boolean\n  same-pair (a) (b) = a == b\n\n  count : Boolean -> Integer\n  count (b) = if b then 1 else 0\n\nSection: E\n  opening : Integer\n  opening = count (same Red Green) + count (differ Red Red) + count (same-box Empty Empty) + count (same-list [] []) + count (same-pair (MkPair 1 Empty) (MkPair 2 Empty))\n";
+        let all = ir(src);
+        let color = r#"(fn (sum "Color" (args)) (fn (sum "Color" (args)) boolean))"#;
+        // `same` and `differ` have one caller each and are inlined into
+        // `opening`, so the call is read there, with `Red` for `a`.
+        assert!(
+            all.contains(&format!(r#"(apply (apply (name "__eq_Color" {color}) (name "Red" (sum "Color" (args))) (fn (sum "Color" (args)) boolean)) (name "Green" (sum "Color" (args))) boolean)"#)),
+            "{all}"
+        );
+        assert!(
+            all.contains(&format!(r#"(if (apply (apply (name "__eq_Color" {color}) (name "Red" (sum "Color" (args))) (fn (sum "Color" (args)) boolean)) (name "Red" (sum "Color" (args))) boolean) (bool-lit false) (bool-lit true) boolean)"#)),
+            "/= is an if: {all}"
+        );
+        assert!(
+            all.contains(r#"(name "__eq_Box@Integer" (fn (ctd "Box" (args int-default)) (fn (ctd "Box" (args int-default)) boolean)))"#),
+            "{all}"
+        );
+        assert!(all.contains(r#"(binary eq (name "a" (list int-default)) (name "b" (list int-default)) boolean)"#), "{all}");
+        // The helper's body: field 0 is an Integer, field 1 calls Box's
+        // instantiated helper, and both `MkPair` patterns carry `Pair`.
+        let pair = def_line(src, "__eq_Pair");
+        assert!(pair.contains(r#"(ctor-pat "MkPair" (subs (var-pat "__exf0" int-default) (var-pat "__exf1" (ctd "Box" (args text)))) (sum "Pair" (args)))"#), "{pair}");
+        assert!(pair.contains(r#"(binary and (binary eq (name "__exf0" int-default) (name "__eyf0" int-default) boolean) (apply (apply (name "__eq_Box@Text""#), "{pair}");
+    }
+
     /// **A BARE CONSTRUCTED TYPE IS A NAME, NOT AN ANSWER**, and the RESOLVE
     /// phase is what turns it into one. `__self-type-defs` is declared
     /// `List TypeBinding` in the builtin table and reaches lowering as
