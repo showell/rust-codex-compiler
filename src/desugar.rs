@@ -334,11 +334,19 @@ impl<'a> Desugar<'a> {
             }
             NodeKind::ForExpr => {
                 // `for x in xs -> b` is `map-list (\x -> b) xs`.
-                let var = n
+                //
+                // **THE `map-list` NAME CARRIES THE LOOP VARIABLE'S SPAN**,
+                // upstream's `token-span var-tok` (Desugarer.codex:80); the
+                // lambda and both applications are synthetic. The name is
+                // the one invented node here the checker can record an
+                // expression type for, so it is one `expr-types` per
+                // comprehension -- the whole of the 33-unit `ai-*` family
+                // when this node was synthetic like the others.
+                let var_tok = n
                     .own_tokens()
-                    .find(|t| matches!(t.kind, Kind::Identifier | Kind::Underscore) && self.text(t) != "for")
-                    .map(|t| self.sym(t))
-                    .unwrap_or_default();
+                    .find(|t| matches!(t.kind, Kind::Identifier | Kind::Underscore) && self.text(t) != "for");
+                let var = var_tok.map(|t| self.sym(t)).unwrap_or_default();
+                let var_span = var_tok.map_or_else(|| self.synth(), span_of);
                 match kids.as_slice() {
                     [list, body] => {
                         let lam = Expr::Lambda(
@@ -346,7 +354,7 @@ impl<'a> Desugar<'a> {
                             Rc::new(self.expr(body)),
                             self.synth(),
                         );
-                        let map_fn = Expr::NameRef(self.sym_str("map-list"), self.synth());
+                        let map_fn = Expr::NameRef(self.sym_str("map-list"), var_span);
                         Expr::Apply(
                             Rc::new(Expr::Apply(Rc::new(map_fn), Rc::new(lam), self.synth())),
                             Rc::new(self.expr(list)),
