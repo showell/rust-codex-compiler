@@ -747,6 +747,15 @@ impl UnifyState {
             self.error(Cdx::TYPE_MISMATCH, format!("Type mismatch: {} vs {}", type_desc(&ra), type_desc(&rb)));
             return;
         }
+        // A primitive meeting a function is reported too: `x 6` for an
+        // integer `x`, `take-int process-exit`. The post-scoper census finds
+        // no such pair on a clean program, which is what admits it here.
+        let fun_vs_primitive = matches!((&ra, &rb), (Ty::Fun(..), b) if primitive_head(b).is_some())
+            || matches!((&ra, &rb), (a, Ty::Fun(..)) if primitive_head(a).is_some());
+        if fun_vs_primitive {
+            self.error(Cdx::TYPE_MISMATCH, format!("Type mismatch: {} vs {}", type_desc(&ra), type_desc(&rb)));
+            return;
+        }
         let (Some(ha), Some(hb)) = (primitive_head(&ra), primitive_head(&rb)) else {
             return;
         };
