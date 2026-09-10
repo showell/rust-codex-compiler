@@ -18,7 +18,7 @@
 # either side.
 UNITS="${UNITS:-$HOME/units-current}"
 BIN="${CHECKDUMP:-$HOME/build/rust-target/release/checkdump}"
-ORACLE="${CODEXCHECK:-$HOME/showell_repos/codex-zig-transpiler/generated/local/codexcheck}"
+ORACLE="${CODEXCHECK:-$HOME/codexir/codexcheck}"
 [ -d "$UNITS" ] || { echo "no units at $UNITS"; exit 2; }
 
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gate_provenance.sh"
