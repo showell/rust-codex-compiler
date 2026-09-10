@@ -617,21 +617,23 @@ impl UnifyState {
     /// NO to an ill-typed program instead of emitting best-effort IR that only
     /// the interpreter or the plug then refuses.
     ///
-    /// **TWO INTEGERS OF DIFFERENT RANGES ARE NOT A CONFLICT** -- a byte, a
-    /// u16 and the full i64 are reconciled by the checker's range handling, so
-    /// same-head numeric mismatches are excluded. Measured to add ZERO
-    /// diagnostics across the self-host (3,222 defs, check-errors 0), the
-    /// curated 28, and the 29 Roc ports; the env `CDX_MEASURE_CONFLICTS` prints
-    /// each one so that stays checkable.
+    /// **ONLY A PRIMITIVE MEETING A DIFFERENT PRIMITIVE IS REPORTED.** Integer,
+    /// Real, Text, Boolean and Char are the heads upstream's unifier has no
+    /// reconciling arm for. Every other concrete pair stays a gap, because
+    /// upstream reconciles pairs this unifier does not model: a unit type
+    /// against its base (`infer-arithmetic`'s UnitTy arms), a vector mask
+    /// against Boolean (`infer-comparison`), a constructed wrapper against
+    /// its payload. Reporting those invented 68 CDX2001s over the 1,269-unit
+    /// corpus on programs the oracle compiles clean. Two Integers of different
+    /// RANGES are one head and are reconciled by range handling. The env
+    /// `CDX_MEASURE_CONFLICTS` prints every primitive conflict so the count
+    /// stays checkable.
     fn report_conflict(&mut self, a: &Ty, b: &Ty) {
         let (ra, rb) = (self.deep_resolve(a), self.deep_resolve(b));
-        let mut vs = std::collections::BTreeSet::new();
-        collect_type_vars(&ra, &mut vs);
-        collect_type_vars(&rb, &mut vs);
-        if !vs.is_empty() {
+        let (Some(ha), Some(hb)) = (primitive_head(&ra), primitive_head(&rb)) else {
             return;
-        }
-        if matches!((&ra, &rb), (Ty::Integer(..), Ty::Integer(..))) {
+        };
+        if ha == hb {
             return;
         }
         if std::env::var_os("CDX_MEASURE_CONFLICTS").is_some() {
@@ -1344,6 +1346,19 @@ struct ParamEntry {
 /// deliberate: `let slot = spill-base + st.spill-count` emits `(let "slot"
 /// int-default ...)` and every reference to `slot` inside it carries
 /// `(int 0 65535 ov-error)`. Read off `codexir` over a six-case matrix.
+/// The head of a primitive type, or `None` for anything a reconciling rule
+/// upstream might still accept. See `report_conflict`.
+fn primitive_head(t: &Ty) -> Option<&'static str> {
+    match t {
+        Ty::Integer(..) => Some("Integer"),
+        Ty::Real(..) => Some("Real"),
+        Ty::Text => Some("Text"),
+        Ty::Boolean => Some("Boolean"),
+        Ty::Char => Some("Char"),
+        _ => None,
+    }
+}
+
 fn arith_result_ty(lt: &Ty, rt: &Ty) -> Ty {
     let (Ty::Integer(l_lo, l_hi, _), Ty::Integer(r_lo, r_hi, _)) = (lt, rt) else {
         return lt.clone();
