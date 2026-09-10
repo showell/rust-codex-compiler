@@ -616,6 +616,22 @@ mod tests {
         assert!(!op.contains("(tvar"), "helper's return variable survived inlining: {op}");
     }
 
+    /// A real literal types as `real` in the checker, as `infer-literal`
+    /// says. Answering `error` for it typed every `let` whose value STARTS
+    /// with one -- `if c then 0.0 else x`, `0.0 - x` -- as `error`, and every
+    /// later read of that name carried it to the wire: 104 names over 24 of
+    /// safari's 54 specs, and `sgn * hw` on an `error` operand chose `mul-int`
+    /// over `mul-num`. Upstream's wire says `real` at all of them.
+    #[test]
+    fn a_let_headed_by_a_real_literal_reads_back_real() {
+        let src = "Chapter: T\n\nSection: S\n  clamp : Real -> Real\n  clamp (x) =\n   let v1 = x * 2.0\n   in let v2 = if v1 < 0.0 then 0.0 else v1\n   in let sgn = 0.0 - v2\n   in v2 * sgn\n\nSection: E\n  opening : [Console] Nothing = act\n   print-line-uni (show (real-to-int (clamp 1.0)))\n  end\n";
+        let def = def_line(src, "clamp");
+        assert!(def.contains(r#"(name "v2" real)"#), "v2 read back untyped: {def}");
+        assert!(def.contains(r#"(name "sgn" real)"#), "sgn read back untyped: {def}");
+        assert!(def.contains("mul-num"), "a real product chose the int operator: {def}");
+        assert!(!def.contains("error"), "an error type reached the wire: {def}");
+    }
+
     /// **`-n` IS A NEGATE NODE; `0 - n` IS A BINARY.** The two spell
     /// differently on the wire even though a reader would call them the same
     /// expression, and the negate carries its OPERAND's type. `codexir`'s

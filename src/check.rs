@@ -1872,7 +1872,12 @@ pub fn infer_row(
         }
         E::Lit(_, crate::ast::LiteralKind::TextLit, _) => Ty::Text,
         E::Lit(_, crate::ast::LiteralKind::BoolLit, _) => Ty::Boolean,
-        E::Lit(..) => Ty::Error,
+        // `infer-literal`: a NumLit is `real-f64`, a CharLit is `CharTy`.
+        // Answering `Error` here typed every `let` whose value STARTS with
+        // a real literal -- `if c then 0.0 else x`, `0.0 - x` -- as `error`,
+        // and every later read of that name carried it to the wire.
+        E::Lit(_, crate::ast::LiteralKind::NumLit, _) => Ty::Real(RealWidth::F64, RealMode::Default),
+        E::Lit(_, crate::ast::LiteralKind::CharLit, _) => Ty::Char,
         // `record-expr-type` has SEVEN call sites upstream and the one that
         // fires here is name inference. Counted on fib: 6 names in `fib`, 2 in
         // `double`, 3 in `opening` -- exactly the gold's `expr-types 11`.
