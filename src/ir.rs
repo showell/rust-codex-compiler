@@ -568,6 +568,37 @@ mod tests {
         );
     }
 
+    /// **AN ORPHAN SUM CONSTRUCTOR DEFAULTS ITS TYPE PARAMETER**, the same
+    /// zonk-and-default the empty list gets, generalised to a nullary variant.
+    /// `is-some None` never observes the `Maybe a`'s element, so its `a` is an
+    /// orphan no context binds; the checker defaults it to int-default at the
+    /// call site, keeping the IR hole-free. Upstream leaves the variable free
+    /// and its zig plug refuses it ("type variable ... is not declared") -- this
+    /// is a place our IR is the reference. The generic `is-some` DEFINITION
+    /// still keeps its own variable; only the unconstrained USE is defaulted.
+    #[test]
+    fn an_orphan_sum_constructors_parameter_defaults() {
+        let src = "Chapter: T\n\nSection: M\n  Maybe a =\n   | None\n   | Some (a)\n\n  is-some : Maybe a -> Boolean\n  is-some (m) = when m\n   is None -> False\n   is Some (x) -> True\n\nSection: E\n  opening : [Console] Nothing = act\n   print-line-uni (show (is-some None))\n  end\n";
+        let def = def_line(src, "is-some");
+        assert!(def.contains("(tvar"), "the generic definition lost its variable: {def}");
+        let op = def_line(src, "opening");
+        assert!(
+            op.contains(r#"(name "None" (ctd "Maybe" (args int-default)))"#),
+            "orphan constructor not defaulted at the call site: {op}"
+        );
+        assert!(!op.contains("(tvar"), "orphan variable survived at the call site: {op}");
+    }
+
+    /// The orphan defaulting reaches a NESTED sum: `depth (Some None)` leaves the
+    /// inner `None`'s parameter unconstrained, and the phase defaults it too, so
+    /// no variable reaches the plug from the caller.
+    #[test]
+    fn a_nested_orphan_sum_constructor_defaults() {
+        let src = "Chapter: T\n\nSection: M\n  Maybe a =\n   | None\n   | Some (a)\n\n  depth : Maybe (Maybe a) -> Integer\n  depth (m) = when m\n   is None -> 0\n   is Some (inner) -> when inner\n    is None -> 1\n    is Some (x) -> 2\n\nSection: E\n  opening : [Console] Nothing = act\n   print-line-uni (show (depth (Some None)))\n  end\n";
+        let op = def_line(src, "opening");
+        assert!(!op.contains("(tvar"), "nested orphan variable survived at the call site: {op}");
+    }
+
     /// **`-n` IS A NEGATE NODE; `0 - n` IS A BINARY.** The two spell
     /// differently on the wire even though a reader would call them the same
     /// expression, and the negate carries its OPERAND's type. `codexir`'s
