@@ -1352,6 +1352,21 @@ struct ParamEntry {
 /// deliberate: `let slot = spill-base + st.spill-count` emits `(let "slot"
 /// int-default ...)` and every reference to `slot` inside it carries
 /// `(int 0 65535 ov-error)`. Read off `codexir` over a six-case matrix.
+/// A name this checker cannot type but knows is not undefined: a builtin the
+/// table has no type for, or a unit conversion `A-to-B` between two declared
+/// unit types, which the desugarer synthesises after the check.
+fn known_untyped(env: &TyEnv<'_>, n: Sym) -> bool {
+    let text = env.syms.text(n);
+    if crate::builtins::BUILTINS.iter().any(|(b, _)| *b == text) {
+        return true;
+    }
+    if let Some((a, b)) = text.split_once("-to-") {
+        let is_unit = |t: &str| env.syms.find(t).is_some_and(|s| matches!(env.type_defs.declared().get(&s), Some(Ty::Unit(..))));
+        return is_unit(a) && is_unit(b);
+    }
+    false
+}
+
 /// The head of a primitive type, or `None` for anything a reconciling rule
 /// upstream might still accept. See `report_conflict`.
 fn primitive_head(t: &Ty) -> Option<&'static str> {
@@ -1649,6 +1664,13 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
     for b in &bindings {
         env.bind(b.name, b.ty.clone());
     }
+    // A class method is dispatched through a dictionary the desugarer builds
+    // after this checker has run; the name is known and untyped here.
+    for c in &ch.class_defs {
+        for m in &c.methods {
+            env.bind(m.name, Ty::Error);
+        }
+    }
     for d in &ch.defs {
         // The first type-variable id this definition mints, so its own
         // unconstrained variables can be told from earlier definitions'.
@@ -1733,7 +1755,10 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
             // is why stripping here costs that pass nothing.
             env.bind(p.name, strip_linear(arg));
         }
+        // A `claim`'s body is a proof: Stage 5 binds its `for all` names.
+        st.in_proof = d.is_claim;
         let (body_ty, body_row) = infer_row(&d.body, &mut env, &mut st);
+        st.in_proof = false;
         // **THE BODY MEETS THE DECLARED RESULT.** Without this a definition's
         // own signature decides nothing about what it computes, and an
         // inferred variable never learns what it is: `f : Integer -> List
@@ -1916,8 +1941,12 @@ pub fn infer_row(
                 // `infer-name`: a name no scope binds is CDX3002, and the
                 // reference types as `error` so one unknown name does not
                 // cascade.
+                // A name that is KNOWN and merely untyped here is not
+                // undefined: a builtin this table has no type for, or a unit
+                // conversion `A-to-B` the desugarer synthesises after this
+                // checker has run. Both stay `error`, silently, as before.
                 None => {
-                    if !st.in_proof {
+                    if !st.in_proof && !known_untyped(env, *n) {
                         st.error(Cdx::UNDEFINED_NAME, format!("Undefined name: {}", env.syms.text(*n)));
                     }
                     Ty::Error
@@ -2153,8 +2182,24 @@ pub fn infer_row(
             let mut bound = 0;
             for s in stmts {
                 match s {
+                    // **A `let` AT STATEMENT LEVEL BINDS FOR THE REST OF THE
+                    // BLOCK**, as `<-` does: `let a = bump 1 in print a` is
+                    // followed by statements that read `a`. The chain of lets
+                    // is peeled, each name bound until the block ends, and the
+                    // innermost body is the statement.
                     crate::ast::ActStmt::Exec(x, _) => {
-                        let (t, srow) = infer_row(x, env, st);
+                        let mut stmt: &crate::ast::Expr = x;
+                        while let E::Let(binds, body, _) = stmt {
+                            for b in binds {
+                                let (t, brow) = infer_row(&b.value, env, st);
+                                row = st.row_union(&row, &brow);
+                                let resolved = st.deep_resolve(&t);
+                                env.bind(b.name, resolved);
+                                bound += 1;
+                            }
+                            stmt = body;
+                        }
+                        let (t, srow) = infer_row(stmt, env, st);
                         last = t;
                         row = st.row_union(&row, &srow);
                     }
@@ -2322,7 +2367,6 @@ pub fn infer_row(
             let was = st.in_proof;
             st.in_proof = was || proof;
             let (scrut_ty, srow) = infer_row(scrut, env, st);
-            st.in_proof = was;
             row = srow;
             let result = st.fresh();
             for a in arms {
@@ -2341,6 +2385,7 @@ pub fn infer_row(
                     env.scope.pop();
                 }
             }
+            st.in_proof = was;
             result
         }
         // A record literal is the other site `record-expr-type` is populated
@@ -2531,7 +2576,18 @@ pub fn infer_row(
                 let mark = env.scope.len();
                 for stmt in stmts {
                     match stmt {
-                        crate::ast::ActStmt::Exec(x, _) => last = infer(x, env, st),
+                        crate::ast::ActStmt::Exec(x, _) => {
+                            let mut inner: &crate::ast::Expr = x;
+                            while let E::Let(binds, body, _) = inner {
+                                for b in binds {
+                                    let t = infer(&b.value, env, st);
+                                    let resolved = st.deep_resolve(&t);
+                                    env.bind(b.name, resolved);
+                                }
+                                inner = body;
+                            }
+                            last = infer(inner, env, st);
+                        }
                         crate::ast::ActStmt::Bind(n, x, _) => {
                             last = infer(x, env, st);
                             env.bind(*n, last.clone());
