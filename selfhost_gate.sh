@@ -58,7 +58,7 @@ fi
 echo
 
 # --- the wire, per definition ---------------------------------------------
-"$BIN/irdump" whole "$SUBJECT" Program > "$OUT/ours.ir" 2>/dev/null
+"$BIN/irdump" whole "$SUBJECT" > "$OUT/ours.ir" 2>/dev/null
 "$CODEXIR" < "$SUBJECT" 2> "$OUT/gold.ir" >/dev/null
 
 python3 - "$OUT/ours.ir" "$OUT/gold.ir" <<'PY'

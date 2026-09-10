@@ -34,7 +34,7 @@ gate_provenance "$UNITS"
 same=0; diff=0; ours_refused=0; theirs_refused=0; both_refused=0
 for u in "$UNITS"/*.codex; do
     n="$(basename "$u" .codex)"
-    "$IRDUMP" whole "$u" Program > "$OUT/ours.ir" 2>"$OUT/ours.err"
+    "$IRDUMP" whole "$u" > "$OUT/ours.ir" 2>"$OUT/ours.err"
     oe=$?
     "$CODEXIR" < "$u" 2>"$OUT/theirs.ir" >/dev/null
     if head -1 "$OUT/theirs.ir" | grep -q '^CODEGEN-HALTED'; then te=1; else te=0; fi

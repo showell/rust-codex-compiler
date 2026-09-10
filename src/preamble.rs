@@ -444,12 +444,10 @@ pub fn derived_chapter_name(tree: &Node, src: &[u8]) -> String {
 /// `emit-ir-chapter-prefix`.
 ///
 /// **`(chapter "...")` is a DRIVER PARAMETER, not a fact about the source.**
-/// `compile-frontend source "Program" flags` -- the name is handed in, and the
-/// title beside it is derived. `native/codexir` passes the unit's own chapter
-/// and the transpiler's guest driver passes the literal `"Program"`, which is
-/// why the compiler's own gold says `(chapter "Program") (title
-/// "Parsmi--CodexZigHarness")`. So a caller that knows which driver it is
-/// comparing against says so, and everything else stays derived.
+/// `compile-frontend source "Program" flags` -- the driver hands that literal
+/// in at every site, and the title beside it is derived from the source. A
+/// caller passes `Some("Program")` to say what the driver says; `None` derives
+/// the name too, which only the retired ladder bank ever wanted.
 pub fn emit(tree: &Node, src: &[u8], chapter_name: Option<&str>) -> String {
     let title = derived_chapter_name(tree, src);
     let chapter = chapter_name.unwrap_or(&title).to_string();

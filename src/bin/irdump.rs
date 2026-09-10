@@ -30,7 +30,7 @@ fn main() -> ExitCode {
             }
             None => ExitCode::from(2),
         },
-        Some("whole") if args.len() == 2 || args.len() == 3 => match whole(Path::new(&args[1]), args.get(2).map(String::as_str)) {
+        Some("whole") if args.len() == 2 => match whole(Path::new(&args[1]), Some("Program")) {
             Ok(text) => {
                 let out = std::io::stdout();
                 let _ = writeln!(out.lock(), "{text}");
@@ -291,6 +291,12 @@ parameter (`compile-frontend source \"Program\" flags`), not a fact about the so
 ///
 /// The preamble ends at `  (defs`, `ir::emit_defs` contributes the definition
 /// lines, and the two closing parens shut `(defs` and `(chapter`.
+/// The IR of one unit, as the driver emits it. **THE CHAPTER IS NAMED
+/// `Program`**: `opening.codex` hands that literal to `compile-frontend` at every
+/// site, so a compiled unit is `(chapter "Program")` whatever its source calls
+/// itself, and the source's own name is the title beside it. `grade_whole` is
+/// the one caller that says otherwise, because the retired ladder bank named
+/// the entry chapter.
 fn whole(path: &Path, chapter: Option<&str>) -> Result<String, String> {
     // **RESOLVING IS THIS COMPILER'S JOB, AND IT IS IDEMPOTENT.** `load` fetches
     // only the cites the file does not already carry, so a raw corpus program is
