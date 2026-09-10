@@ -113,6 +113,11 @@ impl SymTab {
     /// The symbol for a name already interned, without interning it. Callers
     /// that only want to ASK about a name use this: interning from a lookup
     /// grows the table with names the tree does not contain.
+    /// The symbol at an index, for reading a `Sym(N)` back out of a message.
+    pub fn sym_at(&self, i: usize) -> Option<Sym> {
+        (i < self.text.len()).then(|| Sym(i as u32))
+    }
+
     pub fn find(&self, s: &str) -> Option<Sym> {
         self.index.get(s).copied()
     }

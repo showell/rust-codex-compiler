@@ -209,6 +209,13 @@ pub struct UnifyState {
     /// `effect-exempt`: the definition being checked sits in a chapter with a
     /// `grounds` declaration, so a `let` may bind an effectful value.
     pub effect_exempt: bool,
+    /// The interned `List` and `LinkedList`, for a type application meeting
+    /// a list type; a state built without a symbol table has neither.
+    pub list_name: Option<Name>,
+    pub linked_list_name: Option<Name>,
+    /// Inside an equality's two sides: every mismatch is the program's,
+    /// because both sides are ground terms the normalizer already reduced.
+    pub propeq_depth: u32,
 }
 
 /// `expr-type-key` (Unifier.codex:133): file id in the top 16 bits, start
@@ -250,6 +257,8 @@ pub struct Cdx;
 impl Cdx {
     pub const TYPE_MISMATCH: u16 = 2001;
     pub const UNDEFINED_NAME: u16 = 3002;
+    pub const ARITHMETIC_REQUIRES_NUMERIC: u16 = 2003;
+    pub const NON_EXHAUSTIVE_MATCH: u16 = 2070;
     pub const EFFECT_UNDECLARED: u16 = 2031;
     pub const LET_BINDS_EFFECTFUL: u16 = 2033;
     pub const ROW_MISMATCH: u16 = 2090;
@@ -282,6 +291,9 @@ impl Default for UnifyState {
             unify_gaps: 0,
             in_proof: false,
             effect_exempt: false,
+            list_name: None,
+            linked_list_name: None,
+            propeq_depth: 0,
         }
     }
 }
@@ -598,6 +610,10 @@ impl UnifyState {
             }
             Ty::Vector(n, e) => Ty::Vector(n, Box::new(self.deep_resolve(&e))),
             Ty::Unit(n, e) => Ty::Unit(n, Box::new(self.deep_resolve(&e))),
+            Ty::PropEq(a, b) => Ty::PropEq(Box::new(self.deep_resolve(&a)), Box::new(self.deep_resolve(&b))),
+            Ty::TypeApply(f, a) => {
+                Ty::TypeApply(Box::new(self.deep_resolve(&f)), Box::new(self.deep_resolve(&a)))
+            }
             other => other,
         }
     }
@@ -634,6 +650,9 @@ impl UnifyState {
                 self.occurs_in(var_id, &f, depth + 1) || self.occurs_in(var_id, &a, depth + 1)
             }
             Ty::Linear(i) => self.occurs_in(var_id, &i, depth + 1),
+            Ty::PropEq(a, b) => {
+                self.occurs_in(var_id, &a, depth + 1) || self.occurs_in(var_id, &b, depth + 1)
+            }
             _ => false,
         }
     }
@@ -680,13 +699,19 @@ impl UnifyState {
                 eprintln!("CONFLICT-PAIR {} vs {}", head_name(&ra), head_name(&rb));
             }
         }
+        // Two sides of an equality are terms, and `Con:Off` against `Con:On`
+        // is the whole finding.
+        if self.propeq_depth > 0 {
+            self.error(Cdx::TYPE_MISMATCH, format!("Type mismatch: {} vs {}", type_desc(&ra), type_desc(&rb)));
+            return;
+        }
         let (Some(ha), Some(hb)) = (primitive_head(&ra), primitive_head(&rb)) else {
             return;
         };
         if ha == hb {
             return;
         }
-        self.error(Cdx::TYPE_MISMATCH, "Type mismatch");
+        self.error(Cdx::TYPE_MISMATCH, format!("Type mismatch: {} vs {}", type_desc(&ra), type_desc(&rb)));
     }
 
     fn bind_var(&mut self, id: u32, t: Ty) {
@@ -789,8 +814,16 @@ impl UnifyState {
                     self.report_conflict(&a, &b);
                     return false;
                 }
+                // `unify-constructed-args` stops at the first argument that
+                // fails: one CDX2001 for `Cons 9 (Cons 6 Nil)` against
+                // `Cons 5 (Cons 9 Nil)`, not two.
                 let (a1, a2) = (a1.clone(), a2.clone());
-                a1.iter().zip(a2.iter()).fold(true, |ok, (x, y)| self.unify(x, y) && ok)
+                for (x, y) in a1.iter().zip(a2.iter()) {
+                    if !self.unify(x, y) {
+                        return false;
+                    }
+                }
+                true
             }
             (Ty::Effectful(e1, _, r1), Ty::Effectful(e2, _, r2)) => {
                 if e1 != e2 {
@@ -812,6 +845,40 @@ impl UnifyState {
                 let (f1, x1, f2, x2) = (f1.clone(), x1.clone(), f2.clone(), x2.clone());
                 self.unify(&f1, &f2) && self.unify(&x1, &x2)
             }
+            // **A TYPE APPLICATION MEETS A NAMED TYPE BY PEELING ITS LAST
+            // ARGUMENT** (`unify-ctor-apply-peel`): `f a` against `List
+            // Integer` is `f := List` then `a := Integer`; against `Map k v`
+            // it is `f := Map k` then `a := v`. `cong`'s result type is spelled
+            // this way, and without the arm `cong Refl` never meets its claim.
+            (Ty::TypeApply(f, x), Ty::List(e)) | (Ty::List(e), Ty::TypeApply(f, x)) => {
+                let (f, x, e) = (f.clone(), x.clone(), e.clone());
+                let Some(list) = self.list_name else { return false };
+                self.unify(&f, &Ty::TypeCon(list)) && self.unify(&x, &e)
+            }
+            (Ty::TypeApply(f, x), Ty::LinkedList(e)) | (Ty::LinkedList(e), Ty::TypeApply(f, x)) => {
+                let (f, x, e) = (f.clone(), x.clone(), e.clone());
+                let Some(list) = self.linked_list_name else { return false };
+                self.unify(&f, &Ty::TypeCon(list)) && self.unify(&x, &e)
+            }
+            (Ty::TypeApply(f, x), Ty::Constructed(n, args) | Ty::Sum(n, args) | Ty::Record(n, args))
+            | (Ty::Constructed(n, args) | Ty::Sum(n, args) | Ty::Record(n, args), Ty::TypeApply(f, x))
+                if !args.is_empty() =>
+            {
+                let (f, x, n, args) = (f.clone(), x.clone(), *n, args.clone());
+                let (init, last) = args.split_at(args.len() - 1);
+                let head = if init.is_empty() { Ty::TypeCon(n) } else { Ty::Constructed(n, init.to_vec()) };
+                self.unify(&f, &head) && self.unify(&x, &last[0])
+            }
+            // `Refl : forall a. a === a` meets a claim's `Integer === Text`
+            // side by side, and the second side is where it fails.
+            (Ty::PropEq(a1, a2), Ty::PropEq(b1, b2)) => {
+                let (a1, a2, b1, b2) = (a1.clone(), a2.clone(), b1.clone(), b2.clone());
+                self.propeq_depth += 1;
+                let ok = self.unify(&a1, &b1) && self.unify(&a2, &b2);
+                self.propeq_depth -= 1;
+                ok
+            }
+            (Ty::Proof, Ty::Proof | Ty::PropEq(..)) | (Ty::PropEq(..), Ty::Proof) => true,
             // A quantifier on either side is transparent to unification --
             // upstream recurses on the body without instantiating.
             (Ty::ForAll(_, x), _) | (Ty::ForAllEff(_, x), _) | (Ty::Linear(x), _) => {
@@ -862,6 +929,16 @@ fn subst_type_var(t: &Ty, id: u32, with: &Ty) -> Ty {
         ),
         Ty::Vector(n, e) => Ty::Vector(*n, Box::new(subst_type_var(e, id, with))),
         Ty::Unit(n, e) => Ty::Unit(n.clone(), Box::new(subst_type_var(e, id, with))),
+        // `cong`'s `tyapply` and every proof builtin's `propeq` are bound
+        // under the same `forall`; a variable left inside either is the
+        // TABLE's slot, and the first claim to bind it binds it for every
+        // claim after.
+        Ty::PropEq(a, b) => {
+            Ty::PropEq(Box::new(subst_type_var(a, id, with)), Box::new(subst_type_var(b, id, with)))
+        }
+        Ty::TypeApply(f, a) => {
+            Ty::TypeApply(Box::new(subst_type_var(f, id, with)), Box::new(subst_type_var(a, id, with)))
+        }
         // A quantifier that binds the SAME id shadows it, and the body below
         // it is not ours to touch.
         Ty::ForAll(i, _) if *i == id => t.clone(),
@@ -1383,8 +1460,16 @@ pub fn register_defs(
             }
         }
     }
-    for d in &ch.defs {
-        let ty = match d.declared_type.first().and_then(|t| resolve_declared(&ch.syms, tds, t)) {
+    for (i, d) in ch.defs.iter().enumerate() {
+        // `normalize-prop-eq` first: a declared equality registers with both
+        // sides normalized, and only then parameterized.
+        let resolved = ch
+            .proof_plan
+            .declared
+            .get(&i)
+            .cloned()
+            .or_else(|| d.declared_type.first().and_then(|t| resolve_declared(&ch.syms, tds, t)));
+        let ty = match resolved {
             Some(t) => parameterize(&t, &ch.syms, st),
             None => st.fresh(),
         };
@@ -1525,6 +1610,34 @@ fn known_untyped(env: &TyEnv<'_>, n: Sym) -> bool {
 }
 
 /// A type's head constructor, spelled for the conflict census.
+/// `type-desc`, for a message: the head, and a constructed type's name and
+/// arguments, which is what tells `Con:Off` from `Con:On`. Names are spelled
+/// by symbol id here, because the state holds no table; the head is enough
+/// to read a mismatch's shape.
+fn type_desc(t: &Ty) -> String {
+    match t {
+        Ty::Constructed(n, args) | Ty::Sum(n, args) | Ty::Record(n, args) => {
+            let head = match t {
+                Ty::Sum(..) => "Sum",
+                Ty::Record(..) => "Rec",
+                _ => "Con",
+            };
+            if args.is_empty() {
+                format!("{head}:{n:?}")
+            } else {
+                let inner: Vec<String> = args.iter().map(type_desc).collect();
+                format!("{head}:{n:?}[{}]", inner.join(", "))
+            }
+        }
+        Ty::TypeCon(n) => format!("tycon:{n:?}"),
+        Ty::List(e) => format!("List[{}]", type_desc(e)),
+        Ty::Var(i) => format!("T{i}"),
+        Ty::PropEq(a, b) => format!("PropEq[{},{}]", type_desc(a), type_desc(b)),
+        Ty::TypeApply(f, x) => format!("App[{} {}]", type_desc(f), type_desc(x)),
+        _ => head_name(t).to_string(),
+    }
+}
+
 fn head_name(t: &Ty) -> &'static str {
     match t {
         Ty::Integer(..) => "Integer", Ty::Real(..) => "Real", Ty::Text => "Text", Ty::Boolean => "Boolean",
@@ -1546,6 +1659,16 @@ fn primitive_head(t: &Ty) -> Option<&'static str> {
         Ty::Boolean => Some("Boolean"),
         Ty::Char => Some("Char"),
         _ => None,
+    }
+}
+
+/// `is-arithmetic-type`: what `+ - * / ^` accept. A variable or an error
+/// passes, so only a settled non-number is refused (CDX2003).
+fn is_arithmetic_type(t: &Ty) -> bool {
+    match t {
+        Ty::Integer(..) | Ty::Real(..) | Ty::Vector(..) | Ty::Var(_) | Ty::Error => true,
+        Ty::Unit(_, inner) => is_arithmetic_type(inner),
+        _ => false,
     }
 }
 
@@ -1794,8 +1917,40 @@ fn collect_type_vars(t: &Ty, out: &mut std::collections::BTreeSet<u32>) {
     }
 }
 
+/// `Sym(N)` in a message, spelled by name: the state that writes messages
+/// holds no table, so a trace reads them back here.
+pub fn name_syms(msg: &str, syms: &SymTab) -> String {
+    let mut out = String::new();
+    let mut rest = msg;
+    while let Some(p) = rest.find("Sym(") {
+        out.push_str(&rest[..p]);
+        let after = &rest[p + 4..];
+        match after.find(')') {
+            Some(q) => {
+                let name = after[..q].parse::<usize>().ok().and_then(|i| syms.sym_at(i)).map(|s| syms.text(s));
+                match name {
+                    Some(n) => out.push_str(n),
+                    None => out.push_str(&rest[p..p + 5 + q]),
+                }
+                rest = &after[q + 1..];
+            }
+            None => {
+                out.push_str(&rest[p..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 pub fn check_chapter(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState) {
     let (bindings, st, _) = check_chapter_full(ch);
+    if std::env::var_os("CDX_TRACE_DIAGS").is_some() {
+        for d in &st.diags {
+            eprintln!("DIAG CDX{} {}", d.code, name_syms(&d.message, &ch.syms));
+        }
+    }
     (bindings, st)
 }
 
@@ -1804,6 +1959,8 @@ pub fn check_chapter(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState) {
 /// access has to be able to read them.
 pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState, TypeDefs) {
     let mut st = UnifyState::default();
+    st.list_name = ch.syms.find("List");
+    st.linked_list_name = ch.syms.find("LinkedList");
     let tds = TypeDefs::new(ch);
     let bindings = register_defs(ch, &tds, &mut st);
     // Builtins first, then the chapter's own names on top: a chapter that
@@ -1840,7 +1997,11 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
             env.bind(m.name, Ty::Error);
         }
     }
-    for d in &ch.defs {
+    let trace = std::env::var_os("CDX_TRACE_DIAGS").is_some();
+    for (i, d) in ch.defs.iter().enumerate() {
+        if trace {
+            eprintln!("DEF {} diags-so-far {}", ch.syms.text(d.name), st.diags.len());
+        }
         // The first type-variable id this definition mints, so its own
         // unconstrained variables can be told from earlier definitions'.
         let def_var_start = st.next_id;
@@ -1900,6 +2061,48 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
         // arrows".
         if let Some(t) = instantiated.clone() {
             per_def.push(Binding { name: d.name, ty: t });
+        }
+        // **A FOR-ALL CLAIM PROVED BY INDUCTION IS CHECKED CASE BY CASE**
+        // (`check-induction-def`), and nothing else `check-def-normal` does
+        // applies to it. Each constructor's arm is inferred with its field
+        // variables, its hypotheses and its cited claims in scope, and its
+        // type meets the subgoal the normalizer built for that constructor.
+        if let Some(ip) = ch.proof_plan.inductions.get(&i) {
+            if !ip.unproven {
+                let mark = env.scope.len();
+                for (n, t) in &ip.binders {
+                    env.bind(*n, t.clone());
+                }
+                for case in &ip.cases {
+                    match &case.arm {
+                        None => st.error(
+                            Cdx::NON_EXHAUSTIVE_MATCH,
+                            format!("induction proof is missing a case for constructor '{}'", ch.syms.text(case.ctor)),
+                        ),
+                        Some(ap) if ap.unproven => {}
+                        Some(ap) => {
+                            let inner = env.scope.len();
+                            for (n, t) in &ap.binds {
+                                env.bind(*n, t.clone());
+                            }
+                            st.in_proof = true;
+                            let (t, _) = infer_row(&ap.body, &mut env, &mut st);
+                            st.in_proof = false;
+                            if !st.unify(&ap.subgoal, &t) {
+                                st.unify_gaps += 1;
+                            }
+                            while env.scope.len() > inner {
+                                env.scope.pop();
+                            }
+                        }
+                    }
+                }
+                while env.scope.len() > mark {
+                    env.scope.pop();
+                }
+            }
+            default_ambiguous_vars(&mut st, def_var_start, instantiated.as_ref());
+            continue;
         }
         let mut spine = instantiated.clone();
         let mut saved = Vec::new();
@@ -2248,7 +2451,11 @@ pub fn infer_row(
                 // not modelled here yet.
                 OpAdd | OpSub | OpMul | OpDiv | OpPow => {
                     if !st.unify(&lt, &rt) { st.unify_gaps += 1; }
-                    arith_result_ty(&st.resolve(&lt), &st.resolve(&rt))
+                    let (lt, rt) = (st.resolve(&lt), st.resolve(&rt));
+                    if !is_arithmetic_type(&lt) || !is_arithmetic_type(&rt) {
+                        st.error(Cdx::ARITHMETIC_REQUIRES_NUMERIC, "Arithmetic operator requires Integer or Real");
+                    }
+                    arith_result_ty(&lt, &rt)
                 }
                 // `infer-and`: `&` is three operators, dispatched on the
                 // RESOLVED left type -- Boolean is `infer-logical`, Text and
@@ -2569,10 +2776,11 @@ pub fn infer_row(
         // The residual is uniform -- next-id +4, expr-types +1 on both units
         // -- which is the shape a missing subsystem leaves, and the honest
         // fix is to implement it rather than to tune this arm.
-        E::Match(scrut, arms, _) | E::Induction(scrut, arms, _) => {
-            let proof = matches!(e, E::Induction(..));
+        // `AInductionExpr` outside a for-all claim is `ProofTy`, an axiom
+        // upstream warns about and does not look inside.
+        E::Induction(..) => Ty::Proof,
+        E::Match(scrut, arms, _) => {
             let was = st.in_proof;
-            st.in_proof = was || proof;
             let (scrut_ty, srow) = infer_row(scrut, env, st);
             row = srow;
             let result = st.fresh();

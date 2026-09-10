@@ -727,6 +727,7 @@ impl<'a> Desugar<'a> {
             self.sym_str(e);
         }
         ch.syms = std::mem::take(&mut *self.syms.borrow_mut());
+        ch.proof_plan = crate::proof_norm::prepare(&mut ch);
         ch
     }
 

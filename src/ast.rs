@@ -378,6 +378,8 @@ pub struct Chapter {
     /// The table every `Name` in this chapter indexes. It travels with the
     /// tree because a `Sym` read against the wrong table is a wrong name.
     pub syms: SymTab,
+    /// The proof normalizer's plan, built once the symbol table is final.
+    pub proof_plan: crate::proof_norm::ProofPlan,
     pub name: Name,
     pub defs: Vec<Def>,
     pub type_defs: Vec<TypeDef>,
