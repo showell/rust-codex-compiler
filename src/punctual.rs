@@ -234,8 +234,25 @@ fn has_self_call(e: &Expr, me: Name) -> bool {
     found
 }
 
-/// Per definition, after linearity: the three walks and the self call.
-pub fn check_def(d: &crate::ast::Def, rt: &[Name], syms: &SymTab, st: &mut UnifyState) {
+/// `collect-effect-names` over a signature.
+fn effect_names(t: &Ty, syms: &SymTab, out: &mut Vec<String>) {
+    match t {
+        Ty::Fun(_, row, r) => {
+            out.extend(row.labels.iter().map(|(n, _)| n.clone()));
+            effect_names(r, syms, out);
+        }
+        Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => effect_names(b, syms, out),
+        Ty::Effectful(effs, _, inner) => {
+            out.extend(effs.iter().map(|e| syms.text(*e).to_string()));
+            effect_names(inner, syms, out);
+        }
+        _ => {}
+    }
+}
+
+/// Per definition, after linearity: the three walks, the self call, and
+/// the signature's effects (`check-rt-effects`).
+pub fn check_def(d: &crate::ast::Def, declared: Option<&Ty>, rt: &[Name], syms: &SymTab, st: &mut UnifyState) {
     if !d.is_punctual {
         return;
     }
@@ -245,6 +262,16 @@ pub fn check_def(d: &crate::ast::Def, rt: &[Name], syms: &SymTab, st: &mut Unify
     calls(&d.body, &fname, rt, syms, st);
     if has_self_call(&d.body, d.name) {
         st.error(Cdx::RT_UNBOUNDED_RECURSION, format!("punctual function '{fname}' is self-recursive"));
+    }
+    if let Some(t) = declared {
+        let mut effs = Vec::new();
+        effect_names(t, syms, &mut effs);
+        for e in effs {
+            st.error(
+                Cdx::RT_BARE_IO,
+                format!("punctual function '{fname}' declares effect '{e}'; bounded execution requires an effect-free signature"),
+            );
+        }
     }
 }
 

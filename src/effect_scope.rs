@@ -20,7 +20,7 @@ pub type Label = (String, String);
 const CAPABILITY_NAMES: &[&str] = &[
     "Console", "FileSystem", "Network", "Concurrent", "Device", "Gpu.Compute", "Gpu.Memory", "Identity",
     "Capability", "Gpu", "Camera", "Microphone", "Location", "Sensors", "Display", "Flash", "Audio",
-    "Process", "Gpio", "Uart", "Spi", "Adc", "Power", "Rng",
+    "Process", "Gpio", "Uart", "Spi", "I2c", "Adc", "Power", "Rng",
 ];
 
 /// `cap-name-covered`: the name, or its head before the dot.

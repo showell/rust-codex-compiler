@@ -287,6 +287,7 @@ impl Cdx {
     pub const RT_HEAP_ALLOC: u16 = 6002;
     pub const RT_CLOSURE: u16 = 6003;
     pub const RT_UNBOUNDED_RECURSION: u16 = 6005;
+    pub const RT_BARE_IO: u16 = 6004;
     pub const EFFECT_ROW_TWO_TAILS: u16 = 1120;
     pub const EFFECT_ROW_TAIL_DECORATED: u16 = 1121;
     pub const WRAPPING_BAND_NOT_HW_WIDTH: u16 = 1073;
@@ -2448,7 +2449,7 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
         // The zonk-and-default phase for this definition. See
         // `default_ambiguous_vars`.
         // The punctuality checks, after linearity as upstream orders them.
-        crate::punctual::check_def(d, &rt_names, &ch.syms, &mut st);
+        crate::punctual::check_def(d, instantiated.as_ref(), &rt_names, &ch.syms, &mut st);
         default_ambiguous_vars(&mut st, def_var_start, instantiated.as_ref());
         for _ in saved {
             env.scope.pop();
