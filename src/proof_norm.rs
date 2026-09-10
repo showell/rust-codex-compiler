@@ -973,12 +973,13 @@ fn type_mentions_proof(t: &Ty, fuel: i32, tds: &TypeDefs) -> bool {
         }
         Ty::ForAll(_, b) | Ty::ForAllEff(_, b) | Ty::Effectful(_, _, b) => type_mentions_proof(b, fuel - 1, tds),
         Ty::TypeApply(f, a) => type_mentions_proof(f, fuel - 1, tds) || type_mentions_proof(a, fuel - 1, tds),
-        Ty::Constructed(_, args) | Ty::Sum(_, args) => args.iter().any(|a| type_mentions_proof(a, fuel - 1, tds)),
-        Ty::Record(n, args) => {
+        // A named type's ARGUMENTS only. Upstream's record carries its
+        // fields inline and a recursive field is a bare constructed name,
+        // so its walk ends; a lookup through the type table here would not,
+        // and running out of fuel answers yes -- which made every definition
+        // of the desk family a proof term.
+        Ty::Constructed(_, args) | Ty::Sum(_, args) | Ty::Record(_, args) => {
             args.iter().any(|a| type_mentions_proof(a, fuel - 1, tds))
-                || tds
-                    .record_fields(*n)
-                    .is_some_and(|fs| fs.iter().any(|(_, ft)| type_mentions_proof(ft, fuel - 1, tds)))
         }
         _ => false,
     }

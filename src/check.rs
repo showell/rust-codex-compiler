@@ -269,6 +269,8 @@ impl Cdx {
     pub const DUPLICATE_DEFINITION: u16 = 3001;
     pub const UNDEFINED_TYPE_NAME: u16 = 3008;
     pub const UNKNOWN_PATTERN_CTOR: u16 = 2072;
+    pub const NARROWING_RECORD_SET_LITERAL: u16 = 2050;
+    pub const NARROWING_RECORD_SET: u16 = 2051;
     pub const NON_GRAMMATICAL_PROOF: u16 = 4024;
     pub const EFFECT_UNDECLARED: u16 = 2031;
     pub const LET_BINDS_EFFECTFUL: u16 = 2033;
@@ -1780,11 +1782,20 @@ fn lint_vec_lane(f: &crate::ast::Expr, a: &crate::ast::Expr, env: &TyEnv, st: &m
 
 /// `is-arithmetic-type`: what `+ - * / ^` accept. A variable or an error
 /// passes, so only a settled non-number is refused (CDX2003).
+///
+/// **ONLY A SETTLED NON-NUMBER IS REFUSED.** `Integer wrapping` reaches this
+/// checker as a constructed type, and a shape this unifier does not model
+/// is not evidence of a text operand; the heads upstream's own rule names
+/// as non-numeric are the ones refused here.
 fn is_arithmetic_type(t: &Ty) -> bool {
     match t {
-        Ty::Integer(..) | Ty::Real(..) | Ty::Vector(..) | Ty::Var(_) | Ty::Error => true,
         Ty::Unit(_, inner) => is_arithmetic_type(inner),
-        _ => false,
+        // The census shows a record or a function where this checker's
+        // chapter scoping resolves a name wrongly (`Rec:DateTime` on the
+        // desk family); only a primitive that is plainly not a number is
+        // refused until that is closed.
+        Ty::Text | Ty::Boolean | Ty::Char => false,
+        _ => true,
     }
 }
 
@@ -1809,6 +1820,7 @@ fn arith_result_ty(lt: &Ty, rt: &Ty) -> Ty {
 /// which is the record's.
 fn bind_record_set_value(
     f: &crate::ast::Expr,
+    value_arg: &crate::ast::Expr,
     value_ty: &Ty,
     ret: &Ty,
     env: &TyEnv<'_>,
@@ -1831,12 +1843,11 @@ fn bind_record_set_value(
         _ => None,
     };
     let Some(ft) = field_ty else { return };
-    if !crate::lowering_types::has_typevars(&st.deep_resolve(value_ty)) {
-        return;
-    }
-    if !st.unify(&ft, value_ty) {
+    if crate::lowering_types::has_typevars(&st.deep_resolve(value_ty)) && !st.unify(&ft, value_ty) {
         st.unify_gaps += 1;
     }
+    // `lint-record-set-check`, after the binding.
+    crate::narrowing::lint_narrowing_check(value_arg, value_ty, &ft, &format!("field '{field}'"), env, st);
 }
 
 /// `resolve-constructed-to-record` + `lookup-record-field` +
@@ -2114,6 +2125,16 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
             env.bind(m.name, Ty::Error);
         }
     }
+    env.locals_start = env.scope.len();
+    // `register-const-range`: a nullary definition that IS an integer literal.
+    for d in &ch.defs {
+        if d.params.is_empty() {
+            if let crate::ast::Expr::Lit(v, crate::ast::LiteralKind::IntLit, _) = &d.body {
+                let n = crate::token::lit_text_to_integer(v);
+                env.const_ranges.push((d.name, (n, n)));
+            }
+        }
+    }
     let trace = std::env::var_os("CDX_TRACE_DIAGS").is_some();
     for (i, d) in ch.defs.iter().enumerate() {
         if trace {
@@ -2242,7 +2263,11 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
             // the type it actually has. Whether the parameter was declared
             // linear is read from the SYNTAX by `linearity::check_def`, which
             // is why stripping here costs that pass nothing.
+            let param_range = crate::narrowing::param_range_of(&arg);
             env.bind(p.name, strip_linear(arg));
+            if let Some(r) = param_range {
+                env.note_range(&ch.syms.text(p.name).to_string(), r);
+            }
         }
         // `def-grounded-names`: the `grounds` of this definition's chapter,
         // which cover its body's effects and exempt its lets (`effect-exempt`).
@@ -2275,6 +2300,14 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
         if let Some(w) = want {
             if !st.unify(&body_ty, &w) {
                 st.unify_gaps += 1;
+            }
+            // `lint-return-narrowing`: a bounded declared result takes the
+            // body only when the body's range is proven inside it.
+            if let Ty::Integer(lo, hi, mode) = st.deep_resolve(&w) {
+                if lo > i64::MIN || hi < i64::MAX {
+                    let bound = Ty::Integer(lo, hi, mode);
+                    crate::narrowing::lint_narrowing_check(&d.body, &body_ty, &bound, "bounded return", &env, &mut st);
+                }
             }
         }
         // **A QUANTIFIED DEFINITION IS TIED BACK TO ITS OWN SIGNATURE**, after
@@ -2606,7 +2639,10 @@ pub fn infer_row(
                     if !st.unify(&lt, &rt) { st.unify_gaps += 1; }
                     let (lt, rt) = (st.resolve(&lt), st.resolve(&rt));
                     if !is_arithmetic_type(&lt) || !is_arithmetic_type(&rt) {
-                        st.error(Cdx::ARITHMETIC_REQUIRES_NUMERIC, "Arithmetic operator requires Integer or Real");
+                        st.error(
+                            Cdx::ARITHMETIC_REQUIRES_NUMERIC,
+                            format!("Arithmetic operator requires Integer or Real ({} and {})", type_desc(&lt), type_desc(&rt)),
+                        );
                     }
                     arith_result_ty(&lt, &rt)
                 }
@@ -2661,8 +2697,24 @@ pub fn infer_row(
             if !st.unify(&ct, &Ty::Boolean) {
                 st.unify_gaps += 1;
             }
+            // `infer-if`: each arm is inferred in the environment the
+            // condition refines for it (`arm-refined-env`).
+            let rf = crate::narrowing::if_refinement(c, env, st);
+            let lr_mark = env.local_ranges.len();
+            if let Some(rf) = &rf {
+                if let Some(iv) = crate::narrowing::arm_refinement(rf, rf.then_iv, a, env) {
+                    env.note_range(&rf.target.clone(), iv);
+                }
+            }
             let (ta, arow) = infer_row(a, env, st);
+            env.local_ranges.truncate(lr_mark);
+            if let Some(rf) = &rf {
+                if let Some(iv) = crate::narrowing::arm_refinement(rf, rf.else_iv, b, env) {
+                    env.note_range(&rf.target.clone(), iv);
+                }
+            }
             let (tb, brow) = infer_row(b, env, st);
+            env.local_ranges.truncate(lr_mark);
             if !st.unify(&ta, &tb) {
                 st.unify_gaps += 1;
             }
@@ -2713,7 +2765,10 @@ pub fn infer_row(
             // while the value still carries variables: a bounded-integer field
             // handed a wider integer is the narrowing lint's business and
             // unification would refuse it.
-            bind_record_set_value(f, &at, &ret, env, st);
+            // `check-class-op-app`, `lint-arg-narrowing`, `lint-record-set`,
+            // `lint-vec-lane`: the application lints, in upstream's order.
+            crate::narrowing::lint_arg_narrowing(f, &ft, a, &at, env, st);
+            bind_record_set_value(f, a, &at, &ret, env, st);
             lint_vec_lane(f, a, env, st);
             let halves = st.row_union(&frow, &arow);
             row = st.row_union(&halves, &EffectRow { id: call_row, ..Default::default() });
@@ -2799,7 +2854,13 @@ pub fn infer_row(
                 // `open-spine-rows` mints nothing where upstream mints for the
                 // spine it can now see.
                 let resolved = st.deep_resolve(&t);
+                // `record-local-range`, before the name is bound: the value
+                // is proven against what was in scope when it was written.
+                let range = crate::narrowing::local_range_of(&b.value, &resolved, env, st);
                 env.bind(b.name, resolved);
+                if let Some(r) = range {
+                    env.note_range(env.syms.text(b.name), r);
+                }
                 row = st.row_union(&row, &brow);
             }
             let (t, body_row) = infer_row(body, env, st);
@@ -3008,6 +3069,8 @@ pub fn infer_row(
                     if !st.unify(&ft, &want) {
                         st.unify_gaps += 1;
                     }
+                    let desc = format!("field '{}'", env.syms.text(f.name));
+                    crate::narrowing::lint_narrowing_check(&f.value, &ft, &want, &desc, env, st);
                 }
                 row = st.row_union(&row, &frow);
             }
@@ -3332,17 +3395,58 @@ pub struct TyEnv<'a> {
     /// **Symbols, not text.** This is a linear scan on the hot path of
     /// inference, and it now compares four bytes.
     pub scope: Vec<(Sym, Ty)>,
+    /// Where the locals begin: everything bound below this index is a
+    /// global or a builtin (`env-is-local`).
+    pub locals_start: usize,
+    /// `local-ranges`: what a local (or a `recv.field`) is proven to hold,
+    /// each entry stamped with the scope depth it was made at, so a popped
+    /// scope's entries stop applying.
+    pub local_ranges: Vec<(String, crate::narrowing::Range, usize)>,
+    /// `const-ranges`: a nullary definition whose body is an integer literal.
+    pub const_ranges: Vec<(Sym, crate::narrowing::Range)>,
 }
 
 impl<'a> TyEnv<'a> {
     pub fn new(syms: &'a SymTab, type_defs: &'a TypeDefs) -> TyEnv<'a> {
-        TyEnv { syms, type_defs, scope: Vec::new() }
+        TyEnv {
+            syms,
+            type_defs,
+            scope: Vec::new(),
+            locals_start: usize::MAX,
+            local_ranges: Vec::new(),
+            const_ranges: Vec::new(),
+        }
     }
     pub fn get(&self, n: Sym) -> Option<&Ty> {
         self.scope.iter().rev().find(|(k, _)| *k == n).map(|(_, v)| v)
     }
     pub fn bind(&mut self, n: Sym, t: Ty) {
         self.scope.push((n, t));
+    }
+    /// `env-is-local`: bound above the globals.
+    pub fn is_local(&self, n: Sym) -> bool {
+        self.scope.iter().rposition(|(k, _)| *k == n).is_some_and(|i| i >= self.locals_start)
+    }
+    pub fn note_range(&mut self, name: &str, r: crate::narrowing::Range) {
+        let depth = self.scope.len();
+        self.local_ranges.push((name.to_string(), r, depth));
+    }
+    pub fn local_range(&self, name: &str) -> Option<crate::narrowing::Range> {
+        let depth = self.scope.len();
+        self.local_ranges.iter().rev().find(|(k, _, d)| k == name && *d <= depth).map(|(_, r, _)| *r)
+    }
+    pub fn const_range(&self, n: Sym) -> Option<crate::narrowing::Range> {
+        self.const_ranges.iter().find(|(k, _)| *k == n).map(|(_, r)| *r)
+    }
+}
+
+/// `lookup-field-ty-for-lint`: a field's declared type through a record or
+/// a constructed reference to one.
+pub fn field_type_for_lint(env: &TyEnv<'_>, ty: &Ty, fname: Sym) -> Option<Ty> {
+    match ty {
+        Ty::Record(rn, _) => env.type_defs.field(*rn, fname).cloned(),
+        Ty::Constructed(cn, cargs) => constructed_field(env, *cn, cargs, fname),
+        _ => None,
     }
 }
 
