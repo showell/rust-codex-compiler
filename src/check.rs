@@ -2521,9 +2521,14 @@ pub fn infer_row(
         // Three statement lists, all of them walked: the body, the retry
         // fallback and the failure arm are all program the checker sees.
         E::Try(t) => {
+            // **EACH OF THE THREE STATEMENT LISTS IS ITS OWN SCOPE.** A name
+            // the body binds with `<-` is not in scope in the fallback: there
+            // the name is whatever the enclosing scope says, the global in
+            // `scope-try-region`, which reads it as Text after the body bound
+            // an Integer of the same name.
             let mut last = Ty::Nothing;
-            let mark = env.scope.len();
             for stmts in [&t.body, &t.fallback, &t.failure] {
+                let mark = env.scope.len();
                 for stmt in stmts {
                     match stmt {
                         crate::ast::ActStmt::Exec(x, _) => last = infer(x, env, st),
@@ -2533,8 +2538,8 @@ pub fn infer_row(
                         }
                     }
                 }
+                env.scope.truncate(mark);
             }
-            env.scope.truncate(mark);
             last
         }
         E::Error(..) => Ty::Error,
