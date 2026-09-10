@@ -296,6 +296,7 @@ impl Cdx {
     pub const ROW_MISMATCH: u16 = 2090;
     pub const INFINITE_TYPE: u16 = 2010;
     pub const UNKNOWN_RECORD_FIELD: u16 = 2005;
+    pub const MISSING_RECORD_FIELD: u16 = 2006;
     pub const FIELD_ON_UNIT_TYPE: u16 = 2095;
     pub const USE_AFTER_CONSUME: u16 = 2061;
     pub const MUTABLE_ALIAS: u16 = 2062;
@@ -3201,8 +3202,16 @@ pub fn infer_row(
                 Ty::Record(rn, _) | Ty::Constructed(rn, _) | Ty::Sum(rn, _) => *rn,
                 _ => *n,
             };
+            let is_record = matches!(result, Ty::Record(..)) && env.type_defs.record_fields(rec_name).is_some();
             for f in fields {
                 let (ft, frow) = infer_row(&f.value, env, st);
+                // `record-field-unknown`: a field the record does not declare.
+                if is_record && env.type_defs.field_index(rec_name, f.name).is_none() {
+                    st.error(
+                        Cdx::UNKNOWN_RECORD_FIELD,
+                        format!("Record '{}' has no field '{}'", env.syms.text(rec_name), env.syms.text(f.name)),
+                    );
+                }
                 // **AND THIS IS WHERE AN EMPTY LIST LEARNS ITS ELEMENT TYPE.**
                 // `infer-and-unify-record-fields` (line 1996) unifies each value
                 // against its field's type. Without it `R { tags = [] }` reaches
@@ -3220,6 +3229,20 @@ pub fn infer_row(
                     crate::narrowing::lint_narrowing_check(&f.value, &ft, &want, &desc, env, st);
                 }
                 row = st.row_union(&row, &frow);
+            }
+            // `check-record-complete`: a field left out of a literal is zero,
+            // which is a value nobody wrote.
+            if is_record {
+                let declared_names: Vec<Sym> =
+                    env.type_defs.record_fields(rec_name).map_or(Vec::new(), |fs| fs.iter().map(|(n, _)| *n).collect());
+                for name in declared_names {
+                    if !fields.iter().any(|f| f.name == name) {
+                        st.error(
+                            Cdx::MISSING_RECORD_FIELD,
+                            format!("Record '{}' is built without a value for field '{}'. A field left out of a literal is not left alone -- it is zero.", env.syms.text(rec_name), env.syms.text(name)),
+                        );
+                    }
+                }
             }
             st.record_expr_type(*sp, result.clone());
             return (result, row);
