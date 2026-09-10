@@ -283,6 +283,10 @@ impl Cdx {
     pub const LIST_LITERAL_TOO_LARGE: u16 = 9004;
     pub const INVALID_TAB_ESCAPE: u16 = 5;
     pub const CAPABILITY_NOT_GRANTED: u16 = 4001;
+    pub const RT_CALLS_UNSAFE: u16 = 6001;
+    pub const RT_HEAP_ALLOC: u16 = 6002;
+    pub const RT_CLOSURE: u16 = 6003;
+    pub const RT_UNBOUNDED_RECURSION: u16 = 6005;
     pub const EFFECT_ROW_TWO_TAILS: u16 = 1120;
     pub const EFFECT_ROW_TAIL_DECORATED: u16 = 1121;
     pub const WRAPPING_BAND_NOT_HW_WIDTH: u16 = 1073;
@@ -2181,6 +2185,7 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
         }
     }
     let trace = std::env::var_os("CDX_TRACE_DIAGS").is_some();
+    let rt_names: Vec<Sym> = ch.defs.iter().filter(|d| d.is_punctual).map(|d| d.name).collect();
     for (i, d) in ch.defs.iter().enumerate() {
         if trace {
             eprintln!("DEF {} diags-so-far {}", ch.syms.text(d.name), st.diags.len());
@@ -2442,11 +2447,15 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
         );
         // The zonk-and-default phase for this definition. See
         // `default_ambiguous_vars`.
+        // The punctuality checks, after linearity as upstream orders them.
+        crate::punctual::check_def(d, &rt_names, &ch.syms, &mut st);
         default_ambiguous_vars(&mut st, def_var_start, instantiated.as_ref());
         for _ in saved {
             env.scope.pop();
         }
     }
+    // `check-rt-cycles`, before the proof rules.
+    crate::punctual::check_cycles(ch, &mut st);
     // `check-proof-cycles` and `check-proof-grammar`, over the checked types.
     crate::proof_norm::check_proof_rules(ch, &per_def, &tds, &mut st);
     // **THE RESOLVER'S ERRORS HALT THE DRIVER BEFORE THE CHECKER RUNS.** A

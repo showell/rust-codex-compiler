@@ -33,6 +33,7 @@ pub mod preamble;
 pub mod name_rules;
 pub mod narrowing;
 pub mod proof_norm;
+pub mod punctual;
 pub mod resolve_types;
 pub mod scope;
 pub mod scoper;
