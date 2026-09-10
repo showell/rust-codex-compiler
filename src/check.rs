@@ -241,6 +241,7 @@ pub struct Diag {
 pub struct Cdx;
 
 impl Cdx {
+    pub const TYPE_MISMATCH: u16 = 2001;
     pub const INFINITE_TYPE: u16 = 2010;
     pub const UNKNOWN_RECORD_FIELD: u16 = 2005;
     pub const FIELD_ON_UNIT_TYPE: u16 = 2095;
@@ -607,6 +608,38 @@ impl UnifyState {
         self.diags.len()
     }
 
+    /// **A CONFLICT BETWEEN TWO FULLY-CONCRETE, DIFFERENT-HEAD TYPES IS THE
+    /// PROGRAM'S ERROR, NOT THE UNIFIER'S IGNORANCE.** A `false` out of `unify`
+    /// otherwise means only "this partial unifier could not decide" -- which is
+    /// true when a variable is involved. But `Integer` meeting `Text`, with no
+    /// variable on either side, is not indecision: the types genuinely differ,
+    /// and upstream reports `CDX2001`. Reported here so `check-errors` can say
+    /// NO to an ill-typed program instead of emitting best-effort IR that only
+    /// the interpreter or the plug then refuses.
+    ///
+    /// **TWO INTEGERS OF DIFFERENT RANGES ARE NOT A CONFLICT** -- a byte, a
+    /// u16 and the full i64 are reconciled by the checker's range handling, so
+    /// same-head numeric mismatches are excluded. Measured to add ZERO
+    /// diagnostics across the self-host (3,222 defs, check-errors 0), the
+    /// curated 28, and the 29 Roc ports; the env `CDX_MEASURE_CONFLICTS` prints
+    /// each one so that stays checkable.
+    fn report_conflict(&mut self, a: &Ty, b: &Ty) {
+        let (ra, rb) = (self.deep_resolve(a), self.deep_resolve(b));
+        let mut vs = std::collections::BTreeSet::new();
+        collect_type_vars(&ra, &mut vs);
+        collect_type_vars(&rb, &mut vs);
+        if !vs.is_empty() {
+            return;
+        }
+        if matches!((&ra, &rb), (Ty::Integer(..), Ty::Integer(..))) {
+            return;
+        }
+        if std::env::var_os("CDX_MEASURE_CONFLICTS").is_some() {
+            eprintln!("CONCRETE-CONFLICT {ra:?} vs {rb:?}");
+        }
+        self.error(Cdx::TYPE_MISMATCH, "Type mismatch");
+    }
+
     fn bind_var(&mut self, id: u32, t: Ty) {
         if let Some(slot) = self.substitutions.get_mut(id as usize) {
             *slot = t;
@@ -704,6 +737,7 @@ impl UnifyState {
             | (Ty::Constructed(n1, a1), Ty::Record(n2, a2))
             | (Ty::Record(n1, a1), Ty::Constructed(n2, a2)) => {
                 if n1 != n2 {
+                    self.report_conflict(&a, &b);
                     return false;
                 }
                 let (a1, a2) = (a1.clone(), a2.clone());
@@ -711,6 +745,7 @@ impl UnifyState {
             }
             (Ty::Effectful(e1, _, r1), Ty::Effectful(e2, _, r2)) => {
                 if e1 != e2 {
+                    self.report_conflict(&a, &b);
                     return false;
                 }
                 let (r1, r2) = (r1.clone(), r2.clone());
@@ -738,7 +773,12 @@ impl UnifyState {
                 let (a, y) = (a.clone(), y.clone());
                 self.unify(&a, &y)
             }
-            _ => a == b,
+            _ => {
+                if a != b {
+                    self.report_conflict(&a, &b);
+                }
+                a == b
+            }
         }
     }
 }
@@ -3432,5 +3472,46 @@ mod unification_stays_acyclic {
         let n = crate::symbol::SymTab::default().intern("");
         assert!(st.unify(&v, &Ty::Constructed(n, vec![v.clone()])));
         assert_eq!(st.errors(), 0);
+    }
+
+    /// **A CONCRETE-HEAD MISMATCH IS `CDX2001`.** Two fully-resolved types with
+    /// different head constructors -- Integer meeting Text -- are a type error
+    /// the program earned, reported rather than swallowed as a gap that ships
+    /// best-effort IR only the interpreter or plug then refuses.
+    #[test]
+    fn a_concrete_head_mismatch_is_a_type_mismatch() {
+        let int = Ty::Integer(i64::MIN, i64::MAX, super::Overflow::Error);
+        let mut st = UnifyState::default();
+        assert!(!st.unify(&int, &Ty::Text), "Integer and Text do not unify");
+        assert_eq!(st.errors(), 1, "and it is reported");
+        assert_eq!(st.diags[0].code, super::Cdx::TYPE_MISMATCH, "as CDX2001");
+    }
+
+    /// **TWO INTEGERS OF DIFFERENT RANGES ARE NOT A TYPE ERROR.** A byte meeting
+    /// the full i64 range is reconciled by the checker's range handling, not
+    /// reported -- the exclusion that keeps the self-host at check-errors 0.
+    #[test]
+    fn differently_ranged_integers_are_not_a_type_mismatch() {
+        let byte = Ty::Integer(0, 255, super::Overflow::Error);
+        let wide = Ty::Integer(i64::MIN, i64::MAX, super::Overflow::Error);
+        let mut st = UnifyState::default();
+        let _ = st.unify(&byte, &wide);
+        assert_eq!(st.errors(), 0, "a range mismatch is not a type error");
+    }
+
+    /// **A MISMATCH THAT STILL HOLDS A VARIABLE IS A GAP, NOT AN ERROR.** A name
+    /// mismatch between `Maybe Integer` and `Either <var>` is the partial
+    /// unifier's ignorance -- a later unification could still decide the
+    /// variable -- so it is not a `CDX2001`.
+    #[test]
+    fn a_mismatch_involving_a_variable_is_not_reported() {
+        let mut st = UnifyState::default();
+        let v = st.fresh();
+        let mut syms = crate::symbol::SymTab::default();
+        let maybe =
+            Ty::Constructed(syms.intern("Maybe"), vec![Ty::Integer(0, 0, super::Overflow::Error)]);
+        let either = Ty::Constructed(syms.intern("Either"), vec![v]);
+        assert!(!st.unify(&maybe, &either), "different names do not unify");
+        assert_eq!(st.errors(), 0, "but a variable is present, so it is a gap");
     }
 }
