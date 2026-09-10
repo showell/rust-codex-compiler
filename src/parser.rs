@@ -37,6 +37,9 @@ pub struct Parsed {
     /// The lexer's refusals, each with upstream's code name; a unit with
     /// any of these is never checked.
     pub lex_errors: Vec<crate::lexer::Diag>,
+    /// Parse-phase refusals with upstream's code: pagination (CDX3004). A
+    /// unit with any of these is never checked either.
+    pub diagnostics: Vec<(u16, String)>,
     /// Bodies collected but not yet given structure. Reported, never hidden.
     pub unparsed_bodies: usize,
     /// Annotations whose type the type grammar could not finish reading.
@@ -311,10 +314,12 @@ pub fn parse(src: &[u8]) -> Parsed {
     }
 
     let tree = p.b.finish().expect("the builder guarantees full coverage");
+    let diagnostics = check_pagination(src);
     Parsed {
         tree,
         errors: p.errors,
         lex_errors,
+        diagnostics,
         unparsed_bodies: p.unparsed_bodies,
         unread_types: p.unread_types,
         unread_type_defs: p.unread_type_defs,
@@ -722,4 +727,46 @@ mod tests {
         assert_eq!(p.tree.descendants(NodeKind::ChapterHeader).len(), 1);
         assert_eq!(p.tree.descendants(NodeKind::SectionHeader).len(), 2);
     }
+}
+
+/// `check-pagination` (Parser.codex:1244): a chapter written across several
+/// pages numbers them `Page N of M`, with `M` the page count and every `N`
+/// distinct. A chapter that appears once needs no marker.
+pub fn check_pagination(src: &[u8]) -> Vec<(u16, String)> {
+    const CHAPTER_PAGINATION: u16 = 3004;
+    // (chapter, n, m) per occurrence, in file order; m == 0 is no marker.
+    let mut occs: Vec<(String, i64, i64)> = Vec::new();
+    for line in src.split(|b| *b == b'\n') {
+        let line = String::from_utf8_lossy(line);
+        let line = line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("Chapter:") {
+            occs.push((rest.trim().to_string(), 0, 0));
+        } else if let Some(rest) = line.strip_prefix("Page ") {
+            let mut words = rest.split_whitespace();
+            let n = words.next().and_then(|w| w.parse::<i64>().ok()).unwrap_or(0);
+            let m = match (words.next(), words.next()) {
+                (Some("of"), Some(w)) => w.parse::<i64>().unwrap_or(0),
+                _ => 0,
+            };
+            if let Some(last) = occs.last_mut() {
+                last.1 = n;
+                last.2 = m;
+            }
+        }
+    }
+    let mut errs = Vec::new();
+    for (chapter, n, m) in &occs {
+        let k = occs.iter().filter(|(c, _, _)| c == chapter).count() as i64;
+        if k <= 1 {
+            continue;
+        }
+        if *m == 0 {
+            errs.push((CHAPTER_PAGINATION, format!("Chapter '{chapter}' spans {k} files, but this page carries no 'Page N of M' marker. Number the pages, or an accidental duplicate chapter name is indistinguishable from a deliberate page and the two merge silently.")));
+        } else if *m != k {
+            errs.push((CHAPTER_PAGINATION, format!("Chapter '{chapter}' spans {k} files but this page declares 'of {m}'. The declared page count must equal the number of files the chapter spans.")));
+        } else if occs.iter().filter(|(c, pn, _)| c == chapter && pn == n).count() > 1 {
+            errs.push((CHAPTER_PAGINATION, format!("Chapter '{chapter}' has two pages numbered {n}. Each page of a chapter needs a distinct number.")));
+        }
+    }
+    errs
 }

@@ -38,10 +38,13 @@ fn main() -> ExitCode {
             let parsed = parser::parse(&src);
             // The lexer's refusals halt the driver before anything is
             // checked, as upstream's does.
-            if !parsed.lex_errors.is_empty() {
+            if !parsed.lex_errors.is_empty() || !parsed.diagnostics.is_empty() {
                 let mut st = check::UnifyState::default();
                 for d in &parsed.lex_errors {
                     st.error(check::lex_code(d.code), d.msg);
+                }
+                for (code, msg) in &parsed.diagnostics {
+                    st.error(*code, msg.clone());
                 }
                 let out = std::io::stdout();
                 let _ = write!(out.lock(), "{}", check::section(&codexc::symbol::SymTab::default(), &[], &st));
