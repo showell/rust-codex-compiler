@@ -1,0 +1,19 @@
+Chapter: P5
+
+Section: Maybe
+
+  Maybe a =
+   | None
+   | Some (a)
+
+  is-some : Maybe a -> Boolean
+  is-some (m) = when m
+   is None -> False
+   is Some (x) -> True
+
+Section: Main
+
+  opening : [Console] Nothing
+  opening = act
+   print-line-uni (show (is-some None))
+  end

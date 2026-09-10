@@ -1,0 +1,11 @@
+Chapter: P10
+
+Section: Main
+
+  bad : Integer -> Integer
+  bad (n) = n + "hello"
+
+  opening : [Console] Nothing
+  opening = act
+   print-line-uni (show (bad 1))
+  end

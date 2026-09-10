@@ -1,0 +1,13 @@
+Chapter: P9b
+
+Section: Box
+
+  make-empty : Integer -> List a
+  make-empty (n) = []
+
+Section: Main
+
+  opening : [Console] Nothing
+  opening = act
+   print-line-uni (show (list-length (make-empty 0)))
+  end

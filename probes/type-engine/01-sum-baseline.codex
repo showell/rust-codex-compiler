@@ -1,0 +1,22 @@
+Chapter: P1
+
+Section: Nat
+
+  Nat =
+   | Zero
+   | Succ (Nat)
+
+  to-int : Nat -> Integer
+  to-int (n) = when n
+   is Zero -> 0
+   is Succ (m) -> 1 + to-int m
+
+  three : Nat
+  three = Succ (Succ (Succ Zero))
+
+Section: Main
+
+  opening : [Console] Nothing
+  opening = act
+   print-line-uni (show (to-int three))
+  end

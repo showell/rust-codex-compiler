@@ -1,0 +1,11 @@
+Chapter: P7
+
+Section: Main
+
+  my-id (x) = x
+
+  opening : [Console] Nothing
+  opening = act
+   print-line-uni (show (my-id 7))
+   print-line-uni (my-id "hello")
+  end
