@@ -11,6 +11,7 @@ pub mod bundle;
 pub mod charcode;
 pub mod check;
 pub mod cohesion;
+pub mod cost;
 pub mod code;
 pub mod cst;
 pub mod decl;

@@ -225,6 +225,9 @@ pub struct Def {
     /// author wrote none. **ZERO MEANS UNDECLARED, NOT ZERO INSTRUCTIONS**;
     /// upstream's `emit-wcet-check` substitutes a default of 256 and warns.
     pub wcet_budget: i64,
+    /// `bounded <class>` in the `punctual` slot: a ceiling in the lattice
+    /// `none < fixed < budgeted < linear < growing`.
+    pub bounded_class: Option<String>,
 }
 
 #[derive(Clone, Debug)]

@@ -452,7 +452,9 @@ fn parse_def(p: &mut Parser<'_>, src: &[u8], first: Token) {
     if p.kind(0) == Some(Kind::BoundedKeyword) {
         let bcp = p.b.checkpoint();
         p.bump();
-        if matches!(p.kind(0), Some(Kind::Identifier) | Some(Kind::TypeIdentifier)) {
+        // The class is a word, and `linear` is the lexer's keyword for the
+        // linear type modifier as well: any keyword is a class here.
+        if p.kind(0).is_some_and(|k| matches!(k, Kind::Identifier | Kind::TypeIdentifier) || k.is_keyword()) {
             p.bump(); // the bound class
         }
         p.b.wrap_from(bcp, NodeKind::Bounded);

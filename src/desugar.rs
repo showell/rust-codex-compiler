@@ -900,6 +900,7 @@ impl<'a> Desugar<'a> {
                 is_claim: false,
                 is_punctual: false,
                 wcet_budget: 0,
+                bounded_class: None,
             };
             out.push(mk(
                 self.sym_str(&format!("{class_text}-dict-{key}")),
@@ -987,6 +988,7 @@ impl<'a> Desugar<'a> {
                     is_claim: false,
                     is_punctual: false,
                     wcet_budget: 0,
+                bounded_class: None,
                 });
 
                 // `synth-family-extract`: the family in, Integer out.
@@ -1007,6 +1009,7 @@ impl<'a> Desugar<'a> {
                     is_claim: false,
                     is_punctual: false,
                     wcet_budget: 0,
+                bounded_class: None,
                 });
             }
         }
@@ -1110,6 +1113,7 @@ impl<'a> Desugar<'a> {
             is_claim: false,
             is_punctual: false,
             wcet_budget: 0,
+                bounded_class: None,
         }
     }
 
@@ -1186,6 +1190,11 @@ impl<'a> Desugar<'a> {
                 .and_then(|p| p.tokens().find(|t| t.kind == Kind::IntegerLiteral))
                 .and_then(|t| self.text(t).parse().ok())
                 .unwrap_or(0),
+            bounded_class: d
+                .children_of(NodeKind::Bounded)
+                .next()
+                .and_then(|b| b.tokens().filter(|t| !t.kind.is_trivia()).nth(1))
+                .map(|t| self.text(t).to_string()),
         }
     }
 

@@ -288,6 +288,8 @@ impl Cdx {
     pub const RT_CLOSURE: u16 = 6003;
     pub const RT_UNBOUNDED_RECURSION: u16 = 6005;
     pub const RT_BARE_IO: u16 = 6004;
+    pub const BOUNDED_EXCEEDED: u16 = 6101;
+    pub const BOUNDED_UNKNOWN_CLASS: u16 = 6102;
     pub const EFFECT_ROW_TWO_TAILS: u16 = 1120;
     pub const EFFECT_ROW_TAIL_DECORATED: u16 = 1121;
     pub const WRAPPING_BAND_NOT_HW_WIDTH: u16 = 1073;
@@ -2455,8 +2457,9 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
             env.scope.pop();
         }
     }
-    // `check-rt-cycles`, before the proof rules.
+    // `check-rt-cycles`, then `check-bounded-decls`, before the proof rules.
     crate::punctual::check_cycles(ch, &mut st);
+    crate::cost::check_bounded_decls(ch, &mut st);
     // `check-proof-cycles` and `check-proof-grammar`, over the checked types.
     crate::proof_norm::check_proof_rules(ch, &per_def, &tds, &mut st);
     // **THE RESOLVER'S ERRORS HALT THE DRIVER BEFORE THE CHECKER RUNS.** A
