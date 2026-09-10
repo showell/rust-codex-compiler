@@ -636,14 +636,21 @@ impl UnifyState {
     /// stays checkable.
     fn report_conflict(&mut self, a: &Ty, b: &Ty) {
         let (ra, rb) = (self.deep_resolve(a), self.deep_resolve(b));
+        // The census: every concrete, variable-free, different-head pair,
+        // whether or not the rule below reports it.
+        if std::env::var_os("CDX_MEASURE_CONFLICTS").is_some() {
+            let mut vs = std::collections::BTreeSet::new();
+            collect_type_vars(&ra, &mut vs);
+            collect_type_vars(&rb, &mut vs);
+            if vs.is_empty() && head_name(&ra) != head_name(&rb) {
+                eprintln!("CONFLICT-PAIR {} vs {}", head_name(&ra), head_name(&rb));
+            }
+        }
         let (Some(ha), Some(hb)) = (primitive_head(&ra), primitive_head(&rb)) else {
             return;
         };
         if ha == hb {
             return;
-        }
-        if std::env::var_os("CDX_MEASURE_CONFLICTS").is_some() {
-            eprintln!("CONCRETE-CONFLICT {ra:?} vs {rb:?}");
         }
         self.error(Cdx::TYPE_MISMATCH, "Type mismatch");
     }
@@ -1365,6 +1372,18 @@ fn known_untyped(env: &TyEnv<'_>, n: Sym) -> bool {
         return is_unit(a) && is_unit(b);
     }
     false
+}
+
+/// A type's head constructor, spelled for the conflict census.
+fn head_name(t: &Ty) -> &'static str {
+    match t {
+        Ty::Integer(..) => "Integer", Ty::Real(..) => "Real", Ty::Text => "Text", Ty::Boolean => "Boolean",
+        Ty::Char => "Char", Ty::Nothing => "Nothing", Ty::Fun(..) => "Fun", Ty::List(..) => "List",
+        Ty::Record(..) => "Record", Ty::Sum(..) => "Sum", Ty::Constructed(..) => "Constructed",
+        Ty::Unit(..) => "Unit", Ty::Vector(..) => "Vector", Ty::VectorMask(..) => "VectorMask",
+        Ty::LinkedList(..) => "LinkedList", Ty::Linear(..) => "Linear", Ty::TypeApply(..) => "TypeApply",
+        Ty::Var(..) => "Var", Ty::Error => "Error", Ty::NoExpect => "NoExpect", _ => "Other",
+    }
 }
 
 /// The head of a primitive type, or `None` for anything a reconciling rule
