@@ -50,6 +50,8 @@ pub fn code_for(msg: &str) -> u16 {
         1032
     } else if msg.starts_with("an 'act' block must contain") {
         1040
+    } else if msg.starts_with("Expected field name in record literal") {
+        1024
     } else if msg.contains("is a reserved keyword") {
         1060
     } else if msg.starts_with("chained '->' in a type") {

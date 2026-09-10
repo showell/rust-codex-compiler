@@ -727,6 +727,9 @@ impl<'a> Desugar<'a> {
             self.sym_str(e);
         }
         ch.syms = std::mem::take(&mut *self.syms.borrow_mut());
+        // The chapter scoper runs on the whole unit, before the proof plan
+        // reads definitions by name.
+        crate::scoper::apply(&mut ch);
         ch.proof_plan = crate::proof_norm::prepare(&mut ch);
         ch
     }

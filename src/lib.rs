@@ -35,6 +35,7 @@ pub mod narrowing;
 pub mod proof_norm;
 pub mod resolve_types;
 pub mod scope;
+pub mod scoper;
 pub mod seams;
 pub mod symbol;
 pub mod pattern;

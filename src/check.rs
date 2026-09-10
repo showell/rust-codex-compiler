@@ -283,6 +283,9 @@ impl Cdx {
     pub const LIST_LITERAL_TOO_LARGE: u16 = 9004;
     pub const INVALID_TAB_ESCAPE: u16 = 5;
     pub const CAPABILITY_NOT_GRANTED: u16 = 4001;
+    pub const EFFECT_ROW_TWO_TAILS: u16 = 1120;
+    pub const EFFECT_ROW_TAIL_DECORATED: u16 = 1121;
+    pub const WRAPPING_BAND_NOT_HW_WIDTH: u16 = 1073;
     pub const SCOPE_VIOLATION: u16 = 4002;
     pub const INVALID_CARRIAGE_RETURN_ESCAPE: u16 = 6;
     pub const UNTERMINATED_TEXT: u16 = 7;
@@ -2449,8 +2452,13 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
     // duplicate definition or an undefined lowercase name is all the oracle
     // reports for that program; everything the checker went on to find is
     // dropped here, as it was never found there.
-    if st.diags.iter().any(|d| matches!(d.code, Cdx::DUPLICATE_DEFINITION | Cdx::UNDEFINED_NAME)) {
-        st.diags.retain(|d| matches!(d.code, Cdx::DUPLICATE_DEFINITION | Cdx::UNDEFINED_NAME));
+    // A parse-phase code raised here (the type syntax rules) halts earlier
+    // still, on its own.
+    let halts = |code: u16| code < 2000 || matches!(code, Cdx::DUPLICATE_DEFINITION | Cdx::UNDEFINED_NAME);
+    if st.diags.iter().any(|d| d.code < 2000) {
+        st.diags.retain(|d| d.code < 2000);
+    } else if st.diags.iter().any(|d| halts(d.code)) {
+        st.diags.retain(|d| halts(d.code));
     }
     // The check/lower boundary, where upstream sorts too: everything below
     // this line looks entries up rather than appending them.

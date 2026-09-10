@@ -17,8 +17,107 @@ use crate::check::{Cdx, TypeDefs, UnifyState};
 use crate::symbol::SymTab;
 
 pub fn check(ch: &Chapter, tds: &TypeDefs, st: &mut UnifyState) {
+    type_syntax(ch, st);
     duplicates(ch, st);
     type_names(ch, tds, st);
+}
+
+/// Upstream's type PARSER refuses these; this parser reads them and the
+/// rule is applied over the type expressions instead, with the parser's
+/// codes, which halt the driver as a parse error does.
+fn type_syntax(ch: &Chapter, st: &mut UnifyState) {
+    for d in &ch.defs {
+        if let Some(t) = d.declared_type.first() {
+            walk_syntax(t, ch, st);
+        }
+    }
+    for td in &ch.type_defs {
+        match td {
+            TypeDef::Variant(_, _, ctors, _) => {
+                for c in ctors {
+                    for f in &c.fields {
+                        walk_syntax(f, ch, st);
+                    }
+                }
+            }
+            TypeDef::Record(_, _, fields, _, _) => {
+                for f in fields {
+                    walk_syntax(&f.type_expr, ch, st);
+                }
+            }
+            TypeDef::Unit(_, base, _) => walk_syntax(base, ch, st),
+        }
+    }
+}
+
+/// `bounds-are-hw-width`: a wrapping band is exactly one hardware width.
+fn bounds_are_hw_width(lo: i64, hi: i64) -> bool {
+    matches!(
+        (lo, hi),
+        (0, 255)
+            | (-128, 127)
+            | (0, 65535)
+            | (-32768, 32767)
+            | (0, 4294967295)
+            | (-2147483648, 2147483647)
+            | (i64::MIN, i64::MAX)
+    )
+}
+
+fn walk_syntax(t: &TypeExpr, ch: &Chapter, st: &mut UnifyState) {
+    match t {
+        TypeExpr::Effect(_, _, tail, ret, _) => {
+            // `[e, f]`: at most one row variable (CDX1120); `[e.Write]`: a
+            // row variable takes no dotted sub-effect (CDX1121).
+            if tail.len() > 1 {
+                st.error(
+                    Cdx::EFFECT_ROW_TWO_TAILS,
+                    format!(
+                        "an effect row may name at most one row variable; found '{}' after an earlier row variable",
+                        ch.syms.text(tail[1])
+                    ),
+                );
+            }
+            for v in tail {
+                let text = ch.syms.text(*v);
+                if let Some(dot) = text.find('.') {
+                    st.error(
+                        Cdx::EFFECT_ROW_TAIL_DECORATED,
+                        format!("a row variable is a bare lowercase identifier; '{}' cannot take a dotted sub-effect", &text[..dot]),
+                    );
+                }
+            }
+            walk_syntax(ret, ch, st);
+        }
+        TypeExpr::BoundedInt(_, lo, hi, crate::ast::OverflowMode::Wrapping, _) => {
+            if !bounds_are_hw_width(*lo, *hi) {
+                st.error(
+                    Cdx::WRAPPING_BAND_NOT_HW_WIDTH,
+                    format!("a wrapping band must be exactly its hardware width, and {lo} to {hi} is not: the store wraps at the width, so the field can hold a value outside the declared range"),
+                );
+            }
+        }
+        TypeExpr::Fun(p, r, _) => {
+            walk_syntax(p, ch, st);
+            walk_syntax(r, ch, st);
+        }
+        TypeExpr::App(ctor, args, _) => {
+            walk_syntax(ctor, ch, st);
+            for a in args {
+                walk_syntax(a, ch, st);
+            }
+        }
+        TypeExpr::Linear(inner, _) | TypeExpr::Constrained(_, _, inner, _) => walk_syntax(inner, ch, st),
+        TypeExpr::Forall(_, vt, p, _) => {
+            walk_syntax(vt, ch, st);
+            walk_syntax(p, ch, st);
+        }
+        TypeExpr::PropEq(l, r, _) => {
+            walk_syntax(l, ch, st);
+            walk_syntax(r, ch, st);
+        }
+        _ => {}
+    }
 }
 
 fn dup(st: &mut UnifyState, msg: String) {

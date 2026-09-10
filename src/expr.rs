@@ -436,6 +436,11 @@ fn record_braces(p: &mut Parser<'_>) {
             break;
         }
         let fcp = p.b.checkpoint();
+        // `cdx-bad-field-syntax`: a field is named by a word, and upstream
+        // lets a reserved word (`effect`) name one.
+        if !(t.kind == Kind::Identifier || t.kind.is_keyword()) {
+            p.err("Expected field name in record literal");
+        }
         p.bump(); // the field name
         if p.kind(0) == Some(Kind::Equals) {
             p.bump();
