@@ -672,6 +672,16 @@ impl<'a> Desugar<'a> {
                 }
                 NodeKind::TypeDef => {
                     if let Some(td) = self.type_def(child) {
+                        let derives: Vec<String> = child
+                            .children_of(NodeKind::Deriving)
+                            .flat_map(|d| d.tokens())
+                            .filter(|t| t.kind == Kind::TypeIdentifier)
+                            .map(|t| self.text(t).to_string())
+                            .collect();
+                        let name = match &td {
+                            TypeDef::Record(n, ..) | TypeDef::Variant(n, ..) | TypeDef::Unit(n, ..) => *n,
+                        };
+                        ch.derivings.push((name, derives));
                         ch.type_defs.push(td);
                     }
                 }

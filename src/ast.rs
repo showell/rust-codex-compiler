@@ -401,6 +401,10 @@ pub struct Chapter {
     /// definition instead, so this survives only because `a-rt-names` is a
     /// graded line of the desugar dump.
     pub rt_names: Vec<String>,
+    /// Each type definition's `deriving` names (`Show`, `Eq`, `Ord`), by
+    /// type name. Upstream synthesises `__show_T` and `__compare_T` from
+    /// these; the class-instance check reads them here.
+    pub derivings: Vec<(Name, Vec<String>)>,
     pub conversions: Vec<String>,
     pub span: Span,
 }

@@ -289,6 +289,7 @@ impl Cdx {
     pub const RT_UNBOUNDED_RECURSION: u16 = 6005;
     pub const RT_BARE_IO: u16 = 6004;
     pub const BOUNDED_EXCEEDED: u16 = 6101;
+    pub const NO_CLASS_INSTANCE: u16 = 2052;
     pub const BOUNDED_UNKNOWN_CLASS: u16 = 6102;
     pub const EFFECT_ROW_TWO_TAILS: u16 = 1120;
     pub const EFFECT_ROW_TAIL_DECORATED: u16 = 1121;
@@ -1818,6 +1819,37 @@ fn lint_vec_lane(f: &crate::ast::Expr, a: &crate::ast::Expr, env: &TyEnv, st: &m
     );
 }
 
+/// `check-class-op-app`: `show` needs a Show instance and `compare` an Ord
+/// one. A nominal type has one when its definition derives the class;
+/// a function value never has one; anything else is not asked.
+fn check_class_op_app(f: &crate::ast::Expr, arg_ty: &Ty, env: &TyEnv<'_>, st: &mut UnifyState) {
+    let crate::ast::Expr::NameRef(n, _) = f else { return };
+    let cls = match env.syms.text(*n) {
+        "show" => "Show",
+        "compare" => "Ord",
+        _ => return,
+    };
+    let rty = strip_forall(&st.deep_resolve(arg_ty));
+    if let Ty::Fun(..) = rty {
+        st.error(
+            Cdx::NO_CLASS_INSTANCE,
+            format!("No {cls} instance for a function value. A call given fewer arguments than the definition declares is a partial application, not a result, so this is usually a missing argument at the call rather than a missing instance on a type"),
+        );
+        return;
+    }
+    let tn = match &rty {
+        Ty::Sum(n, _) | Ty::Record(n, _) | Ty::Constructed(n, _) => *n,
+        _ => return,
+    };
+    let derives = env.derivings.iter().find(|(t, _)| *t == tn).is_some_and(|(_, ds)| ds.iter().any(|d| d == cls));
+    if !derives {
+        st.error(
+            Cdx::NO_CLASS_INSTANCE,
+            format!("No {cls} instance for type '{}'; derive {cls} on the type or convert manually", env.syms.text(tn)),
+        );
+    }
+}
+
 /// `is-arithmetic-type`: what `+ - * / ^` accept. A variable or an error
 /// passes, so only a settled non-number is refused (CDX2003).
 ///
@@ -2143,6 +2175,7 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
     // Builtins first, then the chapter's own names on top: a chapter that
     // defines `max` shadows the builtin, which the golds show for that name.
     let mut env = builtin_env(&ch.syms, &tds);
+    env.derivings = &ch.derivings;
     // Collected during the walk and appended after it, so a lookup by name
     // finds the instantiated type rather than the generalised one.
     // The registry the linear walk asks one question of: is the callee's k-th
@@ -2869,6 +2902,7 @@ pub fn infer_row(
             // unification would refuse it.
             // `check-class-op-app`, `lint-arg-narrowing`, `lint-record-set`,
             // `lint-vec-lane`: the application lints, in upstream's order.
+            check_class_op_app(f, &at, env, st);
             crate::narrowing::lint_arg_narrowing(f, &ft, a, &at, env, st);
             bind_record_set_value(f, a, &at, &ret, env, st);
             crate::effect_scope::lint_effect_scope(f, a, env, st);
@@ -3619,6 +3653,8 @@ pub struct TyEnv<'a> {
     pub local_ranges: Vec<(String, crate::narrowing::Range, usize)>,
     /// `const-ranges`: a nullary definition whose body is an integer literal.
     pub const_ranges: Vec<(Sym, crate::narrowing::Range)>,
+    /// The chapter's `deriving` clauses, by type name.
+    pub derivings: &'a [(Sym, Vec<String>)],
 }
 
 impl<'a> TyEnv<'a> {
@@ -3630,6 +3666,7 @@ impl<'a> TyEnv<'a> {
             locals_start: usize::MAX,
             local_ranges: Vec::new(),
             const_ranges: Vec::new(),
+            derivings: &[],
         }
     }
     pub fn get(&self, n: Sym) -> Option<&Ty> {
