@@ -27,6 +27,7 @@
 
 use crate::ast::{ActStmt, Def, Expr, MatchArm, Pat, TypeExpr};
 use crate::check::{Cdx, Ty, TypeDefs, UnifyState};
+use crate::lowering_types as lt;
 use crate::symbol::{Sym, SymTab};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -744,27 +745,6 @@ fn check_tuple_component(
 // The mutable discipline
 // ---------------------------------------------------------------------------
 
-/// `peel-fun-return`.
-fn peel_fun_return(t: &Ty) -> Option<&Ty> {
-    match t {
-        Ty::Fun(_, _, r) => Some(r),
-        Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => peel_fun_return(b),
-        _ => None,
-    }
-}
-
-/// `peel-returns-n`: the type left after `k` arguments. An effect row is peeled
-/// WITHOUT spending an argument -- it wraps the result, it is not one.
-fn peel_returns_n(t: &Ty, k: usize) -> Option<&Ty> {
-    if k == 0 {
-        return Some(t);
-    }
-    match t {
-        Ty::Effectful(_, _, inner) => peel_returns_n(inner, k),
-        other => peel_returns_n(peel_fun_return(other)?, k - 1),
-    }
-}
-
 /// `type-mentions-mut` (subject 50906). Fuel-bounded because a record's fields
 /// can reach the record again, and a self-referential type would otherwise
 /// walk forever.
@@ -823,7 +803,7 @@ fn return_mentions_mut(env: &LinEnv, t: &Ty, target: Sym, fuel: i32) -> bool {
 fn apply_threads(env: &LinEnv, target: Sym, e: &Expr) -> bool {
     let Some(h) = head_name(e) else { return false };
     let Some(t) = env.bindings.get(&h) else { return false };
-    peel_returns_n(t, arg_count(e))
+    lt::peel_returns_n(t, arg_count(e))
         .is_some_and(|r| return_mentions_mut(env, r, target, 8))
 }
 

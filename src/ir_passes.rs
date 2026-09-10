@@ -187,7 +187,17 @@ struct Candidate {
     name: Sym,
     params: Vec<Sym>,
     ptys: Vec<Ty>,
+    /// The declared type AFTER the parameters: what the call site receives.
+    rty: Ty,
     body: IrExpr,
+}
+
+/// A candidate's declared return type. Lowering has already refused any
+/// definition with more parameters than its type has arrows.
+fn declared_return(d: &IrDef) -> Ty {
+    lt::peel_returns_n(&d.ty, d.params.len())
+        .cloned()
+        .expect("lowering refuses a definition with more params than arrows")
 }
 
 /// **A BOUNDED SIGNATURE IS NEVER INLINED.** A function with a bounded
@@ -306,6 +316,7 @@ fn collect_leaf_defs(defs: &[IrDef], syms: &SymTab) -> Vec<Candidate> {
             name: d.name,
             params: d.params.iter().map(|p| p.name).collect(),
             ptys: d.params.iter().map(|p| p.ty.clone()).collect(),
+            rty: declared_return(d),
             body: d.body.clone(),
         })
         .collect()
@@ -417,15 +428,22 @@ fn collect_once_defs(defs: &[IrDef], syms: &SymTab) -> Vec<Candidate> {
             name: d.name,
             params: d.params.iter().map(|p| p.name).collect(),
             ptys: d.params.iter().map(|p| p.ty.clone()).collect(),
+            rty: declared_return(d),
             body: d.body.clone(),
         })
         .collect()
 }
 
 /// `once-retype`: the candidate's declared parameter types matched against
-/// the argument types, and whatever that teaches substituted into each node's
-/// type. A polymorphic helper inlined at a concrete call site would otherwise
-/// carry its own type variables into the caller.
+/// the argument types, AND ITS DECLARED RETURN TYPE AGAINST THE CALL SITE'S
+/// TYPE, and whatever that teaches substituted into each node's type. A
+/// polymorphic helper inlined at a concrete call site would otherwise carry
+/// its own type variables into the caller.
+///
+/// The return pair is what reaches a variable that appears in no parameter --
+/// `make-empty : Integer -> List a` is generic where it is defined, and only
+/// the site (already resolved by the checker, orphans defaulted) says what `a`
+/// is here. Parameters alone would carry `a` into the caller as a hole.
 fn once_retype(ty: &Ty, ptys: &[Ty], atys: &[Ty]) -> Ty {
     ptys.iter().zip(atys.iter()).fold(ty.clone(), |t, (p, a)| lt::subst_from_arg(p, a, &t))
 }
@@ -532,11 +550,14 @@ fn once_site(e: &IrExpr, cands: &[Candidate], bound: &[Sym]) -> IrExpr {
     if once_free_escapes(&c.body, &c.params, bound) {
         return e.clone();
     }
-    // The types are threaded only where a parameter is polymorphic; a
+    // The types are threaded only where the signature is polymorphic; a
     // monomorphic candidate's body already says what it means.
-    if c.ptys.iter().any(lt::has_typevars) {
-        let atys: Vec<Ty> = args.iter().map(|a| a.ty()).collect();
-        subst_once(&c.body, &c.params, &args, &c.ptys, &atys)
+    if c.ptys.iter().chain(std::iter::once(&c.rty)).any(lt::has_typevars) {
+        let mut ptys = c.ptys.clone();
+        ptys.push(c.rty.clone());
+        let mut atys: Vec<Ty> = args.iter().map(|a| a.ty()).collect();
+        atys.push(e.ty());
+        subst_once(&c.body, &c.params, &args, &ptys, &atys)
     } else {
         subst_once(&c.body, &c.params, &args, &[], &[])
     }

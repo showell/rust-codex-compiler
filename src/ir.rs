@@ -599,6 +599,23 @@ mod tests {
         assert!(!op.contains("(tvar"), "nested orphan variable survived at the call site: {op}");
     }
 
+    /// A helper whose type variable lives ONLY in its return type --
+    /// `make-empty : Integer -> List a` -- is generic where defined, and the
+    /// single-caller inliner copies its body into the caller. Parameter/argument
+    /// matching never reaches `a`; the call site's own type does (the checker
+    /// resolved it, orphans defaulted), so the inlined `[]` takes `int-default`
+    /// and no hole reaches the plug. Upstream carries the variable through.
+    #[test]
+    fn an_inlined_helpers_return_type_takes_the_call_sites_type() {
+        let src = "Chapter: T\n\nSection: B\n  make-empty : Integer -> List a\n  make-empty (n) = []\n\nSection: M\n  opening : [Console] Nothing = act\n   print-line-uni (show (list-length (make-empty 0)))\n  end\n";
+        let op = def_line(src, "opening");
+        assert!(
+            op.contains("(list-expr (elems) int-default)"),
+            "inlined return type not taken from the call site: {op}"
+        );
+        assert!(!op.contains("(tvar"), "helper's return variable survived inlining: {op}");
+    }
+
     /// **`-n` IS A NEGATE NODE; `0 - n` IS A BINARY.** The two spell
     /// differently on the wire even though a reader would call them the same
     /// expression, and the negate carries its OPERAND's type. `codexir`'s

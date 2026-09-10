@@ -34,13 +34,17 @@ break upstream shares is a Codex-wide frontier, not our regression.
 
 - **04-inline-return-orphan** — `make-empty : Integer -> List a; make-empty (n)
   = []`, used as `list-length (make-empty 0)`. `make-empty`'s `a` is a genuine
-  generic where DEFINED (its zonk protects it), an orphan where USED. Inlining
-  (`ir_passes.rs` `once_retype`) recovers type variables only by matching
-  parameters to arguments — `a` is in the return type, in no parameter, so it is
-  carried into the caller as a free var, and inlining runs AFTER check's
-  zonk-and-default so nothing defaults it. Both arms fail — a shared frontier.
-  (Pinning from outside, `list-push (unwrap (make-empty 0)) 5`, does not reach
-  the inlined body either.)
+  generic where DEFINED (its zonk protects it), an orphan where USED. The
+  single-caller inliner (`ir_passes.rs` `once_retype`) used to recover type
+  variables only by matching parameters to arguments — `a` is in the return
+  type, in no parameter, so it was carried into the caller as a free var, and
+  inlining runs AFTER check's zonk-and-default so nothing defaulted it. **Now
+  the candidate's declared return type is matched against the call site's own
+  type** (which the checker resolved, orphans defaulted), so the inlined `[]`
+  takes `int-default` and our plug accepts it (`0`). **Upstream still carries
+  the variable and its plug refuses it.** Locked as `ir.rs`
+  `an_inlined_helpers_return_type_takes_the_call_sites_type`. Self-host wire
+  unmoved (2869 of 2869), so no definition there has this shape.
 
 - **05-nonfatal-unify** — `n + "hello"`. Our checker emits IR; the interpreter
   catches it at runtime and the zig plug at build. **Upstream rejects at check**
@@ -54,11 +58,12 @@ break upstream shares is a Codex-wide frontier, not our regression.
 
 ## The three phases, seen through the probes
 
-- **phase 1, zonk-and-default:** 02 shows it working and ahead of upstream; 04
-  shows its blind spot — vars injected after check (by inlining) are never
-  defaulted.
-- **phase 2, bidirectional check:** 04's pinned variant wants the expected type
-  to flow down into an inlined body.
+- **phase 1, zonk-and-default:** 02 shows it working and ahead of upstream. 04
+  was its blind spot — a var the inliner copied in after check — and is closed
+  not by a second default but by the site's type flowing into the copy.
+- **phase 2, bidirectional check:** 04 is the first place an expected type
+  flows DOWN (site into inlined body); the checker itself still threads `want`
+  ad hoc.
 - **phase 3, generalization:** 03 is the case; without it, an undeclared
   polymorphic definition is either mis-defaulted or (better) should be rejected.
 

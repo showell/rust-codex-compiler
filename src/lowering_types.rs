@@ -256,3 +256,24 @@ mod tests {
         );
     }
 }
+
+/// `peel-fun-return`.
+pub fn peel_fun_return(t: &Ty) -> Option<&Ty> {
+    match t {
+        Ty::Fun(_, _, r) => Some(r),
+        Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => peel_fun_return(b),
+        _ => None,
+    }
+}
+
+/// `peel-returns-n`: the type left after `k` arguments. An effect row is peeled
+/// WITHOUT spending an argument -- it wraps the result, it is not one.
+pub fn peel_returns_n(t: &Ty, k: usize) -> Option<&Ty> {
+    if k == 0 {
+        return Some(t);
+    }
+    match t {
+        Ty::Effectful(_, _, inner) => peel_returns_n(inner, k),
+        other => peel_returns_n(peel_fun_return(other)?, k - 1),
+    }
+}
