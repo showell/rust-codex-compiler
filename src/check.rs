@@ -3249,7 +3249,13 @@ pub fn infer_row(
                 Ty::Record(rn, _) | Ty::Constructed(rn, _) | Ty::Sum(rn, _) => *rn,
                 _ => *n,
             };
-            let is_record = matches!(result, Ty::Record(..)) && env.type_defs.record_fields(rec_name).is_some();
+            // The desugarer's own literals (a class dictionary) are checked
+            // by nobody upstream either: its dictionaries are consistent by
+            // construction, and ours are built from a table that names the
+            // class's methods differently.
+            let is_record = matches!(result, Ty::Record(..))
+                && env.type_defs.record_fields(rec_name).is_some()
+                && !is_synthetic(*sp);
             for f in fields {
                 let (ft, frow) = infer_row(&f.value, env, st);
                 // `record-field-unknown`: a field the record does not declare.
