@@ -202,8 +202,15 @@ impl Prover<'_, '_> {
             }
             Expr::Lit(..) => UNKNOWN,
             Expr::NameRef(n, _) => {
+                // A name the prover itself bound (`bind-let-ranges`) is a
+                // local whether or not the checker's scope still holds it:
+                // a definition's body is proven after its lets were popped.
+                let text = self.env.syms.text(*n);
+                if let Some((_, r)) = self.extra.iter().rev().find(|(k, _)| k == text) {
+                    return *r;
+                }
                 if self.env.is_local(*n) {
-                    self.local_range(self.env.syms.text(*n))
+                    self.local_range(text)
                 } else {
                     self.name_range(*n)
                 }
@@ -215,9 +222,8 @@ impl Prover<'_, '_> {
                 let mark = self.extra.len();
                 for b in binds {
                     let r = self.range(&b.value);
-                    if is_bounded(r) {
-                        self.extra.push((self.env.syms.text(b.name).to_string(), r));
-                    }
+                    // Bound unknown as well, so the name is a local from here.
+                    self.extra.push((self.env.syms.text(b.name).to_string(), r));
                 }
                 let out = self.range(body);
                 self.extra.truncate(mark);

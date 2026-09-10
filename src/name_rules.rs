@@ -38,10 +38,15 @@ fn duplicates(ch: &Chapter, st: &mut UnifyState) {
     }
     let mut types: BTreeSet<Name> = BTreeSet::new();
     for td in &ch.type_defs {
-        let (n, ctors) = match td {
-            TypeDef::Record(n, ..) | TypeDef::Unit(n, ..) => (*n, None),
-            TypeDef::Variant(n, _, cs, _) => (*n, Some(cs)),
+        let (n, ctors, span) = match td {
+            TypeDef::Record(n, _, _, _, sp) | TypeDef::Unit(n, _, sp) => (*n, None, *sp),
+            TypeDef::Variant(n, _, cs, sp) => (*n, Some(cs), *sp),
         };
+        // The desugarer's own type definitions (a class's dictionary) are
+        // not the program's, and it may build one more than once.
+        if crate::check::is_synthetic(span) {
+            continue;
+        }
         if !types.insert(n) {
             dup(st, format!("Duplicate type definition: '{}' is already defined", syms.text(n)));
         }

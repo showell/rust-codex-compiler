@@ -130,6 +130,11 @@ impl Kind {
         matches!(self, Kind::Spaces | Kind::SkippedProse | Kind::Unmapped)
     }
 
+    /// A reserved word: every kind the lexer names as one.
+    pub fn is_keyword(self) -> bool {
+        self.name().ends_with("Keyword")
+    }
+
     /// Layout, not syntax: the tokens the lexer emits to describe where lines
     /// and blocks begin. Cobblestone's parser consumes them for structure and
     /// they never spell an operator or a literal.

@@ -29,6 +29,40 @@ pub struct ParseError {
     pub msg: String,
     pub line: u32,
     pub col: u32,
+    /// Upstream's code when this message is one upstream's parser reports
+    /// the same way; 0 when it is this parser's own account of a gap, which
+    /// no gate should read as a verdict.
+    pub code: u16,
+}
+
+/// The messages this parser records that ARE upstream's refusals, by code.
+/// Anything else it records is its own gap and stays uncoded.
+pub fn code_for(msg: &str) -> u16 {
+    if msg.starts_with("expected 'then'") {
+        1021
+    } else if msg.starts_with("expected 'else'") {
+        1022
+    } else if msg.starts_with("expected 'in' after let bindings") {
+        1023
+    } else if msg == "expected ']'" {
+        1025
+    } else if msg.starts_with("expected '->' in a match arm") || msg.starts_with("expected a pattern after '|'") {
+        1032
+    } else if msg.starts_with("an 'act' block must contain") {
+        1040
+    } else if msg.contains("is a reserved keyword") {
+        1060
+    } else if msg.starts_with("chained '->' in a type") {
+        1072
+    } else if msg.starts_with("Expected token kind mismatch") || msg.starts_with("expected '=' after the parameters") {
+        1000
+    } else if msg.starts_with("Application ended at newline") {
+        1070
+    } else if msg.starts_with("A line may not begin with '.'") {
+        1071
+    } else {
+        0
+    }
 }
 
 pub struct Parsed {
@@ -63,6 +97,9 @@ pub(crate) struct Parser<'a> {
     pub(crate) src: &'a [u8],
     pub(crate) toks: Vec<Token>,
     pub(crate) errors: Vec<ParseError>,
+    /// The line the last definition's body ended on, for the continuation
+    /// rule above.
+    pub(crate) last_def_end_line: u32,
     pub(crate) unparsed_bodies: usize,
     pub(crate) unread_types: usize,
     pub(crate) unread_type_defs: usize,
@@ -139,6 +176,7 @@ impl<'a> Parser<'a> {
                     msg: format!("Expected token kind mismatch, got byte 0x{byte:02x}"),
                     line,
                     col,
+                    code: 0,
                 });
             }
             self.b.eat();
@@ -160,9 +198,20 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The line of the last significant token consumed.
+    pub(crate) fn prev_sig_line(&self) -> u32 {
+        self.toks[..self.at()]
+            .iter()
+            .rev()
+            .find(|t| !t.kind.is_trivia() && !matches!(t.kind, Kind::Newline | Kind::Indent | Kind::Dedent))
+            .map_or(0, |t| t.line)
+    }
+
     pub(crate) fn err(&mut self, msg: impl Into<String>) {
         let (line, col) = self.sig(0).map(|t| (t.line, t.col)).unwrap_or((0, 0));
-        self.errors.push(ParseError { msg: msg.into(), line, col });
+        let msg: String = msg.into();
+        let code = code_for(&msg);
+        self.errors.push(ParseError { msg, line, col, code });
     }
 }
 
@@ -208,6 +257,7 @@ pub fn parse(src: &[u8]) -> Parsed {
         src,
         toks,
         errors: Vec::new(),
+        last_def_end_line: 0,
         unparsed_bodies: 0,
         unread_types: 0,
         unread_type_defs: 0,
@@ -306,6 +356,20 @@ pub fn parse(src: &[u8]) -> Parsed {
                 // word out of the middle of it as a definition -- which is
                 // exactly what the `Page 1 of 3` footer produced, an item
                 // called `of` at column 8.
+                //
+                // Two shapes of skipped line ARE upstream's refusals: a line
+                // at column 1 that is no header (`expect` on the item kind,
+                // CDX1000), and a deeper
+                // line right after a definition's last line, which upstream's
+                // expression parser reads as an argument that fell off the
+                // application (CDX1070). Any other skipped line is prose-like
+                // and silent, as it is there.
+                let text = String::from_utf8_lossy(t.text(src)).to_string();
+                if t.col == 1 && t.kind != Kind::EndOfFile && text != "Page" {
+                    p.err(format!("Expected token kind mismatch, got '{text}'"));
+                } else if t.col > TOP_LEVEL_COL && p.last_def_end_line + 1 == t.line {
+                    p.err(format!("Application ended at newline; '{text}' on line {} is not parsed as an argument (column {}). Put the whole application on one line, or bind the argument with a let", t.line, t.col));
+                }
                 p.b.start(NodeKind::Loose);
                 p.eat_to_end_of_line();
                 p.b.end();
@@ -314,7 +378,12 @@ pub fn parse(src: &[u8]) -> Parsed {
     }
 
     let tree = p.b.finish().expect("the builder guarantees full coverage");
-    let diagnostics = check_pagination(src);
+    // Every coded refusal, in source order: the parser's, then the pages'.
+    let mut coded: Vec<(u32, u32, u16, String)> =
+        p.errors.iter().filter(|e| e.code != 0).map(|e| (e.line, e.col, e.code, e.msg.clone())).collect();
+    coded.sort_by_key(|(l, c, _, _)| (*l, *c));
+    let mut diagnostics: Vec<(u16, String)> = coded.into_iter().map(|(_, _, code, msg)| (code, msg)).collect();
+    diagnostics.extend(check_pagination(src));
     Parsed {
         tree,
         errors: p.errors,
@@ -464,6 +533,11 @@ fn parse_def(p: &mut Parser<'_>, src: &[u8], first: Token) {
         p.bump(); // (
         if matches!(p.kind(0), Some(Kind::Identifier) | Some(Kind::Underscore)) {
             p.bump();
+        } else if p.kind(0).is_some_and(|k| k.is_keyword()) {
+            // `report-reserved-keyword "a parameter name"`.
+            let word = p.sig(0).map(|t| String::from_utf8_lossy(t.text(src)).to_string()).unwrap_or_default();
+            p.err(format!("'{word}' is a reserved keyword and cannot be used as a parameter name; rename it"));
+            p.bump();
         }
         if p.kind(0) == Some(Kind::RightParen) {
             p.bump();
@@ -485,6 +559,7 @@ fn parse_def(p: &mut Parser<'_>, src: &[u8], first: Token) {
         eat_item_body(p, name.col);
     }
 
+    p.last_def_end_line = p.prev_sig_line();
     p.b.end(); // Def
 }
 
@@ -525,6 +600,21 @@ fn body(p: &mut Parser<'_>, def_col: u32) {
                 // that wrote three of them for two `act` blocks is skipped in
                 // silence -- 23 of them in the checkout. A RUN of real code is
                 // a different thing and stays an unread body.
+                // Two stray shapes ARE upstream's refusals, from its
+                // expression parser: a line beginning with `.`
+                // (`emit-leading-dot-error`, CDX1071), and a line beginning
+                // with `(`, `[` or a literal after an application, which it
+                // reads as an argument that fell off at the newline
+                // (`check-multiline-app`, CDX1070). A lone `end` is neither.
+                let text = String::from_utf8_lossy(t.text(p.src)).to_string();
+                if text.starts_with('.') {
+                    p.err("A line may not begin with '.'. Field access must follow its receiver on the same line: write 'receiver.field', or bind the receiver with a let and continue on the next line".to_string());
+                } else if matches!(
+                    t.kind,
+                    Kind::LeftParen | Kind::LeftBracket | Kind::IntegerLiteral | Kind::NumberLiteral | Kind::TextLiteral | Kind::CharLiteral
+                ) {
+                    p.err(format!("Application ended at newline; '{text}' on line {} is not parsed as an argument (column {}). Put the whole application on one line, or bind the argument with a let", t.line, t.col));
+                }
                 let cp = p.b.checkpoint();
                 p.eat_to_end_of_line();
                 p.skip_newlines();

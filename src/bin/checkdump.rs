@@ -36,6 +36,15 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             };
             let parsed = parser::parse(&src);
+            if std::env::var_os("CDX_TRACE_PARSE").is_some() {
+                for e in &parsed.errors {
+                    eprintln!("PARSE-ERROR {}:{} {}", e.line, e.col, e.msg);
+                }
+                eprintln!(
+                    "PARSE-COUNTS unparsed-bodies {} unread-types {} unread-type-defs {} unclosed-blocks {} resynced-lines {}",
+                    parsed.unparsed_bodies, parsed.unread_types, parsed.unread_type_defs, parsed.unclosed_blocks, parsed.resynced_lines
+                );
+            }
             // The lexer's refusals halt the driver before anything is
             // checked, as upstream's does.
             if !parsed.lex_errors.is_empty() || !parsed.diagnostics.is_empty() {
