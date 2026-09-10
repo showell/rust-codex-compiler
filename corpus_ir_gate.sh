@@ -22,7 +22,7 @@
 set -u
 UNITS="${UNITS:-$HOME/units-current}"
 IRDUMP="${IRDUMP:-$HOME/build/rust-target/release/irdump}"
-CODEXIR="${CODEXIR:-$HOME/showell_repos/codex-zig-transpiler/generated/local/codexir}"
+CODEXIR="${CODEXIR:-$HOME/codexir/codexir}"
 OUT="${OUT:-$(mktemp -d)}"
 
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gate_provenance.sh"

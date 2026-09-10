@@ -35,10 +35,13 @@ gate_provenance() {                       # gate_provenance <units-dir>
     fi
     printf '          %s units\n' "$(ls "$units"/*.codex 2>/dev/null | wc -l)"
 
-    if [ -f "$t/generated/PROVENANCE.oracles" ]; then
-        printf 'oracles   %s\n' "$(grep -A1 '^checkout' "$t/generated/PROVENANCE.oracles" | tail -1 | sed 's/^ *//')"
+    # The oracle BUNDLE: codexir and codexcheck beside the PROVENANCE.oracles
+    # that names their checkout. ~/codexir by default; CODEX_ORACLES overrides.
+    local ob="${CODEX_ORACLES:-$HOME/codexir}"
+    if [ -f "$ob/PROVENANCE.oracles" ]; then
+        printf 'oracles   %s  (%s)\n' "$(grep -A1 '^checkout' "$ob/PROVENANCE.oracles" | tail -1 | sed 's/^ *//')" "$ob"
     else
-        printf 'oracles   REVISION UNKNOWN -- no PROVENANCE.oracles beside them\n'
+        printf 'oracles   REVISION UNKNOWN -- no PROVENANCE.oracles in %s\n' "$ob"
     fi
 
     local head dirty
