@@ -202,6 +202,10 @@ pub struct UnifyState {
     /// and `check-errors` is graded against the oracle. Counted so the gap is
     /// visible rather than swallowed.
     pub unify_gaps: usize,
+    /// Inside an induction proof's scrutinee. Stage 5 (`check-induction-def`)
+    /// binds the forall's value binders there and this checker does not, so
+    /// a name it cannot find is not CDX3002.
+    pub in_proof: bool,
 }
 
 /// `expr-type-key` (Unifier.codex:133): file id in the top 16 bits, start
@@ -242,6 +246,7 @@ pub struct Cdx;
 
 impl Cdx {
     pub const TYPE_MISMATCH: u16 = 2001;
+    pub const UNDEFINED_NAME: u16 = 3002;
     pub const INFINITE_TYPE: u16 = 2010;
     pub const UNKNOWN_RECORD_FIELD: u16 = 2005;
     pub const FIELD_ON_UNIT_TYPE: u16 = 2095;
@@ -269,6 +274,7 @@ impl Default for UnifyState {
             pat_types: Vec::new(),
             diags: Vec::new(),
             unify_gaps: 0,
+            in_proof: false,
         }
     }
 }
@@ -1907,7 +1913,15 @@ pub fn infer_row(
                     let inst = st.instantiate(&r);
                     st.open_spine_rows(&inst)
                 }
-                None => Ty::Error,
+                // `infer-name`: a name no scope binds is CDX3002, and the
+                // reference types as `error` so one unknown name does not
+                // cascade.
+                None => {
+                    if !st.in_proof {
+                        st.error(Cdx::UNDEFINED_NAME, format!("Undefined name: {}", env.syms.text(*n)));
+                    }
+                    Ty::Error
+                }
             };
             // **THE SPINE MINTS BEFORE THE APPLICATION AROUND IT MINTS
             // ANYTHING**, which is what puts a row id on the wire: in fib,
@@ -2304,7 +2318,11 @@ pub fn infer_row(
         // -- which is the shape a missing subsystem leaves, and the honest
         // fix is to implement it rather than to tune this arm.
         E::Match(scrut, arms, _) | E::Induction(scrut, arms, _) => {
+            let proof = matches!(e, E::Induction(..));
+            let was = st.in_proof;
+            st.in_proof = was || proof;
             let (scrut_ty, srow) = infer_row(scrut, env, st);
+            st.in_proof = was;
             row = srow;
             let result = st.fresh();
             for a in arms {
