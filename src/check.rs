@@ -260,6 +260,15 @@ impl Cdx {
     pub const ARITHMETIC_REQUIRES_NUMERIC: u16 = 2003;
     pub const NON_EXHAUSTIVE_MATCH: u16 = 2070;
     pub const CIRCULAR_PROOF: u16 = 4023;
+    pub const UNKNOWN_NAME: u16 = 2002;
+    pub const INT_LITERAL_OVERFLOW: u16 = 2071;
+    pub const REAL_LITERAL_OVERFLOW: u16 = 2073;
+    pub const VEC_LANE_OUT_OF_RANGE: u16 = 2093;
+    pub const NOTHING_AS_VALUE: u16 = 2086;
+    pub const TYPE_ARITY: u16 = 2032;
+    pub const DUPLICATE_DEFINITION: u16 = 3001;
+    pub const UNDEFINED_TYPE_NAME: u16 = 3008;
+    pub const UNKNOWN_PATTERN_CTOR: u16 = 2072;
     pub const NON_GRAMMATICAL_PROOF: u16 = 4024;
     pub const EFFECT_UNDECLARED: u16 = 2031;
     pub const LET_BINDS_EFFECTFUL: u16 = 2033;
@@ -816,10 +825,14 @@ impl UnifyState {
                     self.report_conflict(&a, &b);
                     return false;
                 }
-                // `unify-constructed-args` stops at the first argument that
-                // fails: one CDX2001 for `Cons 9 (Cons 6 Nil)` against
-                // `Cons 5 (Cons 9 Nil)`, not two.
+                // `unify-constructed-args` refuses two arities outright, and
+                // stops at the first argument that fails: one CDX2001 for
+                // `Cons 9 (Cons 6 Nil)` against `Cons 5 (Cons 9 Nil)`, not two.
                 let (a1, a2) = (a1.clone(), a2.clone());
+                if a1.len() != a2.len() {
+                    self.error(Cdx::TYPE_MISMATCH, "Type mismatch: type constructor applied at different arities");
+                    return false;
+                }
                 for (x, y) in a1.iter().zip(a2.iter()) {
                     if !self.unify(x, y) {
                         return false;
@@ -1068,6 +1081,11 @@ impl TypeDefs {
     /// A record's fields in declaration order -- the mutable walk asks whether
     /// any of them reaches a mutable record, and `Ty::Record` does not carry
     /// them.
+    /// Whether the unit declares this type name.
+    pub fn has(&self, n: Sym) -> bool {
+        self.by_name.contains_key(&n)
+    }
+
     pub fn record_fields(&self, rec: Sym) -> Option<&[(Sym, Ty)]> {
         self.fields.get(&rec).map(|f| f.as_slice())
     }
@@ -1673,6 +1691,93 @@ fn primitive_head(t: &Ty) -> Option<&'static str> {
     }
 }
 
+/// `int-lit-first-sig` and `int-lit-sig-digits`: the significant digits of
+/// a literal, past leading zeros, with underscores skipped.
+fn sig_digits(val: &str, from: usize) -> Vec<u8> {
+    let bytes = &val.as_bytes()[from..];
+    let start = bytes.iter().position(|&c| c != b'0' && c != b'_').unwrap_or(bytes.len());
+    bytes[start..].iter().copied().filter(|&c| c != b'_').collect()
+}
+
+fn is_hex_literal_text(val: &str) -> bool {
+    val.starts_with('#')
+}
+
+/// `int-lit-exceeds`: digit-wise against a maximum of the same length.
+fn digits_exceed(digits: &[u8], max: &str) -> bool {
+    for (c, m) in digits.iter().zip(max.bytes()) {
+        if *c > m {
+            return true;
+        }
+        if *c < m {
+            return false;
+        }
+    }
+    false
+}
+
+/// `int-lit-out-of-range`: more than sixteen hex digits, or a decimal past
+/// `9223372036854775807`.
+fn int_lit_out_of_range(val: &str) -> bool {
+    if is_hex_literal_text(val) {
+        return sig_digits(val, 1).len() > 16;
+    }
+    let d = sig_digits(val, 0);
+    match d.len() {
+        n if n < 19 => false,
+        n if n > 19 => true,
+        _ => digits_exceed(&d, "9223372036854775807"),
+    }
+}
+
+/// `int-lit-is-min-magnitude`: exactly `9223372036854775808`.
+fn int_lit_is_min_magnitude(val: &str) -> bool {
+    if is_hex_literal_text(val) {
+        return false;
+    }
+    let d = sig_digits(val, 0);
+    d.len() == 19 && digits_exceed(&d, "9223372036854775807") && !digits_exceed(&d, "9223372036854775808")
+}
+
+/// `num-lit-out-of-range`: every digit on both sides of the point counts.
+fn num_lit_out_of_range(val: &str) -> bool {
+    let joined: String = val.chars().filter(|c| *c != '.').collect();
+    let d = sig_digits(&joined, 0);
+    match d.len() {
+        n if n < 19 => false,
+        n if n > 19 => true,
+        _ => digits_exceed(&d, "9223372036854775807"),
+    }
+}
+
+/// `lint-vec-lane`: `vec-extract v N` and `vec4-extract v N` with a literal
+/// lane outside the builtin's own lane count.
+fn lint_vec_lane(f: &crate::ast::Expr, a: &crate::ast::Expr, env: &TyEnv, st: &mut UnifyState) {
+    use crate::ast::{Expr as E, LiteralKind};
+    let E::Apply(inner, _, _) = f else { return };
+    let E::NameRef(n, _) = &**inner else { return };
+    let lanes: i64 = match env.syms.text(*n) {
+        "vec-extract" => 2,
+        "vec4-extract" => 4,
+        _ => return,
+    };
+    let idx = match a {
+        E::Lit(v, LiteralKind::IntLit, _) => crate::token::lit_text_to_integer(v),
+        E::Unary(x, _) => match &**x {
+            E::Lit(v, LiteralKind::IntLit, _) => -crate::token::lit_text_to_integer(v),
+            _ => return,
+        },
+        _ => return,
+    };
+    if idx >= 0 && idx < lanes {
+        return;
+    }
+    st.error(
+        Cdx::VEC_LANE_OUT_OF_RANGE,
+        format!("Lane {idx} is outside this vector: it has {lanes} lanes, numbered 0 to {}. The lane count comes from the builtin's own type, so this is decided here rather than read out of bounds at runtime. Use a lane in range, or vec-reduce-add if you meant to combine every lane.", lanes - 1),
+    );
+}
+
 /// `is-arithmetic-type`: what `+ - * / ^` accept. A variable or an error
 /// passes, so only a settled non-number is refused (CDX2003).
 fn is_arithmetic_type(t: &Ty) -> bool {
@@ -1973,6 +2078,7 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
     st.list_name = ch.syms.find("List");
     st.linked_list_name = ch.syms.find("LinkedList");
     let tds = TypeDefs::new(ch);
+    crate::name_rules::check(ch, &tds, &mut st);
     let bindings = register_defs(ch, &tds, &mut st);
     // Builtins first, then the chapter's own names on top: a chapter that
     // defines `max` shadows the builtin, which the golds show for that name.
@@ -2242,6 +2348,13 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
     }
     // `check-proof-cycles` and `check-proof-grammar`, over the checked types.
     crate::proof_norm::check_proof_rules(ch, &per_def, &tds, &mut st);
+    // **THE RESOLVER'S ERRORS HALT THE DRIVER BEFORE THE CHECKER RUNS.** A
+    // duplicate definition or an undefined lowercase name is all the oracle
+    // reports for that program; everything the checker went on to find is
+    // dropped here, as it was never found there.
+    if st.diags.iter().any(|d| matches!(d.code, Cdx::DUPLICATE_DEFINITION | Cdx::UNDEFINED_NAME)) {
+        st.diags.retain(|d| matches!(d.code, Cdx::DUPLICATE_DEFINITION | Cdx::UNDEFINED_NAME));
+    }
     // The check/lower boundary, where upstream sorts too: everything below
     // this line looks entries up rather than appending them.
     st.sort_expr_types();
@@ -2325,7 +2438,15 @@ pub fn infer_row(
     use crate::ast::Expr as E;
     let mut row = EffectRow::default();
     let t = match e {
-        E::Lit(_, crate::ast::LiteralKind::IntLit, _) => {
+        // `check-lit-range`: a literal wider than 64 bits is refused from
+        // its digit text, before anything could wrap it.
+        E::Lit(text, crate::ast::LiteralKind::IntLit, _) => {
+            if int_lit_out_of_range(text) {
+                st.error(
+                    Cdx::INT_LITERAL_OVERFLOW,
+                    format!("Integer literal '{text}' exceeds 64 bits (decimal max 9223372036854775807, hash form max 16 hex digits) and would be silently truncated"),
+                );
+            }
             Ty::Integer(i64::MIN, i64::MAX, Overflow::Error)
         }
         E::Lit(_, crate::ast::LiteralKind::TextLit, _) => Ty::Text,
@@ -2334,7 +2455,15 @@ pub fn infer_row(
         // Answering `Error` here typed every `let` whose value STARTS with
         // a real literal -- `if c then 0.0 else x`, `0.0 - x` -- as `error`,
         // and every later read of that name carried it to the wire.
-        E::Lit(_, crate::ast::LiteralKind::NumLit, _) => Ty::Real(RealWidth::F64, RealMode::Default),
+        E::Lit(text, crate::ast::LiteralKind::NumLit, _) => {
+            if num_lit_out_of_range(text) {
+                st.error(
+                    Cdx::REAL_LITERAL_OVERFLOW,
+                    format!("Real literal '{text}' carries more decimal digits than fit an i64. Every digit on both sides of the point is accumulated into one wrapping i64 before the scale is applied, so this reads back as a different number with no fault"),
+                );
+            }
+            Ty::Real(RealWidth::F64, RealMode::Default)
+        }
         E::Lit(_, crate::ast::LiteralKind::CharLit, _) => Ty::Char,
         // `record-expr-type` has SEVEN call sites upstream and the one that
         // fires here is name inference. Counted on fib: 6 names in `fib`, 2 in
@@ -2357,9 +2486,20 @@ pub fn infer_row(
                 // undefined: a builtin this table has no type for, or a unit
                 // conversion `A-to-B` the desugarer synthesises after this
                 // checker has run. Both stay `error`, silently, as before.
+                // A capitalised name is a type name to the resolver, which
+                // says nothing about it; `infer-name` then finds no binding
+                // and it is CDX2002. A lowercase one the resolver refuses as
+                // CDX3002, and the checker never runs.
                 None => {
-                    if !st.in_proof && !known_untyped(env, *n) {
-                        st.error(Cdx::UNDEFINED_NAME, format!("Undefined name: {}", env.syms.text(*n)));
+                    let name = env.syms.text(*n);
+                    if name == "Nothing" {
+                        st.error(Cdx::NOTHING_AS_VALUE, "'Nothing' is a type, not a value. For an empty Maybe use 'None' (cite Foreword chapter Maybe); 'Nothing' is only the return type of effectful procedures, e.g. [Console] Nothing.");
+                    } else if !st.in_proof && !known_untyped(env, *n) {
+                        if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                            st.error(Cdx::UNKNOWN_NAME, format!("Unknown name: {name}"));
+                        } else {
+                            st.error(Cdx::UNDEFINED_NAME, format!("Undefined name: {name}"));
+                        }
                     }
                     Ty::Error
                 }
@@ -2574,6 +2714,7 @@ pub fn infer_row(
             // handed a wider integer is the narrowing lint's business and
             // unification would refuse it.
             bind_record_set_value(f, &at, &ret, env, st);
+            lint_vec_lane(f, a, env, st);
             let halves = st.row_union(&frow, &arow);
             row = st.row_union(&halves, &EffectRow { id: call_row, ..Default::default() });
             ret
@@ -2680,6 +2821,11 @@ pub fn infer_row(
         // application rule was; until then they recurse and mint nothing of
         // their own, which is a number that can be checked rather than a
         // subtree that cannot.
+        // `-9223372036854775808` is one literal, not a negation of one past
+        // the maximum (`is-int-min-literal`).
+        E::Unary(x, _) if matches!(&**x, E::Lit(t, crate::ast::LiteralKind::IntLit, _) if int_lit_is_min_magnitude(t)) => {
+            Ty::Integer(i64::MIN, i64::MAX, Overflow::Error)
+        }
         E::Unary(x, _) => {
             let (t, xrow) = infer_row(x, env, st);
             row = xrow;
@@ -3137,9 +3283,15 @@ fn bind_pattern(
                     }
                     inst
                 }
-                // Not in scope. Upstream bags a CDX error and binds the
-                // fields against `ErrorTy`, which mints one apiece below.
-                None => Ty::Error,
+                // Not in scope: `bind-ctor-pattern-generic`'s CDX2072, and the
+                // fields bind against `ErrorTy`, which mints one apiece below.
+                None => {
+                    st.error(
+                        Cdx::UNKNOWN_PATTERN_CTOR,
+                        format!("Pattern constructor '{}' is not in scope; this arm could never match. Check the constructor names of the scrutinee's type.", env.syms.text(*name)),
+                    );
+                    Ty::Error
+                }
             };
             let mut spine = ctor_ty;
             let mut bound = 0;
