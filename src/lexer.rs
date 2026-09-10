@@ -594,14 +594,27 @@ fn scan_number(lx: &mut Lexer, out: &mut Vec<Token>, at: (u32, u32, u32)) {
 
 fn scan_char_literal(lx: &mut Lexer, out: &mut Vec<Token>, at: (u32, u32, u32)) {
     lx.advance_char(); // past the opening quote
-    if lx.at_end() {
+    // `cdx-unterminated-char`: the line ends before the closing quote.
+    let unterminated = |lx: &mut Lexer| {
+        lx.errors.push(Diag {
+            code: "cdx-unterminated-char",
+            msg: "Unterminated character literal: hit end of line before closing '",
+            line: at.1,
+            col: at.2,
+            offset: at.0,
+            len: 1,
+        });
+    };
+    if lx.at_end() || lx.peek() == b'\n' {
+        unterminated(lx);
         out.push(lx.tok(Kind::ErrorToken, at, lx.off - at.0));
         return;
     }
     if lx.peek() == b'\\' {
         let esc_at = lx.mark();
         lx.advance_char();
-        if lx.at_end() {
+        if lx.at_end() || lx.peek() == b'\n' {
+            unterminated(lx);
             out.push(lx.tok(Kind::ErrorToken, at, lx.off - at.0));
             return;
         }
@@ -639,6 +652,10 @@ fn scan_char_literal(lx: &mut Lexer, out: &mut Vec<Token>, at: (u32, u32, u32)) 
     if !lx.at_end() && lx.peek() == b'\'' {
         lx.advance_char();
     }
+    // A quote with a character after it and no closing quote is left as it
+    // was: this lexer runs over every line, and an apostrophe in a table or
+    // a note the parser later skips (`child's`) is not a literal upstream
+    // ever lexes. Only the line ending at the quote is upstream's CDX8.
     out.push(lx.tok(Kind::CharLiteral, at, lx.off - at.0));
 }
 

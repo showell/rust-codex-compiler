@@ -216,6 +216,9 @@ pub struct UnifyState {
     /// Inside an equality's two sides: every mismatch is the program's,
     /// because both sides are ground terms the normalizer already reduced.
     pub propeq_depth: u32,
+    /// `scope-grants`: the definition being checked grants these effects,
+    /// each with its scope (`""` for none).
+    pub scope_grants: Vec<(String, String)>,
 }
 
 /// `expr-type-key` (Unifier.codex:133): file id in the top 16 bits, start
@@ -278,6 +281,12 @@ impl Cdx {
     pub const BODY_FIXES_DECLARED_VAR: u16 = 2087;
     pub const FIELD_ASSIGN_UNOBSERVABLE: u16 = 2068;
     pub const LIST_LITERAL_TOO_LARGE: u16 = 9004;
+    pub const INVALID_TAB_ESCAPE: u16 = 5;
+    pub const CAPABILITY_NOT_GRANTED: u16 = 4001;
+    pub const SCOPE_VIOLATION: u16 = 4002;
+    pub const INVALID_CARRIAGE_RETURN_ESCAPE: u16 = 6;
+    pub const UNTERMINATED_TEXT: u16 = 7;
+    pub const UNTERMINATED_CHAR: u16 = 8;
     pub const NON_GRAMMATICAL_PROOF: u16 = 4024;
     pub const EFFECT_UNDECLARED: u16 = 2031;
     pub const LET_BINDS_EFFECTFUL: u16 = 2033;
@@ -314,6 +323,7 @@ impl Default for UnifyState {
             list_name: None,
             linked_list_name: None,
             propeq_depth: 0,
+            scope_grants: Vec::new(),
         }
     }
 }
@@ -2061,6 +2071,17 @@ fn collect_type_vars(t: &Ty, out: &mut std::collections::BTreeSet<u32>) {
     }
 }
 
+/// The lexer names its refusals by upstream's code name; this is the number.
+pub fn lex_code(name: &str) -> u16 {
+    match name {
+        "cdx-invalid-tab-escape" => Cdx::INVALID_TAB_ESCAPE,
+        "cdx-invalid-carriage-return-escape" => Cdx::INVALID_CARRIAGE_RETURN_ESCAPE,
+        "cdx-unterminated-text" => Cdx::UNTERMINATED_TEXT,
+        "cdx-unterminated-char" => Cdx::UNTERMINATED_CHAR,
+        _ => 1000,
+    }
+}
+
 /// `Sym(N)` in a message, spelled by name: the state that writes messages
 /// holds no table, so a trace reads them back here.
 pub fn name_syms(msg: &str, syms: &SymTab) -> String {
@@ -2143,6 +2164,9 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
         }
     }
     env.locals_start = env.scope.len();
+    // `check-opening-capabilities`: the opening's effects, against the
+    // manifest's vocabulary.
+    crate::effect_scope::check_opening_capabilities(&env, &mut st);
     // `register-const-range`: a nullary definition that IS an integer literal.
     for d in &ch.defs {
         if d.params.is_empty() {
@@ -2302,7 +2326,13 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
         st.effect_exempt = !grounded.is_empty();
         // A `claim`'s body is a proof: Stage 5 binds its `for all` names.
         st.in_proof = d.is_claim;
+        // `granted-st`: what this definition's signature grants, with scopes.
+        st.scope_grants = instantiated
+            .as_ref()
+            .map(|t| st.resolve_row(&declared_performing_row(t, d.params.len(), &ch.syms)).labels)
+            .unwrap_or_default();
         let (body_ty, body_row) = infer_row(&d.body, &mut env, &mut st);
+        st.scope_grants.clear();
         st.in_proof = false;
         st.effect_exempt = false;
         // **THE BODY MEETS THE DECLARED RESULT.** Without this a definition's
@@ -2819,6 +2849,7 @@ pub fn infer_row(
             // `lint-vec-lane`: the application lints, in upstream's order.
             crate::narrowing::lint_arg_narrowing(f, &ft, a, &at, env, st);
             bind_record_set_value(f, a, &at, &ret, env, st);
+            crate::effect_scope::lint_effect_scope(f, a, env, st);
             lint_vec_lane(f, a, env, st);
             let halves = st.row_union(&frow, &arow);
             row = st.row_union(&halves, &EffectRow { id: call_row, ..Default::default() });

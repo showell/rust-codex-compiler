@@ -15,6 +15,7 @@ pub mod code;
 pub mod cst;
 pub mod decl;
 pub mod desugar;
+pub mod effect_scope;
 pub mod expr;
 pub mod heapwatch;
 pub mod interp;

@@ -36,6 +36,17 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             };
             let parsed = parser::parse(&src);
+            // The lexer's refusals halt the driver before anything is
+            // checked, as upstream's does.
+            if !parsed.lex_errors.is_empty() {
+                let mut st = check::UnifyState::default();
+                for d in &parsed.lex_errors {
+                    st.error(check::lex_code(d.code), d.msg);
+                }
+                let out = std::io::stdout();
+                let _ = write!(out.lock(), "{}", check::section(&codexc::symbol::SymTab::default(), &[], &st));
+                return ExitCode::SUCCESS;
+            }
             let mut dg = Desugar::new(&src);
             let ch = dg.chapter(&parsed.tree);
             let (bindings, st) = check::check_chapter(&ch);

@@ -34,6 +34,9 @@ pub struct ParseError {
 pub struct Parsed {
     pub tree: Node,
     pub errors: Vec<ParseError>,
+    /// The lexer's refusals, each with upstream's code name; a unit with
+    /// any of these is never checked.
+    pub lex_errors: Vec<crate::lexer::Diag>,
     /// Bodies collected but not yet given structure. Reported, never hidden.
     pub unparsed_bodies: usize,
     /// Annotations whose type the type grammar could not finish reading.
@@ -195,6 +198,7 @@ pub(crate) fn starts_an_item(k: Kind) -> bool {
 
 pub fn parse(src: &[u8]) -> Parsed {
     let lexed = crate::lexer::tokenize(src);
+    let lex_errors = lexed.errors;
     let toks = lexed.tokens;
     let mut p = Parser {
         b: Builder::new(toks.clone()),
@@ -310,6 +314,7 @@ pub fn parse(src: &[u8]) -> Parsed {
     Parsed {
         tree,
         errors: p.errors,
+        lex_errors,
         unparsed_bodies: p.unparsed_bodies,
         unread_types: p.unread_types,
         unread_type_defs: p.unread_type_defs,
