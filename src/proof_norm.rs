@@ -19,8 +19,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::ast::{BinaryOp, Chapter, Def, Expr, LiteralKind, MatchArm, Name, Pat, TypeDef, TypeExpr};
-use crate::check::{resolve_declared, Ty, TypeDefs};
+use crate::ast::{BinaryOp, Chapter, Def, Expr, LiteralKind, MatchArm, Name, Pat, Span, TypeDef, TypeExpr};
+use crate::check::{expr_type_key, resolve_declared, Binding, Cdx, Ty, TypeDefs, UnifyState};
 use crate::symbol::SymTab;
 
 /// `proof-norm-fuel`.
@@ -951,6 +951,202 @@ fn aexpr_to_cterm(e: &Expr, syms: &mut SymTab) -> Ty {
             _ => Ty::Constructed(syms.intern("__nonterm"), Vec::new()),
         },
         _ => Ty::Constructed(syms.intern("__nonterm"), Vec::new()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// After every definition is checked: `Section: Proof Acyclicity` and
+// `check-proof-grammar` (TypeChecker.codex:2207, :2344).
+
+/// `type-mentions-proof`: a definition is proof-relevant when its CHECKED
+/// type mentions `Proof` or an equality anywhere. Fuel-capped, and answers
+/// yes on exhaustion, so a pathological type errs toward checking.
+fn type_mentions_proof(t: &Ty, fuel: i32, tds: &TypeDefs) -> bool {
+    if fuel <= 0 {
+        return true;
+    }
+    match t {
+        Ty::Proof | Ty::PropEq(..) => true,
+        Ty::Fun(p, _, r) => type_mentions_proof(p, fuel - 1, tds) || type_mentions_proof(r, fuel - 1, tds),
+        Ty::List(e) | Ty::LinkedList(e) | Ty::Linear(e) | Ty::Vector(_, e) | Ty::Unit(_, e) => {
+            type_mentions_proof(e, fuel - 1, tds)
+        }
+        Ty::ForAll(_, b) | Ty::ForAllEff(_, b) | Ty::Effectful(_, _, b) => type_mentions_proof(b, fuel - 1, tds),
+        Ty::TypeApply(f, a) => type_mentions_proof(f, fuel - 1, tds) || type_mentions_proof(a, fuel - 1, tds),
+        Ty::Constructed(_, args) | Ty::Sum(_, args) => args.iter().any(|a| type_mentions_proof(a, fuel - 1, tds)),
+        Ty::Record(n, args) => {
+            args.iter().any(|a| type_mentions_proof(a, fuel - 1, tds))
+                || tds
+                    .record_fields(*n)
+                    .is_some_and(|fs| fs.iter().any(|(_, ft)| type_mentions_proof(ft, fuel - 1, tds)))
+        }
+        _ => false,
+    }
+}
+
+fn span_of(e: &Expr) -> Span {
+    match e {
+        Expr::Lit(_, _, s)
+        | Expr::NameRef(_, s)
+        | Expr::Apply(_, _, s)
+        | Expr::Binary(_, _, _, s)
+        | Expr::Unary(_, s)
+        | Expr::If(_, _, _, s)
+        | Expr::Let(_, _, s)
+        | Expr::Lambda(_, _, s)
+        | Expr::Match(_, _, s)
+        | Expr::List(_, s)
+        | Expr::Record(_, _, s)
+        | Expr::FieldAccess(_, _, s)
+        | Expr::Act(_, s)
+        | Expr::FieldAssign(_, _, _, s)
+        | Expr::Lazy(_, s)
+        | Expr::Error(_, s)
+        | Expr::Induction(_, _, s) => *s,
+        Expr::Handle(h) => h.span,
+        Expr::WithTimeout(w) => w.span,
+        Expr::Try(t) => t.span,
+    }
+}
+
+/// `collect-rt-mentions` with the empty self: every proof-relevant name the
+/// body mentions, itself included, each once.
+fn proof_mentions(body: &Expr, names: &[Name]) -> Vec<Name> {
+    let mut acc: Vec<Name> = Vec::new();
+    body.walk(&mut |e| {
+        if let Expr::NameRef(n, _) = e {
+            if names.contains(n) && !acc.contains(n) {
+                acc.push(*n);
+            }
+        }
+    });
+    acc
+}
+
+fn reaches(edges: &[(Name, Vec<Name>)], from: Name, target: Name, visited: &mut Vec<Name>) -> bool {
+    if from == target {
+        return true;
+    }
+    if visited.contains(&from) {
+        return false;
+    }
+    visited.push(from);
+    edges
+        .iter()
+        .find(|(n, _)| *n == from)
+        .is_some_and(|(_, calls)| calls.iter().any(|c| reaches(edges, *c, target, visited)))
+}
+
+/// `pg-form-name`: what a disallowed proof term is.
+fn form_name(e: &Expr) -> &'static str {
+    match e {
+        Expr::If(..) => "an if-expression",
+        Expr::Match(..) => "a when-expression (a proof recurses only through 'induction')",
+        Expr::Lambda(..) => "a lambda",
+        Expr::Act(..) => "an act block",
+        Expr::Binary(..) => "a binary-operator expression",
+        Expr::Unary(..) => "a unary-operator expression",
+        Expr::List(..) => "a list literal",
+        Expr::Record(..) => "a record literal",
+        Expr::FieldAccess(..) => "a field access",
+        Expr::Try(..) => "a try expression",
+        Expr::Handle(..) => "a handle expression",
+        Expr::WithTimeout(..) => "a with-timeout expression",
+        Expr::FieldAssign(..) => "a field assignment",
+        Expr::Lazy(..) => "a lazy expression",
+        _ => "a non-proof expression",
+    }
+}
+
+struct Grammar<'a> {
+    st: &'a UnifyState,
+    tds: &'a TypeDefs,
+    errs: Vec<String>,
+}
+
+impl Grammar<'_> {
+    /// `pg-is-prop`: the recorded type of this expression mentions a proof.
+    fn is_prop(&self, e: &Expr) -> bool {
+        let key = expr_type_key(span_of(e));
+        let Ok(i) = self.st.expr_types.binary_search_by_key(&key, |(k, _)| *k) else { return false };
+        let t = self.st.deep_resolve(&self.st.expr_types[i].1);
+        type_mentions_proof(&t, 64, self.tds)
+    }
+
+    /// `check-proof-term`.
+    fn term(&mut self, e: &Expr) {
+        match e {
+            Expr::NameRef(..) => {}
+            Expr::Apply(f, a, _) => {
+                self.term(f);
+                if self.is_prop(a) {
+                    self.term(a);
+                }
+            }
+            Expr::Induction(_, arms, _) => {
+                for arm in arms {
+                    self.term(&arm.body);
+                }
+            }
+            Expr::Let(binds, body, _) => {
+                self.term(body);
+                for b in binds {
+                    if self.is_prop(&b.value) {
+                        self.term(&b.value);
+                    }
+                }
+            }
+            other => self.errs.push(format!(
+                "proof term uses a disallowed form: {}. A proof body may only be a proof builtin (Refl, sym, trans, cong, app-cong, assume), an inductive hypothesis, a cited claim, an 'induction' expression, or a let of proof terms. To assert this equality without proof, use 'assume'.",
+                form_name(other)
+            )),
+        }
+    }
+}
+
+/// `check-proof-cycles` then `check-proof-grammar`, over the checked types.
+pub fn check_proof_rules(ch: &Chapter, per_def: &[Binding], tds: &TypeDefs, st: &mut UnifyState) {
+    let names: Vec<Name> = ch
+        .defs
+        .iter()
+        .filter(|d| {
+            per_def
+                .iter()
+                .find(|b| b.name == d.name)
+                .is_some_and(|b| type_mentions_proof(&st.deep_resolve(&b.ty), 64, tds))
+        })
+        .map(|d| d.name)
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    let edges: Vec<(Name, Vec<Name>)> = ch
+        .defs
+        .iter()
+        .filter(|d| names.contains(&d.name))
+        .map(|d| (d.name, proof_mentions(&d.body, &names)))
+        .collect();
+    for (name, calls) in &edges {
+        let mut visited = Vec::new();
+        if calls.iter().any(|c| reaches(&edges, *c, *name, &mut visited)) {
+            st.error(
+                Cdx::CIRCULAR_PROOF,
+                format!(
+                    "circular proof: '{}' justifies itself, directly or through other proof definitions or cited lemmas; a proof term cannot assume its own conclusion. Recursion in a proof is only sound through structural induction, and lemma chains must be acyclic. To assert this equality without proof, use 'assume'.",
+                    ch.syms.text(*name)
+                ),
+            );
+        }
+    }
+    st.sort_expr_types();
+    let mut errs = Vec::new();
+    for d in ch.defs.iter().filter(|d| names.contains(&d.name)) {
+        let mut g = Grammar { st, tds, errs: Vec::new() };
+        g.term(&d.body);
+        errs.extend(g.errs);
+    }
+    for m in errs {
+        st.error(Cdx::NON_GRAMMATICAL_PROOF, m);
     }
 }
 

@@ -259,6 +259,8 @@ impl Cdx {
     pub const UNDEFINED_NAME: u16 = 3002;
     pub const ARITHMETIC_REQUIRES_NUMERIC: u16 = 2003;
     pub const NON_EXHAUSTIVE_MATCH: u16 = 2070;
+    pub const CIRCULAR_PROOF: u16 = 4023;
+    pub const NON_GRAMMATICAL_PROOF: u16 = 4024;
     pub const EFFECT_UNDECLARED: u16 = 2031;
     pub const LET_BINDS_EFFECTFUL: u16 = 2033;
     pub const ROW_MISMATCH: u16 = 2090;
@@ -868,6 +870,15 @@ impl UnifyState {
                 let (init, last) = args.split_at(args.len() - 1);
                 let head = if init.is_empty() { Ty::TypeCon(n) } else { Ty::Constructed(n, init.to_vec()) };
                 self.unify(&f, &head) && self.unify(&x, &last[0])
+            }
+            // A bare name in type position is `TypeCon` from `resolve_declared`
+            // and `Constructed n []` from a type definition's parameters and
+            // from the proof normalizer; upstream spells both `ConstructedTy n
+            // []`, so they are one type here.
+            (Ty::TypeCon(a), Ty::Constructed(b, args)) | (Ty::Constructed(b, args), Ty::TypeCon(a))
+                if a == b && args.is_empty() =>
+            {
+                true
             }
             // `Refl : forall a. a === a` meets a claim's `Integer === Text`
             // side by side, and the second side is where it fails.
@@ -2229,6 +2240,8 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
             env.scope.pop();
         }
     }
+    // `check-proof-cycles` and `check-proof-grammar`, over the checked types.
+    crate::proof_norm::check_proof_rules(ch, &per_def, &tds, &mut st);
     // The check/lower boundary, where upstream sorts too: everything below
     // this line looks entries up rather than appending them.
     st.sort_expr_types();
