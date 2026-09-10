@@ -10,7 +10,7 @@
 // VALUE and not a function of one argument. `None` is one of the eight
 // that declare no type at all. Re-run the probe after a pin change; do
 // not edit by hand.
-pub const BUILTINS: [(&str, Option<usize>); 265] = [
+pub const BUILTINS: [(&str, Option<usize>); 266] = [
     ("negate", Some(1)),
     ("text-length", Some(1)),
     ("integer-to-text", Some(1)),
@@ -66,6 +66,7 @@ pub const BUILTINS: [(&str, Option<usize>); 265] = [
     ("run-process", Some(2)),
     ("run-process-full", Some(2)),
     ("process-exit", Some(1)),
+    ("host-socket", Some(4)),
     ("fork", Some(1)),
     ("await", Some(1)),
     ("par", Some(2)),

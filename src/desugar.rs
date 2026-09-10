@@ -778,9 +778,11 @@ impl<'a> Desugar<'a> {
                 .children_of(NodeKind::InstanceMethod)
                 .map(|m| InstanceMethodDef {
                     name: self.leading(m),
+                    // `name_of`, as a definition's parameters are: the
+                    // LEADING token of `(x)` is the paren.
                     params: m
                         .children_of(NodeKind::ParamGroup)
-                        .map(|g| self.leading(g))
+                        .map(|g| self.name_of(g))
                         .collect(),
                     body: m
                         .child_nodes()
