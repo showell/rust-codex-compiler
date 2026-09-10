@@ -364,6 +364,7 @@ impl UnifyState {
         }
         let mut merged = a.labels.clone();
         merged.extend(b.labels.iter().cloned());
+        let merged = canonical_labels(merged);
         if a.id < 0 {
             return EffectRow { labels: merged, tail: b.tail, id: b.id };
         }
@@ -1230,6 +1231,84 @@ fn check_let_bind_row(st: &mut UnifyState, row: &EffectRow, name: &str) {
     }
 }
 
+/// `make-row`'s `sort-labels-canonical`: a row's labels are a set, sorted
+/// by name then scope, with no label twice.
+fn canonical_labels(mut ls: Vec<(String, String)>) -> Vec<(String, String)> {
+    ls.sort();
+    ls.dedup();
+    ls
+}
+
+/// `effect-covered-by`: a body effect is covered when a declared name is it,
+/// or is the head of it before the dot (`Console` covers `Console.Write`).
+fn effect_covered_by(declared: &[String], body_eff: &str) -> bool {
+    if declared.iter().any(|d| d == body_eff) {
+        return true;
+    }
+    match body_eff.find('.') {
+        Some(dot) => declared.iter().any(|d| d == &body_eff[..dot]),
+        None => false,
+    }
+}
+
+/// `scope-kind`/`scope-subsumes`: what a scope covers depends on the effect.
+/// A `Network` scope is an authority (host, optional port); a `Console` scope
+/// is a channel, equal or nothing; every other scope is a path prefix.
+fn scope_subsumes(eff: &str, outer: &str, inner: &str) -> bool {
+    if eff.starts_with("Network") {
+        let host = |a: &str| a.split(':').next().unwrap_or("").to_string();
+        let port = |a: &str| a.find(':').map(|p| a[p + 1..].to_string()).unwrap_or_default();
+        host(outer) == host(inner) && (port(outer).is_empty() || port(inner) == port(outer))
+    } else if eff.starts_with("Console") {
+        inner == outer
+    } else {
+        inner.starts_with(outer)
+    }
+}
+
+/// `label-parent-index`: the parameter label that covers an argument label,
+/// by scope (a scoped label under an unscoped or subsuming one of the same
+/// name, unless the parameter names it exactly) or by dot (`Console.Write`
+/// under an unscoped `Console`).
+fn label_parent_index(plabels: &[(String, String)], al: &(String, String)) -> Option<usize> {
+    let (name, scope) = al;
+    if !scope.is_empty() && !plabels.iter().any(|p| p == al) {
+        let by_scope = plabels
+            .iter()
+            .position(|(pn, ps)| pn == name && (ps.is_empty() || scope_subsumes(name, ps, scope)));
+        if by_scope.is_some() {
+            return by_scope;
+        }
+    }
+    let dot = name.find('.')?;
+    let head = &name[..dot];
+    plabels.iter().position(|(pn, ps)| ps.is_empty() && pn == head)
+}
+
+/// `widen-arg-to-param`: a function passed as an argument has its row's
+/// labels lifted to the parameter's covering labels before the two arrows
+/// are unified, so `[Console.Write]` meets `[Console]` and agrees. The other
+/// direction lifts nothing and `unify_row` refuses it.
+fn widen_arg_to_param(st: &UnifyState, func_ty: &Ty, arg_ty: &Ty) -> Ty {
+    let Ty::Fun(ap, arow, aret) = arg_ty else { return arg_ty.clone() };
+    let Ty::Fun(p, _, _) = strip_forall(&st.resolve(func_ty)) else { return arg_ty.clone() };
+    let Ty::Fun(_, prow, _) = st.resolve(&p) else { return arg_ty.clone() };
+    let pr = st.resolve_row(&prow);
+    let arr = st.resolve_row(arow);
+    if pr.labels.is_empty() || arr.labels.is_empty() {
+        return arg_ty.clone();
+    }
+    let widened: Vec<(String, String)> = arr
+        .labels
+        .iter()
+        .map(|al| label_parent_index(&pr.labels, al).map(|i| pr.labels[i].clone()).unwrap_or_else(|| al.clone()))
+        .collect();
+    if widened == arr.labels {
+        return arg_ty.clone();
+    }
+    Ty::Fun(ap.clone(), EffectRow { labels: widened, tail: arr.tail, id: arr.id }, aret.clone())
+}
+
 /// `declared-performing-row`: the row the signature grants the body -- the
 /// `pcount`-th arrow's, or an effectful nullary's effects as labels.
 fn declared_performing_row(t: &Ty, pcount: usize, syms: &SymTab) -> EffectRow {
@@ -1897,11 +1976,10 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
             let body = st.resolve_row(&body_row);
             let mut allowed: Vec<String> = declared.labels.iter().map(|(n, _)| n.clone()).collect();
             allowed.extend(grounded.iter().cloned());
-            for (name, _) in &body.labels {
-                let head = name.split('.').next().unwrap_or(name);
-                if !allowed.iter().any(|a| a == name || a == head) {
-                    st.error(Cdx::EFFECT_UNDECLARED, format!("Effect '{name}' not declared in function signature"));
-                }
+            // `find-uncovered-effect` stops at the first: one CDX2031 per
+            // definition however many effects the body performs unnamed.
+            if let Some((name, _)) = body.labels.iter().find(|(n, _)| !effect_covered_by(&allowed, n)) {
+                st.error(Cdx::EFFECT_UNDECLARED, format!("Effect '{name}' not declared in function signature"));
             }
         }
         if let (Some(Ty::ForAll(..) | Ty::ForAllEff(..)), Some(inst)) =
@@ -2247,11 +2325,12 @@ pub fn infer_row(
             // two open rows with different tails. Minting it here as well
             // counted it twice.
             let call_row = st.fresh_row();
+            let passed = widen_arg_to_param(st, &ft, &at);
             // `unify st (fr.inferred-type) (FunTy passed-ty (row-var call-row-id) ret-ty)`
             // -- and THIS is what decides an inferred type. `show`'s
             // instantiated variable meets the argument here and nowhere else.
             let want = Ty::Fun(
-                Box::new(at.clone()),
+                Box::new(passed),
                 EffectRow { id: call_row, ..Default::default() },
                 Box::new(ret.clone()),
             );
@@ -2673,7 +2752,31 @@ pub fn infer_row(
         // their effect rows.
         E::Handle(h) => {
             let (t, body_row) = infer_row(&h.body, env, st);
-            row = body_row;
+            // `AHandleExpr`: the handled effect leaves the body's row. A label
+            // the handler covers (exactly, or as the head of a dotted one) is
+            // dropped; a body whose row is open and names nothing covered is
+            // unified with `[eff | tp]` for a fresh `tp`, and `tp` is what
+            // remains; a closed row naming nothing covered is left as it is
+            // (upstream warns `cdx-handler-unused`).
+            let eff = env.syms.text(h.effect).to_string();
+            let covers = [eff.clone()];
+            let resolved = st.resolve_row(&body_row);
+            row = if resolved.labels.iter().any(|(n, _)| effect_covered_by(&covers, n)) {
+                EffectRow {
+                    labels: resolved.labels.iter().filter(|(n, _)| !effect_covered_by(&covers, n)).cloned().collect(),
+                    tail: resolved.tail.clone(),
+                    id: resolved.id,
+                }
+            } else if resolved.id >= 0 {
+                let tp = st.fresh_row();
+                let ext = EffectRow { labels: vec![(eff.clone(), String::new())], tail: String::new(), id: tp };
+                if !st.unify_row(&body_row, &ext) {
+                    st.unify_gaps += 1;
+                }
+                EffectRow { id: tp, ..Default::default() }
+            } else {
+                body_row
+            };
             for c in &h.clauses {
                 let mark = env.scope.len();
                 for p in &c.params {
