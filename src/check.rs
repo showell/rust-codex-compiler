@@ -1493,6 +1493,62 @@ fn param_walk(t: &Ty, syms: &SymTab, st: &mut UnifyState, entries: &mut Vec<Para
 /// body is walked, which is what lets `fib` call itself. A one-pass checker
 /// would find `fib` undefined inside its own body and mint a fresh variable
 /// for it -- reaching a plausible answer with the wrong `next-id`.
+/// **The zonk-and-default phase.** Run once at the end of each definition, it
+/// resolves every type variable the definition minted and DEFAULTS the ones
+/// inference left ambiguous, so no unresolved type reaches lowering or a plug.
+///
+/// "Ambiguous" here is precise: a variable minted while checking this
+/// definition (`def_var_start .. next_id`) that is still free AND is not one
+/// the definition's own type binds. A variable the type binds is a generic and
+/// is kept -- lowering spells it and a plug emits it as a comptime parameter.
+/// A variable the type does NOT bind is an ORPHAN: nothing observes it (an
+/// empty list's element, an unread binding's type), so its concrete identity is
+/// irrelevant and a concrete default is what lets a strict plug size it.
+///
+/// The default is `int-default`. With no type classes there is no
+/// class-directed defaulting to be cleverer than that; a provably-unobserved
+/// value can take any concrete type, and int-default is one every plug emits.
+///
+/// This is phase ONE only. A free variable the type DOES bind but that is not a
+/// proper `ForAll` -- an undeclared polymorphic function, a generic lifted
+/// closure -- is a GENERALISATION problem, not an ambiguity, and is left for
+/// the plug/monomorphisation phase; defaulting it here would wrongly make a
+/// polymorphic definition monomorphic.
+fn default_ambiguous_vars(st: &mut UnifyState, def_var_start: u32, own_type: Option<&Ty>) {
+    let mut generics = std::collections::BTreeSet::new();
+    if let Some(t) = own_type {
+        collect_type_vars(&st.deep_resolve(t), &mut generics);
+    }
+    let int_default = Ty::Integer(i64::MIN, i64::MAX, Overflow::Error);
+    for v in def_var_start..st.next_id {
+        if !generics.contains(&v) && st.resolve(&Ty::Var(v)) == Ty::Var(v) {
+            if !st.unify(&Ty::Var(v), &int_default) {
+                st.unify_gaps += 1;
+            }
+        }
+    }
+}
+
+/// Every type-variable id that appears in a type. Used to learn a
+/// definition's own generics from its instantiated type, so that defaulting an
+/// unconstrained variable leaves the generics alone.
+fn collect_type_vars(t: &Ty, out: &mut std::collections::BTreeSet<u32>) {
+    match t {
+        Ty::Var(id) => { out.insert(*id); }
+        Ty::List(a) | Ty::LinkedList(a) | Ty::Vector(_, a) | Ty::Unit(_, a)
+        | Ty::Linear(a) | Ty::ForAll(_, a) | Ty::ForAllEff(_, a) => collect_type_vars(a, out),
+        Ty::Fun(a, _, b) | Ty::PropEq(a, b) | Ty::TypeApply(a, b) => {
+            collect_type_vars(a, out);
+            collect_type_vars(b, out);
+        }
+        Ty::Sum(_, xs) | Ty::Record(_, xs) | Ty::Constructed(_, xs) => {
+            for x in xs { collect_type_vars(x, out); }
+        }
+        Ty::Effectful(_, _, a) => collect_type_vars(a, out),
+        _ => {}
+    }
+}
+
 pub fn check_chapter(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState) {
     let (bindings, st, _) = check_chapter_full(ch);
     (bindings, st)
@@ -1533,6 +1589,9 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
         env.bind(b.name, b.ty.clone());
     }
     for d in &ch.defs {
+        // The first type-variable id this definition mints, so its own
+        // unconstrained variables can be told from earlier definitions'.
+        let def_var_start = st.next_id;
         // A definition's parameters take their types from its declared arrow
         // spine, walked in order.
         // A DEFINITION'S PARAMETERS COME FROM ITS DECLARED ARROW, and mint
@@ -1678,6 +1737,9 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
             },
             &mut st,
         );
+        // The zonk-and-default phase for this definition. See
+        // `default_ambiguous_vars`.
+        default_ambiguous_vars(&mut st, def_var_start, instantiated.as_ref());
         for _ in saved {
             env.scope.pop();
         }

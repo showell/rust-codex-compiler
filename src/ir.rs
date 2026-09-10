@@ -502,11 +502,33 @@ mod tests {
     #[test]
     fn an_orphan_empty_list_defaults_its_element() {
         let src = "Chapter: T\n\nSection: S\n  ae : Integer -> Integer\n  ae (n) = let x = [] in let y = x in if list-length y == 0 then 42 else 0\n\nSection: E\n  opening : Integer\n  opening = ae 0\n";
-        // The LITERAL's element is what the zig plug sizes; defaulting it is
-        // what makes the program build. The orphan variable may still appear in
-        // erased positions (a name's recorded type), which the plug ignores.
+        // The checker resolves the orphan at the layer that owns types, so the
+        // WHOLE definition is consistent -- literal, bindings, and references
+        // all int-default, no variable left for a plug to choke on.
         let l = def_line(src, "ae");
         assert!(l.contains("(list-expr (elems) int-default)"), "orphan literal not defaulted: {l}");
+        assert!(!l.contains("(tvar"), "orphan variable survived in the definition: {l}");
+    }
+
+    /// The zonk-and-default phase reaches an empty list in DIRECT position, not
+    /// only through an alias. `list-length []` -- element observed only by its
+    /// length -- defaults; called twice so the single-caller pass leaves the
+    /// definition standing to inspect.
+    #[test]
+    fn an_orphan_empty_list_in_direct_position_defaults() {
+        let src = "Chapter: T\n\nSection: S\n  count-empty : Integer -> Integer\n  count-empty (n) = list-length []\n\nSection: E\n  opening : [Console] Nothing = act\n   print-line-uni (show (count-empty 1))\n   print-line-uni (show (count-empty 2))\n  end\n";
+        let l = def_line(src, "count-empty");
+        assert!(l.contains("(list-expr (elems) int-default)"), "direct empty not defaulted: {l}");
+        assert!(!l.contains("(tvar"), "orphan survived: {l}");
+    }
+
+    /// An UNUSED binding of an empty list: the element is an orphan the phase
+    /// defaults, independent of the plug's handling of the unused binding.
+    #[test]
+    fn an_unused_empty_list_binding_defaults_its_element() {
+        let src = "Chapter: T\n\nSection: S\n  ret : Integer -> Integer\n  ret (n) = let e = [] in 42\n\nSection: E\n  opening : [Console] Nothing = act\n   print-line-uni (show (ret 1))\n   print-line-uni (show (ret 2))\n  end\n";
+        let l = def_line(src, "ret");
+        assert!(!l.contains("(tvar"), "orphan survived in unused binding: {l}");
     }
 
     /// **A DEFINITION'S OWN GENERIC IS NOT AN ORPHAN.** An empty list typed as
