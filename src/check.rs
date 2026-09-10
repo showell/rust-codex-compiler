@@ -271,6 +271,13 @@ impl Cdx {
     pub const UNKNOWN_PATTERN_CTOR: u16 = 2072;
     pub const NARROWING_RECORD_SET_LITERAL: u16 = 2050;
     pub const NARROWING_RECORD_SET: u16 = 2051;
+    pub const REAL_EQUALITY_BANNED: u16 = 2085;
+    pub const TEXT_ORDERING_BANNED: u16 = 2089;
+    pub const LIST_PATTERN_SHAPE: u16 = 2088;
+    pub const UNREACHABLE_MATCH_ARM: u16 = 2096;
+    pub const BODY_FIXES_DECLARED_VAR: u16 = 2087;
+    pub const FIELD_ASSIGN_UNOBSERVABLE: u16 = 2068;
+    pub const LIST_LITERAL_TOO_LARGE: u16 = 9004;
     pub const NON_GRAMMATICAL_PROOF: u16 = 4024;
     pub const EFFECT_UNDECLARED: u16 = 2031;
     pub const LET_BINDS_EFFECTFUL: u16 = 2033;
@@ -1025,6 +1032,8 @@ fn subst_row_var(t: &Ty, id: i32, with: i32) -> Ty {
 pub struct TypeDefs {
     by_name: std::collections::BTreeMap<Sym, Ty>,
     fields: std::collections::BTreeMap<Sym, Vec<(Sym, Ty)>>,
+    /// A variant's constructor names, in declaration order.
+    ctors: std::collections::BTreeMap<Sym, Vec<Sym>>,
 }
 
 impl TypeDefs {
@@ -1034,7 +1043,10 @@ impl TypeDefs {
         for d in &ch.type_defs {
             let (n, params, is_record) = match d {
                 TypeDef::Record(n, ps, ..) => (n, ps, true),
-                TypeDef::Variant(n, ps, ..) => (n, ps, false),
+                TypeDef::Variant(n, ps, cs, _) => {
+                    td.ctors.insert(*n, cs.iter().map(|c| c.name).collect());
+                    (n, ps, false)
+                }
                 // `build-type-def-map`'s `AUnitTypeDef` arm (subject 51723)
                 // binds `UnitTy name <resolved base>`. **A UNIT IS NOT ITS
                 // BASE AND IT IS NOT A BARE NAME**: binding `TypeCon` lost the
@@ -1083,6 +1095,11 @@ impl TypeDefs {
     /// A record's fields in declaration order -- the mutable walk asks whether
     /// any of them reaches a mutable record, and `Ty::Record` does not carry
     /// them.
+    /// A variant's constructors, in declaration order.
+    pub fn ctors(&self, n: Sym) -> Option<&[Sym]> {
+        self.ctors.get(&n).map(|v| v.as_slice())
+    }
+
     /// Whether the unit declares this type name.
     pub fn has(&self, n: Sym) -> bool {
         self.by_name.contains_key(&n)
@@ -2185,6 +2202,10 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
         } else {
             own.clone().map(|t| st.instantiate(&t))
         };
+        // The signature's variables as the body meets them: the ones the
+        // instantiation just minted (`declared-vars`).
+        let declared_vars: Vec<u32> =
+            if d.declared_type.is_empty() { Vec::new() } else { (def_var_start..st.next_id).collect() };
         // **WHAT LOWERING SPELLS FOR THIS DEFINITION IS THIS TYPE, NOT THE
         // GENERALISED ONE.** `check-def-normal` answers
         // `inferred-type = declared.expected-type` -- the INSTANTIATED type --
@@ -2333,6 +2354,19 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
             // definition however many effects the body performs unnamed.
             if let Some((name, _)) = body.labels.iter().find(|(n, _)| !effect_covered_by(&allowed, n)) {
                 st.error(Cdx::EFFECT_UNDECLARED, format!("Effect '{name}' not declared in function signature"));
+            }
+        }
+        // `check-declared-rigidity`, before the signature is tied back: a
+        // declared type variable the body settled is the caller's choice
+        // taken away (CDX2087).
+        for id in &declared_vars {
+            let settled = st.resolve(&Ty::Var(*id));
+            if settled != Ty::Var(*id) {
+                let desc = type_desc(&st.deep_resolve(&settled));
+                st.error(
+                    Cdx::BODY_FIXES_DECLARED_VAR,
+                    format!("the body of '{}' decides a type its own signature leaves to the caller: a declared type variable is fixed by the body to {desc}. A signature variable is the caller's to choose, so the body must answer every choice; if the body only ever answers {desc}, declare that.", ch.syms.text(d.name)),
+                );
             }
         }
         if let (Some(Ty::ForAll(..) | Ty::ForAllEff(..)), Some(inst)) =
@@ -2624,6 +2658,22 @@ pub fn infer_row(
                 OpEq | OpNotEq | OpLt | OpGt | OpLtEq | OpGtEq | OpDefEq
                 | OpApproxEq | OpApproxEqExact => {
                     if !st.unify(&lt, &rt) { st.unify_gaps += 1; }
+                    // `infer-binary-op`: equality on a real and an ordering
+                    // on text or a character are refused after the meet.
+                    let (rl, rr) = (st.resolve(&lt), st.resolve(&rt));
+                    let real = |t: &Ty| matches!(t, Ty::Real(..));
+                    let text_or_char = |t: &Ty| matches!(t, Ty::Text | Ty::Char);
+                    match op {
+                        OpEq | OpNotEq if real(&rl) || real(&rr) => st.error(
+                            Cdx::REAL_EQUALITY_BANNED,
+                            "Floating-point equality is not safe. Use the ~ operator: x ~ y (approximately equal, 4 ULP tolerance), x ~0 y (bitwise exact, if you are certain)",
+                        ),
+                        OpLt | OpGt | OpLtEq | OpGtEq if text_or_char(&rl) || text_or_char(&rr) => st.error(
+                            Cdx::TEXT_ORDERING_BANNED,
+                            "Ordering on Text or a character has no single meaning. On Text this compared the operands as POINTERS, so the answer followed allocation order and not content. CCE numbers characters by frequency rather than alphabetically, so even a code-point order is not the alphabet. Use text-collate (Foreword chapter Collate) for alphabetical order, or text-compare for code-point order; for a character, compare char-code c as an Integer, which says what it is doing",
+                        ),
+                        _ => {}
+                    }
                     Ty::Boolean
                 }
                 // `infer-logical`: both operands MEET Boolean.
@@ -2908,6 +2958,13 @@ pub fn infer_row(
         // `f (x) = []` is next-id 3 and expr-types 1 where `f (x) = [x]` is 2
         // and 1, on a body with no names in it at all.
         E::List(xs, sp) => {
+            // `max-list-literal-elems`.
+            if xs.len() > 65504 {
+                st.error(
+                    Cdx::LIST_LITERAL_TOO_LARGE,
+                    format!("List literal has {} elements; at most 65504 are accepted. Split it across several definitions and join them.", xs.len()),
+                );
+            }
             // **AN EMPTY LIST IS A BARE VARIABLE, NOT A LIST OF ONE.**
             // `infer-list` (TypeCheckerInference.codex:1249) answers
             // `fr-ty` and records `fr-ty` -- so `[]` is whatever the context
@@ -3003,6 +3060,18 @@ pub fn infer_row(
             let was = st.in_proof;
             let (scrut_ty, srow) = infer_row(scrut, env, st);
             row = srow;
+            // `check-list-arm-guard`: a guard on a `Nil` or `Cons` arm over
+            // the builtin list is not supported.
+            let trivial = |g: &E| matches!(g, E::Lit(t, crate::ast::LiteralKind::BoolLit, _) if t == "True");
+            if let Ty::List(_) = st.deep_resolve(&scrut_ty) {
+                for a in arms {
+                    if let crate::ast::Pat::Ctor(cn, _, _) = &a.pattern {
+                        if matches!(env.syms.text(*cn), "Nil" | "Cons") && !trivial(&a.guard) {
+                            st.error(Cdx::LIST_PATTERN_SHAPE, "List pattern not supported yet: a guard on a Nil or Cons arm; test inside the arm body");
+                        }
+                    }
+                }
+            }
             let result = st.fresh();
             for a in arms {
                 // The SCRUTINEE'S type, not nothing: `infer-plain-arm` passes
@@ -3021,6 +3090,45 @@ pub fn infer_row(
                 }
             }
             st.in_proof = was;
+            // `check-match-exhaustiveness`, after the arms: an unguarded
+            // catch-all that is not last shadows the arm after it
+            // (CDX2096); with no catch-all, every constructor of the
+            // scrutinee's variant needs an arm (CDX2070).
+            let is_catchall = |a: &crate::ast::MatchArm| matches!(a.pattern, crate::ast::Pat::Wild(_) | crate::ast::Pat::Var(..));
+            if let Some(ci) = arms.iter().position(|a| is_catchall(a) && trivial(&a.guard)) {
+                if ci + 1 < arms.len() {
+                    st.error(Cdx::UNREACHABLE_MATCH_ARM, "This arm cannot be reached: an earlier arm matches every remaining value.");
+                }
+            }
+            if !arms.iter().any(is_catchall) {
+                let resolved = st.deep_resolve(&scrut_ty);
+                let (tname, ctors): (Option<String>, Vec<String>) = match &resolved {
+                    Ty::Sum(n, _) => (
+                        Some(env.syms.text(*n).to_string()),
+                        env.type_defs.ctors(*n).map_or(Vec::new(), |cs| cs.iter().map(|c| env.syms.text(*c).to_string()).collect()),
+                    ),
+                    Ty::List(_) => (Some("List".to_string()), vec!["Nil".to_string(), "Cons".to_string()]),
+                    _ => (None, Vec::new()),
+                };
+                if let Some(tname) = tname {
+                    if !ctors.is_empty() {
+                        let covered: Vec<String> = arms
+                            .iter()
+                            .filter_map(|a| match &a.pattern {
+                                crate::ast::Pat::Ctor(cn, _, _) => Some(env.syms.text(*cn).to_string()),
+                                _ => None,
+                            })
+                            .collect();
+                        let missing: Vec<String> = ctors.into_iter().filter(|c| !covered.contains(c)).collect();
+                        if !missing.is_empty() {
+                            st.error(
+                                Cdx::NON_EXHAUSTIVE_MATCH,
+                                format!("Non-exhaustive match on '{tname}': missing {}", missing.join(", ")),
+                            );
+                        }
+                    }
+                }
+            }
             result
         }
         // A record literal is the other site `record-expr-type` is populated
@@ -3165,6 +3273,21 @@ pub fn infer_row(
             if let Some(ft) = field_ty {
                 if !st.unify(&vt, &ft) {
                     st.unify_gaps += 1;
+                }
+            }
+            // `field-assign-observable`: a write through a definition's name
+            // lands on a record nobody else can see.
+            if let E::NameRef(rn, _) = &**r {
+                let resolved = st.deep_resolve(&obj);
+                if !env.is_local(*rn) && !matches!(resolved, Ty::Unit(..)) {
+                    let type_name = match &resolved {
+                        Ty::Record(n, _) | Ty::Constructed(n, _) => env.syms.text(*n).to_string(),
+                        _ => String::new(),
+                    };
+                    st.error(
+                        Cdx::FIELD_ASSIGN_UNOBSERVABLE,
+                        format!("Field assignment to '{}' cannot be observed: it names a definition, not a binding, so each mention builds a new '{type_name}' and this write is discarded. Bind the record with a let and thread it, or make the definition take the record as a parameter", env.syms.text(*rn)),
+                    );
                 }
             }
             obj
@@ -3319,10 +3442,27 @@ fn bind_pattern(
             // matched against the element type directly.
             if let Ty::List(elem) = st.deep_resolve(ty) {
                 let n = env.syms.text(*name);
+                let shape = |st: &mut UnifyState, msg: &str| {
+                    st.error(Cdx::LIST_PATTERN_SHAPE, format!("List pattern not supported yet: {msg}"));
+                };
+                let simple = |p: &P| matches!(p, P::Var(..) | P::Wild(_));
+                // `bind-list-ctor-pattern`: `Nil` takes nothing, `Cons` takes
+                // a name or `_` for the head and for the tail.
                 if n == "Nil" {
+                    if !subs.is_empty() {
+                        shape(st, "Nil takes no fields");
+                    }
                     return 0;
                 }
-                if n == "Cons" && subs.len() == 2 {
+                if n == "Cons" {
+                    if subs.len() != 2 {
+                        shape(st, "Cons over the builtin List takes exactly two fields, the head and the tail");
+                        return 0;
+                    }
+                    if !simple(&subs[0]) || !simple(&subs[1]) {
+                        shape(st, "a Cons field over the builtin List must be a name or _; bind the tail and match it in a nested when");
+                        return 0;
+                    }
                     let tail = Ty::List(elem.clone());
                     return bind_pattern(&subs[0], &elem, env, st)
                         + bind_pattern(&subs[1], &tail, env, st);
