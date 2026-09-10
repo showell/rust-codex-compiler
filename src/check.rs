@@ -206,6 +206,9 @@ pub struct UnifyState {
     /// binds the forall's value binders there and this checker does not, so
     /// a name it cannot find is not CDX3002.
     pub in_proof: bool,
+    /// `effect-exempt`: the definition being checked sits in a chapter with a
+    /// `grounds` declaration, so a `let` may bind an effectful value.
+    pub effect_exempt: bool,
 }
 
 /// `expr-type-key` (Unifier.codex:133): file id in the top 16 bits, start
@@ -247,6 +250,9 @@ pub struct Cdx;
 impl Cdx {
     pub const TYPE_MISMATCH: u16 = 2001;
     pub const UNDEFINED_NAME: u16 = 3002;
+    pub const EFFECT_UNDECLARED: u16 = 2031;
+    pub const LET_BINDS_EFFECTFUL: u16 = 2033;
+    pub const ROW_MISMATCH: u16 = 2090;
     pub const INFINITE_TYPE: u16 = 2010;
     pub const UNKNOWN_RECORD_FIELD: u16 = 2005;
     pub const FIELD_ON_UNIT_TYPE: u16 = 2095;
@@ -275,6 +281,7 @@ impl Default for UnifyState {
             diags: Vec::new(),
             unify_gaps: 0,
             in_proof: false,
+            effect_exempt: false,
         }
     }
 }
@@ -390,6 +397,21 @@ impl UnifyState {
     /// registration and its own instantiation, and it is what an application
     /// costs beyond its call row. Not unifying rows at all left both of those
     /// unaccounted, so every `[e]` in the depot came out one row low per use.
+    /// `row-mismatch-msg`, as `cdx-row-mismatch`.
+    fn row_mismatch(&mut self, a: &EffectRow, b: &EffectRow) {
+        let desc = |r: &EffectRow| {
+            let mut parts: Vec<String> = r.labels.iter().map(|(n, _)| n.clone()).collect();
+            if r.id >= 0 {
+                parts.push(if r.tail.is_empty() { format!("e{}", r.id) } else { r.tail.clone() });
+            }
+            format!("[{}]", parts.join(", "))
+        };
+        self.error(
+            Cdx::ROW_MISMATCH,
+            format!("cannot reconcile effect rows {} and {}: an effect on one side is not allowed by the other", desc(a), desc(b)),
+        );
+    }
+
     pub fn unify_row(&mut self, r1: &EffectRow, r2: &EffectRow) -> bool {
         let a = self.resolve_row(r1);
         let b = self.resolve_row(r2);
@@ -399,10 +421,20 @@ impl UnifyState {
         let only1: Vec<_> = a.labels.iter().filter(|l| !b.labels.contains(l)).cloned().collect();
         let only2: Vec<_> = b.labels.iter().filter(|l| !a.labels.contains(l)).cloned().collect();
         match (a.id >= 0, b.id >= 0) {
-            // Both closed: they agree or they do not, and neither mints.
-            (false, false) => only1.is_empty() && only2.is_empty(),
+            // Both closed: they agree or they do not, and neither mints. A
+            // disagreement is `unify-row-both-closed`'s CDX2090.
+            (false, false) => {
+                if only1.is_empty() && only2.is_empty() {
+                    return true;
+                }
+                self.row_mismatch(&a, &b);
+                false
+            }
+            // Open against closed: the open side may carry no label the
+            // closed side lacks (`unify-row-open-closed`).
             (true, false) => {
                 if !only1.is_empty() {
+                    self.row_mismatch(&a, &b);
                     return false;
                 }
                 self.add_row_subst(a.id, EffectRow { labels: only2, ..Default::default() });
@@ -410,6 +442,7 @@ impl UnifyState {
             }
             (false, true) => {
                 if !only2.is_empty() {
+                    self.row_mismatch(&b, &a);
                     return false;
                 }
                 self.add_row_subst(b.id, EffectRow { labels: only1, ..Default::default() });
@@ -1183,6 +1216,44 @@ fn flatten_app(t: &crate::ast::TypeExpr) -> (&crate::ast::TypeExpr, Vec<&crate::
 /// `last-arrow-row`: the row on the arrow that RETURNS THE BODY, which for an
 /// undeclared definition is the only arrow carrying an open row -- the ones
 /// wrapped around it carry `empty-row`.
+/// `check-let-bind-row`: a `let` may not bind an effectful value unless the
+/// chapter grounds its effects; the effectful form is `<-` in an act.
+fn check_let_bind_row(st: &mut UnifyState, row: &EffectRow, name: &str) {
+    if st.effect_exempt {
+        return;
+    }
+    if !st.resolve_row(row).labels.is_empty() {
+        st.error(
+            Cdx::LET_BINDS_EFFECTFUL,
+            format!("let-binding '{name}' to an effectful value is not allowed outside an act-bind. Use '{name} <- ...' inside an act block."),
+        );
+    }
+}
+
+/// `declared-performing-row`: the row the signature grants the body -- the
+/// `pcount`-th arrow's, or an effectful nullary's effects as labels.
+fn declared_performing_row(t: &Ty, pcount: usize, syms: &SymTab) -> EffectRow {
+    match t {
+        Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => declared_performing_row(b, pcount, syms),
+        Ty::Fun(_, row, r) => {
+            if pcount <= 1 {
+                row.clone()
+            } else {
+                declared_performing_row(r, pcount - 1, syms)
+            }
+        }
+        Ty::Effectful(effs, scopes, _) => EffectRow {
+            labels: effs
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (syms.text(*e).to_string(), scopes.get(i).cloned().unwrap_or_default()))
+                .collect(),
+            ..Default::default()
+        },
+        _ => EffectRow::default(),
+    }
+}
+
 fn last_arrow_row(t: &Ty) -> EffectRow {
     match t {
         Ty::Fun(_, row, r) => match r.as_ref() {
@@ -1774,10 +1845,21 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
             // is why stripping here costs that pass nothing.
             env.bind(p.name, strip_linear(arg));
         }
+        // `def-grounded-names`: the `grounds` of this definition's chapter,
+        // which cover its body's effects and exempt its lets (`effect-exempt`).
+        let grounded: Vec<String> = ch
+            .ground_effects
+            .iter()
+            .filter_map(|e| e.split_once('\n'))
+            .filter(|(slug, _)| *slug == d.chapter_slug)
+            .map(|(_, n)| n.to_string())
+            .collect();
+        st.effect_exempt = !grounded.is_empty();
         // A `claim`'s body is a proof: Stage 5 binds its `for all` names.
         st.in_proof = d.is_claim;
         let (body_ty, body_row) = infer_row(&d.body, &mut env, &mut st);
         st.in_proof = false;
+        st.effect_exempt = false;
         // **THE BODY MEETS THE DECLARED RESULT.** Without this a definition's
         // own signature decides nothing about what it computes, and an
         // inferred variable never learns what it is: `f : Integer -> List
@@ -1805,6 +1887,23 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
         // row are two OPEN rows with different tails, and equating them is the
         // third row such a signature costs. Its position matters: it lands
         // after everything the body minted, not before.
+        // `check-effect-row-subset`: every effect the body performs is named
+        // by the signature's performing row, or grounded by the chapter, or
+        // it is CDX2031. A dotted effect `Console.Write` is covered by
+        // `Console`. An undeclared definition's row is open and names nothing,
+        // so it may perform nothing, as upstream rules.
+        if let Some(t) = &instantiated {
+            let declared = st.resolve_row(&declared_performing_row(t, d.params.len(), &ch.syms));
+            let body = st.resolve_row(&body_row);
+            let mut allowed: Vec<String> = declared.labels.iter().map(|(n, _)| n.clone()).collect();
+            allowed.extend(grounded.iter().cloned());
+            for (name, _) in &body.labels {
+                let head = name.split('.').next().unwrap_or(name);
+                if !allowed.iter().any(|a| a == name || a == head) {
+                    st.error(Cdx::EFFECT_UNDECLARED, format!("Effect '{name}' not declared in function signature"));
+                }
+            }
+        }
         if let (Some(Ty::ForAll(..) | Ty::ForAllEff(..)), Some(inst)) =
             (own.clone(), instantiated.clone())
         {
@@ -2211,6 +2310,7 @@ pub fn infer_row(
                         while let E::Let(binds, body, _) = stmt {
                             for b in binds {
                                 let (t, brow) = infer_row(&b.value, env, st);
+                                check_let_bind_row(st, &brow, env.syms.text(b.name));
                                 row = st.row_union(&row, &brow);
                                 let resolved = st.deep_resolve(&t);
                                 env.bind(b.name, resolved);
@@ -2250,6 +2350,7 @@ pub fn infer_row(
             let mark = env.scope.len();
             for b in binds {
                 let (t, brow) = infer_row(&b.value, env, st);
+                check_let_bind_row(st, &brow, env.syms.text(b.name));
                 // **A LET BINDS THE DEEP-RESOLVED TYPE, NOT THE INFERRED ONE.**
                 // `infer-let-bindings` (TypeCheckerInference.codex:504) resolves
                 // before it binds, and the difference is not cosmetic: binding
@@ -2280,10 +2381,18 @@ pub fn infer_row(
         // application rule was; until then they recurse and mint nothing of
         // their own, which is a number that can be checked rather than a
         // subtree that cannot.
-        E::Unary(x, _) | E::Lazy(x, _) => {
+        E::Unary(x, _) => {
             let (t, xrow) = infer_row(x, env, st);
             row = xrow;
             t
+        }
+        // `infer-expr`'s `ALazyExpr` arm: a lazy value is a thunk from
+        // Integer whose arrow carries the body's row, opened; the lazy
+        // expression itself performs nothing until forced.
+        E::Lazy(x, _) => {
+            let (t, xrow) = infer_row(x, env, st);
+            let thunk_row = st.open_row_if_closed(&xrow);
+            Ty::Fun(Box::new(Ty::Integer(i64::MIN, i64::MAX, Overflow::Error)), thunk_row, Box::new(t))
         }
         // **AN EMPTY LIST MINTS ONE VARIABLE AND RECORDS IT; A NON-EMPTY ONE
         // MINTS NOTHING.** `[]` has no element to read a type from, so the
@@ -2599,7 +2708,8 @@ pub fn infer_row(
                             let mut inner: &crate::ast::Expr = x;
                             while let E::Let(binds, body, _) = inner {
                                 for b in binds {
-                                    let t = infer(&b.value, env, st);
+                                    let (t, brow) = infer_row(&b.value, env, st);
+                                    check_let_bind_row(st, &brow, env.syms.text(b.name));
                                     let resolved = st.deep_resolve(&t);
                                     env.bind(b.name, resolved);
                                 }
@@ -2930,7 +3040,13 @@ fn build(syms: &SymTab, head: &str, args: &[Ty], words: &[String], rows: &[Effec
         // The effect NAMES a builtin declares are not carried: `infer-name`
         // answers the inner type and hands the row to its caller, so they
         // never reach this wire through a reference. See the probe.
-        "eff" => Ty::Effectful(Vec::new(), Vec::new(), Box::new(args.first()?.clone())),
+        // `(eff Console.Read int)`: the words are the effect names, interned
+        // by the desugarer so a program that never spells them can carry them.
+        "eff" => Ty::Effectful(
+            words.iter().filter_map(|w| syms.find(w)).collect(),
+            words.iter().map(|_| String::new()).collect(),
+            Box::new(args.first()?.clone()),
+        ),
         _ => return None,
     })
 }

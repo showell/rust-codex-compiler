@@ -289,6 +289,14 @@ pub const BUILTINS: [(&str, Option<usize>); 266] = [
 // it -- and instantiating a forall mints, which next-id grades.
 //
 // Re-run the probe after a pin change; do not edit by hand.
+/// The effect names the effectful nullary builtins above carry, interned by
+/// the desugarer so `(eff Name inner)` can resolve them in any program.
+pub const BUILTIN_EFFECT_NAMES: [&str; 5] = ["Console.Read", "Process", "Device.Block", "Identity", "Network.Read"];
+
+/// The type names the table above refers to, interned the same way: a builtin
+/// whose type names `Task` is otherwise untyped in a program that never does.
+pub const BUILTIN_TYPE_NAMES: [&str; 4] = ["Maybe", "Task", "TypeBinding", "schan-name"];
+
 pub const BUILTIN_TYPES: [(&str, &str); 252] = [
     ("negate", "(forall 0 (fn (tvar 0) empty (tvar 0)))"),
     ("text-length", "(fn text empty int)"),
@@ -328,8 +336,8 @@ pub const BUILTIN_TYPES: [(&str, &str); 252] = [
     ("__list-tail", "(forall 0 (fn (list (tvar 0)) empty (list (tvar 0))))"),
     ("__list-head", "(forall 0 (fn (list (tvar 0)) empty (tvar 0)))"),
     ("__list-len", "(forall 0 (fn (list (tvar 0)) empty int))"),
-    ("read-line", "(eff (ctd Maybe text))"),
-    ("read-line-cce", "(eff (ctd Maybe text))"),
+    ("read-line", "(eff Console.Read (ctd Maybe text))"),
+    ("read-line-cce", "(eff Console.Read (ctd Maybe text))"),
     ("read-file-raw", "(fn text (row FileSystem.Read) text)"),
     ("read-serial-cce", "(fn text empty text)"),
     ("read-file-uni", "(fn text (row FileSystem.Read) text)"),
@@ -339,9 +347,9 @@ pub const BUILTIN_TYPES: [(&str, &str); 252] = [
     ("text-split", "(fn text empty (fn text empty (list text)))"),
     ("text-contains", "(fn text empty (fn text empty bool))"),
     ("text-starts-with", "(fn text empty (fn text empty bool))"),
-    ("get-args", "(eff (list text))"),
+    ("get-args", "(eff Process (list text))"),
     ("get-env", "(fn text (row Process) text)"),
-    ("current-dir", "(eff text)"),
+    ("current-dir", "(eff Process text)"),
     ("run-process", "(fn text empty (fn text (row Process) text))"),
     ("process-exit", "(fn int (row Process) nothing)"),
     ("fork", "(forall 0 (fn (fn nothing empty (tvar 0)) empty (ctd Task (tvar 0))))"),
@@ -391,10 +399,10 @@ pub const BUILTIN_TYPES: [(&str, &str); 252] = [
     ("poke-mmio-32", "(fn int empty (fn int empty (fn int (row Device.Mmio) int)))"),
     ("alloc-bytes", "(fn int empty int)"),
     ("block-select", "(fn int (row Device.Block) int)"),
-    ("block-sector-count", "(eff int)"),
+    ("block-sector-count", "(eff Device.Block int)"),
     ("key-load", "(fn int (row Identity) int)"),
-    ("key-zero", "(eff int)"),
-    ("key-status", "(eff int)"),
+    ("key-zero", "(eff Identity int)"),
+    ("key-status", "(eff Identity int)"),
     ("process-yield", "int"),
     ("process-spawn", "(foralleff 0 (fn (fn int (rowvar 0) int) (row Concurrent) int))"),
     ("process-exit-self", "int"),
@@ -427,7 +435,7 @@ pub const BUILTIN_TYPES: [(&str, &str); 252] = [
     ("identity-get-proc", "(fn int empty (fn int (row Identity) int))"),
     ("process-spawn-with-heap", "(foralleff 0 (fn (fn int (rowvar 0) int) empty (fn int (row Concurrent) int)))"),
     ("process-spawn-on-core", "(foralleff 0 (fn (fn int (rowvar 0) int) empty (fn int (row Concurrent) int)))"),
-    ("net-status", "(eff int)"),
+    ("net-status", "(eff Network.Read int)"),
     ("net-get-hwaddr", "(fn int (row Network.Read) int)"),
     ("net-send-raw", "(fn int empty (fn int (row Network.Write) int))"),
     ("net-recv-raw", "(fn int (row Network.Read) int)"),

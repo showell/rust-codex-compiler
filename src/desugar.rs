@@ -723,6 +723,9 @@ impl<'a> Desugar<'a> {
         // after the derived defs -- `desugar-document`'s order (subject 43290).
         self.synth_class_type_defs(&mut ch);
         self.synth_instance_defs(&mut ch);
+        for e in crate::builtins::BUILTIN_EFFECT_NAMES.iter().chain(crate::builtins::BUILTIN_TYPE_NAMES.iter()) {
+            self.sym_str(e);
+        }
         ch.syms = std::mem::take(&mut *self.syms.borrow_mut());
         ch
     }
