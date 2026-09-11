@@ -98,6 +98,19 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Narrow `base` to the builtins and `keep`. The driver's base is every
+    /// name in the UNIT, so a `let pose` is spelled `pose_1` whenever any
+    /// chapter or spec in the unit defines a `pose`; an emitter writing one
+    /// module per chapter, where another chapter's name is reached qualified,
+    /// keeps only the chapter's own names, so the module's text does not
+    /// depend on which spec is attached.
+    pub fn restrict_base(&mut self, keep: &std::collections::BTreeSet<Sym>) {
+        let mut base: std::collections::BTreeSet<Sym> =
+            crate::check::builtin_names(&self.syms.borrow()).into_iter().collect();
+        base.extend(keep.iter().copied());
+        self.base = base;
+    }
+
     /// The text of a name. One borrow, one line.
     fn text(&self, n: Sym) -> String {
         self.syms.borrow().text(n).to_string()
