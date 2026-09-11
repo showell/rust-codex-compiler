@@ -1,5 +1,5 @@
-//! Roc from the IR: the definitions the driver would emit for a unit, spelled
-//! as one Roc program for Roc's default Echo platform.
+//! Roc from the IR: a unit's chapters as Roc type modules, whole, and the
+//! chapter holding `opening` as an app for Roc's default Echo platform.
 //!
 //! The IR carries a type on every node, so this READS types rather than
 //! inferring them: `int-default` is `I64`, `real` is `F64`, and every
@@ -39,53 +39,6 @@ fn leaf_literals(e: &IrExpr) -> usize {
     n
 }
 
-/// The whole unit as ONE Roc program, for the default Echo platform.
-pub fn emit_program(
-    ch: &Chapter,
-    tds: &TypeDefs,
-    syms: &SymTab,
-    defs: &[IrDef],
-) -> Result<String, String> {
-    let mut cx = Cx::new(ch, tds, syms, defs, false);
-    let mut body = String::new();
-    let mut slug = String::new();
-    let mut main = None;
-    for d in defs {
-        if syms.text(d.name) == "opening" {
-            main = Some(cx.opening(d)?);
-            continue;
-        }
-        if d.origin != slug {
-            slug = d.origin.clone();
-            body.push_str(&format!("\n# --- {slug} ---\n"));
-        }
-        body.push('\n');
-        body.push_str(&cx.def_or_baked(d, 0)?);
-    }
-    let Some(main) = main else {
-        return Err("no opening: nothing to run".into());
-    };
-    let mut out = format!(
-        "# {} -- emitted from Codex by rocemit (rust-codex-compiler). Do not edit.\n\n",
-        ch.chapter_title
-    );
-    // `Maybe` is a language type the checker knows without a declaration
-    // (`ctd`); a unit that cites the chapter declaring it carries its own.
-    if !cx.type_module.contains_key(&cx.maybe) {
-        out.push_str("Maybe(a) : [None, Just(a)]\n");
-    }
-    for td in &ch.type_defs {
-        out.push_str(&cx.type_def(td, 0)?);
-    }
-    if cx.uses_line {
-        out.push_str(LINE_HELPER);
-    }
-    out.push_str(&body);
-    out.push_str("\n# --- Entry ---\n\n");
-    out.push_str(&main);
-    Ok(out)
-}
-
 const LINE_HELPER: &str =
     "\n# The Echo platform's echo! writes no newline; a Codex line is one.\nline! = |s| echo!(Str.concat(s, \"\\n\"))\n";
 
@@ -106,7 +59,7 @@ pub fn emit_modules(
     syms: &SymTab,
     defs: &[IrDef],
 ) -> Result<Vec<(String, String)>, String> {
-    let mut cx = Cx::new(ch, tds, syms, defs, true);
+    let mut cx = Cx::new(ch, tds, syms, defs);
     let Some(app) = defs.iter().find(|d| syms.text(d.name) == "opening") else {
         return Err("no opening: nothing to run".into());
     };
@@ -191,11 +144,9 @@ struct Cx<'a> {
     /// Every emitted definition and its parameter count: a call must be
     /// saturated, because Roc calls are.
     arity: BTreeMap<Sym, usize>,
-    /// Which chapter each definition and each declared type lives in. Empty
-    /// in the single-file layout, where nothing is qualified.
+    /// Which chapter each definition and each declared type lives in.
     def_module: BTreeMap<Sym, String>,
     type_module: BTreeMap<Sym, String>,
-    modules: bool,
     maybe: Sym,
     /// The chapter being emitted, and the modules its text has reached for.
     current: String,
@@ -217,14 +168,13 @@ struct Fold {
 }
 
 impl<'a> Cx<'a> {
-    fn new(ch: &Chapter, tds: &'a TypeDefs, syms: &'a SymTab, defs: &[IrDef], modules: bool) -> Cx<'a> {
+    fn new(ch: &Chapter, tds: &'a TypeDefs, syms: &'a SymTab, defs: &[IrDef]) -> Cx<'a> {
         let mut cx = Cx {
             syms,
             tds,
             arity: defs.iter().map(|d| (d.name, d.params.len())).collect(),
             def_module: BTreeMap::new(),
             type_module: BTreeMap::new(),
-            modules,
             maybe: syms.find("Maybe").unwrap_or_default(),
             current: String::new(),
             imports: Default::default(),
@@ -239,10 +189,8 @@ impl<'a> Cx<'a> {
             };
             cx.type_module.insert(n, c.clone());
         }
-        if modules {
-            for d in defs {
-                cx.def_module.insert(d.name, d.origin.clone());
-            }
+        for d in defs {
+            cx.def_module.insert(d.name, d.origin.clone());
         }
         cx
     }
@@ -250,7 +198,7 @@ impl<'a> Cx<'a> {
     /// A name from module `module`, as seen from the module being emitted:
     /// bare at home, `Module.name` elsewhere, and the import is remembered.
     fn qualified(&mut self, module: &str, name: String) -> String {
-        if !self.modules || module.is_empty() || module == self.current {
+        if module.is_empty() || module == self.current {
             return name;
         }
         self.imports.insert(module.to_string());
@@ -277,10 +225,10 @@ impl<'a> Cx<'a> {
         let name = self.syms.text(n).to_string();
         let m = match self.type_module.get(&n) {
             Some(m) => m.clone(),
-            None if self.modules && n == self.maybe => "Prelude".to_string(),
+            None if n == self.maybe => "Prelude".to_string(),
             None => String::new(),
         };
-        if !self.modules || m.is_empty() {
+        if m.is_empty() {
             return name;
         }
         if m != self.current {
@@ -304,8 +252,7 @@ impl<'a> Cx<'a> {
         // In the module layout another chapter's definition is reached as
         // `Module.name`, so only a definition of THIS module can collide --
         // and a module's text must not depend on which spec is attached.
-        let collides = self.arity.contains_key(&n)
-            && (!self.modules || self.def_module.get(&n).is_some_and(|m| *m == self.current));
+        let collides = self.arity.contains_key(&n) && self.def_module.get(&n).is_some_and(|m| *m == self.current);
         Ok(if collides { format!("{id}_") } else { id })
     }
 
@@ -521,10 +468,9 @@ impl<'a> Cx<'a> {
     /// records or as floats, in one list or many) and the same data as a
     /// string checks in half a second. So a constant that is a literal of
     /// BAKED_AT or more leaves is left to a baker that spells it as a
-    /// string. In the single-file layout the line names it and the driver
-    /// appends the baked text; in the module layout it forwards to
-    /// `<Slug>Data.name`, the module the baker writes. Either way a missing
-    /// baked name is Roc's undefined-name error, never a silent hole.
+    /// string: the definition forwards to `<Slug>Data.name`, the module the
+    /// baker writes, under a line that says so. A missing baked name is
+    /// Roc's undefined-name error, never a silent hole.
     fn def_or_baked(&mut self, d: &IrDef, base: usize) -> Result<String, String> {
         let leaves = leaf_literals(&d.body);
         if !d.params.is_empty() || leaves < BAKED_AT {
@@ -533,13 +479,12 @@ impl<'a> Cx<'a> {
         let sig = self.signature(d)?;
         let name = self.ident(d.name)?;
         let tabs = "\t".repeat(base);
-        let mut out = format!("{tabs}# baked: {name} : {sig} -- {} {leaves} literals\n", d.origin);
-        if self.modules {
-            let data = format!("{}Data", d.origin);
-            let from = self.qualified(&data, name.clone());
-            out.push_str(&format!("{tabs}{name} : {sig}\n{tabs}{name} = {from}\n"));
-        }
-        Ok(out)
+        let data = format!("{}Data", d.origin);
+        let from = self.qualified(&data, name.clone());
+        Ok(format!(
+            "{tabs}# baked: {name} : {sig} -- {} {leaves} literals\n{tabs}{name} : {sig}\n{tabs}{name} = {from}\n",
+            d.origin
+        ))
     }
 
     fn def(&mut self, d: &IrDef, base: usize) -> Result<String, String> {

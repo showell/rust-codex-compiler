@@ -1,8 +1,7 @@
 //! Roc from a Codex unit.
 //!
-//!     rocemit <unit.codex>            one Roc program on stdout
-//!     rocemit <unit.codex> <dir>      one type module per chapter and the
-//!                                     spec's app, written into <dir>; the
+//!     rocemit <unit.codex> <dir>      one type module per chapter, whole, and
+//!                                     the spec's app, written into <dir>; the
 //!                                     app's file name on stdout
 //!
 //! The same road as `irdump whole` -- resolve, parse, desugar, check, lower --
@@ -16,10 +15,9 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.as_slice() {
-        [path] => emit(Path::new(path), None),
-        [path, dir] => emit(Path::new(path), Some(Path::new(dir))),
+        [path, dir] => emit(Path::new(path), Path::new(dir)),
         _ => {
-            eprintln!("usage: rocemit <unit.codex> [<dir>]");
+            eprintln!("usage: rocemit <unit.codex> <dir>");
             return ExitCode::from(2);
         }
     };
@@ -36,7 +34,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn emit(path: &Path, dir: Option<&Path>) -> Result<String, String> {
+fn emit(path: &Path, dir: &Path) -> Result<String, String> {
     let src = codexc::bundle::load(path)?;
     let parsed = parser::parse(&src);
     if !parsed.lex_errors.is_empty() || !parsed.diagnostics.is_empty() {
@@ -57,10 +55,6 @@ fn emit(path: &Path, dir: Option<&Path>) -> Result<String, String> {
     if let Some(halt) = codexc::ir::codegen_halted(&st) {
         return Err(halt);
     }
-    let Some(dir) = dir else {
-        let low = codexc::ir::lower_chapter(&ch, &bindings, &st, &tds, &codexc::ir::IR_EMIT_ROOTS)?;
-        return codexc::roc_emit::emit_program(&ch, &tds, &low.syms, &low.defs);
-    };
     // **A MODULE IS THE WHOLE CHAPTER, AS WRITTEN.** The driver's prune and
     // its inlining pipeline are the IR wire's rules; a chapter module that
     // fifty apps import wants every definition and one text.
