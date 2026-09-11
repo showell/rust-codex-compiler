@@ -924,7 +924,9 @@ fn lower_unit_ctor_value(arg: IrExpr, unit_ty: &Ty, sp: crate::ast::Span, cx: &L
         | IrExpr::Record(..)
         | IrExpr::FieldAccess(..) => arg.with_ty(unit_ty.clone()),
         other => {
-            let nm = cx.syms.borrow_mut().intern(&format!("__unit-{}", sp.offset));
+            // A synthetic span is offset 0 upstream; ours number them.
+            let offset = if sp.line == 0 { 0 } else { sp.offset };
+            let nm = cx.syms.borrow_mut().intern(&format!("__unit-{offset}"));
             IrExpr::Let(nm, unit_ty.clone(), Box::new(other), Box::new(IrExpr::Name(nm, unit_ty.clone(), sp)), sp)
         }
     }
