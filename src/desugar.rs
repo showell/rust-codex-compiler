@@ -737,6 +737,7 @@ impl<'a> Desugar<'a> {
             self.sym_str(e);
         }
         ch.syms = std::mem::take(&mut *self.syms.borrow_mut());
+        crate::classes::apply(&mut ch);
         // The chapter scoper runs on the whole unit, before the proof plan
         // reads definitions by name.
         crate::scoper::apply(&mut ch);
@@ -1026,6 +1027,9 @@ impl<'a> Desugar<'a> {
         ch.defs.extend(out);
     }
 
+    /// `push-derived-for-type`: for each type definition, `__show_T` when it
+    /// derives Show, `__eq_T` when it derives Eq or is a variant whose
+    /// fields the language will compare, `__compare_T` when it derives Ord.
     fn synth_derived_defs(&self, ch: &mut Chapter) {
         let mut out = Vec::new();
         // `find`, not `intern`: upstream compares the field type's TEXT to
@@ -1034,18 +1038,215 @@ impl<'a> Desugar<'a> {
         // have a field naming one, so the absent symbol answers eq-safe.
         let real = self.syms.borrow().find("Real");
         for td in &ch.type_defs {
-            let TypeDef::Variant(name, _, ctors, _) = td else { continue };
-            let eq_safe = match real {
-                None => true,
-                Some(r) => !ctors
-                    .iter()
-                    .any(|c| c.fields.iter().any(|f| type_names(f, r))),
+            let name = match td {
+                TypeDef::Record(n, ..) | TypeDef::Variant(n, ..) | TypeDef::Unit(n, ..) => *n,
             };
-            if eq_safe {
-                out.push(self.eq_def(*name, ctors));
+            let derives = |cls: &str| {
+                ch.derivings.iter().any(|(n, ds)| *n == name && ds.iter().any(|d| d == cls))
+            };
+            if derives("Show") {
+                out.push(self.show_def(name, td));
+            }
+            let eq_safe = match td {
+                TypeDef::Variant(_, _, ctors, _) => match real {
+                    None => true,
+                    Some(r) => !ctors.iter().any(|c| c.fields.iter().any(|f| type_names(f, r))),
+                },
+                _ => false,
+            };
+            if derives("Eq") || eq_safe {
+                out.push(self.eq_def(name, td));
+            }
+            if derives("Ord") {
+                out.push(self.compare_def(name, td));
             }
         }
         ch.defs.extend(out);
+    }
+
+    fn lit_text(&self, t: &str) -> Expr {
+        Expr::Lit(t.to_string(), LiteralKind::TextLit, self.synth())
+    }
+
+    fn name_expr(&self, n: Name) -> Expr {
+        Expr::NameRef(n, self.synth())
+    }
+
+    fn append(&self, a: Expr, b: Expr) -> Expr {
+        Expr::Binary(Rc::new(a), BinaryOp::OpAppend, Rc::new(b), self.synth())
+    }
+
+    fn call1(&self, f: &str, a: Expr) -> Expr {
+        Expr::Apply(Rc::new(self.name_expr(self.sym_str(f))), Rc::new(a), self.synth())
+    }
+
+    fn true_guard(&self) -> Expr {
+        Expr::Lit("True".into(), LiteralKind::BoolLit, self.synth())
+    }
+
+    fn field_vars(&self, pre: &str, n: usize) -> Vec<Name> {
+        (0..n).map(|i| self.sym_str(&format!("{pre}{i}"))).collect()
+    }
+
+    fn var_pats(&self, vs: &[Name]) -> Vec<Pat> {
+        vs.iter().map(|v| Pat::Var(*v, self.synth())).collect()
+    }
+
+    fn synth_def(&self, name: &str, params: Vec<Name>, declared: TypeExpr, body: Expr) -> Def {
+        Def {
+            name: self.sym_str(name),
+            params: params.into_iter().map(|n| Param { name: n, span: self.synth() }).collect(),
+            declared_type: vec![declared],
+            body,
+            chapter_slug: String::new(),
+            span: self.synth(),
+            is_claim: false,
+            is_punctual: false,
+            wcet_budget: 0,
+            bounded_class: None,
+        }
+    }
+
+    /// `gen-show-def`: `__show_T : T -> Text` over one parameter `__sv`.
+    fn show_def(&self, tname: Name, td: &TypeDef) -> Def {
+        let show_name = format!("__show_{}", self.syms.borrow().text(tname));
+        let pname = self.sym_str("__sv");
+        let tref = TypeExpr::Named(tname, self.synth());
+        let text = TypeExpr::Named(self.sym_str("Text"), self.synth());
+        let body = match td {
+            TypeDef::Variant(_, _, ctors, _) => {
+                let arms = ctors
+                    .iter()
+                    .map(|c| {
+                        let cname = self.syms.borrow().text(c.name).to_string();
+                        let vars = self.field_vars("__f", c.fields.len());
+                        // `gen-show-arm-body`: the constructor's name, then
+                        // each field shown after a space.
+                        let body = vars.iter().fold(self.lit_text(&cname), |acc, v| {
+                            let spaced = self.append(acc, self.lit_text(" "));
+                            self.append(spaced, self.call1("show", self.name_expr(*v)))
+                        });
+                        MatchArm {
+                            pattern: Pat::Ctor(c.name, self.var_pats(&vars), self.synth()),
+                            body,
+                            guard: self.true_guard(),
+                            span: self.synth(),
+                            alt_group: NO_ALT_GROUP,
+                        }
+                    })
+                    .collect();
+                Expr::Match(Rc::new(self.name_expr(pname)), arms, self.synth())
+            }
+            TypeDef::Record(_, _, fields, _, _) => {
+                // `gen-show-record`: `{ f = show p.f, g = show p.g }`.
+                let mut acc = self.lit_text("{");
+                for (i, f) in fields.iter().enumerate() {
+                    let fname = self.syms.borrow().text(f.name).to_string();
+                    let sep = if i == 0 { " " } else { ", " };
+                    let label = self.append(acc, self.lit_text(&format!("{sep}{fname} = ")));
+                    let access = Expr::FieldAccess(Rc::new(self.name_expr(pname)), f.name, self.synth());
+                    acc = self.append(label, self.call1("show", access));
+                }
+                self.append(acc, self.lit_text(" }"))
+            }
+            TypeDef::Unit(..) => self.call1("show", self.name_expr(pname)),
+        };
+        // `gen-show-def` declares NO type: the definition is undeclared
+        // upstream, and an undeclared definition is built its own shape and
+        // minted for it.
+        let _ = (tref, text);
+        let mut d = self.synth_def(&show_name, vec![pname], TypeExpr::Named(Name::default(), self.synth()), body);
+        d.declared_type.clear();
+        d
+    }
+
+    /// `gen-compare-def`: `__compare_T : T, T -> Integer`, lexicographic
+    /// over fields, constructors ordered by declaration.
+    fn compare_def(&self, tname: Name, td: &TypeDef) -> Def {
+        let cmp_name = format!("__compare_{}", self.syms.borrow().text(tname));
+        let (xn, yn) = (self.sym_str("__cx"), self.sym_str("__cy"));
+        let tref = TypeExpr::Named(tname, self.synth());
+        let integer = TypeExpr::Named(self.sym_str("Integer"), self.synth());
+        let body = match td {
+            TypeDef::Variant(_, _, ctors, _) => {
+                let arms = ctors
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let xvars = self.field_vars("__cxf", c.fields.len());
+                        let yarms = ctors
+                            .iter()
+                            .enumerate()
+                            .map(|(j, d)| {
+                                let nf = d.fields.len();
+                                if i == j {
+                                    let yvars = self.field_vars("__cyf", nf);
+                                    let lhss: Vec<Expr> = xvars.iter().map(|v| self.name_expr(*v)).collect();
+                                    let rhss: Vec<Expr> = yvars.iter().map(|v| self.name_expr(*v)).collect();
+                                    MatchArm {
+                                        pattern: Pat::Ctor(d.name, self.var_pats(&yvars), self.synth()),
+                                        body: self.cmp_lex(&lhss, &rhss),
+                                        guard: self.true_guard(),
+                                        span: self.synth(),
+                                        alt_group: NO_ALT_GROUP,
+                                    }
+                                } else {
+                                    let one = Expr::Lit("1".into(), LiteralKind::IntLit, self.synth());
+                                    let body = if i < j { Expr::Unary(Rc::new(one), self.synth()) } else { one };
+                                    MatchArm {
+                                        pattern: Pat::Ctor(d.name, (0..nf).map(|_| Pat::Wild(self.synth())).collect(), self.synth()),
+                                        body,
+                                        guard: self.true_guard(),
+                                        span: self.synth(),
+                                        alt_group: NO_ALT_GROUP,
+                                    }
+                                }
+                            })
+                            .collect();
+                        MatchArm {
+                            pattern: Pat::Ctor(c.name, self.var_pats(&xvars), self.synth()),
+                            body: Expr::Match(Rc::new(self.name_expr(yn)), yarms, self.synth()),
+                            guard: self.true_guard(),
+                            span: self.synth(),
+                            alt_group: NO_ALT_GROUP,
+                        }
+                    })
+                    .collect();
+                Expr::Match(Rc::new(self.name_expr(xn)), arms, self.synth())
+            }
+            TypeDef::Record(_, _, fields, _, _) => {
+                let lhss: Vec<Expr> =
+                    fields.iter().map(|f| Expr::FieldAccess(Rc::new(self.name_expr(xn)), f.name, self.synth())).collect();
+                let rhss: Vec<Expr> =
+                    fields.iter().map(|f| Expr::FieldAccess(Rc::new(self.name_expr(yn)), f.name, self.synth())).collect();
+                self.cmp_lex(&lhss, &rhss)
+            }
+            TypeDef::Unit(..) => self.call1("compare", self.name_expr(xn)),
+        };
+        let ty = TypeExpr::Fun(
+            Rc::new(tref.clone()),
+            Rc::new(TypeExpr::Fun(Rc::new(tref), Rc::new(integer), self.synth())),
+            self.synth(),
+        );
+        self.synth_def(&cmp_name, vec![xn, yn], ty, body)
+    }
+
+    /// `gen-cmp-lex`: `let __cc0 = compare l0 r0 in if __cc0 == 0 then ... else __cc0`.
+    fn cmp_lex(&self, lhss: &[Expr], rhss: &[Expr]) -> Expr {
+        let zero = || Expr::Lit("0".into(), LiteralKind::IntLit, self.synth());
+        let mut rest = zero();
+        for i in (0..lhss.len()).rev() {
+            let ci = self.sym_str(&format!("__cc{i}"));
+            let cmp = Expr::Apply(
+                Rc::new(Expr::Apply(Rc::new(self.name_expr(self.sym_str("compare"))), Rc::new(lhss[i].clone()), self.synth())),
+                Rc::new(rhss[i].clone()),
+                self.synth(),
+            );
+            let cond = Expr::Binary(Rc::new(self.name_expr(ci)), BinaryOp::OpEq, Rc::new(zero()), self.synth());
+            let body = Expr::If(Rc::new(cond), Rc::new(rest), Rc::new(self.name_expr(ci)), self.synth());
+            rest = Expr::Let(vec![LetBind { name: ci, value: cmp, span: self.synth() }], Rc::new(body), self.synth());
+        }
+        rest
     }
 
     /// `gen-eq-def`: `__eq_T (__ex) (__ey)` is a `when` over `__ex` whose every
@@ -1056,7 +1257,49 @@ impl<'a> Desugar<'a> {
     /// skips a synthetic span, so none of these names reaches `expr-types`.
     /// That is why `expr-types` already matched on units whose `next-id` did
     /// not -- the missing definitions mint variables and record nothing.
-    fn eq_def(&self, tname: Name, ctors: &[VariantCtorDef]) -> Def {
+    fn eq_def(&self, tname: Name, td: &TypeDef) -> Def {
+        let (xn, yn) = (self.sym_str("__ex"), self.sym_str("__ey"));
+        match td {
+            TypeDef::Variant(_, _, ctors, _) => self.eq_variant_def(tname, ctors),
+            // `gen-eq-record`: every field pair compared with `==`, joined
+            // by `&`; `gen-eq-body`'s unit arm compares the values.
+            TypeDef::Record(_, _, fields, _, _) => {
+                let one = |f: &RecordFieldDef| {
+                    Expr::Binary(
+                        Rc::new(Expr::FieldAccess(Rc::new(self.name_expr(xn)), f.name, self.synth())),
+                        BinaryOp::OpEq,
+                        Rc::new(Expr::FieldAccess(Rc::new(self.name_expr(yn)), f.name, self.synth())),
+                        self.synth(),
+                    )
+                };
+                let body = match fields.split_first() {
+                    None => self.true_guard(),
+                    Some((first, rest)) => rest.iter().fold(one(first), |acc, f| {
+                        Expr::Binary(Rc::new(acc), BinaryOp::OpAnd, Rc::new(one(f)), self.synth())
+                    }),
+                };
+                self.eq_shell(tname, xn, yn, body)
+            }
+            TypeDef::Unit(..) => {
+                let body = Expr::Binary(Rc::new(self.name_expr(xn)), BinaryOp::OpEq, Rc::new(self.name_expr(yn)), self.synth());
+                self.eq_shell(tname, xn, yn, body)
+            }
+        }
+    }
+
+    fn eq_shell(&self, tname: Name, xn: Name, yn: Name, body: Expr) -> Def {
+        let eq_name = format!("__eq_{}", self.syms.borrow().text(tname));
+        let tref = TypeExpr::Named(tname, self.synth());
+        let boolean = TypeExpr::Named(self.sym_str("Boolean"), self.synth());
+        let ty = TypeExpr::Fun(
+            Rc::new(tref.clone()),
+            Rc::new(TypeExpr::Fun(Rc::new(tref), Rc::new(boolean), self.synth())),
+            self.synth(),
+        );
+        self.synth_def(&eq_name, vec![xn, yn], ty, body)
+    }
+
+    fn eq_variant_def(&self, tname: Name, ctors: &[VariantCtorDef]) -> Def {
         // **THE LIVE TABLE, NOT THE CHAPTER'S.** `ch.syms` is filled by the
         // `take` on the line after this runs, so reading a name out of it here
         // answers `<not this table>` -- which is what every derived definition
@@ -1358,7 +1601,20 @@ impl<'a> Desugar<'a> {
             }
             NodeKind::LinearType => TypeExpr::Linear(Rc::new(first(0)), sp),
             NodeKind::PropEqType => TypeExpr::PropEq(Rc::new(first(0)), Rc::new(first(1)), sp),
-            NodeKind::ConstrainedType => first(kids.len().saturating_sub(1)),
+            // `Showable a => a -> Text`: the constraint is the first kid, an
+            // application of the class to its type variable.
+            NodeKind::ConstrainedType => {
+                let body = first(kids.len().saturating_sub(1));
+                match first(0) {
+                    TypeExpr::App(head, args, _) => match (&*head, args.first()) {
+                        (TypeExpr::Named(cls, _), Some(TypeExpr::Named(tv, _))) => {
+                            TypeExpr::Constrained(*cls, *tv, Rc::new(body), sp)
+                        }
+                        _ => body,
+                    },
+                    _ => body,
+                }
+            }
             // `for all (xs : T), P` -- the variable is the name after the
             // paren. Taking the first name under the node returns `for`,
             // which is an ordinary identifier the lexer knows nothing about.

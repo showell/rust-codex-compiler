@@ -2211,9 +2211,32 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
     }
     // A class method is dispatched through a dictionary the desugarer builds
     // after this checker has run; the name is known and untyped here.
+    // `register-class-methods`: a class with more than one instance binds
+    // each method at its declared, parameterized type and a `__dict-of-C`
+    // at `forall v. CDict v`, minting the one variable; a class with one
+    // instance binds nothing here, its methods being bare definitions.
     for c in &ch.class_defs {
+        let instances = ch.instance_defs.iter().filter(|i| i.class_name == c.name).count();
+        if instances <= 1 {
+            continue;
+        }
         for m in &c.methods {
-            env.bind(m.name, Ty::Error);
+            let t = resolve_declared(&ch.syms, &tds, &m.type_expr).map(|t| parameterize(&t, &ch.syms, &mut st));
+            env.bind(m.name, t.unwrap_or(Ty::Error));
+        }
+        let v = st.fresh();
+        let dict_ty = match v {
+            Ty::Var(id) => {
+                let dict_name = ch.syms.find(&format!("{}Dict", ch.syms.text(c.name)));
+                match dict_name {
+                    Some(dn) => Ty::ForAll(id, Box::new(Ty::Constructed(dn, vec![Ty::Var(id)]))),
+                    None => Ty::Var(id),
+                }
+            }
+            other => other,
+        };
+        if let Some(placeholder) = ch.syms.find(&format!("__dict-of-{}", ch.syms.text(c.name))) {
+            env.bind(placeholder, dict_ty);
         }
     }
     env.locals_start = env.scope.len();

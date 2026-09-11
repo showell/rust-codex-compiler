@@ -10,6 +10,7 @@ pub mod bump;
 pub mod bundle;
 pub mod charcode;
 pub mod check;
+pub mod classes;
 pub mod cohesion;
 pub mod cost;
 pub mod code;
