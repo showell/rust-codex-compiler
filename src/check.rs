@@ -1529,9 +1529,12 @@ pub fn register_defs(
     //
     // **A NAME ALREADY BOUND WINS**, and the operation is skipped rather than
     // overwriting it; upstream raises CDX3001 for that collision elsewhere.
+    // `env-has-unsorted` sees the builtins too: a foreword effect whose
+    // operations are builtins (`get-state`, `set-state`) registers nothing.
     for ed in &ch.effect_defs {
         for op in &ed.ops {
-            if out.iter().any(|b| b.name == op.name) {
+            let text = ch.syms.text(op.name);
+            if out.iter().any(|b| b.name == op.name) || crate::builtins::BUILTINS.iter().any(|(b, _)| *b == text) {
                 continue;
             }
             if let Some(t) = resolve_declared(&ch.syms, tds, &op.type_expr) {

@@ -644,13 +644,10 @@ impl<'a> Desugar<'a> {
 
     // -- the chapter ---------------------------------------------------------
 
-    /// `desugar-document`, as far as the pieces that need no scope.
-    ///
-    /// The synthesis steps upstream runs after the plain translation --
-    /// `synth-family-member-defs`, `synth-conversion-defs`,
-    /// `synth-derived-defs`, `synth-instance-defs`, `rewrite-constrained-defs`,
-    /// `insert-dicts-at-call-sites` -- are NOT here yet, and the def count says
-    /// so rather than the tree pretending they ran.
+    /// `desugar-document`: the plain translation, then the synthesis steps
+    /// in upstream's order -- family members, conversions, derived defs,
+    /// class dictionaries and instances -- then the class rewrite, the
+    /// chapter scoper and the proof plan.
     pub fn chapter(&mut self, tree: &Node) -> Chapter {
         let mut ch = Chapter::default();
         // The unit's own chapter is the last one; a definition's slug is the
@@ -734,6 +731,7 @@ impl<'a> Desugar<'a> {
         // `desugar-document` appends family-member, conversion and derived
         // defs in that order, and registration order is what `next-id` counts.
         self.synth_family_defs(tree, &mut ch);
+        self.synth_conversion_defs(tree, &mut ch);
         self.synth_derived_defs(&mut ch);
         // The dictionary TYPE before the definitions that build one, and both
         // after the derived defs -- `desugar-document`'s order (subject 43290).
@@ -1068,6 +1066,37 @@ impl<'a> Desugar<'a> {
             }
         }
         ch.defs.extend(out);
+    }
+
+    /// `synth-conversion-defs`: `1 Minute = 60 Second` declares
+    /// `Minute-to-Second : Minute -> Second`, `Minute-to-Second (__cv) =
+    /// Second (__cv * 60)`, the factor being the right count over the left.
+    fn synth_conversion_defs(&self, tree: &Node, ch: &mut Chapter) {
+        for node in tree.descendants(NodeKind::Conversion) {
+            let toks: Vec<Token> =
+                node.tokens().filter(|t| !t.kind.is_trivia() && t.kind != Kind::Newline).copied().collect();
+            let [from_val, from_unit, _eq, to_val, to_unit, ..] = toks.as_slice() else { continue };
+            let from_n = crate::token::lit_text_to_integer(&self.text(from_val));
+            let to_n = crate::token::lit_text_to_integer(&self.text(to_val));
+            let factor = if from_n == 0 { 0 } else { to_n / from_n };
+            let from_text = self.text(from_unit).to_string();
+            let to_text = self.text(to_unit).to_string();
+            let pname = self.sym_str("__cv");
+            let sig = TypeExpr::Fun(
+                Rc::new(TypeExpr::Named(self.sym_str(&from_text), self.synth())),
+                Rc::new(TypeExpr::Named(self.sym_str(&to_text), self.synth())),
+                self.synth(),
+            );
+            let mul = Expr::Binary(
+                Rc::new(self.name_expr(pname)),
+                BinaryOp::OpMul,
+                Rc::new(Expr::Lit(factor.to_string(), LiteralKind::IntLit, self.synth())),
+                self.synth(),
+            );
+            let body = self.call1(&to_text, mul);
+            let def = self.synth_def(&format!("{from_text}-to-{to_text}"), vec![pname], sig, body);
+            ch.defs.push(def);
+        }
     }
 
     fn lit_text(&self, t: &str) -> Expr {
