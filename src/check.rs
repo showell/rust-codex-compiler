@@ -1207,19 +1207,17 @@ pub fn resolve_declared(
         T::Fun(a, b, _) => {
             let arg = Box::new(resolve_declared(syms, tds, a)?);
             match &**b {
+                // `make-row-from-names` sorts the labels canonically (by
+                // name, then scope): the wire spells a row in that order.
                 T::Effect(effs, scopes, tail, inner, _) => Ty::Fun(
                     arg,
                     EffectRow {
-                        labels: effs
-                            .iter()
-                            .enumerate()
-                            .map(|(i, e)| {
-                                (
-                                    syms.text(*e).to_string(),
-                                    scopes.get(i).cloned().unwrap_or_default(),
-                                )
-                            })
-                            .collect(),
+                        labels: canonical_labels(
+                            effs.iter()
+                                .enumerate()
+                                .map(|(i, e)| (syms.text(*e).to_string(), scopes.get(i).cloned().unwrap_or_default()))
+                                .collect(),
+                        ),
                         tail: tail.first().map_or(String::new(), |t| syms.text(*t).to_string()),
                         id: -1,
                     },

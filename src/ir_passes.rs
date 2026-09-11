@@ -372,7 +372,48 @@ fn leaf_site(e: &IrExpr, cands: &[Candidate], bound: &[Sym]) -> IrExpr {
     if args.len() != c.params.len() || !args_simple(&args) {
         return e.clone();
     }
-    subst_leaf(&c.body, &c.params, &args)
+    fold_rem_expr(&subst_leaf(&c.body, &c.params, &args))
+}
+
+/// `fold-rem-expr`: over a substituted body, `X - (X / Y) * Y` (either
+/// order of the product) is `rem-int X Y`.
+fn fold_rem_expr(e: &IrExpr) -> IrExpr {
+    use IrExpr as E;
+    match e {
+        E::Binary(op, l, r, ty, sp) => {
+            let fl = fold_rem_expr(l);
+            let fr = fold_rem_expr(r);
+            if *op == IrBinOp::SubInt {
+                if let E::Binary(IrBinOp::MulInt, ml, mr, _, _) = &fr {
+                    if rem_div_matches(&fl, ml, mr) {
+                        return E::Binary(IrBinOp::RemInt, Box::new(fl), mr.clone(), ty.clone(), *sp);
+                    }
+                    if rem_div_matches(&fl, mr, ml) {
+                        return E::Binary(IrBinOp::RemInt, Box::new(fl), ml.clone(), ty.clone(), *sp);
+                    }
+                }
+            }
+            E::Binary(*op, Box::new(fl), Box::new(fr), ty.clone(), *sp)
+        }
+        other => other.clone(),
+    }
+}
+
+/// `rem-div-matches`: `d` is `x / y`, by name or literal.
+fn rem_div_matches(x: &IrExpr, d: &IrExpr, y: &IrExpr) -> bool {
+    match d {
+        IrExpr::Binary(IrBinOp::DivInt, dx, dy, _, _) => operand_same(dx, x) && operand_same(dy, y),
+        _ => false,
+    }
+}
+
+/// `ir-operand-same`: two names of one symbol, or two equal integer literals.
+fn operand_same(a: &IrExpr, b: &IrExpr) -> bool {
+    match (a, b) {
+        (IrExpr::Name(n, _, _), IrExpr::Name(m, _, _)) => n == m,
+        (IrExpr::IntLit(v, _), IrExpr::IntLit(w, _)) => v == w,
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -320,6 +320,43 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
         // Upstream never refuses here. A callee whose type is not an arrow
         // peels to `ErrorTy` and the node takes the expectation, or the
         // checker's recorded answer, instead.
+        // `lower-apply`: two builtins applied to two arguments lower to
+        // their own shapes -- `int-rem a b` is a `rem-int` binary and
+        // `compare a b` dispatches on the left operand's type
+        // (`lower-int-rem-apply`, `lower-compare-apply`).
+        Expr::Apply(f, a, s) if special_apply_name(f, cx).is_some() => {
+            let (name, a1) = special_apply_name(f, cx).expect("guarded");
+            let int_default = Ty::Integer(i64::MIN, i64::MAX, crate::check::Overflow::Error);
+            if name == "int-rem" {
+                let l = expr(&a1, &int_default, cx)?;
+                let r = expr(a, &int_default, cx)?;
+                return Ok(IrExpr::Binary(IrBinOp::RemInt, Box::new(l), Box::new(r), want.clone(), *s));
+            }
+            let l = expr(&a1, &Ty::NoExpect, cx)?;
+            let r = expr(a, &Ty::NoExpect, cx)?;
+            let lt = cx.st.deep_resolve(&l.ty());
+            let tn = type_name_of(&lt, cx);
+            let helper = if tn.is_empty() || is_primitive_type_name(&tn) {
+                None
+            } else {
+                cx.syms.borrow().find(&format!("__compare_{tn}")).and_then(|h| {
+                    cx.overlay_ty(h).or_else(|| cx.bindings.get(&h).cloned()).map(|t| (h, t))
+                })
+            };
+            return Ok(match helper {
+                Some((h, raw)) => {
+                    let fty = crate::check::strip_forall(&cx.st.deep_resolve(&raw));
+                    let inner = IrExpr::Apply(
+                        Box::new(IrExpr::Name(h, fty.clone(), *s)),
+                        Box::new(l),
+                        peel_fun_return(&fty),
+                        *s,
+                    );
+                    IrExpr::Apply(Box::new(inner), Box::new(r), int_default, *s)
+                }
+                None => lower_compare_prim(&lt, l, r, cx, *s),
+            });
+        }
         Expr::Apply(f, a, s) => {
             let f = expr(f, &Ty::NoExpect, cx)?;
             let fty = f.ty();
@@ -337,9 +374,12 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
         // `add-num` and `add-vec` are three names for one source `+` -- so
         // this needs the operands typed first and refuses where it cannot
         // tell.
+        // `lower-expr-at`'s `ABinaryExpr` arm lowers BOTH operands with the
+        // binary's own expectation, and a builtin binary (`rem-int`) then
+        // carries it -- `boolean` under an `==`.
         Expr::Binary(l, op, r, s) => {
-            let l = expr(l, &Ty::NoExpect, cx)?;
-            let r = expr(r, &Ty::NoExpect, cx)?;
+            let l = expr(l, want, cx)?;
+            let r = expr(r, want, cx)?;
             let lty = l.ty();
             // `lower-binary-maybe-eq` (IR/Lowering.codex:653): `==` and `/=`
             // ask `lower-eq-dispatch` FIRST, and only an operand type with no
@@ -389,25 +429,37 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
             //
             // The vector and Real-mode arms are not modelled here yet; when
             // they are, they go BEFORE the Real test, in upstream's order.
-            let arith = |int: IrBinOp, num: IrBinOp| -> IrBinOp {
-                match &lty {
+            // `lower-bin-op` (LoweringTypes.codex:206), on the left type with
+            // its unit stripped: a vector, a saturating real, a trapping
+            // real, an approximate real, a real, or an integer.
+            let bty = strip_unit(&lty);
+            let arith = |int: IrBinOp, num: IrBinOp, appr: IrBinOp, trap: IrBinOp, sat: IrBinOp, vec: IrBinOp| -> IrBinOp {
+                use crate::check::{RealMode, RealWidth};
+                match &bty {
+                    Ty::Vector(..) => vec,
+                    Ty::Real(_, RealMode::Saturating) => sat,
+                    Ty::Real(_, RealMode::Trapping) => trap,
+                    Ty::Real(RealWidth::F32, _) => appr,
                     Ty::Real(..) => num,
                     _ => int,
                 }
             };
+            let cmp = |scalar: IrBinOp, vec: IrBinOp| -> IrBinOp {
+                if matches!(bty, Ty::Vector(..)) { vec } else { scalar }
+            };
             let (name, ty) = match op {
-                BinaryOp::OpAdd => (arith(IrBinOp::AddInt, IrBinOp::AddNum), lty.clone()),
-                BinaryOp::OpSub => (arith(IrBinOp::SubInt, IrBinOp::SubNum), lty.clone()),
-                BinaryOp::OpMul => (arith(IrBinOp::MulInt, IrBinOp::MulNum), lty.clone()),
-                BinaryOp::OpDiv => (arith(IrBinOp::DivInt, IrBinOp::DivNum), lty.clone()),
+                BinaryOp::OpAdd => (arith(IrBinOp::AddInt, IrBinOp::AddNum, IrBinOp::AddRealApprox, IrBinOp::AddRealTrapping, IrBinOp::AddRealSaturating, IrBinOp::AddVec), lty.clone()),
+                BinaryOp::OpSub => (arith(IrBinOp::SubInt, IrBinOp::SubNum, IrBinOp::SubRealApprox, IrBinOp::SubRealTrapping, IrBinOp::SubRealSaturating, IrBinOp::SubVec), lty.clone()),
+                BinaryOp::OpMul => (arith(IrBinOp::MulInt, IrBinOp::MulNum, IrBinOp::MulRealApprox, IrBinOp::MulRealTrapping, IrBinOp::MulRealSaturating, IrBinOp::MulVec), lty.clone()),
+                BinaryOp::OpDiv => (arith(IrBinOp::DivInt, IrBinOp::DivNum, IrBinOp::DivRealApprox, IrBinOp::DivRealTrapping, IrBinOp::DivRealSaturating, IrBinOp::DivVec), lty.clone()),
                 // NOT `arith`: upstream has no Real arm for `^`.
                 BinaryOp::OpPow => (IrBinOp::PowInt, lty.clone()),
                 BinaryOp::OpEq => (IrBinOp::Eq, Ty::Boolean),
                 BinaryOp::OpNotEq => (IrBinOp::NotEq, Ty::Boolean),
-                BinaryOp::OpLt => (IrBinOp::Lt, Ty::Boolean),
-                BinaryOp::OpGt => (IrBinOp::Gt, Ty::Boolean),
-                BinaryOp::OpLtEq => (IrBinOp::LtEq, Ty::Boolean),
-                BinaryOp::OpGtEq => (IrBinOp::GtEq, Ty::Boolean),
+                BinaryOp::OpLt => (cmp(IrBinOp::Lt, IrBinOp::LtVec), Ty::Boolean),
+                BinaryOp::OpGt => (cmp(IrBinOp::Gt, IrBinOp::GtVec), Ty::Boolean),
+                BinaryOp::OpLtEq => (cmp(IrBinOp::LtEq, IrBinOp::LtEqVec), Ty::Boolean),
+                BinaryOp::OpGtEq => (cmp(IrBinOp::GtEq, IrBinOp::GtEqVec), Ty::Boolean),
                 // **ONE TOKEN, THREE ATOMS.** `&` is `and` over Booleans,
                 // `append-text` over Text and `append-list` over a List, and
                 // the OPERAND type is what picks. `and` the keyword is only
@@ -440,7 +492,9 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
         // **THE BRANCHES DO NOT HAVE TO AGREE, AND USUALLY DO NOT.** The
         // checker unified them; the wire did not.
         Expr::If(c, th, el, s) => {
-            let c = expr(c, &Ty::NoExpect, cx)?;
+            // `lower-expr-at c BooleanTy`: the condition's expectation is
+            // Boolean, and a binary in it carries that on the wire.
+            let c = expr(c, &Ty::Boolean, cx)?;
             let resolved = cx.st.deep_resolve(want);
             let t0 = expr(th, &resolved, cx)?;
             let tty = t0.ty();
@@ -848,6 +902,56 @@ fn eq_dispatch(
 /// `type-name-of` (IR/Lowering.codex:695): the bare name, arguments DISCARDED,
 /// and `""` for anything without one -- a unit type included, so `==` on a
 /// unit type never reaches its own generated helper.
+/// `int-rem` or `compare` applied to its first argument, when the callee
+/// is that name applied once.
+fn special_apply_name(f: &Expr, cx: &Lower) -> Option<(&'static str, Expr)> {
+    let Expr::Apply(inner, a1, _) = f else { return None };
+    let Expr::NameRef(n, _) = &**inner else { return None };
+    let which = match cx.syms.borrow().text(*n) {
+        "int-rem" => "int-rem",
+        "compare" => "compare",
+        _ => return None,
+    };
+    Some((which, (**a1).clone()))
+}
+
+/// `is-primitive-type-name`.
+fn is_primitive_type_name(n: &str) -> bool {
+    matches!(n, "Integer" | "Real" | "Text" | "Boolean" | "Char" | "Nothing" | "List")
+}
+
+/// `lower-compare-prim`: `text-compare` on Text, and `gen-int-compare` --
+/// two lets and two ifs answering -1, 1 or 0 -- on anything else.
+fn lower_compare_prim(lt: &Ty, l: IrExpr, r: IrExpr, cx: &Lower, sp: crate::ast::Span) -> IrExpr {
+    let int_default = Ty::Integer(i64::MIN, i64::MAX, crate::check::Overflow::Error);
+    if matches!(lt, Ty::Text) {
+        let tc = cx.syms.borrow_mut().intern("text-compare");
+        let fty = Ty::Fun(
+            Box::new(Ty::Text),
+            crate::check::EffectRow::default(),
+            Box::new(Ty::Fun(Box::new(Ty::Text), crate::check::EffectRow::default(), Box::new(int_default.clone()))),
+        );
+        let inner = IrExpr::Apply(Box::new(IrExpr::Name(tc, fty.clone(), sp)), Box::new(l), peel_fun_return(&fty), sp);
+        return IrExpr::Apply(Box::new(inner), Box::new(r), int_default, sp);
+    }
+    let (na, nb) = {
+        let mut syms = cx.syms.borrow_mut();
+        (syms.intern("__cmpa"), syms.intern("__cmpb"))
+    };
+    let name = |n| IrExpr::Name(n, int_default.clone(), sp);
+    let lit = |v| IrExpr::IntLit(v, sp);
+    let cmp = |op| IrExpr::Binary(op, Box::new(name(na)), Box::new(name(nb)), Ty::Boolean, sp);
+    let inner_if = IrExpr::If(Box::new(cmp(IrBinOp::Gt)), Box::new(lit(1)), Box::new(lit(0)), int_default.clone(), sp);
+    let outer_if = IrExpr::If(Box::new(cmp(IrBinOp::Lt)), Box::new(lit(-1)), Box::new(inner_if), int_default.clone(), sp);
+    IrExpr::Let(
+        na,
+        int_default.clone(),
+        Box::new(l),
+        Box::new(IrExpr::Let(nb, int_default.clone(), Box::new(r), Box::new(outer_if), sp)),
+        sp,
+    )
+}
+
 fn type_name_of(t: &Ty, cx: &Lower) -> String {
     match t {
         Ty::Integer(..) => "Integer".into(),
