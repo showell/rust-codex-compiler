@@ -1387,8 +1387,11 @@ fn check_let_bind_row(st: &mut UnifyState, row: &EffectRow, name: &str) {
 
 /// `make-row`'s `sort-labels-canonical`: a row's labels are a set, sorted
 /// by name then scope, with no label twice.
+/// `sort-labels-canonical`: by name, then scope, in `text-compare` order --
+/// which is CCE code order, not the alphabet.
 fn canonical_labels(mut ls: Vec<(String, String)>) -> Vec<(String, String)> {
-    ls.sort();
+    let key = |s: &str| -> Vec<i64> { s.chars().map(crate::charcode::char_code).collect() };
+    ls.sort_by(|a, b| key(&a.0).cmp(&key(&b.0)).then_with(|| key(&a.1).cmp(&key(&b.1))));
     ls.dedup();
     ls
 }
@@ -2803,16 +2806,40 @@ pub fn infer_row(
                 // `infer-arithmetic`: the operands MEET, the answer is the
                 // tighter of the two (`arith-result-ty`). The `UnitTy` arms are
                 // not modelled here yet.
+                // `infer-arithmetic`: a unit on either side unifies its BASE
+                // with the other operand and the unit is the answer; two
+                // units unify whole. Otherwise the operands meet and the
+                // answer is the tighter of the two (`arith-result-ty`).
                 OpAdd | OpSub | OpMul | OpDiv | OpPow => {
-                    if !st.unify(&lt, &rt) { st.unify_gaps += 1; }
-                    let (lt, rt) = (st.resolve(&lt), st.resolve(&rt));
-                    if !is_arithmetic_type(&lt) || !is_arithmetic_type(&rt) {
-                        st.error(
-                            Cdx::ARITHMETIC_REQUIRES_NUMERIC,
-                            format!("Arithmetic operator requires Integer or Real ({} and {})", type_desc(&lt), type_desc(&rt)),
-                        );
+                    let (lt0, rt0) = (st.resolve(&lt), st.resolve(&rt));
+                    match (&lt0, &rt0) {
+                        (Ty::Unit(..), Ty::Unit(..)) => {
+                            if !st.unify(&lt0, &rt0) { st.unify_gaps += 1; }
+                            if !is_arithmetic_type(&lt0) || !is_arithmetic_type(&rt0) {
+                                st.error(Cdx::ARITHMETIC_REQUIRES_NUMERIC, "Arithmetic operator requires Integer or Real".to_string());
+                            }
+                            lt0
+                        }
+                        (Ty::Unit(_, li), _) => {
+                            if !st.unify(li, &rt0) { st.unify_gaps += 1; }
+                            lt0.clone()
+                        }
+                        (_, Ty::Unit(_, ri)) => {
+                            if !st.unify(&lt0, ri) { st.unify_gaps += 1; }
+                            rt0.clone()
+                        }
+                        _ => {
+                            if !st.unify(&lt, &rt) { st.unify_gaps += 1; }
+                            let (lt, rt) = (st.resolve(&lt), st.resolve(&rt));
+                            if !is_arithmetic_type(&lt) || !is_arithmetic_type(&rt) {
+                                st.error(
+                                    Cdx::ARITHMETIC_REQUIRES_NUMERIC,
+                                    format!("Arithmetic operator requires Integer or Real ({} and {})", type_desc(&lt), type_desc(&rt)),
+                                );
+                            }
+                            arith_result_ty(&lt, &rt)
+                        }
                     }
-                    arith_result_ty(&lt, &rt)
                 }
                 // `infer-and`: `&` is three operators, dispatched on the
                 // RESOLVED left type -- Boolean is `infer-logical`, Text and
