@@ -37,6 +37,7 @@ pub mod narrowing;
 pub mod proof_norm;
 pub mod punctual;
 pub mod resolve_types;
+pub mod roc_emit;
 pub mod scope;
 pub mod scoper;
 pub mod seams;

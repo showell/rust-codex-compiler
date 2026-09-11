@@ -32,6 +32,7 @@
 //! rather than the lowered defs, and keeps the numbers upstream would give.
 
 use crate::ast::{Chapter, Expr, LiteralKind};
+use crate::ir_chapter::IrDef;
 use crate::check::{Binding, TypeDefs, UnifyState};
 use crate::symbol::SymTab;
 use std::collections::BTreeMap;
@@ -106,6 +107,14 @@ fn reachable(ch: &Chapter, roots: &[&str]) -> std::collections::BTreeSet<String>
     seen
 }
 
+/// The lowered, resolved, lifted and pruned definitions, with the table
+/// their names index. What every emitter reads: the IR text emitter and the
+/// Roc emitter are two spellings of this one document.
+pub struct Lowered {
+    pub syms: SymTab,
+    pub defs: Vec<IrDef>,
+}
+
 pub fn emit_defs_checked(
     ch: &Chapter,
     bindings: &[Binding],
@@ -113,6 +122,18 @@ pub fn emit_defs_checked(
     tds: &TypeDefs,
     roots: &[&str],
 ) -> Result<String, String> {
+    let low = lower_chapter(ch, bindings, st, tds, roots)?;
+    Ok(crate::ir_text::emit_defs(&low.syms, &low.defs))
+}
+
+/// Lower, run the pipeline, resolve, lift, prune -- the driver's order.
+pub fn lower_chapter(
+    ch: &Chapter,
+    bindings: &[Binding],
+    st: &UnifyState,
+    tds: &TypeDefs,
+    roots: &[&str],
+) -> Result<Lowered, String> {
     let keep = reachable(ch, roots);
     if keep.is_empty() {
         return Err("no root reached: the chapter defines none of ir-emit-roots".into());
@@ -157,7 +178,7 @@ pub fn emit_defs_checked(
     let defs = crate::resolve_types::resolve_defs(defs, &syms, &type_map);
     let defs = crate::lambda_lifting::lift_lambdas(defs, &mut syms);
     let defs = crate::ir_passes::prune_unreachable_roots(defs, roots, &syms);
-    Ok(crate::ir_text::emit_defs(&syms, &defs))
+    Ok(Lowered { syms, defs })
 }
 
 /// The `--- lower ---` section: a SHAPE dump, not IR text.
