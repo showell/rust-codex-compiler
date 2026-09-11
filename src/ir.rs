@@ -62,10 +62,24 @@ pub const IR_EMIT_ROOTS: [&str; 6] = [
 ];
 
 /// Check, then lower -- the driver's own two steps, in its own order
-/// (`opening.codex:798`).
+/// (`opening.codex:798`). A program the checker refuses is not lowered:
+/// the driver halts with the count and the first diagnostic.
 pub fn emit_defs(ch: &Chapter) -> Result<String, String> {
     let (bindings, st, tds) = crate::check::check_chapter_full(ch);
+    if let Some(halt) = codegen_halted(&st) {
+        return Err(halt);
+    }
     emit_defs_checked(ch, &bindings, &st, &tds, &IR_EMIT_ROOTS)
+}
+
+/// The driver's halt line when the checker raised, else None.
+pub fn codegen_halted(st: &crate::check::UnifyState) -> Option<String> {
+    let n = st.errors();
+    if n == 0 {
+        return None;
+    }
+    let first = st.diags.first().map(|d| format!("CDX{} {}", d.code, d.message)).unwrap_or_default();
+    Some(format!("CODEGEN-HALTED: {n} error(s); no IR emitted; first {first}"))
 }
 
 /// Names reachable from the roots, following NameRefs through def bodies.
@@ -442,10 +456,11 @@ mod tests {
     /// def lines in `punctual-quire` alone were wrong by these two bytes.
     #[test]
     fn a_punctual_def_publishes_its_flag_and_its_budget() {
-        // `f` is SELF-RECURSIVE so that it survives to the wire: a constant
-        // call to a straight-line function is folded and the definition pruned.
+        // `f` takes a LIST so that it survives to the wire: a constant call to
+        // a straight-line function is folded and the definition pruned, and a
+        // punctual function may not recurse (CDX6005 halts the driver).
         let chapter = |modifier: &str| {
-            format!("Chapter: T\n\nSection: S\n  {modifier}f : Integer -> Integer\n  f (n) =\n   if n <= 1 then n\n   else f (n - 1)\n\nSection: Main\n  opening : [Console] Nothing = act\n   print-line-uni (show (f 9))\n  end\n")
+            format!("Chapter: T\n\nSection: S\n  {modifier}f : List Integer -> Integer\n  f (xs) = list-length xs + 1\n\nSection: Main\n  opening : [Console] Nothing = act\n   print-line-uni (show (f [1, 2, 3]))\n  end\n")
         };
         assert!(def_line(&chapter(""), "f").ends_with("int-default) 0 0)"), "{}", def_line(&chapter(""), "f"));
         assert!(def_line(&chapter("punctual "), "f").ends_with("int-default) 1 0)"), "{}", def_line(&chapter("punctual "), "f"));
@@ -830,7 +845,9 @@ mod tests {
     /// Five definitions of the compiler disappeared that way.
     #[test]
     fn the_pipeline_runs_before_the_lift() {
-        let src = "Chapter: T\n\nSection: S\n  node : List Integer, Integer -> List Integer\n  node (xs) (k) = for x in xs -> x + k\n\n  ins : List Integer, Integer -> Integer\n  ins (xs) (k) = list-length (node xs k)\n\nSection: E\n  opening : Integer\n  opening = ins [1] 2\n";
+        // A comprehension desugars to a call of `map-list`, which a corpus
+        // unit carries from ListUtils; a chapter without it is refused.
+        let src = "Chapter: T\n\nSection: S\n  map-list : List a, (a -> b) -> List b\n  map-list (xs) (f) = map-list-loop xs f 0 (list-length xs) []\n\n  map-list-loop : List a, (a -> b), Integer, Integer, List b -> List b\n  map-list-loop (xs) (f) (i) (n) (acc) =\n   if i >= n then acc\n   else map-list-loop xs f (i + 1) n (list-push acc (f (list-at xs i)))\n\n  node : List Integer, Integer -> List Integer\n  node (xs) (k) = for x in xs -> x + k\n\n  ins : List Integer, Integer -> Integer\n  ins (xs) (k) = list-length (node xs k)\n\nSection: E\n  opening : Integer\n  opening = ins [1] 2\n";
         let all = ir(src);
         assert!(all.contains(r#"(def "node" "T""#), "node was inlined away:\n{all}");
         assert!(all.contains(r#"(name "node" ("#), "the call to node went too:\n{all}");

@@ -309,6 +309,20 @@ fn whole(path: &Path, chapter: Option<&str>) -> Result<String, String> {
     // is a believable number for a young front end and was entirely the harness.
     let src = codexc::bundle::load(path)?;
     let parsed = parser::parse(&src);
+    // The lexer's and the parser's refusals halt the driver before anything
+    // is checked, as upstream's does.
+    if !parsed.lex_errors.is_empty() || !parsed.diagnostics.is_empty() {
+        let mut st = codexc::check::UnifyState::default();
+        for d in &parsed.lex_errors {
+            st.error(codexc::check::lex_code(d.code), d.msg);
+        }
+        for (code, msg) in &parsed.diagnostics {
+            st.error(*code, msg.clone());
+        }
+        if let Some(halt) = codexc::ir::codegen_halted(&st) {
+            return Err(halt);
+        }
+    }
     let head = preamble::emit(&parsed.tree, &src, chapter);
     let mut dg = codexc::desugar::Desugar::new(&src);
     let ch = dg.chapter(&parsed.tree);
