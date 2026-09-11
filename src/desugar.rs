@@ -690,8 +690,14 @@ impl<'a> Desugar<'a> {
                     ops: self.ops(child),
                     span: head_span(child),
                 }),
+                // The class's own name is the node's own token; the
+                // superclass's sits under the `Superclass` node.
                 NodeKind::ClassDef => ch.class_defs.push(ClassDef {
-                    name: self.name_of(child),
+                    name: child
+                        .own_tokens()
+                        .find(|t| matches!(t.kind, Kind::Identifier | Kind::TypeIdentifier))
+                        .map(|t| self.sym(t))
+                        .unwrap_or_default(),
                     methods: self.ops(child),
                     superclass: child
                         .children_of(NodeKind::Superclass)

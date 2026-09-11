@@ -33,17 +33,17 @@ use crate::token::Kind;
 /// with the same function, so they share a node kind here too.
 ///
 /// **A superclass is written in front with a fat arrow**, and it is told from
-/// the class's own name only by looking two tokens ahead: `class Eq => Ord
+/// the class's own name only by looking two tokens ahead: `class Eq a => Ord
 /// where` names Ord and `class Ord where` names Ord as well.
 pub(crate) fn parse_class_def(p: &mut Parser<'_>) {
     p.b.start(NodeKind::ClassDef);
     p.bump(); // class
+    let scp = p.b.checkpoint();
     if p.sig(0).is_some() {
         p.bump(); // the name -- or the SUPERCLASS, which the arrow decides
     }
     if p.kind(0) == Some(Kind::Identifier) && p.kind(1) == Some(Kind::FatArrow) {
-        let scp = p.b.checkpoint();
-        p.bump(); // =>'s left, already eaten above; this is the real name
+        p.bump(); // the superclass's type variable
         p.bump(); // =>
         p.b.wrap_from(scp, NodeKind::Superclass);
         if p.sig(0).is_some() {
