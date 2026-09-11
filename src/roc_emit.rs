@@ -26,6 +26,19 @@ const KEYWORDS: [&str; 18] = [
     "match", "module", "or", "return", "var", "where", "while",
 ];
 
+/// A constant with this many literal leaves is a data table, baked elsewhere.
+pub const BAKED_AT: usize = 256;
+
+fn leaf_literals(e: &IrExpr) -> usize {
+    let mut n = 0;
+    e.walk(&mut |x| {
+        if matches!(x, IrExpr::IntLit(..) | IrExpr::NumLit(..) | IrExpr::TextLit(..) | IrExpr::BoolLit(..)) {
+            n += 1;
+        }
+    });
+    n
+}
+
 pub fn emit_program(
     ch: &Chapter,
     tds: &TypeDefs,
@@ -53,6 +66,24 @@ pub fn emit_program(
             body.push_str(&format!("\n# --- {slug} ---\n"));
         }
         body.push('\n');
+        // **A DATA TABLE IS NOT EMITTED, AND THE OMISSION IS WRITTEN DOWN.**
+        // Roc's checker is superlinear in the literal elements of a FILE
+        // (measured: 1k, 2k, 4k points check in 3.6, 9.9, 31 seconds, as
+        // records or as floats, in one list or many) and the same data as a
+        // string checks in half a second. So a constant that is a literal of
+        // BAKED_AT or more leaves is left to a baker that spells it as a
+        // string, and this line names it; if no baker supplies the name, Roc
+        // stops on an undefined name rather than running without it.
+        let leaves = leaf_literals(&d.body);
+        if d.params.is_empty() && leaves >= BAKED_AT {
+            let sig = cx.signature(d)?;
+            body.push_str(&format!(
+                "# baked: {} : {sig} -- {} {leaves} literals\n",
+                cx.ident(d.name)?,
+                d.chapter_slug
+            ));
+            continue;
+        }
         body.push_str(&cx.def(d)?);
     }
     let Some(main) = main else {
