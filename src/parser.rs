@@ -60,7 +60,7 @@ pub fn code_for(msg: &str) -> u16 {
         1000
     } else if msg.starts_with("Application ended at newline") {
         1070
-    } else if msg.starts_with("A line may not begin with '.'") {
+    } else if msg.starts_with("A line may not begin with '.'") || msg.starts_with("A '.' selector must be followed by a field name") {
         1071
     } else {
         0
@@ -200,6 +200,17 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The next significant token on a LATER line: past at least one
+    /// newline, and past the indentation tokens that follow it.
+    pub(crate) fn sig_past_newlines(&self) -> Option<Token> {
+        let mut it = self.toks[self.at()..].iter().filter(|t| !t.kind.is_trivia());
+        let first = it.next()?;
+        if first.kind != Kind::Newline {
+            return None;
+        }
+        it.find(|t| !matches!(t.kind, Kind::Newline | Kind::Indent | Kind::Dedent)).copied()
+    }
+
     /// The last significant token consumed.
     pub(crate) fn prev_sig(&self) -> Option<Token> {
         self.toks[..self.at()].iter().rev().find(|t| !t.kind.is_trivia()).copied()
@@ -219,6 +230,13 @@ impl<'a> Parser<'a> {
         let msg: String = msg.into();
         let code = code_for(&msg);
         self.errors.push(ParseError { msg, line, col, code });
+    }
+
+    /// An error placed at a token other than the next one.
+    pub(crate) fn err_at(&mut self, t: Token, msg: impl Into<String>) {
+        let msg: String = msg.into();
+        let code = code_for(&msg);
+        self.errors.push(ParseError { msg, line: t.line, col: t.col, code });
     }
 }
 
@@ -609,16 +627,14 @@ fn body(p: &mut Parser<'_>, def_col: u32) {
                 // that wrote three of them for two `act` blocks is skipped in
                 // silence -- 23 of them in the checkout. A RUN of real code is
                 // a different thing and stays an unread body.
-                // Two stray shapes ARE upstream's refusals, from its
-                // expression parser: a line beginning with `.`
-                // (`emit-leading-dot-error`, CDX1071), and a line beginning
-                // with `(`, `[` or a literal after an application, which it
-                // reads as an argument that fell off at the newline
-                // (`check-multiline-app`, CDX1070). A lone `end` is neither.
+                // One stray shape IS upstream's refusal, from its expression
+                // parser: a line beginning with `(`, `[` or a literal after
+                // an application, which it reads as an argument that fell off
+                // at the newline (`check-multiline-app`, CDX1070). A line
+                // beginning with `.` is refused by the expression parser
+                // itself (`parse_field_access`). A lone `end` is neither.
                 let text = String::from_utf8_lossy(t.text(p.src)).to_string();
-                if text.starts_with('.') {
-                    p.err("A line may not begin with '.'. Field access must follow its receiver on the same line: write 'receiver.field', or bind the receiver with a let and continue on the next line".to_string());
-                } else if matches!(
+                if matches!(
                     t.kind,
                     Kind::LeftParen | Kind::LeftBracket | Kind::IntegerLiteral | Kind::NumberLiteral | Kind::TextLiteral | Kind::CharLiteral
                 ) {

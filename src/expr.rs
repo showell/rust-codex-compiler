@@ -296,7 +296,20 @@ fn parse_field_access(p: &mut Parser<'_>, cp: usize, mut kind: NodeKind) -> Node
                 p.b.wrap_from(cp, NodeKind::Revised);
                 kind = NodeKind::Revised;
             }
-            _ => return kind,
+            // `is-leading-dot-continuation`: a `.` on a later line, outside
+            // brackets, is refused here and left unconsumed -- and every
+            // postfix layer that reaches it refuses it again, which is why
+            // upstream reports one such line twice.
+            _ => {
+                if p.paren_depth == 0 {
+                    if let Some(dot) = p.sig_past_newlines() {
+                        if dot.kind == Kind::Dot {
+                            p.err_at(dot, format!("A line may not begin with '.'. Field access must follow its receiver on the same line: write 'receiver.field', or bind the receiver with a let. (A '.' begins line {}.)", dot.line));
+                        }
+                    }
+                }
+                return kind;
+            }
         }
     }
 }
@@ -355,13 +368,17 @@ fn parse_atom(p: &mut Parser<'_>) -> NodeKind {
             NodeKind::LazyExpr
         }
         Kind::Dot => {
-            // A leading `.field` selector.
+            // A leading `.field` selector; a bare `.` is an error node
+            // (`parse-selector-expr`).
             p.bump();
             if p.kind(0).is_some_and(is_field_name) {
                 p.bump();
+                p.b.wrap_from(cp, NodeKind::Selector);
+                return NodeKind::Selector;
             }
-            p.b.wrap_from(cp, NodeKind::Selector);
-            NodeKind::Selector
+            p.err_at(t, "A '.' selector must be followed by a field name. Field access follows its receiver on the same line (receiver.field), and a bare '.field' selector needs the field name immediately after the dot. A stray '.' often means an act block above was never closed with 'end', so the statement parser is reading prose as code.".to_string());
+            p.b.wrap_from(cp, NodeKind::ErrExpr);
+            NodeKind::ErrExpr
         }
         _ => {
             p.bump();
