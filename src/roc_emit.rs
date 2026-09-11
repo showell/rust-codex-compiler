@@ -39,20 +39,14 @@ fn leaf_literals(e: &IrExpr) -> usize {
     n
 }
 
+/// The whole unit as ONE Roc program, for the default Echo platform.
 pub fn emit_program(
     ch: &Chapter,
     tds: &TypeDefs,
     syms: &SymTab,
     defs: &[IrDef],
 ) -> Result<String, String> {
-    let mut cx = Cx {
-        syms,
-        tds,
-        arity: defs.iter().map(|d| (d.name, d.params.len())).collect(),
-        locals: Vec::new(),
-        tvars: BTreeMap::new(),
-        uses_line: false,
-    };
+    let mut cx = Cx::new(ch, tds, syms, defs, false);
     let mut body = String::new();
     let mut slug = String::new();
     let mut main = None;
@@ -66,25 +60,7 @@ pub fn emit_program(
             body.push_str(&format!("\n# --- {slug} ---\n"));
         }
         body.push('\n');
-        // **A DATA TABLE IS NOT EMITTED, AND THE OMISSION IS WRITTEN DOWN.**
-        // Roc's checker is superlinear in the literal elements of a FILE
-        // (measured: 1k, 2k, 4k points check in 3.6, 9.9, 31 seconds, as
-        // records or as floats, in one list or many) and the same data as a
-        // string checks in half a second. So a constant that is a literal of
-        // BAKED_AT or more leaves is left to a baker that spells it as a
-        // string, and this line names it; if no baker supplies the name, Roc
-        // stops on an undefined name rather than running without it.
-        let leaves = leaf_literals(&d.body);
-        if d.params.is_empty() && leaves >= BAKED_AT {
-            let sig = cx.signature(d)?;
-            body.push_str(&format!(
-                "# baked: {} : {sig} -- {} {leaves} literals\n",
-                cx.ident(d.name)?,
-                d.chapter_slug
-            ));
-            continue;
-        }
-        body.push_str(&cx.def(d)?);
+        body.push_str(&cx.def_or_baked(d, 0)?);
     }
     let Some(main) = main else {
         return Err("no opening: nothing to run".into());
@@ -95,23 +71,115 @@ pub fn emit_program(
     );
     // `Maybe` is a language type the checker knows without a declaration
     // (`ctd`); a unit that cites the chapter declaring it carries its own.
-    let declares_maybe = ch.type_defs.iter().any(|td| match td {
-        TypeDef::Record(n, ..) | TypeDef::Variant(n, ..) | TypeDef::Unit(n, ..) => syms.text(*n) == "Maybe",
-    });
-    if !declares_maybe {
+    if !cx.type_module.contains_key(&cx.maybe) {
         out.push_str("Maybe(a) : [None, Just(a)]\n");
     }
     for td in &ch.type_defs {
-        out.push_str(&cx.type_def(td)?);
+        out.push_str(&cx.type_def(td, 0)?);
     }
     if cx.uses_line {
-        out.push_str("\n# The Echo platform's echo! writes no newline; a Codex line is one.\n");
-        out.push_str("line! = |s| echo!(Str.concat(s, \"\\n\"))\n");
+        out.push_str(LINE_HELPER);
     }
     out.push_str(&body);
     out.push_str("\n# --- Entry ---\n\n");
     out.push_str(&main);
     Ok(out)
+}
+
+const LINE_HELPER: &str =
+    "\n# The Echo platform's echo! writes no newline; a Codex line is one.\nline! = |s| echo!(Str.concat(s, \"\\n\"))\n";
+
+/// The unit as Roc TYPE MODULES, one per Codex chapter, and one app for the
+/// chapter that holds `opening`: `(<file name>, <text>)` pairs.
+///
+/// A chapter becomes a void module, `Slug :: [].{ ... }`, whose associated
+/// items are the chapter's type definitions and definitions; another module
+/// reaches them as `Slug.name`. Roc's module documentation recommends
+/// exactly this shape for a namespace of functions, and it is what lets the
+/// screensaver itself import the same chapters the specs grade.
+///
+/// A baked constant is a forwarder to `<Slug>Data.name`, a module the stills
+/// baker writes; the app is the spec's own definitions and `main!`.
+pub fn emit_modules(
+    ch: &Chapter,
+    tds: &TypeDefs,
+    syms: &SymTab,
+    defs: &[IrDef],
+) -> Result<Vec<(String, String)>, String> {
+    let mut cx = Cx::new(ch, tds, syms, defs, true);
+    let Some(app) = defs.iter().find(|d| syms.text(d.name) == "opening") else {
+        return Err("no opening: nothing to run".into());
+    };
+    let app_slug = app.chapter_slug.clone();
+    let mut slugs: Vec<String> = Vec::new();
+    for d in defs {
+        if !slugs.contains(&d.chapter_slug) {
+            slugs.push(d.chapter_slug.clone());
+        }
+    }
+    for c in &ch.type_def_chapters {
+        if !slugs.contains(c) {
+            slugs.push(c.clone());
+        }
+    }
+    let mut files = Vec::new();
+    let mut prelude = false;
+    for slug in &slugs {
+        module_name(slug)?;
+        cx.current = slug.clone();
+        cx.imports.clear();
+        let mut items = String::new();
+        let base = if *slug == app_slug { 0 } else { 1 };
+        for (td, c) in ch.type_defs.iter().zip(&ch.type_def_chapters) {
+            if c == slug {
+                items.push_str(&cx.type_def(td, base)?);
+            }
+        }
+        let mut main = None;
+        for d in defs.iter().filter(|d| d.chapter_slug == *slug) {
+            if syms.text(d.name) == "opening" {
+                main = Some(cx.opening(d)?);
+                continue;
+            }
+            items.push('\n');
+            items.push_str(&cx.def_or_baked(d, base)?);
+        }
+        if items.is_empty() && main.is_none() {
+            continue;
+        }
+        prelude |= cx.imports.contains("Prelude");
+        let mut text = format!("# {slug} -- emitted from Codex by rocemit (rust-codex-compiler). Do not edit.\n");
+        for m in &cx.imports {
+            text.push_str(&format!("import {m}\n"));
+        }
+        if let Some(main) = main {
+            if cx.uses_line {
+                text.push_str(LINE_HELPER);
+            }
+            text.push_str(&items);
+            text.push_str("\n# --- Entry ---\n\n");
+            text.push_str(&main);
+        } else {
+            text.push_str(&format!("\n{slug} :: [].{{\n{items}}}\n"));
+        }
+        files.push((format!("{slug}.roc"), text));
+    }
+    if prelude {
+        files.push((
+            "Prelude.roc".into(),
+            "# Prelude -- the language types no chapter declares.\n\nPrelude :: [].{\n\tMaybe(a) : [None, Just(a)]\n}\n".into(),
+        ));
+    }
+    Ok(files)
+}
+
+/// A chapter slug as a Roc module name: capitalised, alphanumeric.
+fn module_name(slug: &str) -> Result<&str, String> {
+    if slug.starts_with(|c: char| c.is_ascii_uppercase()) && slug.chars().all(|c| c.is_ascii_alphanumeric()) {
+        Ok(slug)
+    } else {
+        Err(format!("chapter `{slug}` is not a Roc module name"))
+    }
 }
 
 struct Cx<'a> {
@@ -120,6 +188,15 @@ struct Cx<'a> {
     /// Every emitted definition and its parameter count: a call must be
     /// saturated, because Roc calls are.
     arity: BTreeMap<Sym, usize>,
+    /// Which chapter each definition and each declared type lives in. Empty
+    /// in the single-file layout, where nothing is qualified.
+    def_module: BTreeMap<Sym, String>,
+    type_module: BTreeMap<Sym, String>,
+    modules: bool,
+    maybe: Sym,
+    /// The chapter being emitted, and the modules its text has reached for.
+    current: String,
+    imports: std::collections::BTreeSet<String>,
     /// Names bound by the enclosing parameters, lets and patterns.
     locals: Vec<Sym>,
     /// Type-variable letters, per definition signature.
@@ -128,6 +205,77 @@ struct Cx<'a> {
 }
 
 impl<'a> Cx<'a> {
+    fn new(ch: &Chapter, tds: &'a TypeDefs, syms: &'a SymTab, defs: &[IrDef], modules: bool) -> Cx<'a> {
+        let mut cx = Cx {
+            syms,
+            tds,
+            arity: defs.iter().map(|d| (d.name, d.params.len())).collect(),
+            def_module: BTreeMap::new(),
+            type_module: BTreeMap::new(),
+            modules,
+            maybe: syms.find("Maybe").unwrap_or_default(),
+            current: String::new(),
+            imports: Default::default(),
+            locals: Vec::new(),
+            tvars: BTreeMap::new(),
+            uses_line: false,
+        };
+        for (td, c) in ch.type_defs.iter().zip(&ch.type_def_chapters) {
+            let n = match td {
+                TypeDef::Record(n, ..) | TypeDef::Variant(n, ..) | TypeDef::Unit(n, ..) => *n,
+            };
+            cx.type_module.insert(n, c.clone());
+        }
+        if modules {
+            for d in defs {
+                cx.def_module.insert(d.name, d.chapter_slug.clone());
+            }
+        }
+        cx
+    }
+
+    /// A name from module `module`, as seen from the module being emitted:
+    /// bare at home, `Module.name` elsewhere, and the import is remembered.
+    fn qualified(&mut self, module: &str, name: String) -> String {
+        if !self.modules || module.is_empty() || module == self.current {
+            return name;
+        }
+        self.imports.insert(module.to_string());
+        format!("{module}.{name}")
+    }
+
+    /// A definition's name as a reference.
+    fn def_ref(&mut self, n: Sym) -> Result<String, String> {
+        let m = self.def_module.get(&n).cloned().unwrap_or_default();
+        let id = self.ident(n)?;
+        Ok(self.qualified(&m, id))
+    }
+
+    /// A declared type's name as a reference. `Maybe` undeclared is the
+    /// Prelude's, in the module layout.
+    ///
+    /// **ALWAYS QUALIFIED, EVEN AT HOME.** Chapter Cat declares a type named
+    /// Cat, and inside `Cat :: [].{ ... }` a bare `Cat` is the module's own
+    /// void type, not the alias nested in it: every definition returning a
+    /// Cat then returns the empty type, and every unit that builds a world
+    /// crashes at compile time. `Cat.Cat` resolves to the alias from inside
+    /// and outside alike.
+    fn type_ref(&mut self, n: Sym) -> String {
+        let name = self.syms.text(n).to_string();
+        let m = match self.type_module.get(&n) {
+            Some(m) => m.clone(),
+            None if self.modules && n == self.maybe => "Prelude".to_string(),
+            None => String::new(),
+        };
+        if !self.modules || m.is_empty() {
+            return name;
+        }
+        if m != self.current {
+            self.imports.insert(m.clone());
+        }
+        format!("{m}.{name}")
+    }
+
     // ---- names ----------------------------------------------------------
 
     fn ident(&self, n: Sym) -> Result<String, String> {
@@ -175,7 +323,7 @@ impl<'a> Cx<'a> {
             }
             Ty::ForAll(_, b) | Ty::ForAllEff(_, b) | Ty::Linear(b) => self.ty(b)?,
             Ty::Sum(n, a) | Ty::Record(n, a) | Ty::Constructed(n, a) => {
-                let name = self.syms.text(*n).to_string();
+                let name = self.type_ref(*n);
                 if a.is_empty() {
                     name
                 } else {
@@ -236,7 +384,7 @@ impl<'a> Cx<'a> {
         Ok(if ps.is_empty() { r } else { format!("{} -> {}", ps.join(", "), r) })
     }
 
-    fn texpr(&self, t: &TypeExpr) -> Result<String, String> {
+    fn texpr(&mut self, t: &TypeExpr) -> Result<String, String> {
         Ok(match t {
             TypeExpr::Named(n, _) => match self.syms.text(*n) {
                 "Real" => "F64".into(),
@@ -244,14 +392,22 @@ impl<'a> Cx<'a> {
                 "Text" => "Str".into(),
                 "Boolean" => "Bool".into(),
                 "Nothing" => "{}".into(),
-                s => s.to_string(),
+                s if s.starts_with(|c: char| c.is_ascii_lowercase()) => s.to_string(),
+                _ => self.type_ref(*n),
             },
             TypeExpr::App(f, args, _) => {
                 let TypeExpr::Named(n, _) = &**f else {
                     return Err("a type applied to a non-name".into());
                 };
-                let args: Result<Vec<_>, _> = args.iter().map(|a| self.texpr(a)).collect();
-                format!("{}({})", self.syms.text(*n), args?.join(", "))
+                let head = match self.syms.text(*n) {
+                    "List" => "List".to_string(),
+                    _ => self.type_ref(*n),
+                };
+                let mut xs = Vec::new();
+                for a in args {
+                    xs.push(self.texpr(a)?);
+                }
+                format!("{head}({})", xs.join(", "))
             }
             TypeExpr::Fun(..) => {
                 let mut ps = Vec::new();
@@ -266,15 +422,17 @@ impl<'a> Cx<'a> {
         })
     }
 
-    fn type_def(&self, td: &TypeDef) -> Result<String, String> {
+    fn type_def(&mut self, td: &TypeDef, base: usize) -> Result<String, String> {
+        let syms = self.syms;
         let head = |n: Sym, ps: &[Sym]| -> Result<String, String> {
-            let name = self.syms.text(n).to_string();
+            let name = syms.text(n).to_string();
             if ps.is_empty() {
                 return Ok(name);
             }
-            let ps: Vec<&str> = ps.iter().map(|p| self.syms.text(*p)).collect();
+            let ps: Vec<&str> = ps.iter().map(|p| syms.text(*p)).collect();
             Ok(format!("{name}({})", ps.join(", ")))
         };
+        let tabs = "\t".repeat(base);
         Ok(match td {
             TypeDef::Record(n, ps, fields, _, _) => {
                 let mut fs = Vec::new();
@@ -282,9 +440,9 @@ impl<'a> Cx<'a> {
                     fs.push(format!("{} : {}", self.ident(f.name)?, self.texpr(&f.type_expr)?));
                 }
                 if fs.is_empty() {
-                    format!("{} : {{}}\n", head(*n, ps)?)
+                    format!("{tabs}{} : {{}}\n", head(*n, ps)?)
                 } else {
-                    format!("{} : {{ {} }}\n", head(*n, ps)?, fs.join(", "))
+                    format!("{tabs}{} : {{ {} }}\n", head(*n, ps)?, fs.join(", "))
                 }
             }
             TypeDef::Variant(n, ps, ctors, _) => {
@@ -297,11 +455,14 @@ impl<'a> Cx<'a> {
                     if c.fields.is_empty() {
                         cs.push(tag);
                     } else {
-                        let fs: Result<Vec<_>, _> = c.fields.iter().map(|f| self.texpr(f)).collect();
-                        cs.push(format!("{tag}({})", fs?.join(", ")));
+                        let mut fs = Vec::new();
+                        for f in &c.fields {
+                            fs.push(self.texpr(f)?);
+                        }
+                        cs.push(format!("{tag}({})", fs.join(", ")));
                     }
                 }
-                format!("{} : [{}]\n", head(*n, ps)?, cs.join(", "))
+                format!("{tabs}{} : [{}]\n", head(*n, ps)?, cs.join(", "))
             }
             TypeDef::Unit(n, ..) => return Err(format!("unit type `{}`", self.syms.text(*n))),
         })
@@ -309,7 +470,36 @@ impl<'a> Cx<'a> {
 
     // ---- definitions ----------------------------------------------------
 
-    fn def(&mut self, d: &IrDef) -> Result<String, String> {
+    /// A definition, or the line that says a data table was left to a baker.
+    ///
+    /// **A DATA TABLE IS NOT EMITTED, AND THE OMISSION IS WRITTEN DOWN.**
+    /// Roc's checker is superlinear in the literal elements of a FILE
+    /// (measured: 1k, 2k, 4k points check in 3.6, 9.9, 31 seconds, as
+    /// records or as floats, in one list or many) and the same data as a
+    /// string checks in half a second. So a constant that is a literal of
+    /// BAKED_AT or more leaves is left to a baker that spells it as a
+    /// string. In the single-file layout the line names it and the driver
+    /// appends the baked text; in the module layout it forwards to
+    /// `<Slug>Data.name`, the module the baker writes. Either way a missing
+    /// baked name is Roc's undefined-name error, never a silent hole.
+    fn def_or_baked(&mut self, d: &IrDef, base: usize) -> Result<String, String> {
+        let leaves = leaf_literals(&d.body);
+        if !d.params.is_empty() || leaves < BAKED_AT {
+            return self.def(d, base);
+        }
+        let sig = self.signature(d)?;
+        let name = self.ident(d.name)?;
+        let tabs = "\t".repeat(base);
+        let mut out = format!("{tabs}# baked: {name} : {sig} -- {} {leaves} literals\n", d.chapter_slug);
+        if self.modules {
+            let data = format!("{}Data", d.chapter_slug);
+            let from = self.qualified(&data, name.clone());
+            out.push_str(&format!("{tabs}{name} : {sig}\n{tabs}{name} = {from}\n"));
+        }
+        Ok(out)
+    }
+
+    fn def(&mut self, d: &IrDef, base: usize) -> Result<String, String> {
         let name = self.ident(d.name)?;
         let sig = self.signature(d)?;
         let mark = self.locals.len();
@@ -318,12 +508,13 @@ impl<'a> Cx<'a> {
             self.locals.push(p.name);
             ps.push(self.binder(p.name, &[&d.body])?);
         }
-        let body = self.expr(&d.body, 1)?;
+        let body = self.expr(&d.body, base)?;
         self.locals.truncate(mark);
+        let tabs = "\t".repeat(base);
         Ok(if ps.is_empty() {
-            format!("{name} : {sig}\n{name} = {body}\n")
+            format!("{tabs}{name} : {sig}\n{tabs}{name} = {body}\n")
         } else {
-            format!("{name} : {sig}\n{name} = |{}| {body}\n", ps.join(", "))
+            format!("{tabs}{name} : {sig}\n{tabs}{name} = |{}| {body}\n", ps.join(", "))
         })
     }
 
@@ -437,14 +628,14 @@ impl<'a> Cx<'a> {
     /// A name standing alone: a definition (a constant, or a function as a
     /// value), a local, or a nullary constructor. A builtin as a VALUE has no
     /// Roc spelling here.
-    fn name_value(&self, n: Sym) -> Result<String, String> {
-        let t = self.syms.text(n);
+    fn name_value(&mut self, n: Sym) -> Result<String, String> {
         if self.locals.contains(&n) {
             return self.local(n);
         }
         if self.arity.contains_key(&n) {
-            return self.ident(n);
+            return self.def_ref(n);
         }
+        let t = self.syms.text(n);
         if t.starts_with(|c: char| c.is_ascii_uppercase()) {
             return self.tag(n);
         }
@@ -520,7 +711,7 @@ impl<'a> Cx<'a> {
             if xs.len() < k {
                 return Err(format!("`{text}` applied to {} of {k} arguments", xs.len()));
             }
-            let first = format!("{}({})", self.ident(*n)?, xs[..k].join(", "));
+            let first = format!("{}({})", self.def_ref(*n)?, xs[..k].join(", "));
             return Ok(if xs.len() == k { first } else { format!("{first}({})", xs[k..].join(", ")) });
         }
         if text.starts_with(|c: char| c.is_ascii_uppercase()) {

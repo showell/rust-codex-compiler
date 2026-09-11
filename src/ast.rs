@@ -386,6 +386,10 @@ pub struct Chapter {
     pub name: Name,
     pub defs: Vec<Def>,
     pub type_defs: Vec<TypeDef>,
+    /// The chapter each type definition was declared in, parallel to
+    /// `type_defs`. A `TypeDef` carries no slug of its own; an emitter that
+    /// writes one module per chapter needs to know where a type lives.
+    pub type_def_chapters: Vec<String>,
     pub effect_defs: Vec<EffectDef>,
     pub class_defs: Vec<ClassDef>,
     pub instance_defs: Vec<InstanceDef>,

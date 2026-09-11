@@ -680,6 +680,7 @@ impl<'a> Desugar<'a> {
                         };
                         ch.derivings.push((name, derives));
                         ch.type_defs.push(td);
+                        ch.type_def_chapters.push(slug.clone());
                     }
                 }
                 NodeKind::EffectDef => ch.effect_defs.push(EffectDef {

@@ -82,7 +82,14 @@ pub fn lift_lambdas(defs: Vec<IrDef>, syms: &mut SymTab) -> Vec<IrDef> {
         // `lift-defs` opens each definition with its parameters as the whole
         // of `enclosing` -- nothing outside a definition is capturable.
         let mut scope: Vec<Sym> = d.params.iter().map(|p| p.name).collect();
+        let before = lifted.len();
         let body = lift_expr(d.body, &mut scope, names, syms, &mut lifted);
+        // A lifted lambda belongs to the chapter of the definition it was
+        // lifted from; the wire does not say so, an emitter writing one
+        // module per chapter needs it.
+        for l in &mut lifted[before..] {
+            l.chapter_slug = d.chapter_slug.clone();
+        }
         out.push(IrDef { body, ..d });
     }
     out.extend(lifted);
