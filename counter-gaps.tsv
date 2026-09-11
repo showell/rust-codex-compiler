@@ -1,0 +1,6 @@
+# Counter divergences whose cause is FILED and is not ours: the unit, then why.
+# A row here prints as FILED and does not make the gate RED.
+#
+#   unit<TAB>why
+#
+nrf52840-drivers	upstream's class scanner reads `instance ID)` out of the section title "TWIM0 (I2C, 0x40003000 -- shared with SPIM via instance ID)" and synthesizes a dictionary `ID-dict-)`: 2 ids, pruned from the wire

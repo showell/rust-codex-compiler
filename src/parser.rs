@@ -447,7 +447,31 @@ fn looks_like_type_def(p: &Parser<'_>) -> bool {
     while crate::typedef::starts_type_params(p, n) {
         n += if p.kind(n) == Some(Kind::LeftParen) { 3 } else { 1 };
     }
-    p.kind(n) == Some(Kind::Equals)
+    if p.kind(n) != Some(Kind::Equals) {
+        return false;
+    }
+    // `parse-type-def-inner`: past the `=` and any newlines, the body must
+    // begin `unit`, `record`, a pipe, or a type identifier with a pipe later
+    // on its line (`looks-like-variant`). Anything else -- `MaxDepth = 3` --
+    // is a DEFINITION whose name is capitalised.
+    let mut m = n + 1;
+    while matches!(p.kind(m), Some(Kind::Newline | Kind::Indent | Kind::Dedent)) {
+        m += 1;
+    }
+    match p.kind(m) {
+        Some(Kind::UnitKeyword | Kind::RecordKeyword | Kind::Pipe) => true,
+        Some(Kind::TypeIdentifier) => {
+            let mut k = m + 1;
+            loop {
+                match p.kind(k) {
+                    Some(Kind::Pipe) => return true,
+                    Some(Kind::Newline | Kind::EndOfFile) | None => return false,
+                    _ => k += 1,
+                }
+            }
+        }
+        _ => false,
+    }
 }
 
 fn parse_def(p: &mut Parser<'_>, src: &[u8], first: Token) {

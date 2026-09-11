@@ -23,16 +23,22 @@ UNITS="${UNITS:-$HOME/units-current}"
 
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gate_provenance.sh"
 gate_provenance "$UNITS"
-same=0; diff=0; halt=0
+# `counter-gaps.tsv`: a unit whose divergence has a FILED cause that is not
+# ours prints as FILED with the row's reason and does not make the gate RED.
+GAPS="$ROOT/counter-gaps.tsv"
+filed_why() { [ -f "$GAPS" ] && awk -F'\t' -v u="$1" '$1 == u { print $2; exit }' "$GAPS"; }
+same=0; diff=0; halt=0; filed=0
 for u in "$UNITS"/*.codex; do
     out="$("$ROOT/tools/counters.sh" "$u")"
     case "$out" in
         SAME*) same=$((same + 1)) ;;
         *"oracle[HALT]"*) halt=$((halt + 1)) ;;
-        *) diff=$((diff + 1)); echo "$out" ;;
+        *) n="$(basename "$u" .codex)"; why="$(filed_why "$n")"
+           if [ -n "$why" ]; then filed=$((filed + 1)); echo "FILED $n  $why"
+           else diff=$((diff + 1)); echo "$out"; fi ;;
     esac
 done
 echo
-echo "$same agree, $diff diverge, $halt the oracle refuses"
+echo "$same agree, $diff diverge, $filed filed, $halt the oracle refuses"
 [ $diff -eq 0 ] || { echo RED; exit 1; }
 echo GREEN
