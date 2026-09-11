@@ -56,8 +56,10 @@ fn fold_expr(e: &IrExpr, defined: &BTreeSet<Sym>, syms: &SymTab) -> IrExpr {
     let go = |x: &IrExpr| Box::new(fold_expr(x, defined, syms));
     match e {
         // `-5` is one node on the wire, not a negate around a literal.
+        // `-9223372036854775808` lexes to `i64::MIN` by wrapping accumulation
+        // and negating that wraps back to itself, as upstream's does.
         E::Negate(x, t, s) => match fold_expr(x, defined, syms) {
-            E::IntLit(v, _) => E::IntLit(-v, *s),
+            E::IntLit(v, _) => E::IntLit(v.wrapping_neg(), *s),
             fx => E::Negate(Box::new(fx), t.clone(), *s),
         },
         E::Apply(f, a, t, s) => {
