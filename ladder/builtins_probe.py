@@ -220,6 +220,37 @@ def _elems(form):
     return out
 
 
+def _vec_len(form):
+    """A vector's lane count: a literal, or `(0 - 1)` for the unsized -1."""
+    if isinstance(form, str):
+        return int(form) if re.fullmatch(r'-?\d+', form) else None
+    if isinstance(form, list) and len(form) == 3 and form[1] == '-':
+        try:
+            return int(form[0]) - int(form[2])
+        except ValueError:
+            return None
+    return None
+
+
+def _name_aliases(text):
+    """`schan-name : Name = Name { value = "SChan" }` -- the names
+    Builtins.codex gives its constructed types before the table uses them."""
+    return dict(re.findall(r'^\s*([a-z][\w-]*)\s*:\s*Name\s*=\s*Name\s*\{\s*value\s*=\s*"([^"]*)"', text, re.M))
+
+
+def _named_rows(text):
+    """`identity-admin-row = EffectRow { labels = [ ... ] ... }` in
+    Types/TypeEnv.codex: each named row's labels, space-joined."""
+    out = {}
+    for m in re.finditer(r'^\s*([a-z][\w-]*)\s*=\s*EffectRow\s*\{(.*?)^\s*\}', text, re.M | re.S):
+        out[m.group(1)] = ' '.join(re.findall(r'name\s*=\s*Name\s*\{\s*value\s*=\s*"([^"]*)"', m.group(2)))
+    return out
+
+
+NAME_ALIASES = _name_aliases(SOURCE.read_text(errors='replace'))
+NAMED_ROWS = _named_rows((CODEX / 'codex' / 'compiler' / 'Types' / 'TypeEnv.codex').read_text(errors='replace'))
+
+
 def _bare(form):
     """`("Maybe")` is the name `Maybe`: a parenthesised `Name { ... }` record
     that the collapse above left as a one-element form."""
@@ -256,6 +287,9 @@ def _check_type(form):
         # so unlike an empty row it must NOT be minted a fresh one.
         if isinstance(row, list) and row and row[0] == 'row-var' and len(row) > 1:
             return f'(fn {a} (rowvar {row[1]}) {r})'
+        # A row NAMED in Types/TypeEnv.codex -- `(identity-admin-row)`.
+        if isinstance(row, list) and len(row) == 1 and row[0] in NAMED_ROWS:
+            return f'(fn {a} (row {NAMED_ROWS[row[0]]}) {r})'
         return None
     if head == 'TypeVar' and len(form) >= 2:
         return f'(tvar {form[1]})'
@@ -269,21 +303,20 @@ def _check_type(form):
         e = _check_type(form[1])
         return f'(list {e})' if e else None
     if head == 'EffectfulTy' and len(form) >= 4:
-        # **THE EFFECT NAMES ARE DROPPED, AND THAT IS SAFE FOR EXACTLY ONE
-        # REASON.** `infer-name` (TypeCheckerInference.codex:171) answers the
-        # INNER type for an effectful name and hands the row to its caller, so
-        # a builtin's effect names never reach the IR through a reference to
-        # it; the `(effectful ...)` a wire carries comes from a DEFINITION's
-        # own declared type, which is read from source and not from here. The
-        # day something reads a builtin's row, this has to carry it.
+        # `(eff Name.. inner)`: the effect names come first, and the desugarer
+        # interns them (BUILTIN_EFFECT_NAMES) so a reference can resolve them
+        # in a program that never names the effect itself.
         b = _check_type(form[3])
-        return f'(eff {b})' if b else None
+        raw = form[1] if isinstance(form[1], list) else [form[1]]
+        names = [n.strip('"') for n in raw if n != '#list']
+        return f'(eff {" ".join(names)} {b})'.replace('  ', ' ') if b else None
     # `deck-record T` is a record ON THE DECK -- a placement, not a type.
     if head == 'deck-record' and len(form) >= 2:
         return _check_type(form[1])
     if head == 'VectorTy' and len(form) >= 3:
         e = _check_type(form[2])
-        return f'(vec {form[1]} {e})' if e else None
+        n = _vec_len(form[1])
+        return f'(vec {n} {e})' if e and n is not None else None
     if head == 'VectorMaskTy' and len(form) >= 2:
         return f'(vec-mask {form[1]})'
     if head == 'LinkedListTy' and len(form) >= 2:
@@ -296,7 +329,7 @@ def _check_type(form):
     # constructor whose name carries a space would need quoting. None does.
     if head == 'ConstructedTy' and len(form) >= 3:
         args = _elems(form[2])
-        name = _bare(form[1])
+        name = NAME_ALIASES.get(_bare(form[1]), _bare(form[1]))
         if args is None or not name:
             return None
         rendered = [_check_type(a) for a in args]

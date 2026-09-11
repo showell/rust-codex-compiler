@@ -295,9 +295,9 @@ pub const BUILTIN_EFFECT_NAMES: [&str; 5] = ["Console.Read", "Process", "Device.
 
 /// The type names the table above refers to, interned the same way: a builtin
 /// whose type names `Task` is otherwise untyped in a program that never does.
-pub const BUILTIN_TYPE_NAMES: [&str; 4] = ["Maybe", "Task", "TypeBinding", "schan-name"];
+pub const BUILTIN_TYPE_NAMES: [&str; 4] = ["Maybe", "SChan", "Task", "TypeBinding"];
 
-pub const BUILTIN_TYPES: [(&str, &str); 252] = [
+pub const BUILTIN_TYPES: [(&str, &str); 254] = [
     ("negate", "(forall 0 (fn (tvar 0) empty (tvar 0)))"),
     ("text-length", "(fn text empty int)"),
     ("integer-to-text", "(fn int empty text)"),
@@ -383,6 +383,7 @@ pub const BUILTIN_TYPES: [(&str, &str); 252] = [
     ("cpu-read-cr0", "int"),
     ("cpu-read-cr3", "int"),
     ("hosted-kind", "int"),
+    ("host-socket", "(fn int empty (fn int empty (fn int empty (fn int (row Network.Write) int))))"),
     ("cpu-cpuid-eax", "(fn int empty int)"),
     ("cpu-cpuid-ebx", "(fn int empty int)"),
     ("cpu-cpuid-ecx", "(fn int empty int)"),
@@ -432,6 +433,7 @@ pub const BUILTIN_TYPES: [(&str, &str); 252] = [
     ("identity-set", "(fn int empty (fn int (row Identity) int))"),
     ("device-seed", "(fn int (row Identity) int)"),
     ("boot-factstore-status", "int"),
+    ("identity-set-proc", "(fn int empty (fn int empty (fn int (row Identity Capability) int)))"),
     ("identity-get-proc", "(fn int empty (fn int (row Identity) int))"),
     ("process-spawn-with-heap", "(foralleff 0 (fn (fn int (rowvar 0) int) empty (fn int (row Concurrent) int)))"),
     ("process-spawn-on-core", "(foralleff 0 (fn (fn int (rowvar 0) int) empty (fn int (row Concurrent) int)))"),
@@ -545,11 +547,11 @@ pub const BUILTIN_TYPES: [(&str, &str); 252] = [
     ("memory-fence", "(fn int empty int)"),
     ("vec-empty", "(forall 0 (vec 0 (tvar 0)))"),
     ("vec-singleton", "(forall 0 (fn (tvar 0) empty (vec 1 (tvar 0))))"),
-    ("vec-head", "(forall 0 (fn (vec ['0', '-', '1'] (tvar 0)) empty (tvar 0)))"),
-    ("vec-cons", "(forall 0 (fn (tvar 0) empty (fn (vec ['0', '-', '1'] (tvar 0)) empty (vec ['0', '-', '1'] (tvar 0)))))"),
-    ("vec-length", "(forall 0 (fn (vec ['0', '-', '1'] (tvar 0)) empty int))"),
-    ("s-new", "(forall 0 (ctd schan-name (tvar 0)))"),
-    ("s-recv-value", "(forall 0 (fn (ctd schan-name (tvar 0)) empty int))"),
+    ("vec-head", "(forall 0 (fn (vec -1 (tvar 0)) empty (tvar 0)))"),
+    ("vec-cons", "(forall 0 (fn (tvar 0) empty (fn (vec -1 (tvar 0)) empty (vec -1 (tvar 0)))))"),
+    ("vec-length", "(forall 0 (fn (vec -1 (tvar 0)) empty int))"),
+    ("s-new", "(forall 0 (ctd SChan (tvar 0)))"),
+    ("s-recv-value", "(forall 0 (fn (ctd SChan (tvar 0)) empty int))"),
 ];
 
 /// `bs-alloc`: each builtin's measured allocation class, from upstream's
