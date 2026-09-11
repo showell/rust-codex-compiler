@@ -399,7 +399,32 @@ impl<'a> Cx<'a> {
             }
         }
         let r = self.ty(cur)?;
-        Ok(if ps.is_empty() { r } else { format!("{} -> {}", ps.join(", "), r) })
+        let sig = if ps.is_empty() { r } else { format!("{} -> {}", ps.join(", "), r) };
+        // **`==` ON A TYPE VARIABLE NEEDS A `where` CLAUSE.** Roc's equality
+        // is the `is_eq` method of the left operand's type; a type variable
+        // has none unless the signature requires one (static-dispatch.md,
+        // "Where Clauses"). The derived equality on the prelude's tuples
+        // compares fields of type `a`.
+        let mut eq_vars: Vec<u32> = Vec::new();
+        d.body.walk(&mut |x| {
+            if let IrExpr::Binary(IrBinOp::Eq | IrBinOp::NotEq, l, _, _, _) = x {
+                let mut t = l.ty();
+                while let Ty::ForAll(_, b) | Ty::ForAllEff(_, b) = t {
+                    t = *b;
+                }
+                if let Ty::Var(id) = t {
+                    if !eq_vars.contains(&id) {
+                        eq_vars.push(id);
+                    }
+                }
+            }
+        });
+        let mut wants: Vec<String> = Vec::new();
+        for id in eq_vars {
+            let v = self.ty(&Ty::Var(id))?;
+            wants.push(format!("{v}.is_eq : {v}, {v} -> Bool"));
+        }
+        Ok(if wants.is_empty() { sig } else { format!("{sig} where [{}]", wants.join(", ")) })
     }
 
     fn texpr(&mut self, t: &TypeExpr) -> Result<String, String> {

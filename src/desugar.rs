@@ -1049,7 +1049,13 @@ impl<'a> Desugar<'a> {
         // chapter never mentioned. A chapter with no `Real` anywhere cannot
         // have a field naming one, so the absent symbol answers eq-safe.
         let real = self.syms.borrow().find("Real");
-        for td in &ch.type_defs {
+        // A derived definition belongs to the chapter that declared its
+        // type; the walk is over by now, so `self.slug` would say the last
+        // chapter. Its wire slug stays "", as upstream spells it.
+        let mut origins: Vec<String> = Vec::new();
+        for (i, td) in ch.type_defs.iter().enumerate() {
+            let origin = ch.type_def_chapters.get(i).cloned().unwrap_or_default();
+            let before = out.len();
             let name = match td {
                 TypeDef::Record(n, ..) | TypeDef::Variant(n, ..) | TypeDef::Unit(n, ..) => *n,
             };
@@ -1072,6 +1078,12 @@ impl<'a> Desugar<'a> {
             if derives("Ord") {
                 out.push(self.compare_def(name, td));
             }
+            for _ in before..out.len() {
+                origins.push(origin.clone());
+            }
+        }
+        for (d, origin) in out.iter_mut().zip(origins) {
+            d.origin = origin;
         }
         ch.defs.extend(out);
     }
