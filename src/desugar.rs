@@ -1597,13 +1597,13 @@ impl<'a> Desugar<'a> {
                         _ => None,
                     })
                     .unwrap_or(OverflowMode::Error);
-                TypeExpr::BoundedInt(
-                    Rc::new(first(0)),
-                    nums.first().copied().unwrap_or(0),
-                    nums.get(1).copied().unwrap_or(0),
-                    mode,
-                    sp,
-                )
+                // A bare `Integer wrapping` carries no band: the whole width.
+                let (lo, hi) = match nums.as_slice() {
+                    [lo, hi, ..] => (*lo, *hi),
+                    [] => (i64::MIN, i64::MAX),
+                    [lo] => (*lo, 0),
+                };
+                TypeExpr::BoundedInt(Rc::new(first(0)), lo, hi, mode, sp)
             }
             NodeKind::LinearType => TypeExpr::Linear(Rc::new(first(0)), sp),
             NodeKind::PropEqType => TypeExpr::PropEq(Rc::new(first(0)), Rc::new(first(1)), sp),

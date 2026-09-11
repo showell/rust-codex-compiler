@@ -200,6 +200,11 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The last significant token consumed.
+    pub(crate) fn prev_sig(&self) -> Option<Token> {
+        self.toks[..self.at()].iter().rev().find(|t| !t.kind.is_trivia()).copied()
+    }
+
     /// The line of the last significant token consumed.
     pub(crate) fn prev_sig_line(&self) -> u32 {
         self.toks[..self.at()]

@@ -107,6 +107,13 @@ fn parse_forall(p: &mut Parser<'_>, cp: usize) {
 }
 
 fn type_args(p: &mut Parser<'_>, cp: usize) {
+    // `Integer wrapping` with no band is the whole width, wrapping --
+    // upstream's `is-bare-wrapping`, tested before any argument.
+    if bare_wrapping(p) {
+        p.bump();
+        p.b.wrap_from(cp, NodeKind::BoundedIntType);
+        return;
+    }
     let mut any = false;
     while p.kind(0).is_some_and(starts_a_type_arg) {
         parse_type_atom(p);
@@ -115,6 +122,13 @@ fn type_args(p: &mut Parser<'_>, cp: usize) {
     if any {
         p.b.wrap_from(cp, NodeKind::AppType);
     }
+}
+
+fn bare_wrapping(p: &Parser<'_>) -> bool {
+    let Some(prev) = p.prev_sig() else { return false };
+    prev.kind == Kind::TypeIdentifier
+        && p.text_is(prev, b"Integer")
+        && p.sig(0).is_some_and(|t| t.kind == Kind::Identifier && p.text_is(t, b"wrapping"))
 }
 
 fn parse_type_atom(p: &mut Parser<'_>) {
