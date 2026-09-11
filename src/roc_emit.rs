@@ -205,6 +205,15 @@ struct Cx<'a> {
     /// Type-variable letters, per definition signature.
     tvars: BTreeMap<u32, String>,
     uses_line: bool,
+    /// Set while a right fold's body is emitted: its leaves become
+    /// accumulator steps (see `def`).
+    fold: Option<Fold>,
+}
+
+struct Fold {
+    name: Sym,
+    helper: String,
+    acc: String,
 }
 
 impl<'a> Cx<'a> {
@@ -222,6 +231,7 @@ impl<'a> Cx<'a> {
             locals: Vec::new(),
             tvars: BTreeMap::new(),
             uses_line: false,
+            fold: None,
         };
         for (td, c) in ch.type_defs.iter().zip(&ch.type_def_chapters) {
             let n = match td {
@@ -516,14 +526,44 @@ impl<'a> Cx<'a> {
             self.locals.push(p.name);
             ps.push(self.binder(p.name, &[&d.body])?);
         }
-        let body = self.expr(&d.body, base)?;
-        self.locals.truncate(mark);
         let tabs = "\t".repeat(base);
-        Ok(if ps.is_empty() {
-            format!("{tabs}{name} : {sig}\n{tabs}{name} = {body}\n")
+        // **A RIGHT FOLD IS EMITTED AS AN ACCUMULATOR LOOP.** Codex builds a
+        // list by `x & f rest`: the recursive call is the right operand of
+        // an append, and each level copies everything below it, so a
+        // 2,430-element list costs 1.7 seconds in Roc where an accumulator
+        // costs milliseconds (measured, roc-apps probe/cons). The shape is
+        // recognised, not guessed: every recursive call sits as the right
+        // operand of an append at a leaf of the if-tree, and nowhere else.
+        let out = if !ps.is_empty() && is_right_fold(&d.body, d.name) {
+            let acc = self.syms.find("acc").filter(|a| self.locals.contains(a)).map_or("acc", |_| "acc_");
+            let helper = format!("{name}_acc");
+            let (params, ret) = self.fun_parts(&d.ty)?;
+            let _ = params;
+            let mut hsig: Vec<String> = Vec::new();
+            for p in &d.params {
+                hsig.push(self.ty(&p.ty)?);
+            }
+            hsig.push(ret.clone());
+            self.fold = Some(Fold { name: d.name, helper: helper.clone(), acc: acc.to_string() });
+            let body = self.expr(&d.body, base)?;
+            self.fold = None;
+            format!(
+                "{tabs}# {name} builds its list by appending a recursive call; emitted as an accumulator loop, which is linear where the direct shape is quadratic.\n\
+                 {tabs}{name} : {sig}\n{tabs}{name} = |{ps}| {helper}({ps}, [])\n\n\
+                 {tabs}{helper} : {hsig} -> {ret}\n{tabs}{helper} = |{ps}, {acc}| {body}\n",
+                ps = ps.join(", "),
+                hsig = hsig.join(", ")
+            )
         } else {
-            format!("{tabs}{name} : {sig}\n{tabs}{name} = |{}| {body}\n", ps.join(", "))
-        })
+            let body = self.expr(&d.body, base)?;
+            if ps.is_empty() {
+                format!("{tabs}{name} : {sig}\n{tabs}{name} = {body}\n")
+            } else {
+                format!("{tabs}{name} : {sig}\n{tabs}{name} = |{}| {body}\n", ps.join(", "))
+            }
+        };
+        self.locals.truncate(mark);
+        Ok(out)
     }
 
     /// `opening : [Console] Nothing = act ...` is `main!`.
@@ -566,6 +606,11 @@ impl<'a> Cx<'a> {
 
     fn expr(&mut self, e: &IrExpr, ind: usize) -> Result<String, String> {
         use IrExpr as E;
+        if let Some(fold) = self.fold.take() {
+            let out = self.fold_expr(e, ind, &fold);
+            self.fold = Some(fold);
+            return out;
+        }
         Ok(match e {
             E::IntLit(v, _) => int_lit(*v),
             E::NumLit(bits, _) => num_lit(*bits),
@@ -857,6 +902,106 @@ impl<'a> Cx<'a> {
             IrPat::Vec_(..) => return Err("vector pattern".into()),
         })
     }
+}
+
+impl<'a> Cx<'a> {
+    /// The body of a right fold: `if` and `let` keep the mode; an append whose
+    /// right operand is the recursive call becomes a step, `helper(args,
+    /// List.concat(acc, left))`; any other leaf is the end, `List.concat(acc,
+    /// leaf)`, or `acc` alone for an empty list.
+    fn fold_expr(&mut self, e: &IrExpr, ind: usize, fold: &Fold) -> Result<String, String> {
+        use IrExpr as E;
+        match e {
+            E::If(c, t, f, _, _) => {
+                let c = self.expr(c, ind)?;
+                self.fold = Some(Fold { name: fold.name, helper: fold.helper.clone(), acc: fold.acc.clone() });
+                let t = self.expr(t, ind);
+                let f = t.and_then(|t| self.expr(f, ind).map(|f| (t, f)));
+                self.fold = None;
+                let (t, f) = f?;
+                Ok(format!("(if {c} {{ {t} }} else {{ {f} }})"))
+            }
+            E::Let(..) => {
+                let tabs = "\t".repeat(ind + 1);
+                let mut out = String::from("({\n");
+                let mark = self.locals.len();
+                let mut cur = e;
+                while let E::Let(n, _, v, body, _) = cur {
+                    let v = self.expr(v, ind + 1)?;
+                    self.locals.push(*n);
+                    let b = self.binder(*n, &[body])?;
+                    out.push_str(&format!("{tabs}{b} = {v}\n"));
+                    cur = body;
+                }
+                self.fold = Some(Fold { name: fold.name, helper: fold.helper.clone(), acc: fold.acc.clone() });
+                let last = self.expr(cur, ind + 1);
+                self.fold = None;
+                out.push_str(&format!("{tabs}{}\n{}}})", last?, "\t".repeat(ind)));
+                self.locals.truncate(mark);
+                Ok(out)
+            }
+            E::Binary(IrBinOp::AppendList, l, r, _, _) if is_self_call(r, fold.name) => {
+                let l = self.expr(l, ind)?;
+                let mut args = Vec::new();
+                let mut head = &**r;
+                while let E::Apply(f, a, _, _) = head {
+                    args.push(&**a);
+                    head = f;
+                }
+                args.reverse();
+                let mut xs = Vec::new();
+                for a in args {
+                    xs.push(self.expr(a, ind)?);
+                }
+                Ok(format!("{}({}, List.concat({}, {l}))", fold.helper, xs.join(", "), fold.acc))
+            }
+            E::List(xs, _, _) if xs.is_empty() => Ok(fold.acc.clone()),
+            other => {
+                let leaf = self.expr(other, ind)?;
+                Ok(format!("List.concat({}, {leaf})", fold.acc))
+            }
+        }
+    }
+}
+
+/// Whether `e` is `name a b ..`: an application spine headed by the name.
+fn is_self_call(e: &IrExpr, name: Sym) -> bool {
+    let mut head = e;
+    while let IrExpr::Apply(f, _, _, _) = head {
+        head = f;
+    }
+    matches!(head, IrExpr::Name(n, _, _) if *n == name) && matches!(e, IrExpr::Apply(..))
+}
+
+fn calls(e: &IrExpr, name: Sym) -> bool {
+    uses(e, name)
+}
+
+/// A body that builds its list by appending a recursive call: every
+/// recursive call is the right operand of an append at a leaf of the
+/// if/let tree, its arguments make no recursive call, and there is at least
+/// one. The shape is what the accumulator rewrite in `Cx::def` relies on.
+fn is_right_fold(body: &IrExpr, name: Sym) -> bool {
+    fn leaves(e: &IrExpr, name: Sym, found: &mut bool) -> bool {
+        use IrExpr as E;
+        match e {
+            E::If(c, t, f, _, _) => !calls(c, name) && leaves(t, name, found) && leaves(f, name, found),
+            E::Let(_, _, v, b, _) => !calls(v, name) && leaves(b, name, found),
+            E::Binary(IrBinOp::AppendList, l, r, _, _) if is_self_call(r, name) => {
+                let mut args_ok = true;
+                let mut head = &**r;
+                while let E::Apply(f, a, _, _) = head {
+                    args_ok &= !calls(a, name);
+                    head = f;
+                }
+                *found = true;
+                !calls(l, name) && args_ok
+            }
+            other => !calls(other, name),
+        }
+    }
+    let mut found = false;
+    matches!(body.ty(), Ty::List(_)) && leaves(body, name, &mut found) && found
 }
 
 fn uses(e: &IrExpr, n: Sym) -> bool {
