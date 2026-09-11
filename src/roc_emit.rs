@@ -103,6 +103,15 @@ impl<'a> Cx<'a> {
         ident_text(self.syms.text(n))
     }
 
+    /// A local's spelling. Roc has no shadowing: a parameter named like a
+    /// top-level definition is a duplicate definition, so such a local gets
+    /// a trailing underscore. Inside its scope every reference to the name
+    /// is the local's, which is what lexical scope says.
+    fn local(&self, n: Sym) -> Result<String, String> {
+        let id = self.ident(n)?;
+        Ok(if self.arity.contains_key(&n) { format!("{id}_") } else { id })
+    }
+
     fn tag(&self, n: Sym) -> Result<String, String> {
         let t = self.syms.text(n);
         if t.starts_with(|c: char| c.is_ascii_uppercase()) && t.chars().all(|c| c.is_ascii_alphanumeric()) {
@@ -306,7 +315,7 @@ impl<'a> Cx<'a> {
                 IrActStmt::Bind(n, _, e, _) => {
                     let e = self.expr(e, 1)?;
                     self.locals.push(*n);
-                    out.push_str(&format!("\t{} = {e}\n", self.ident(*n)?));
+                    out.push_str(&format!("\t{} = {e}\n", self.local(*n)?));
                 }
             }
         }
@@ -319,7 +328,7 @@ impl<'a> Cx<'a> {
     /// saying so; an unused variable is a warning, and a warning is exit 2.
     fn binder(&self, n: Sym, scope: &[&IrExpr]) -> Result<String, String> {
         let used = scope.iter().any(|e| uses(e, n));
-        let id = self.ident(n)?;
+        let id = self.local(n)?;
         Ok(if used { id } else { format!("_{id}") })
     }
 
@@ -399,7 +408,10 @@ impl<'a> Cx<'a> {
     /// Roc spelling here.
     fn name_value(&self, n: Sym) -> Result<String, String> {
         let t = self.syms.text(n);
-        if self.locals.contains(&n) || self.arity.contains_key(&n) {
+        if self.locals.contains(&n) {
+            return self.local(n);
+        }
+        if self.arity.contains_key(&n) {
             return self.ident(n);
         }
         if t.starts_with(|c: char| c.is_ascii_uppercase()) {
@@ -470,15 +482,15 @@ impl<'a> Cx<'a> {
         for a in &args {
             xs.push(self.expr(a, ind)?);
         }
+        if self.locals.contains(n) {
+            return Ok(format!("{}({})", self.local(*n)?, xs.join(", ")));
+        }
         if let Some(&k) = self.arity.get(n) {
             if xs.len() < k {
                 return Err(format!("`{text}` applied to {} of {k} arguments", xs.len()));
             }
             let first = format!("{}({})", self.ident(*n)?, xs[..k].join(", "));
             return Ok(if xs.len() == k { first } else { format!("{first}({})", xs[k..].join(", ")) });
-        }
-        if self.locals.contains(n) {
-            return Ok(format!("{}({})", self.ident(*n)?, xs.join(", ")));
         }
         if text.starts_with(|c: char| c.is_ascii_uppercase()) {
             return Ok(format!("{}({})", self.tag(*n)?, xs.join(", ")));
