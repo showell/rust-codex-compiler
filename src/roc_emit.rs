@@ -941,7 +941,7 @@ impl<'a> Cx<'a> {
                 Ok(out)
             }
             E::Binary(IrBinOp::AppendList, l, r, _, _) if is_self_call(r, fold.name) => {
-                let l = self.expr(l, ind)?;
+                let grown = self.grow(&fold.acc, l, ind)?;
                 let mut args = Vec::new();
                 let mut head = &**r;
                 while let E::Apply(f, a, _, _) = head {
@@ -953,14 +953,26 @@ impl<'a> Cx<'a> {
                 for a in args {
                     xs.push(self.expr(a, ind)?);
                 }
-                Ok(format!("{}({}, List.concat({}, {l}))", fold.helper, xs.join(", "), fold.acc))
+                Ok(format!("{}({}, {grown})", fold.helper, xs.join(", ")))
             }
-            E::List(xs, _, _) if xs.is_empty() => Ok(fold.acc.clone()),
-            other => {
-                let leaf = self.expr(other, ind)?;
-                Ok(format!("List.concat({}, {leaf})", fold.acc))
-            }
+            other => self.grow(&fold.acc, other, ind),
         }
+    }
+
+    /// The accumulator with a list added at its end. **`List.append` PER
+    /// ELEMENT WHEN THE LIST IS A LITERAL**: appending one element by
+    /// `List.concat(acc, [x])` costs fifty times `List.append(acc, x)`, and
+    /// concat of a three-element literal per step goes quadratic (measured,
+    /// roc-apps probe/cons). Anything that is not a literal is concatenated.
+    fn grow(&mut self, acc: &str, l: &IrExpr, ind: usize) -> Result<String, String> {
+        if let IrExpr::List(xs, _, _) = l {
+            let mut out = acc.to_string();
+            for x in xs {
+                out = format!("List.append({out}, {})", self.expr(x, ind)?);
+            }
+            return Ok(out);
+        }
+        Ok(format!("List.concat({acc}, {})", self.expr(l, ind)?))
     }
 }
 
