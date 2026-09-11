@@ -368,6 +368,14 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
                 Ty::Error | Ty::NoExpect => expected_or_recorded(want, cx, *s),
                 other => other,
             };
+            // `is-unit-ctor`: the constructor of a unit type applied to its
+            // value elides the call and KEEPS the unit type on the value
+            // (`lower-unit-ctor-value`).
+            if let (IrExpr::Name(n, _, _), Ty::Unit(un, _)) = (&f, &ret_ty) {
+                if n == un {
+                    return Ok(lower_unit_ctor_value(a, &ret_ty, *s, cx));
+                }
+            }
             Ok(IrExpr::Apply(Box::new(f), Box::new(a), res, *s))
         }
         // **THE OPERATOR NAME DEPENDS ON THE OPERAND TYPE** -- `add-int`,
@@ -902,6 +910,26 @@ fn eq_dispatch(
 /// `type-name-of` (IR/Lowering.codex:695): the bare name, arguments DISCARDED,
 /// and `""` for anything without one -- a unit type included, so `==` on a
 /// unit type never reaches its own generated helper.
+/// `lower-unit-ctor-value`: a let's body is rewritten inside the let; a node
+/// with a type slot takes the unit type; a literal, which has none, is bound
+/// to `__unit-<offset>` so the name can carry it.
+fn lower_unit_ctor_value(arg: IrExpr, unit_ty: &Ty, sp: crate::ast::Span, cx: &Lower) -> IrExpr {
+    match arg {
+        IrExpr::Let(n, t, v, b, s) => IrExpr::Let(n, t, v, Box::new(lower_unit_ctor_value(*b, unit_ty, sp, cx)), s),
+        IrExpr::Name(..)
+        | IrExpr::Apply(..)
+        | IrExpr::If(..)
+        | IrExpr::Match(..)
+        | IrExpr::Act(..)
+        | IrExpr::Record(..)
+        | IrExpr::FieldAccess(..) => arg.with_ty(unit_ty.clone()),
+        other => {
+            let nm = cx.syms.borrow_mut().intern(&format!("__unit-{}", sp.offset));
+            IrExpr::Let(nm, unit_ty.clone(), Box::new(other), Box::new(IrExpr::Name(nm, unit_ty.clone(), sp)), sp)
+        }
+    }
+}
+
 /// `int-rem` or `compare` applied to its first argument, when the callee
 /// is that name applied once.
 fn special_apply_name(f: &Expr, cx: &Lower) -> Option<(&'static str, Expr)> {

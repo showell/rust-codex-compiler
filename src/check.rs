@@ -3084,10 +3084,22 @@ pub fn infer_row(
         E::Unary(x, _) if matches!(&**x, E::Lit(t, crate::ast::LiteralKind::IntLit, _) if int_lit_is_min_magnitude(t)) => {
             Ty::Integer(i64::MIN, i64::MAX, Overflow::Error)
         }
+        // `infer-unary`: a negated real keeps its type, an undecided
+        // operand is answered as it is, and anything else unifies with
+        // int-default and IS int-default -- a negated bounded integer loses
+        // its bounds.
         E::Unary(x, _) => {
             let (t, xrow) = infer_row(x, env, st);
             row = xrow;
-            t
+            let rt = st.deep_resolve(&t);
+            match rt {
+                Ty::Real(..) | Ty::Var(_) | Ty::Error => rt,
+                _ => {
+                    let int_default = Ty::Integer(i64::MIN, i64::MAX, Overflow::Error);
+                    if !st.unify(&rt, &int_default) { st.unify_gaps += 1; }
+                    int_default
+                }
+            }
         }
         // `infer-expr`'s `ALazyExpr` arm: a lazy value is a thunk from
         // Integer whose arrow carries the body's row, opened; the lazy
