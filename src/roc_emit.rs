@@ -55,8 +55,8 @@ pub fn emit_program(
             main = Some(cx.opening(d)?);
             continue;
         }
-        if d.chapter_slug != slug {
-            slug = d.chapter_slug.clone();
+        if d.origin != slug {
+            slug = d.origin.clone();
             body.push_str(&format!("\n# --- {slug} ---\n"));
         }
         body.push('\n');
@@ -110,11 +110,14 @@ pub fn emit_modules(
     let Some(app) = defs.iter().find(|d| syms.text(d.name) == "opening") else {
         return Err("no opening: nothing to run".into());
     };
-    let app_slug = app.chapter_slug.clone();
+    let app_slug = app.origin.clone();
     let mut slugs: Vec<String> = Vec::new();
     for d in defs {
-        if !slugs.contains(&d.chapter_slug) {
-            slugs.push(d.chapter_slug.clone());
+        if d.origin.is_empty() {
+            return Err(format!("`{}` belongs to no chapter", syms.text(d.name)));
+        }
+        if !slugs.contains(&d.origin) {
+            slugs.push(d.origin.clone());
         }
     }
     for c in &ch.type_def_chapters {
@@ -136,7 +139,7 @@ pub fn emit_modules(
             }
         }
         let mut main = None;
-        for d in defs.iter().filter(|d| d.chapter_slug == *slug) {
+        for d in defs.iter().filter(|d| d.origin == *slug) {
             if syms.text(d.name) == "opening" {
                 main = Some(cx.opening(d)?);
                 continue;
@@ -228,7 +231,7 @@ impl<'a> Cx<'a> {
         }
         if modules {
             for d in defs {
-                cx.def_module.insert(d.name, d.chapter_slug.clone());
+                cx.def_module.insert(d.name, d.origin.clone());
             }
         }
         cx
@@ -288,7 +291,12 @@ impl<'a> Cx<'a> {
     /// is the local's, which is what lexical scope says.
     fn local(&self, n: Sym) -> Result<String, String> {
         let id = self.ident(n)?;
-        Ok(if self.arity.contains_key(&n) { format!("{id}_") } else { id })
+        // In the module layout another chapter's definition is reached as
+        // `Module.name`, so only a definition of THIS module can collide --
+        // and a module's text must not depend on which spec is attached.
+        let collides = self.arity.contains_key(&n)
+            && (!self.modules || self.def_module.get(&n).is_some_and(|m| *m == self.current));
+        Ok(if collides { format!("{id}_") } else { id })
     }
 
     fn tag(&self, n: Sym) -> Result<String, String> {
@@ -490,9 +498,9 @@ impl<'a> Cx<'a> {
         let sig = self.signature(d)?;
         let name = self.ident(d.name)?;
         let tabs = "\t".repeat(base);
-        let mut out = format!("{tabs}# baked: {name} : {sig} -- {} {leaves} literals\n", d.chapter_slug);
+        let mut out = format!("{tabs}# baked: {name} : {sig} -- {} {leaves} literals\n", d.origin);
         if self.modules {
-            let data = format!("{}Data", d.chapter_slug);
+            let data = format!("{}Data", d.origin);
             let from = self.qualified(&data, name.clone());
             out.push_str(&format!("{tabs}{name} : {sig}\n{tabs}{name} = {from}\n"));
         }
@@ -864,16 +872,17 @@ fn uses(e: &IrExpr, n: Sym) -> bool {
 }
 
 /// A Codex name as a Roc identifier: kebab to snake, keywords suffixed. A
-/// lifted `__lam_0` loses its underscores, which in Roc would mark it unused.
+/// lifted `__lam_0` loses its underscores, which in Roc would mark it unused,
+/// and a derived `__eq_Tup2` loses its capitals, which Roc reads as a type.
 fn ident_text(t: &str) -> Result<String, String> {
     let t = t.trim_start_matches('_');
     if t.is_empty() {
         return Err("a name of only underscores cannot be a Roc identifier".into());
     }
-    if !t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') {
+    if !t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         return Err(format!("name `{t}` cannot be a Roc identifier"));
     }
-    let s = t.replace('-', "_");
+    let s = t.replace('-', "_").to_ascii_lowercase();
     Ok(if KEYWORDS.contains(&s.as_str()) { format!("{s}_") } else { s })
 }
 

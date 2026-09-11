@@ -210,7 +210,14 @@ pub struct Def {
     /// infers; the list is how upstream spells `Maybe` here.
     pub declared_type: Vec<TypeExpr>,
     pub body: Expr,
+    /// What the wire prints: the chapter for a written definition, and ""
+    /// for a synthesized one (`__lam_0`, `__show_T`), as upstream spells it.
     pub chapter_slug: String,
+    /// The chapter this definition BELONGS to, wire or not: the same as
+    /// `chapter_slug` for a written definition, and the chapter that caused
+    /// a synthesized one. Never printed; an emitter that writes one module
+    /// per chapter reads it.
+    pub origin: String,
     pub span: Span,
     /// This definition PROVES a `claim`, and the claim sits inside it. A proof
     /// is entered by the checker, never called, so nothing reads it and it is

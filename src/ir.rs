@@ -138,6 +138,30 @@ pub fn lower_chapter(
     if keep.is_empty() {
         return Err("no root reached: the chapter defines none of ir-emit-roots".into());
     }
+    lower_pipeline(ch, bindings, st, tds, roots, true)
+}
+
+/// Lower, resolve, lift -- and NO pipeline and NO prune. What an emitter
+/// writing the chapters AS WRITTEN reads: the pipeline inlines a definition
+/// the unit calls once, so a chapter's shape would depend on which spec is
+/// attached to it, and a module imported by fifty specs has to be one text.
+pub fn lower_whole(
+    ch: &Chapter,
+    bindings: &[Binding],
+    st: &UnifyState,
+    tds: &TypeDefs,
+) -> Result<Lowered, String> {
+    lower_pipeline(ch, bindings, st, tds, &[], false)
+}
+
+fn lower_pipeline(
+    ch: &Chapter,
+    bindings: &[Binding],
+    st: &UnifyState,
+    tds: &TypeDefs,
+    roots: &[&str],
+    driver_passes: bool,
+) -> Result<Lowered, String> {
     // **A LIFTED NAME IS A NAME THE CHAPTER'S TABLE NEVER INTERNED.** `Sym` is
     // an index into the table that made it, so `__lam_0` needs a table that
     // holds it. Interning is append-only, so a clone extended with the lifted
@@ -168,7 +192,7 @@ pub fn lower_chapter(
     // lift first its lambda is already a name and the definition inlines and
     // disappears: that is where the `mcopy-*-node` family and
     // `copy-sx-ctordef` went, five definitions the oracle keeps.
-    let defs = crate::ir_passes::pipeline(defs, &syms);
+    let defs = if driver_passes { crate::ir_passes::pipeline(defs, &syms) } else { defs };
     // RESOLVE, between the pipeline and the lift (subject 65624). The table is
     // the chapter's type declarations OVER every name the checker typed, which
     // is `sort-bindings (type-map & all-bindings)` -- the declaration wins.
@@ -177,7 +201,11 @@ pub fn lower_chapter(
     type_map.extend(tds.declared().iter().map(|(n, t)| (*n, t.clone())));
     let defs = crate::resolve_types::resolve_defs(defs, &syms, &type_map);
     let defs = crate::lambda_lifting::lift_lambdas(defs, &mut syms);
-    let defs = crate::ir_passes::prune_unreachable_roots(defs, roots, &syms);
+    let defs = if driver_passes {
+        crate::ir_passes::prune_unreachable_roots(defs, roots, &syms)
+    } else {
+        defs
+    };
     Ok(Lowered { syms, defs })
 }
 

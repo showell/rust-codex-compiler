@@ -85,10 +85,10 @@ pub fn lift_lambdas(defs: Vec<IrDef>, syms: &mut SymTab) -> Vec<IrDef> {
         let before = lifted.len();
         let body = lift_expr(d.body, &mut scope, names, syms, &mut lifted);
         // A lifted lambda belongs to the chapter of the definition it was
-        // lifted from; the wire does not say so, an emitter writing one
-        // module per chapter needs it.
+        // lifted from. The wire prints "" for it, as upstream does, so this
+        // is `origin`, never `chapter_slug`.
         for l in &mut lifted[before..] {
-            l.chapter_slug = d.chapter_slug.clone();
+            l.origin = d.origin.clone();
         }
         out.push(IrDef { body, ..d });
     }
@@ -315,6 +315,7 @@ fn lift_one(
         ty: lifted_ty.clone(),
         body,
         chapter_slug: String::new(),
+        origin: String::new(),
         span: sp,
         // A lifted lambda is nobody's `punctual` definition, and a lambda
         // parameter cannot be declared linear.

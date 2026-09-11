@@ -417,6 +417,8 @@ pub struct IrDef {
     pub ty: Ty,
     pub body: IrExpr,
     pub chapter_slug: String,
+    /// The chapter this definition belongs to, wire or not -- see `ast::Def`.
+    pub origin: String,
     pub span: Span,
     /// The trailing two fields of the emitted `(def ...)`. They come off the
     /// `punctual` modifier the parser read; upstream recovers them at lowering

@@ -654,6 +654,10 @@ impl<'a> Desugar<'a> {
         // chapter it was WRITTEN in, so the walk tracks it.
         let mut slug = String::new();
         for child in tree.child_nodes() {
+            // Every child is in the chapter the last header opened, and a
+            // synthesized definition (a derived Show, a unit family's
+            // constructor) takes that chapter as its `origin`.
+            self.slug = slug.clone();
             match child.kind {
                 NodeKind::ChapterHeader => {
                     slug = crate::preamble::header_text(child, self.src);
@@ -912,6 +916,7 @@ impl<'a> Desugar<'a> {
                 declared_type: Vec::new(),
                 body,
                 chapter_slug: String::new(),
+                origin: self.slug.clone(),
                 span: self.synth(),
                 is_claim: false,
                 is_punctual: false,
@@ -1000,6 +1005,7 @@ impl<'a> Desugar<'a> {
                         self.synth(),
                     ),
                     chapter_slug: String::new(),
+                origin: self.slug.clone(),
                     span: self.synth(),
                     is_claim: false,
                     is_punctual: false,
@@ -1021,6 +1027,7 @@ impl<'a> Desugar<'a> {
                     declared_type: vec![TypeExpr::Fun(Rc::new(fam_ty.clone()), Rc::new(int(self)), self.synth())],
                     body: divided,
                     chapter_slug: String::new(),
+                origin: self.slug.clone(),
                     span: self.synth(),
                     is_claim: false,
                     is_punctual: false,
@@ -1135,6 +1142,7 @@ impl<'a> Desugar<'a> {
             declared_type: vec![declared],
             body,
             chapter_slug: String::new(),
+                origin: self.slug.clone(),
             span: self.synth(),
             is_claim: false,
             is_punctual: false,
@@ -1398,6 +1406,7 @@ impl<'a> Desugar<'a> {
             )],
             body: Expr::Match(Rc::new(Expr::NameRef(xn, self.synth())), arms, self.synth()),
             chapter_slug: String::new(),
+                origin: self.slug.clone(),
             span: self.synth(),
             is_claim: false,
             is_punctual: false,
@@ -1466,6 +1475,7 @@ impl<'a> Desugar<'a> {
             declared_type,
             body,
             chapter_slug: self.slug.clone(),
+            origin: self.slug.clone(),
             span: name_tok.map(|t| span_of(&t)).unwrap_or_default(),
             // The `claim` is parked INSIDE the definition that proves it, which
             // is what makes the association structural rather than "the next

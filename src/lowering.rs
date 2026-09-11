@@ -232,6 +232,7 @@ pub fn lower_def(d: &crate::ast::Def, cx: &Lower) -> Result<IrDef, String> {
         ty: bound,
         body,
         chapter_slug: d.chapter_slug.clone(),
+        origin: d.origin.clone(),
         span: d.span,
         is_punctual: d.is_punctual,
         wcet_budget: d.wcet_budget,

@@ -57,10 +57,14 @@ fn emit(path: &Path, dir: Option<&Path>) -> Result<String, String> {
     if let Some(halt) = codexc::ir::codegen_halted(&st) {
         return Err(halt);
     }
-    let low = codexc::ir::lower_chapter(&ch, &bindings, &st, &tds, &codexc::ir::IR_EMIT_ROOTS)?;
     let Some(dir) = dir else {
+        let low = codexc::ir::lower_chapter(&ch, &bindings, &st, &tds, &codexc::ir::IR_EMIT_ROOTS)?;
         return codexc::roc_emit::emit_program(&ch, &tds, &low.syms, &low.defs);
     };
+    // **A MODULE IS THE WHOLE CHAPTER, AS WRITTEN.** The driver's prune and
+    // its inlining pipeline are the IR wire's rules; a chapter module that
+    // fifty apps import wants every definition and one text.
+    let low = codexc::ir::lower_whole(&ch, &bindings, &st, &tds)?;
     let files = codexc::roc_emit::emit_modules(&ch, &tds, &low.syms, &low.defs)?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     // The directory holds ONLY this unit's modules: a file from an earlier
