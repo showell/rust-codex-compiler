@@ -39,6 +39,12 @@ const KEYWORDS: [&str; 25] = [
 /// names cannot be imported, since the name is taken before the program
 /// starts (codex/test's forewords/encode-json-numbers declares Json).
 /// Read from `src/build/roc/Builtin.roc`'s own declarations.
+/// The builtins that read and write the address space. A poke answers 0
+/// and is bound to a name nobody reads; the write is the point.
+const MEMORY_OPS: [&str; 9] = [
+    "peek-byte", "peek-16", "peek-32", "peek-qword", "poke-byte", "poke-16", "poke-32", "poke-qword", "alloc-bytes",
+];
+
 const ROC_MODULES: [&str; 22] = [
     "Builtin", "BLAKE3", "Box", "Crypto", "Dec", "Digest", "Encoding", "Hasher", "HttpHeader", "Iter", "Json",
     "List", "Num", "Numeral", "Range", "SHA256", "Set", "Str", "Stream", "F32", "F64", "Bool",
@@ -395,7 +401,13 @@ struct Cx<'a> {
     /// the definitions whose type carries the effect.
     device_ops: std::collections::BTreeSet<Sym>,
     device_defs: std::collections::BTreeSet<Sym>,
-    /// The name holding the device at this point of an effectful body, and
+    /// **THE STATE THIS UNIT THREADS.** `Device` for a GPU kernel, whose
+    /// type says so, or `Mem` for a program that reads and writes an
+    /// address space, whose type does NOT: Codex gives `peek-byte` and
+    /// friends an empty effect row, so the definitions that touch memory
+    /// are found by closure over the call graph instead (`new`).
+    state: &'static str,
+    /// The name holding the state at this point of an effectful body, and
     /// the count of names minted for it in this definition.
     dev: Option<String>,
     dev_n: usize,
@@ -438,6 +450,7 @@ impl<'a> Cx<'a> {
             fold: None,
             device_ops: Default::default(),
             device_defs: Default::default(),
+            state: "Device",
             dev: None,
             dev_n: 0,
             wgsl: false,
@@ -458,6 +471,47 @@ impl<'a> Cx<'a> {
             }
         }
         cx.wgsl = !cx.device_defs.is_empty();
+        // No kernel, so look for memory. A definition touches memory if it
+        // calls one of the builtins or calls something that does, and the
+        // closure runs until nothing new joins.
+        if cx.device_defs.is_empty() {
+            let ops: std::collections::BTreeSet<Sym> = MEMORY_OPS.iter().filter_map(|b| syms.find(b)).collect();
+            if !ops.is_empty() {
+                let mut touch: std::collections::BTreeSet<Sym> = Default::default();
+                loop {
+                    let mut grew = false;
+                    for d in defs {
+                        if touch.contains(&d.name) {
+                            continue;
+                        }
+                        let mut hit = false;
+                        d.body.walk(&mut |x| {
+                            if let IrExpr::Name(n, _, _) = x {
+                                if ops.contains(n) || touch.contains(n) {
+                                    hit = true;
+                                }
+                            }
+                        });
+                        if hit {
+                            touch.insert(d.name);
+                            grew = true;
+                        }
+                    }
+                    if !grew {
+                        break;
+                    }
+                }
+                // **NOT INSTALLED YET.** The closure above is the hard
+                // half and it is done; what is missing is `Mem.roc` (a
+                // sparse page map with sized little-endian loads and a
+                // bump allocator) and threading the state out of the
+                // opening. Until those exist, installing this would emit
+                // calls to a module that is not written and turn 204
+                // honest refusals into compile errors, so the set is
+                // computed and dropped. See docs/memory-plan.md.
+                let _ = (&ops, &touch);
+            }
+        }
         for (td, c) in ch.type_defs.iter().zip(&ch.type_def_chapters) {
             let n = match td {
                 TypeDef::Record(n, ..) | TypeDef::Variant(n, ..) | TypeDef::Unit(n, ..) => *n,
@@ -672,9 +726,9 @@ impl<'a> Cx<'a> {
     /// last.
     fn device_signature(&mut self, d: &IrDef) -> Result<String, String> {
         let (ps, r, _) = self.arrows(d)?;
-        let mut all = vec!["Device.Device".to_string()];
+        let mut all = vec![format!("{s}.{s}", s = self.state)];
         all.extend(ps);
-        let sig = format!("{} -> (Device.Device, {r})", all.join(", "));
+        let sig = format!("{} -> ({s}.{s}, {r})", all.join(", "), s = self.state);
         let wants = self.eq_wants(d)?;
         Ok(if wants.is_empty() { sig } else { format!("{sig} where [{}]", wants.join(", ")) })
     }
@@ -979,7 +1033,7 @@ impl<'a> Cx<'a> {
         }
         let tabs = "\t".repeat(base);
         if self.device_defs.contains(&d.name) {
-            self.imports.insert("Device".into());
+            self.imports.insert(self.state.into());
             for p in &d.params {
                 self.no_dev_name(p.name)?;
             }
@@ -1201,10 +1255,21 @@ impl<'a> Cx<'a> {
                 let mark = self.locals.len();
                 let mut cur = e;
                 while let E::Let(n, _, v, body, _) = cur {
-                    if self.is_effectful(v) {
-                        return Err("an effectful let".into());
-                    }
                     self.no_dev_name(*n)?;
+                    // **A WRITE IS OFTEN A LET NOBODY READS.** `let w =
+                    // poke-byte addr 0 v in peek-byte addr 0` is how every
+                    // fill loop in the corpus is written, so a let whose
+                    // value touches the state binds the state too.
+                    if self.is_effectful(v) {
+                        let v = self.eff_expr(v, ind + 1)?;
+                        let dn = self.fresh_dev();
+                        self.locals.push(*n);
+                        let b = self.binder(*n, &[body])?;
+                        out.push_str(&format!("{tabs}({dn}, {b}) = {v}\n"));
+                        self.dev = Some(dn);
+                        cur = body;
+                        continue;
+                    }
                     let v = self.expr(v, ind + 1)?;
                     self.locals.push(*n);
                     let b = self.binder(*n, &[body])?;
@@ -1267,7 +1332,35 @@ impl<'a> Cx<'a> {
                 Err(format!("`{text}` applied to {} arguments, takes {k}", args.len()))
             }
         };
-        self.imports.insert("Device".into());
+        self.imports.insert(self.state.into());
+        if self.state == "Mem" {
+            // base, offset [, value]; a load answers the value and a store
+            // answers 0, as the interpreter does.
+            let width = |b: &str| -> Option<&'static str> {
+                match b {
+                    "peek-byte" | "poke-byte" => Some("1"),
+                    "peek-16" | "poke-16" => Some("2"),
+                    "peek-32" | "poke-32" => Some("4"),
+                    "peek-qword" | "poke-qword" => Some("8"),
+                    _ => None,
+                }
+            };
+            if let Some(w) = width(&text) {
+                let load = text.starts_with("peek");
+                let want = if load { 2 } else { 3 };
+                if args.len() != want {
+                    return Err(format!("`{text}` applied to {} arguments, takes {want}", args.len()));
+                }
+                let f = if load { "load" } else { "store" };
+                return Ok(format!("Mem.{f}({}, {w})", xs.join(", ")));
+            }
+            if text == "alloc-bytes" {
+                if args.len() != 1 {
+                    return Err("`alloc-bytes` takes one argument".into());
+                }
+                return Ok(format!("Mem.alloc({})", xs.join(", ")));
+            }
+        }
         Ok(match text.as_str() {
             "device-load" => {
                 want(2)?;
