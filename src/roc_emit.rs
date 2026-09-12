@@ -170,6 +170,8 @@ pub fn emit_modules(
         }
     }
     let mut files = Vec::new();
+    // Who each emitted module imports, for the prune below.
+    let mut needs: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut prelude = false;
     for slug in &slugs {
         module_name(slug)?;
@@ -209,16 +211,37 @@ pub fn emit_modules(
         } else {
             text.push_str(&format!("\n{slug} :: [].{{\n{items}}}\n"));
         }
+        needs.insert(slug.clone(), cx.imports.iter().cloned().collect());
         files.push((format!("{slug}.roc"), text));
     }
     if cx.uses_cce {
+        needs.insert("Cce".into(), Vec::new());
         files.push(("Cce.roc".into(), cce_module()));
     }
     if prelude {
-        files.push((
-            "Prelude.roc".into(),
-            PRELUDE.into(),
-        ));
+        needs.insert("Prelude".into(), Vec::new());
+        files.push(("Prelude.roc".into(), PRELUDE.into()));
+    }
+    // **A CHAPTER NOTHING REACHES IS NOT PART OF THE PROGRAM.** Every unit
+    // is bundled with ListUtils and Tuple whether it cites them or not
+    // (bundle.rs calls them implicit), and a unit that cites a chapter for
+    // one of its types drags that chapter's whole cite closure in. Emitting
+    // a module the app never reaches costs the reader a file and the
+    // compiler a check; the import graph is right here, so the prune is
+    // here rather than in whatever reads the directory afterwards.
+    //
+    // A LIBRARY keeps everything: with no app there is no root to reach
+    // from, and its modules are the output.
+    if !app_slug.is_empty() {
+        let mut seen: std::collections::BTreeSet<String> = Default::default();
+        let mut stack = vec![app_slug.clone()];
+        while let Some(m) = stack.pop() {
+            if !seen.insert(m.clone()) {
+                continue;
+            }
+            stack.extend(needs.get(&m).cloned().unwrap_or_default());
+        }
+        files.retain(|(name, _)| seen.contains(name.trim_end_matches(".roc")));
     }
     Ok(files)
 }
