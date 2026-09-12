@@ -128,6 +128,10 @@ Prelude :: [].{
 }
 "#;
 
+/// The same helper, as an item of a chapter module.
+const LINE_HELPER_INDENTED: &str =
+    "\t# The Echo platform's echo! writes no newline; a Codex line is one.\n\tline! = |s| echo!(Str.concat(s, \"\\n\"))\n";
+
 const LINE_HELPER: &str =
     "\n# The Echo platform's echo! writes no newline; a Codex line is one.\nline! = |s| echo!(Str.concat(s, \"\\n\"))\n";
 
@@ -177,6 +181,9 @@ pub fn emit_modules(
         module_name(slug)?;
         cx.current = slug.clone();
         cx.imports.clear();
+        // The helper is per MODULE now: a chapter with a [Console] act
+        // prints as much as an opening does.
+        cx.uses_line = false;
         let mut items = String::new();
         let base = if *slug == app_slug { 0 } else { 1 };
         for (td, c) in ch.type_defs.iter().zip(&ch.type_def_chapters) {
@@ -209,7 +216,8 @@ pub fn emit_modules(
             text.push_str("\n# --- Entry ---\n\n");
             text.push_str(&main);
         } else {
-            text.push_str(&format!("\n{slug} :: [].{{\n{items}}}\n"));
+            let helper = if cx.uses_line { LINE_HELPER_INDENTED } else { "" };
+            text.push_str(&format!("\n{slug} :: [].{{\n{helper}{items}}}\n"));
         }
         needs.insert(slug.clone(), cx.imports.iter().cloned().collect());
         files.push((format!("{slug}.roc"), text));
@@ -1235,14 +1243,31 @@ impl<'a> Cx<'a> {
                 out.push_str(&format!("{}}})", "\t".repeat(ind)));
                 out
             }
-            E::Act(..) => return Err("an act outside opening".into()),
-            E::Record(_, fs, _, _) => {
+            // **AN ACT IS A BLOCK.** Under the Device effect an act threads
+            // the device (`eff_expr`); under Console it does not thread
+            // anything, so the statements are the block's and the last one
+            // is its value, which is what Codex says an act answers.
+            E::Act(stmts, _, _) => self.act_block(stmts, ind)?,
+            // **A CLAMPING FIELD CLAMPS WHERE IT IS BUILT.** `p : Integer
+            // between 0 and 100 clamping` holds 100 when handed 150, and the
+            // clamp is the record's, not the arithmetic's: the IR types the
+            // value as it was written (codex/test's arithmetic, which read
+            // 150 before this).
+            E::Record(n, fs, _, _) => {
                 if fs.is_empty() {
                     return Ok("{}".into());
                 }
                 let mut items = Vec::new();
                 for f in fs {
-                    items.push(format!("{}: {}", self.ident(f.name)?, self.expr(&f.value, ind)?));
+                    let v = self.expr(&f.value, ind)?;
+                    let v = match self.tds.field(*n, f.name) {
+                        Some(Ty::Integer(lo, hi, crate::check::Overflow::Clamping)) => {
+                            let (lo, hi) = (*lo, *hi);
+                            format!("{int}.min({int}.max({v}, {lo}), {hi})", int = self.int())
+                        }
+                        _ => v,
+                    };
+                    items.push(format!("{}: {}", self.ident(f.name)?, v));
                 }
                 format!("{{ {} }}", items.join(", "))
             }
@@ -1262,6 +1287,7 @@ impl<'a> Cx<'a> {
     /// Roc spelling here.
     fn name_value(&mut self, n: Sym) -> Result<String, String> {
         let n = self.instance_base(n);
+
         if self.locals.contains(&n) {
             return self.local(n);
         }
@@ -1295,6 +1321,38 @@ impl<'a> Cx<'a> {
             Some(i) => self.syms.find(&t[..i]).unwrap_or(n),
             None => n,
         }
+    }
+
+    /// An act as a Roc block: `x <- e` binds, a bare statement runs, and
+    /// the last statement is the value.
+    fn act_block(&mut self, stmts: &[IrActStmt], ind: usize) -> Result<String, String> {
+        let Some(last) = stmts.len().checked_sub(1) else {
+            return Err("an empty act".into());
+        };
+        let tabs = "\t".repeat(ind + 1);
+        let mut out = String::from("({\n");
+        let mark = self.locals.len();
+        for (i, st) in stmts.iter().enumerate() {
+            let rest: Vec<&IrExpr> = stmts[i + 1..].iter().map(|s| s.expr()).collect();
+            match st {
+                IrActStmt::Exec(e, _) => {
+                    let e = self.expr(e, ind + 1)?;
+                    out.push_str(&format!("{tabs}{e}\n"));
+                }
+                IrActStmt::Bind(n, _, e, _) => {
+                    let e = self.expr(e, ind + 1)?;
+                    self.locals.push(*n);
+                    let b = if i == last { self.local(*n)? } else { self.binder(*n, &rest)? };
+                    out.push_str(&format!("{tabs}{b} = {e}\n"));
+                    if i == last {
+                        out.push_str(&format!("{tabs}{}\n", self.local(*n)?));
+                    }
+                }
+            }
+        }
+        out.push_str(&format!("{}}})", "\t".repeat(ind)));
+        self.locals.truncate(mark);
+        Ok(out)
     }
 
     /// A `let` chain is one block: `({ a = .. \n b = .. \n body })`. The parens
@@ -1394,6 +1452,36 @@ impl<'a> Cx<'a> {
         if let Some(&k) = self.arity.get(n) {
             if xs.len() < k {
                 return Err(format!("`{text}` applied to {} of {k} arguments", xs.len()));
+            }
+            // **AN EFFECTFUL FUNCTION HANDED TO A PURE PARAMETER.** Codex's
+            // `list-map` carries its argument's effect; the emitted one
+            // takes a pure function, and Roc has no effect variable to
+            // write in its place. Only this shape is a type error, so only
+            // this shape is refused (codex/test's effect-map-effctx).
+            if let Some(callee) = self.defs.iter().find(|d| d.name == *n) {
+                let mut cur = &callee.ty;
+                for a in args.iter().take(k) {
+                    while let Ty::ForAll(_, b) | Ty::ForAllEff(_, b) = cur {
+                        cur = b;
+                    }
+                    let Ty::Fun(p, _, r) = cur else { break };
+                    if matches!(&**p, Ty::Fun(_, row, _) if row.labels.is_empty()) {
+                        if let IrExpr::Name(an, at, _) = a {
+                            let effectful = matches!(at, Ty::Fun(_, row, _) if !row.labels.is_empty())
+                                || self
+                                    .defs
+                                    .iter()
+                                    .any(|d| d.name == *an && matches!(&d.ty, Ty::Fun(_, row, _) if !row.labels.is_empty()));
+                            if effectful {
+                                return Err(format!(
+                                    "`{}`, an effectful function, handed to `{text}`, which takes a pure one",
+                                    self.syms.text(*an)
+                                ));
+                            }
+                        }
+                    }
+                    cur = r;
+                }
             }
             let first = format!("{}({})", self.def_ref(*n)?, xs[..k].join(", "));
             return Ok(if xs.len() == k { first } else { format!("{first}({})", xs[k..].join(", ")) });
