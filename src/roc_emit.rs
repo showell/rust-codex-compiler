@@ -174,6 +174,15 @@ struct Cx<'a> {
     /// the count of names minted for it in this definition.
     dev: Option<String>,
     dev_n: usize,
+    /// **A UNIT WITH A DEVICE KERNEL COMPUTES AS THE PLUG'S WGSL DOES.** The
+    /// wgsl plug lowers Integer to `i32` and Real to `f32`, and WGSL's
+    /// integer arithmetic wraps, its division by zero yields the dividend
+    /// and its remainder by zero yields zero. A kernel's pixels are those
+    /// bits (EarthKernel packs an alpha of `255 * 16777216`, past i32), so
+    /// such a unit is spelled in I32 and F32, with the wrapping operations
+    /// and `Device.div`/`Device.rem`, where a plain `+` on Roc's I32 crashes
+    /// on overflow. Every other unit is I64 and F64, as safari is.
+    wgsl: bool,
 }
 
 struct Fold {
@@ -201,6 +210,7 @@ impl<'a> Cx<'a> {
             device_defs: Default::default(),
             dev: None,
             dev_n: 0,
+            wgsl: false,
         };
         for ed in &ch.effect_defs {
             if ch.syms.text(ed.name) != "Device" {
@@ -217,6 +227,7 @@ impl<'a> Cx<'a> {
                 cx.device_defs.insert(d.name);
             }
         }
+        cx.wgsl = !cx.device_defs.is_empty();
         for (td, c) in ch.type_defs.iter().zip(&ch.type_def_chapters) {
             let n = match td {
                 TypeDef::Record(n, ..) | TypeDef::Variant(n, ..) | TypeDef::Unit(n, ..) => *n,
@@ -301,10 +312,22 @@ impl<'a> Cx<'a> {
 
     // ---- types ----------------------------------------------------------
 
+    /// The integer and real types this unit is spelled in (see `wgsl`).
+    fn int(&self) -> &'static str {
+        if self.wgsl { "I32" } else { "I64" }
+    }
+    fn real(&self) -> &'static str {
+        if self.wgsl { "F32" } else { "F64" }
+    }
+    /// The unsigned type of the same width, for bit patterns.
+    fn uint(&self) -> &'static str {
+        if self.wgsl { "U32" } else { "U64" }
+    }
+
     fn ty(&mut self, t: &Ty) -> Result<String, String> {
         Ok(match t {
-            Ty::Integer(..) => "I64".into(),
-            Ty::Real(RealWidth::F64, _) => "F64".into(),
+            Ty::Integer(..) => self.int().into(),
+            Ty::Real(RealWidth::F64, _) => self.real().into(),
             Ty::Text => "Str".into(),
             Ty::Boolean => "Bool".into(),
             Ty::Nothing => "{}".into(),
@@ -884,7 +907,7 @@ impl<'a> Cx<'a> {
         }
         Ok(match e {
             E::IntLit(v, _) => int_lit(*v),
-            E::NumLit(bits, _) => num_lit(*bits),
+            E::NumLit(bits, _) => num_lit(*bits, self.wgsl),
             E::TextLit(s, _) => roc_quote(s),
             E::BoolLit(b, _) => if *b { "True".into() } else { "False".into() },
             E::CharLit(..) => return Err("char literal".into()),
@@ -893,7 +916,14 @@ impl<'a> Cx<'a> {
                 let (l, r) = (self.expr(l, ind)?, self.expr(r, ind)?);
                 self.binary(*op, l, r)?
             }
-            E::Negate(x, _, _) => format!("(-{})", self.expr(x, ind)?),
+            E::Negate(x, t, _) => {
+                let x = self.expr(x, ind)?;
+                if self.wgsl && matches!(t, Ty::Integer(..)) {
+                    format!("{}.minus_wrap(0, {x})", self.int())
+                } else {
+                    format!("(-{x})")
+                }
+            }
             E::If(c, t, f, _, _) => format!(
                 "(if {} {{ {} }} else {{ {} }})",
                 self.expr(c, ind)?,
@@ -988,16 +1018,33 @@ impl<'a> Cx<'a> {
         Ok(out)
     }
 
-    fn binary(&self, op: IrBinOp, l: String, r: String) -> Result<String, String> {
+    fn binary(&mut self, op: IrBinOp, l: String, r: String) -> Result<String, String> {
         use IrBinOp as B;
+        let int = self.int();
+        if self.wgsl {
+            match op {
+                B::AddInt => return Ok(format!("{int}.plus_wrap({l}, {r})")),
+                B::SubInt => return Ok(format!("{int}.minus_wrap({l}, {r})")),
+                B::MulInt => return Ok(format!("{int}.times_wrap({l}, {r})")),
+                B::DivInt => {
+                    self.imports.insert("Device".into());
+                    return Ok(format!("Device.div({l}, {r})"));
+                }
+                B::RemInt => {
+                    self.imports.insert("Device".into());
+                    return Ok(format!("Device.rem({l}, {r})"));
+                }
+                _ => {}
+            }
+        }
         Ok(match op {
             B::AddInt | B::AddNum => format!("({l} + {r})"),
             B::SubInt | B::SubNum => format!("({l} - {r})"),
             B::MulInt | B::MulNum => format!("({l} * {r})"),
             B::DivNum => format!("({l} / {r})"),
-            B::DivInt => format!("I64.div_trunc_by({l}, {r})"),
-            B::RemInt => format!("I64.rem_by({l}, {r})"),
-            B::PowInt => format!("I64.pow({l}, {r})"),
+            B::DivInt => format!("{int}.div_trunc_by({l}, {r})"),
+            B::RemInt => format!("{int}.rem_by({l}, {r})"),
+            B::PowInt => format!("{int}.pow({l}, {r})"),
             B::Eq => format!("({l} == {r})"),
             B::NotEq => format!("({l} != {r})"),
             B::Lt => format!("({l} < {r})"),
@@ -1010,7 +1057,7 @@ impl<'a> Cx<'a> {
             B::AppendList => format!("List.concat({l}, {r})"),
             // `=~=` is ordinal equality on doubles; two doubles with the same
             // bits have the same ordinal, and -0.0 differs from 0.0 in both.
-            B::ApproxEqExact => format!("(F64.to_bits({l}) == F64.to_bits({r}))"),
+            B::ApproxEqExact => format!("({real}.to_bits({l}) == {real}.to_bits({r}))", real = self.real()),
             other => return Err(format!("binary {}", other.atom())),
         })
     }
@@ -1058,14 +1105,16 @@ impl<'a> Cx<'a> {
                 Err(format!("`{name}` applied to {} arguments, takes {k}", xs.len()))
             }
         };
+        let (int, real, uint) = (self.int(), self.real(), self.uint());
+        let int_lc = int.to_ascii_lowercase();
         Ok(match name {
             "list-length" => {
                 want(1)?;
-                format!("U64.to_i64_wrap(List.len({}))", xs[0])
+                format!("U64.to_{int_lc}_wrap(List.len({}))", xs[0])
             }
             "list-at" => {
                 want(2)?;
-                format!("(List.get({}, I64.to_u64_wrap({})) ?? crash(\"list-at out of range\"))", xs[0], xs[1])
+                format!("(List.get({}, {int}.to_u64_wrap({})) ?? crash(\"list-at out of range\"))", xs[0], xs[1])
             }
             "list-push" | "list-snoc" => {
                 want(2)?;
@@ -1076,55 +1125,68 @@ impl<'a> Cx<'a> {
                 if !matches!(args[0].ty(), Ty::Integer(..)) {
                     return Err(format!("show on a {}", crate::ir_text::render_ty(self.syms, &args[0].ty())));
                 }
-                format!("I64.to_str({})", xs[0])
+                format!("{int}.to_str({})", xs[0])
             }
-            "real-from-int" => {
+            "real-from-int" | "__int-to-real" => {
                 want(1)?;
-                format!("I64.to_f64({})", xs[0])
+                format!("{int}.to_{}({})", real.to_ascii_lowercase(), xs[0])
             }
-            "real-to-int" => {
+            "real-to-int" | "__real-to-int" => {
                 want(1)?;
-                format!("F64.to_i64_wrap({})", xs[0])
+                format!("{real}.to_{int_lc}_wrap({})", xs[0])
             }
             "real-abs" => {
                 want(1)?;
-                format!("F64.abs({})", xs[0])
+                format!("{real}.abs({})", xs[0])
             }
             "real-sqrt" => {
                 want(1)?;
-                format!("F64.sqrt({})", xs[0])
+                format!("{real}.sqrt({})", xs[0])
             }
             "real-max" => {
                 want(2)?;
-                format!("F64.max({}, {})", xs[0], xs[1])
+                format!("{real}.max({}, {})", xs[0], xs[1])
             }
             "real-min" => {
                 want(2)?;
-                format!("F64.min({}, {})", xs[0], xs[1])
+                format!("{real}.min({}, {})", xs[0], xs[1])
             }
             "real-to-bits" => {
                 want(1)?;
-                format!("U64.to_i64_wrap(F64.to_bits({}))", xs[0])
+                format!("{uint}.to_{int_lc}_wrap({real}.to_bits({}))", xs[0])
             }
             "bits-to-real" => {
                 want(1)?;
-                format!("F64.from_bits(I64.to_u64_wrap({}))", xs[0])
+                format!("{real}.from_bits({int}.to_{}_wrap({}))", uint.to_ascii_lowercase(), xs[0])
             }
             "bit-and" => {
                 want(2)?;
-                format!("I64.bitwise_and({}, {})", xs[0], xs[1])
+                format!("{int}.bitwise_and({}, {})", xs[0], xs[1])
             }
             "bit-or" => {
                 want(2)?;
-                format!("I64.bitwise_or({}, {})", xs[0], xs[1])
+                format!("{int}.bitwise_or({}, {})", xs[0], xs[1])
             }
             "bit-xor" => {
                 want(2)?;
-                format!("I64.bitwise_xor({}, {})", xs[0], xs[1])
+                format!("{int}.bitwise_xor({}, {})", xs[0], xs[1])
             }
             "bit-not" => {
                 want(1)?;
-                format!("I64.bitwise_not({})", xs[0])
+                format!("{int}.bitwise_not({})", xs[0])
+            }
+            // A WGSL shift is a shift; Roc's I32 has them.
+            "bit-shl" if self.wgsl => {
+                want(2)?;
+                format!("I32.shl_wrap({}, I32.to_u8_wrap({}))", xs[0], xs[1])
+            }
+            "bit-shr" if self.wgsl => {
+                want(2)?;
+                format!("I32.shr_wrap({}, I32.to_u8_wrap({}))", xs[0], xs[1])
+            }
+            "bit-shru" if self.wgsl => {
+                want(2)?;
+                format!("I32.shr_zf_wrap({}, I32.to_u8_wrap({}))", xs[0], xs[1])
             }
             // Roc's I64 has no shift; a shift by b is a wrapping multiply or
             // an unsigned divide by 2^b, which is what the interpreter does.
@@ -1331,8 +1393,20 @@ fn int_lit(v: i64) -> String {
 /// The IR carries a Real's BITS. Roc reads back the shortest round-tripping
 /// decimal exactly; a value that would need an exponent, or is not finite,
 /// goes through `F64.from_bits` instead.
-fn num_lit(bits: i64) -> String {
+fn num_lit(bits: i64, f32: bool) -> String {
     let f = f64::from_bits(bits as u64);
+    if f32 {
+        // The plug's WGSL reads the same decimal as an f32; so does Roc.
+        let g = f as f32;
+        if !g.is_finite() {
+            return format!("F32.from_bits({})", g.to_bits());
+        }
+        let s = format!("{g:?}");
+        if s.contains('e') {
+            return format!("F32.from_bits({})", g.to_bits());
+        }
+        return if g.is_sign_negative() { format!("({s})") } else { s };
+    }
     if !f.is_finite() {
         return format!("F64.from_bits({})", bits as u64);
     }
