@@ -26,6 +26,34 @@ const KEYWORDS: [&str; 18] = [
     "match", "module", "or", "return", "var", "where", "while",
 ];
 
+/// Every `Named` in a type expression, however deep.
+fn named_types(t: &TypeExpr, out: &mut std::collections::BTreeSet<Sym>) {
+    match t {
+        TypeExpr::Named(n, _) => {
+            out.insert(*n);
+        }
+        TypeExpr::Fun(a, b, _) => {
+            named_types(a, out);
+            named_types(b, out);
+        }
+        TypeExpr::App(f, args, _) => {
+            named_types(f, out);
+            for a in args {
+                named_types(a, out);
+            }
+        }
+        TypeExpr::Effect(_, _, _, b, _) | TypeExpr::BoundedInt(b, ..) | TypeExpr::Linear(b, _) | TypeExpr::Constrained(_, _, b, _) => named_types(b, out),
+        TypeExpr::PropEq(a, b, _) => {
+            named_types(a, out);
+            named_types(b, out);
+        }
+        TypeExpr::Forall(_, a, b, _) => {
+            named_types(a, out);
+            named_types(b, out);
+        }
+    }
+}
+
 const LINE_HELPER: &str =
     "\n# The Echo platform's echo! writes no newline; a Codex line is one.\nline! = |s| echo!(Str.concat(s, \"\\n\"))\n";
 
@@ -142,6 +170,12 @@ struct Cx<'a> {
     /// The chapter holding the opening, emitted as the app rather than a
     /// type module; empty for a library.
     app: String,
+    /// **A TYPE THAT STANDS ON A CYCLE IS NOMINAL.** Roc's `:` is a
+    /// transparent synonym and may not be recursive, directly or mutually;
+    /// `:=` is a nominal type and may. Its constructors are still written
+    /// bare, here and in every other module, so only the definition's
+    /// spelling changes (verified on the nightly).
+    recursive: std::collections::BTreeSet<Sym>,
     imports: std::collections::BTreeSet<String>,
     /// Names bound by the enclosing parameters, lets and patterns.
     locals: Vec<Sym>,
@@ -191,6 +225,7 @@ impl<'a> Cx<'a> {
             maybe: syms.find("Maybe").unwrap_or_default(),
             current: String::new(),
             app: String::new(),
+            recursive: Default::default(),
             imports: Default::default(),
             locals: Vec::new(),
             tvars: BTreeMap::new(),
@@ -227,6 +262,39 @@ impl<'a> Cx<'a> {
         for d in defs {
             cx.def_module.insert(d.name, d.origin.clone());
         }
+        // Who mentions whom, over the declared types alone, and then who
+        // reaches themselves: one round of closure per type is enough for a
+        // chapter's handful, and a fixed point is cheap to spell.
+        let mut mentions: BTreeMap<Sym, std::collections::BTreeSet<Sym>> = BTreeMap::new();
+        for td in &ch.type_defs {
+            let (n, ts) = match td {
+                TypeDef::Record(n, _, fields, _, _) => (*n, fields.iter().map(|f| f.type_expr.clone()).collect::<Vec<_>>()),
+                TypeDef::Variant(n, _, ctors, _) => (*n, ctors.iter().flat_map(|c| c.fields.clone()).collect()),
+                TypeDef::Unit(n, t, _) => (*n, vec![t.clone()]),
+            };
+            let mut out = std::collections::BTreeSet::new();
+            for t in &ts {
+                named_types(t, &mut out);
+            }
+            out.retain(|m| cx.type_module.contains_key(m));
+            mentions.insert(n, out);
+        }
+        loop {
+            let mut grew = false;
+            for (n, ms) in mentions.clone() {
+                for m in &ms {
+                    for far in mentions.get(m).cloned().unwrap_or_default() {
+                        if mentions.get_mut(&n).is_some_and(|set| set.insert(far)) {
+                            grew = true;
+                        }
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        cx.recursive = mentions.iter().filter(|(n, ms)| ms.contains(n)).map(|(n, _)| *n).collect();
         cx
     }
 
@@ -514,6 +582,11 @@ impl<'a> Cx<'a> {
         })
     }
 
+    /// `:` for a plain alias, `:=` for one that stands on a cycle.
+    fn colon(&self, n: Sym) -> &'static str {
+        if self.recursive.contains(&n) { ":=" } else { ":" }
+    }
+
     fn type_def(&mut self, td: &TypeDef, base: usize) -> Result<String, String> {
         let syms = self.syms;
         let head = |n: Sym, ps: &[Sym]| -> Result<String, String> {
@@ -531,10 +604,11 @@ impl<'a> Cx<'a> {
                 for f in fields {
                     fs.push(format!("{} : {}", self.ident(f.name)?, self.texpr(&f.type_expr)?));
                 }
+                let col = self.colon(*n);
                 if fs.is_empty() {
-                    format!("{tabs}{} : {{}}\n", head(*n, ps)?)
+                    format!("{tabs}{} {col} {{}}\n", head(*n, ps)?)
                 } else {
-                    format!("{tabs}{} : {{ {} }}\n", head(*n, ps)?, fs.join(", "))
+                    format!("{tabs}{} {col} {{ {} }}\n", head(*n, ps)?, fs.join(", "))
                 }
             }
             TypeDef::Variant(n, ps, ctors, _) => {
@@ -554,7 +628,7 @@ impl<'a> Cx<'a> {
                         cs.push(format!("{tag}({})", fs.join(", ")));
                     }
                 }
-                format!("{tabs}{} : [{}]\n", head(*n, ps)?, cs.join(", "))
+                format!("{tabs}{} {} [{}]\n", head(*n, ps)?, self.colon(*n), cs.join(", "))
             }
             TypeDef::Unit(n, ..) => return Err(format!("unit type `{}`", self.syms.text(*n))),
         })
@@ -1267,7 +1341,10 @@ impl<'a> Cx<'a> {
             IrPat::Lit(v, ty, _) => match ty {
                 Ty::Integer(..) => v.clone(),
                 Ty::Text => roc_quote(v),
-                Ty::Boolean => if v == "true" { "True".into() } else { "False".into() },
+                // The IR spells it `True` / `False`; a lowercase test made
+                // every boolean pattern `False`, which Roc then called a
+                // non-exhaustive match (codex/test/when-bool-cross).
+                Ty::Boolean => if v.eq_ignore_ascii_case("true") { "True".into() } else { "False".into() },
                 other => return Err(format!("literal pattern of type {}", crate::ir_text::render_ty(self.syms, other))),
             },
             IrPat::Ctor(n, subs, _, _) => {
