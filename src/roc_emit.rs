@@ -1008,6 +1008,11 @@ impl<'a> Cx<'a> {
         if t.starts_with(|c: char| c.is_ascii_uppercase()) {
             return self.tag(n);
         }
+        // A bump-allocator checkpoint (Chess takes one around every search
+        // step). Roc's memory is counted, so the mark is nothing.
+        if t == "__heap-save" {
+            return Ok("0".into());
+        }
         Err(format!("builtin `{t}` used as a value"))
     }
 
@@ -1176,6 +1181,10 @@ impl<'a> Cx<'a> {
                     return Err("__record-set with a computed field name".into());
                 };
                 format!("{{ ..{}, {}: {} }}", xs[0], ident_text(f.trim_matches('"'))?, xs[2])
+            }
+            "__heap-restore" => {
+                want(1)?;
+                "0".into()
             }
             "list-push" | "list-snoc" => {
                 want(2)?;
