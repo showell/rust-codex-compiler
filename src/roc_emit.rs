@@ -480,8 +480,8 @@ impl<'a> Cx<'a> {
     fn texpr(&mut self, t: &TypeExpr) -> Result<String, String> {
         Ok(match t {
             TypeExpr::Named(n, _) => match self.syms.text(*n) {
-                "Real" => "F64".into(),
-                "Integer" => "I64".into(),
+                "Real" => self.real().into(),
+                "Integer" => self.int().into(),
                 "Text" => "Str".into(),
                 "Boolean" => "Bool".into(),
                 "Nothing" => "{}".into(),
@@ -511,7 +511,10 @@ impl<'a> Cx<'a> {
                 }
                 format!("({} -> {})", ps.join(", "), self.texpr(cur)?)
             }
-            _ => return Err("a type form outside the subset in a type definition".into()),
+            // `Integer between lo and hi wrapping`: the Roc type is the
+            // integer; the mode is on every node's type and `binary` reads it.
+            TypeExpr::BoundedInt(inner, _, _, _, _) => self.texpr(inner)?,
+            other => return Err(format!("a type form outside the subset in a type definition: {other:?}").chars().take(160).collect()),
         })
     }
 
@@ -912,9 +915,17 @@ impl<'a> Cx<'a> {
             E::BoolLit(b, _) => if *b { "True".into() } else { "False".into() },
             E::CharLit(..) => return Err("char literal".into()),
             E::Name(n, _, _) => self.name_value(*n)?,
-            E::Binary(op, l, r, _, _) => {
+            E::Binary(op, l, r, t, _) => {
                 let (l, r) = (self.expr(l, ind)?, self.expr(r, ind)?);
-                self.binary(*op, l, r)?
+                // **THE OVERFLOW MODE IS ON THE TYPE.** A field declared
+                // `Integer between lo and hi wrapping` (Rng's LCG state) wraps
+                // where Roc's `+` would crash; the checker carries the mode on
+                // every node of that type, so the spelling follows the node.
+                let wrap = matches!(t, Ty::Integer(_, _, crate::check::Overflow::Wrapping));
+                if matches!(t, Ty::Integer(_, _, crate::check::Overflow::Clamping)) {
+                    return Err("a clamping integer".into());
+                }
+                self.binary(*op, l, r, wrap)?
             }
             E::Negate(x, t, _) => {
                 let x = self.expr(x, ind)?;
@@ -983,6 +994,7 @@ impl<'a> Cx<'a> {
     /// value), a local, or a nullary constructor. A builtin as a VALUE has no
     /// Roc spelling here.
     fn name_value(&mut self, n: Sym) -> Result<String, String> {
+        let n = self.instance_base(n);
         if self.locals.contains(&n) {
             return self.local(n);
         }
@@ -997,6 +1009,20 @@ impl<'a> Cx<'a> {
             return self.tag(n);
         }
         Err(format!("builtin `{t}` used as a value"))
+    }
+
+    /// **AN INSTANCE NAME IS ITS BASE.** `==` on a constructed type with
+    /// arguments is lowered as upstream's x86 emitter spells it, a call of
+    /// `__eq_<T>@<keys>`, one name per instance of the element types; the
+    /// derived definition is `__eq_<T>` alone, and in Roc it is one function,
+    /// its `where` clause dispatching the elements' equality. So a name with
+    /// an `@` is looked up without it.
+    fn instance_base(&self, n: Sym) -> Sym {
+        let t = self.syms.text(n);
+        match t.find('@') {
+            Some(i) => self.syms.find(&t[..i]).unwrap_or(n),
+            None => n,
+        }
     }
 
     /// A `let` chain is one block: `({ a = .. \n b = .. \n body })`. The parens
@@ -1018,9 +1044,17 @@ impl<'a> Cx<'a> {
         Ok(out)
     }
 
-    fn binary(&mut self, op: IrBinOp, l: String, r: String) -> Result<String, String> {
+    fn binary(&mut self, op: IrBinOp, l: String, r: String, wrap: bool) -> Result<String, String> {
         use IrBinOp as B;
         let int = self.int();
+        if wrap && !self.wgsl {
+            match op {
+                B::AddInt => return Ok(format!("{int}.plus_wrap({l}, {r})")),
+                B::SubInt => return Ok(format!("{int}.minus_wrap({l}, {r})")),
+                B::MulInt => return Ok(format!("{int}.times_wrap({l}, {r})")),
+                _ => {}
+            }
+        }
         if self.wgsl {
             match op {
                 B::AddInt => return Ok(format!("{int}.plus_wrap({l}, {r})")),
@@ -1073,6 +1107,7 @@ impl<'a> Cx<'a> {
         let IrExpr::Name(n, _, _) = head else {
             return Err("a call whose head is not a name".into());
         };
+        let n = &self.instance_base(*n);
         let text = self.syms.text(*n).to_string();
         if self.is_device_sym(*n) {
             return Err(format!("`{text}` performs the Device effect outside a statement"));
@@ -1115,6 +1150,32 @@ impl<'a> Cx<'a> {
             "list-at" => {
                 want(2)?;
                 format!("(List.get({}, {int}.to_u64_wrap({})) ?? crash(\"list-at out of range\"))", xs[0], xs[1])
+            }
+            // **CODEX MUTATES IN PLACE; ROC ANSWERS A NEW LIST.** The two
+            // agree when the program uses the answer, which is what every
+            // typed use does; a program that relies on the aliasing (sets and
+            // then reads the old name) diverges silently, and only a verdict
+            // catches it. Past the end is a crash in both.
+            "list-set-at" => {
+                want(3)?;
+                format!("(List.set({}, {int}.to_u64_wrap({}), {}) ?? crash(\"list-set-at past the end\"))", xs[0], xs[1], xs[2])
+            }
+            "min" => {
+                want(2)?;
+                format!("{int}.min({}, {})", xs[0], xs[1])
+            }
+            "max" => {
+                want(2)?;
+                format!("{int}.max({}, {})", xs[0], xs[1])
+            }
+            // `__record-set r "field" v` names the field by a VALUE; when that
+            // value is a literal, it is Roc's record update.
+            "__record-set" => {
+                want(3)?;
+                let IrExpr::TextLit(f, _) = args[1] else {
+                    return Err("__record-set with a computed field name".into());
+                };
+                format!("{{ ..{}, {}: {} }}", xs[0], ident_text(f.trim_matches('"'))?, xs[2])
             }
             "list-push" | "list-snoc" => {
                 want(2)?;
