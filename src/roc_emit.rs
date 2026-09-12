@@ -143,112 +143,114 @@ const MEM: &str = r#"# Mem -- Codex's address space, written by rocemit. Do not 
 #
 # `peek-byte`, `poke-32` and `alloc-bytes` read and write one heap. Codex
 # gives them an empty effect row, so rocemit finds the definitions that
-# touch memory by closure over the call graph and threads this record
+# touch memory by closure over the call graph and threads this value
 # through them, the way it threads a GPU device.
 #
-# PAGES, NOT ONE ARRAY: alloc-bytes hands out addresses from 6 MB up while
-# a kernel test pokes a capability table at 786,432, so a flat array would
-# be megabytes of zeros before the first useful byte. A page is 4 KB and
-# an unmapped page reads zero, which is what the Codex runtime's own
-# sparse map does.
+# **A PERSISTENT TRIE, NOT AN ARRAY OF PAGES.** An array is O(1) per write
+# when the reference count cooperates and O(page) when it does not, and
+# nothing in the source says which one you got: the difference between
+# the two is one extra mention of a name. A trie is O(depth) BY
+# CONSTRUCTION -- the spine is rebuilt every time, so there is no fast
+# path to fall off. Five levels of 32 over 64-byte leaves is a 2 GB space
+# in which a write touches five 32-wide nodes and one 64-byte leaf,
+# whatever the compiler decides about sharing.
 #
-# **A LIST STILL REACHABLE AFTER A WRITE IS COPIED.** Roc writes into a
-# list in place when its reference count is 1, so `List.set(p, i, v) ?? p`
-# -- whose fallback names the list it is setting -- keeps that list live
-# past the set and copies it on every store. Every fallback here crashes
-# instead. On the shipped module that one spelling on the page table is
-# 137.8 s of CPU against 3.5 s.
-#
-# **AND A NESTED LIST IS NOT UNIQUE INSIDE List.update.** The closure does
-# not receive a uniquely owned page, so a byte written through
-# `List.update(pages, p, |page| List.set(page, off, b))` memcpies the
-# whole 4 KB page: a quarter-megabyte fill moved a gigabyte. `put` below
-# TAKES the page out of the table with List.replace, leaving an empty
-# placeholder, writes it while it is genuinely its own, and puts it back.
-# Measured on the 262,144-byte fill: 3.47 s of CPU against 0.32 s.
-#
-# Reading a list costs nothing. A length check on the way to a store is
-# free -- List.set already calls List.len on the list it writes -- so the
-# page table is a fixed size for two other reasons: a program allocates
-# from 6 MB up and pokes literal addresses near zero, so a flat array
-# would be megabytes of zeros; and `List.repeat([], 16384)` is nearly
-# free where a flat 64 MB array is MATERIALISED by the compile-time
-# evaluator.
+# It also removes the cap. There is no page table to size, so there is no
+# address that reads zero and crashes when written, and an untouched
+# address costs nothing at all.
+
 Mem :: [].{
-	Mem : { pages : List(List(U8)), top : I64 }
+	Node := [Empty, Leaf(List(U8)), Branch(List(Mem.Node))]
 
-	page : I64
-	page = 4096
+	Mem : { root : Mem.Node, top : I64 }
 
-	# 16,384 pages of 4 KB: a 64 MB space, past the runtime's own
-	# reservation. An address outside it crashes, as the runtime's
-	# bounds check does.
-	span : U64
-	span = 16384
+	# 6 bits of leaf, 5 levels of 5 bits: 2^31 bytes.
+	leaf_bits : U64
+	leaf_bits = 6
 
-	# The runtime's bump pointer starts at 6 MB, above every address a
-	# program pokes by literal.
-	# **THE BUMP POINTER COMES FROM THE COMMAND LINE**, which is a strange
-	# thing to write and the reason is the compiler. Roc evaluates a call
-	# whose arguments are all known while it builds, with no step limit
-	# and no memory limit (roc-lang/roc#11334), so a Codex program that
-	# fills a framebuffer was being RENDERED during the build -- eight of
-	# them reached the OOM killer at 7 GB. `z` is the argument count,
-	# which is zero at run time and unknowable at build time, so every
-	# value that comes out of this memory is out of the evaluator's reach
-	# and the program runs where it was meant to.
+	leaf_size : U64
+	leaf_size = 64
+
+	fan : U64
+	fan = 32
+
+	depth : I64
+	depth = 5
+
 	new : I64 -> Mem.Mem
-	new = |z| { pages: List.repeat([], Mem.span), top: 6291456 + z }
+	new = |z| { root: Empty, top: 6291456 + z }
 
-	# alloc-bytes answers the old top and bumps it; nothing frees.
 	alloc : Mem.Mem, I64 -> (Mem.Mem, I64)
-	alloc = |mem, n| ({ pages: mem.pages, top: mem.top + n }, mem.top)
+	alloc = |mem, n| ({ root: mem.root, top: mem.top + n }, mem.top)
 
-	# peek-* answers the bytes at base+off little-endian and unsigned; a
-	# qword wraps into I64, as the runtime's does.
+	# The index into the node at `level`: level 0 is the leaf's byte.
+	part : U64, I64 -> U64
+	part = |a, level|
+		if level <= 0 {
+			U64.bitwise_and(a, 63)
+		} else {
+			U64.bitwise_and(U64.div_trunc_by(a, Mem.pow32(level - 1) * Mem.leaf_size), 31)
+		}
+
+	pow32 : I64 -> U64
+	pow32 = |k| if k <= 0 { 1 } else { 32 * Mem.pow32(k - 1) }
+
+	# ---- reading --------------------------------------------------------
+
+	byte_at : Mem.Node, U64, I64 -> U8
+	byte_at = |node, a, level| match node {
+		Empty => 0
+		Leaf(bytes) => List.get(bytes, Mem.part(a, 0)) ?? 0
+		Branch(kids) => Mem.byte_at(List.get(kids, Mem.part(a, level)) ?? Empty, a, level - 1)
+	}
+
 	load : Mem.Mem, I64, I64, I64 -> (Mem.Mem, I64)
 	load = |mem, base, off, width| (mem, U64.to_i64_wrap(Mem.read(mem, base + off, width - 1, 0)))
 
 	read : Mem.Mem, I64, I64, U64 -> U64
 	read = |mem, addr, j, acc|
-		if j < 0 { acc } else {
-			Mem.read(mem, addr, j - 1, U64.plus_wrap(U64.times_wrap(acc, 256), U8.to_u64(Mem.byte(mem, addr + j))))
+		if j < 0 {
+			acc
+		} else {
+			b = Mem.byte_at(mem.root, I64.to_u64_wrap(addr + j), Mem.depth)
+			Mem.read(mem, addr, j - 1, U64.plus_wrap(U64.times_wrap(acc, 256), U8.to_u64(b)))
 		}
 
-	# An unmapped page, and an address outside the space, read zero.
-	byte : Mem.Mem, I64 -> U8
-	byte = |mem, a| List.get(List.get(mem.pages, Mem.page_of(a)) ?? [], Mem.off_in(a)) ?? 0
+	# ---- writing --------------------------------------------------------
 
-	page_of : I64 -> U64
-	page_of = |a| I64.to_u64_wrap(I64.div_trunc_by(a, Mem.page))
-
-	off_in : I64 -> U64
-	off_in = |a| I64.to_u64_wrap(I64.rem_by(a, Mem.page))
-
-	# poke-* answers 0, as the runtime does; the write is the point.
 	store : Mem.Mem, I64, I64, I64, I64 -> (Mem.Mem, I64)
 	store = |mem, base, off, v, width| (Mem.write(mem, base + off, I64.to_u64_wrap(v), width), 0)
 
 	write : Mem.Mem, I64, U64, I64 -> Mem.Mem
 	write = |mem, addr, u, left|
-		if left <= 0 { mem } else {
-			Mem.write(Mem.put(mem, addr, U64.to_u8_wrap(u)), addr + 1, U64.div_trunc_by(u, 256), left - 1)
+		if left <= 0 {
+			mem
+		} else {
+			put = Mem.set_at(mem.root, I64.to_u64_wrap(addr), Mem.depth, U64.to_u8_wrap(u))
+			Mem.write({ root: put, top: mem.top }, addr + 1, U64.div_trunc_by(u, 256), left - 1)
 		}
 
-	put : Mem.Mem, I64, U8 -> Mem.Mem
-	put = |mem, a, b| {
-		p = Mem.page_of(a)
-		taken = List.replace(mem.pages, p, []) ?? crash("Mem: address outside the 64 MB space")
-		{
-			pages: List.set(taken.list, p, Mem.poke(taken.prev, Mem.off_in(a), b)) ?? crash("Mem: address outside the 64 MB space"),
-			top: mem.top,
+	# **THE CHILD COMES OUT BEFORE IT IS WRITTEN.** A list handed to a
+	# closure, or still named after the set, is shared and gets copied.
+	# List.replace takes the child out and leaves a placeholder, so the
+	# recursion works on something it owns. tests/copycheck.sh is the
+	# instrument that tells the two apart.
+	set_at : Mem.Node, U64, I64, U8 -> Mem.Node
+	set_at = |node, a, level, v|
+		if level <= 0 {
+			match node {
+				Leaf(bytes) => Leaf(List.set(bytes, Mem.part(a, 0), v) ?? crash("Mem: offset outside a leaf"))
+				_ => Leaf(List.set(List.repeat(0.U8, Mem.leaf_size), Mem.part(a, 0), v) ?? crash("Mem: offset outside a leaf"))
+			}
+		} else {
+			i = Mem.part(a, level)
+			kids = match node {
+				Branch(cs) => cs
+				_ => List.repeat(Empty, Mem.fan)
+			}
+			taken = List.replace(kids, i, Empty) ?? crash("Mem: index outside a node")
+			Branch(List.set(taken.list, i, Mem.set_at(taken.prev, a, level - 1, v)) ?? crash("Mem: index outside a node"))
 		}
-	}
-
-	# The page is unmapped when the set says the offset is out of range,
-	# since an offset is always under 4,096: mapping it is the answer.
-	poke : List(U8), U64, U8 -> List(U8)
-	poke = |p, bi, b| List.set(p, bi, b) ?? (List.set(List.repeat(0.U8, 4096), bi, b) ?? crash("Mem: offset outside a page"))
 }
 "#;
 
