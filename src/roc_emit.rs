@@ -21,9 +21,14 @@ use crate::ir_chapter::{IrActStmt, IrBinOp, IrDef, IrExpr, IrPat};
 use crate::symbol::{Sym, SymTab};
 use std::collections::BTreeMap;
 
-const KEYWORDS: [&str; 18] = [
-    "and", "as", "crash", "dbg", "else", "expect", "exposing", "for", "if", "import", "in",
-    "match", "module", "or", "return", "var", "where", "while",
+/// Roc's reserved words, tested one at a time against the nightly. The
+/// header's own vocabulary is reserved everywhere, not only in a header:
+/// `targets` as a parameter name is a parse error in the middle of a
+/// module (codex/test's magic-sim-fixes).
+const KEYWORDS: [&str; 25] = [
+    "and", "app", "as", "crash", "dbg", "else", "expect", "exposes", "exposing", "for", "if", "import", "in",
+    "match", "module", "or", "packages", "platform", "provides", "requires", "return", "targets", "var", "where",
+    "while",
 ];
 
 /// Roc's own type names: a chapter that declares one of these spells it
@@ -41,6 +46,37 @@ fn type_name(t: &str) -> String {
     } else {
         t.to_string()
     }
+}
+
+/// **CODEX WRITES A LIST IN PLACE; ROC ANSWERS A NEW ONE.** The two agree
+/// wherever the program uses the answer, and diverge wherever it uses the
+/// list it wrote through another name. Two shapes say the write was for
+/// its effect, and both are refused rather than emitted wrongly:
+///
+/// - a definition that writes one of its own list parameters and answers
+///   something that is not a list (the foreword's `cb-shl1-step` doubles a
+///   bignum in place and answers the carry, and its caller reads the
+///   doubled list);
+/// - a `let` whose value is such a write and whose name nothing reads.
+///
+/// The verdicts that pin the behaviour are `codex/test/edalias` and
+/// `cryptobig`, and both were answering quietly wrong numbers before this.
+/// A definition's result: `k` parameters peel `k` arrows.
+fn result_ty(t: &Ty, k: usize) -> Ty {
+    let mut cur = t.clone();
+    for _ in 0..k {
+        loop {
+            match cur {
+                Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => cur = *b,
+                _ => break,
+            }
+        }
+        match cur {
+            Ty::Fun(_, _, r) => cur = *r,
+            other => return other,
+        }
+    }
+    cur
 }
 
 /// Every `Named` in a type expression, however deep.
@@ -645,6 +681,30 @@ impl<'a> Cx<'a> {
         Ok(format!(".{{\n{t}is_eq : {sig}\n{t}is_eq = |a, b| {call}(a, b)\n{}}}", "\t".repeat(base)))
     }
 
+    /// The name of a list parameter this body writes with `list-set-at`.
+    fn written_param(&self, body: &IrExpr, params: &[Sym]) -> Option<String> {
+        let mut found = None;
+        body.walk(&mut |x| {
+            let mut head = x;
+            let mut args: Vec<&IrExpr> = Vec::new();
+            while let IrExpr::Apply(f, a, _, _) = head {
+                args.push(a);
+                head = f;
+            }
+            args.reverse();
+            if let IrExpr::Name(n, _, _) = head {
+                if args.len() == 3 && self.syms.text(*n) == "list-set-at" {
+                    if let IrExpr::Name(t, _, _) = args[0] {
+                        if params.contains(t) && found.is_none() {
+                            found = Some(self.syms.text(*t).to_string());
+                        }
+                    }
+                }
+            }
+        });
+        found
+    }
+
     /// `:` for a plain alias, `:=` for one that stands on a cycle.
     fn colon(&self, n: Sym) -> &'static str {
         if self.recursive.contains(&n) { ":=" } else { ":" }
@@ -709,6 +769,17 @@ impl<'a> Cx<'a> {
     /// as the literal it is, since the nightly's checker is linear in them.
     fn def(&mut self, d: &IrDef, base: usize) -> Result<String, String> {
         let name = self.ident(d.name)?;
+        // A write to a list parameter, in a definition that answers
+        // something else, is a mutation the caller reads back (see
+        // `writes_a_param`).
+        let ps: Vec<Sym> = d.params.iter().map(|p| p.name).collect();
+        let (_, ret, _) = self.arrows(d)?;
+        if !matches!(result_ty(&d.ty, d.params.len()), Ty::List(_)) {
+            let _ = &ret;
+            if let Some(t) = self.written_param(&d.body, &ps) {
+                return Err(format!("`{}` writes its list parameter `{t}` and answers something else", self.syms.text(d.name)));
+            }
+        }
         let sig = self.signature(d)?;
         let mark = self.locals.len();
         let mut ps = Vec::new();
@@ -776,14 +847,38 @@ impl<'a> Cx<'a> {
 
     /// `opening : [Console] Nothing = act ...` is `main!`.
     fn opening(&mut self, d: &IrDef) -> Result<String, String> {
-        let IrExpr::Act(stmts, _, _) = &d.body else {
-            return Err("opening is not an act".into());
-        };
         if !d.params.is_empty() {
             return Err("opening takes parameters".into());
         }
-        let mut out = String::from("main! = |_args| {\n");
         let mark = self.locals.len();
+        let mut out = String::from("main! = |_args| {\n");
+        // **AN OPENING MAY BE WRAPPED IN LETS**, and upstream runs the act
+        // inside them; the bindings are main!'s own.
+        let mut body = &d.body;
+        while let IrExpr::Let(n, _, v, inner, _) = body {
+            let v = self.expr(v, 1)?;
+            self.locals.push(*n);
+            out.push_str(&format!("\t{} = {v}\n", self.local(*n)?));
+            body = inner;
+        }
+        // **AN OPENING THAT IS A VALUE IS PRINTED**, which is what the
+        // driver does with it and what every verdict in codex/test records.
+        let IrExpr::Act(stmts, _, _) = body else {
+            let text = match body.ty() {
+                Ty::Text => self.expr(body, 1)?,
+                Ty::Integer(..) => format!("I64.to_str({})", self.expr(body, 1)?),
+                other => {
+                    return Err(format!(
+                        "an opening of type {}",
+                        crate::ir_text::render_ty(self.syms, &other)
+                    ))
+                }
+            };
+            self.uses_line = true;
+            out.push_str(&format!("\tline!({text})\n\tOk({{}})\n}}\n"));
+            self.locals.truncate(mark);
+            return Ok(out);
+        };
         for s in stmts {
             match s {
                 IrActStmt::Exec(e, _) => {
@@ -1303,16 +1398,38 @@ impl<'a> Cx<'a> {
                 want(1)?;
                 "0".into()
             }
+            // `__narrow` is the checker's marker for a value proved to fit a
+            // bound; at runtime it is the value (interp.rs).
+            "__narrow" => {
+                want(1)?;
+                xs[0].clone()
+            }
             "list-push" | "list-snoc" => {
                 want(2)?;
                 format!("List.append({}, {})", xs[0], xs[1])
             }
+            // `show` is Codex's own spelling of a value, not Roc's: a
+            // boolean is `True` or `False` (interp::show).
             "show" | "integer-to-text" => {
                 want(1)?;
-                if !matches!(args[0].ty(), Ty::Integer(..)) {
-                    return Err(format!("show on a {}", crate::ir_text::render_ty(self.syms, &args[0].ty())));
+                match args[0].ty() {
+                    Ty::Integer(..) => format!("{int}.to_str({})", xs[0]),
+                    Ty::Boolean => format!("(if {} {{ \"True\" }} else {{ \"False\" }})", xs[0]),
+                    Ty::Text => xs[0].clone(),
+                    other => return Err(format!("show on a {}", crate::ir_text::render_ty(self.syms, &other))),
                 }
-                format!("{int}.to_str({})", xs[0])
+            }
+            // A Codex Text is CCE units over an alphabet of 1..127, so its
+            // length is its byte count.
+            "text-length" => {
+                want(1)?;
+                format!("U64.to_{int_lc}_wrap(Str.count_utf8_bytes({}))", xs[0])
+            }
+            // `text-to-integer` trims and answers 0 for anything it cannot
+            // read, as the interpreter does.
+            "text-to-integer" => {
+                want(1)?;
+                format!("({int}.from_str(Str.trim({})) ?? 0)", xs[0])
             }
             "real-from-int" | "__int-to-real" => {
                 want(1)?;
