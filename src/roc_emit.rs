@@ -60,10 +60,13 @@ pub fn emit_modules(
     defs: &[IrDef],
 ) -> Result<Vec<(String, String)>, String> {
     let mut cx = Cx::new(ch, tds, syms, defs);
-    let Some(app) = defs.iter().find(|d| syms.text(d.name) == "opening") else {
-        return Err("no opening: nothing to run".into());
-    };
-    let app_slug = app.origin.clone();
+    // **A UNIT WITH NO OPENING IS A LIBRARY**: every chapter a module, no
+    // app. That is what a GPU kernel chapter is.
+    let app_slug = defs
+        .iter()
+        .find(|d| syms.text(d.name) == "opening")
+        .map(|a| a.origin.clone())
+        .unwrap_or_default();
     let mut slugs: Vec<String> = Vec::new();
     for d in defs {
         if d.origin.is_empty() {
@@ -159,6 +162,18 @@ struct Cx<'a> {
     /// Set while a right fold's body is emitted: its leaves become
     /// accumulator steps (see `def`).
     fold: Option<Fold>,
+    /// **THE DEVICE EFFECT IS STATE.** A `[Device]` definition takes the
+    /// device as its first parameter and answers `(Device.Device, T)`; the
+    /// effect's operations are `Device.load`, `Device.store` and the index
+    /// reads on the hand-written `Device` module (roc-apps/gpu/roc). These
+    /// are the operations the chapter declares under `effect Device` and
+    /// the definitions whose type carries the effect.
+    device_ops: std::collections::BTreeSet<Sym>,
+    device_defs: std::collections::BTreeSet<Sym>,
+    /// The name holding the device at this point of an effectful body, and
+    /// the count of names minted for it in this definition.
+    dev: Option<String>,
+    dev_n: usize,
 }
 
 struct Fold {
@@ -182,7 +197,26 @@ impl<'a> Cx<'a> {
             tvars: BTreeMap::new(),
             uses_line: false,
             fold: None,
+            device_ops: Default::default(),
+            device_defs: Default::default(),
+            dev: None,
+            dev_n: 0,
         };
+        for ed in &ch.effect_defs {
+            if ch.syms.text(ed.name) != "Device" {
+                continue;
+            }
+            for op in &ed.ops {
+                if let Some(s) = syms.find(ch.syms.text(op.name)) {
+                    cx.device_ops.insert(s);
+                }
+            }
+        }
+        for d in defs {
+            if cx.has_device(&d.ty) {
+                cx.device_defs.insert(d.name);
+            }
+        }
         for (td, c) in ch.type_defs.iter().zip(&ch.type_def_chapters) {
             let n = match td {
                 TypeDef::Record(n, ..) | TypeDef::Variant(n, ..) | TypeDef::Unit(n, ..) => *n,
@@ -320,6 +354,25 @@ impl<'a> Cx<'a> {
 
     /// A definition's signature: `k` parameters peel `k` arrows.
     fn signature(&mut self, d: &IrDef) -> Result<String, String> {
+        let (ps, r) = self.arrows(d)?;
+        let sig = if ps.is_empty() { r } else { format!("{} -> {}", ps.join(", "), r) };
+        let wants = self.eq_wants(d)?;
+        Ok(if wants.is_empty() { sig } else { format!("{sig} where [{}]", wants.join(", ")) })
+    }
+
+    /// A `[Device]` definition's signature: the device first, and the pair
+    /// last.
+    fn device_signature(&mut self, d: &IrDef) -> Result<String, String> {
+        let (ps, r) = self.arrows(d)?;
+        let mut all = vec!["Device.Device".to_string()];
+        all.extend(ps);
+        let sig = format!("{} -> (Device.Device, {r})", all.join(", "));
+        let wants = self.eq_wants(d)?;
+        Ok(if wants.is_empty() { sig } else { format!("{sig} where [{}]", wants.join(", ")) })
+    }
+
+    /// `k` parameters peel `k` arrows: the parameter types and the result.
+    fn arrows(&mut self, d: &IrDef) -> Result<(Vec<String>, String), String> {
         self.tvars.clear();
         let mut cur = &d.ty;
         let mut ps = Vec::new();
@@ -346,12 +399,15 @@ impl<'a> Cx<'a> {
             }
         }
         let r = self.ty(cur)?;
-        let sig = if ps.is_empty() { r } else { format!("{} -> {}", ps.join(", "), r) };
-        // **`==` ON A TYPE VARIABLE NEEDS A `where` CLAUSE.** Roc's equality
-        // is the `is_eq` method of the left operand's type; a type variable
-        // has none unless the signature requires one (static-dispatch.md,
-        // "Where Clauses"). The derived equality on the prelude's tuples
-        // compares fields of type `a`.
+        Ok((ps, r))
+    }
+
+    /// **`==` ON A TYPE VARIABLE NEEDS A `where` CLAUSE.** Roc's equality
+    /// is the `is_eq` method of the left operand's type; a type variable
+    /// has none unless the signature requires one (static-dispatch.md,
+    /// "Where Clauses"). The derived equality on the prelude's tuples
+    /// compares fields of type `a`.
+    fn eq_wants(&mut self, d: &IrDef) -> Result<Vec<String>, String> {
         let mut eq_vars: Vec<u32> = Vec::new();
         d.body.walk(&mut |x| {
             if let IrExpr::Binary(IrBinOp::Eq | IrBinOp::NotEq, l, _, _, _) = x {
@@ -371,7 +427,26 @@ impl<'a> Cx<'a> {
             let v = self.ty(&Ty::Var(id))?;
             wants.push(format!("{v}.is_eq : {v}, {v} -> Bool"));
         }
-        Ok(if wants.is_empty() { sig } else { format!("{sig} where [{}]", wants.join(", ")) })
+        Ok(wants)
+    }
+
+    /// Whether a type carries the Device effect: on an arrow's row, or as
+    /// an effectful nullary's label.
+    fn has_device(&self, t: &Ty) -> bool {
+        let mut cur = t;
+        loop {
+            match cur {
+                Ty::ForAll(_, b) | Ty::ForAllEff(_, b) | Ty::Linear(b) => cur = b,
+                Ty::Fun(_, row, r) => {
+                    if row.labels.iter().any(|(l, _)| l == "Device") {
+                        return true;
+                    }
+                    cur = r;
+                }
+                Ty::Effectful(names, _, _) => return names.iter().any(|n| self.syms.text(*n) == "Device"),
+                _ => return false,
+            }
+        }
     }
 
     fn texpr(&mut self, t: &TypeExpr) -> Result<String, String> {
@@ -497,6 +572,21 @@ impl<'a> Cx<'a> {
             ps.push(self.binder(p.name, &[&d.body])?);
         }
         let tabs = "\t".repeat(base);
+        if self.device_defs.contains(&d.name) {
+            self.imports.insert("Device".into());
+            for p in &d.params {
+                self.no_dev_name(p.name)?;
+            }
+            self.dev_n = 0;
+            self.dev = Some("dev".into());
+            let sig = self.device_signature(d)?;
+            let body = self.eff_expr(&d.body, base)?;
+            self.dev = None;
+            self.locals.truncate(mark);
+            let mut all = vec!["dev".to_string()];
+            all.extend(ps);
+            return Ok(format!("{tabs}{name} : {sig}\n{tabs}{name} = |{}| {body}\n", all.join(", ")));
+        }
         // **A RIGHT FOLD IS EMITTED AS AN ACCUMULATOR LOOP.** Codex builds a
         // list by `x & f rest`: the recursive call is the right operand of
         // an append, and each level copies everything below it, so a
@@ -562,6 +652,212 @@ impl<'a> Cx<'a> {
         self.locals.truncate(mark);
         out.push_str("\tOk({})\n}\n");
         Ok(out)
+    }
+
+    // ---- the Device effect -----------------------------------------------
+
+    /// Whether an expression performs the Device effect: an act, a call of
+    /// an operation or of a `[Device]` definition, or a let, if or match
+    /// whose body does. Arguments and conditions are pure -- Codex binds an
+    /// effectful value only with `<-`.
+    fn is_effectful(&self, e: &IrExpr) -> bool {
+        use IrExpr as E;
+        match e {
+            E::Act(..) => true,
+            E::Name(n, _, _) => self.is_device_sym(*n),
+            E::Apply(..) => {
+                let mut head = e;
+                while let E::Apply(f, _, _, _) = head {
+                    head = f;
+                }
+                matches!(head, E::Name(n, _, _) if self.is_device_sym(*n))
+            }
+            E::Let(_, _, _, body, _) => self.is_effectful(body),
+            E::If(_, t, f, _, _) => self.is_effectful(t) || self.is_effectful(f),
+            E::Match(_, bs, _, _) => bs.iter().any(|b| self.is_effectful(&b.body)),
+            _ => false,
+        }
+    }
+
+    fn is_device_sym(&self, n: Sym) -> bool {
+        self.device_ops.contains(&n) || self.device_defs.contains(&n)
+    }
+
+    /// The threaded device is `dev`, `dev1`, `dev2`, ...: a Codex name
+    /// spelled like one would shadow it.
+    fn no_dev_name(&self, n: Sym) -> Result<(), String> {
+        let id = self.ident(n)?;
+        if id.starts_with("dev") && id[3..].chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!("`{id}` is spelled like the threaded device"));
+        }
+        Ok(())
+    }
+
+    fn fresh_dev(&mut self) -> String {
+        self.dev_n += 1;
+        format!("dev{}", self.dev_n)
+    }
+
+    fn cur_dev(&self) -> Result<String, String> {
+        self.dev.clone().ok_or_else(|| "the Device effect outside a [Device] definition".to_string())
+    }
+
+    /// An expression under the Device effect, as a Roc expression whose
+    /// value is `(Device.Device, T)`: the device comes in as `self.dev` and
+    /// goes out in the pair. A pure expression is paired with the device
+    /// unchanged; an act threads it statement by statement; let, if and a
+    /// call pass it along. `self.dev` is as it was on return, since the
+    /// pair is the only way a device leaves.
+    fn eff_expr(&mut self, e: &IrExpr, ind: usize) -> Result<String, String> {
+        use IrExpr as E;
+        let dev = self.cur_dev()?;
+        if !self.is_effectful(e) {
+            return Ok(format!("({dev}, {})", self.expr(e, ind)?));
+        }
+        let out = match e {
+            E::Act(stmts, _, _) => {
+                let tabs = "\t".repeat(ind + 1);
+                let mut out = String::from("({\n");
+                let mark = self.locals.len();
+                let Some(last) = stmts.len().checked_sub(1) else {
+                    return Err("an empty act".into());
+                };
+                for (i, st) in stmts.iter().enumerate() {
+                    let rest: Vec<&IrExpr> = stmts[i + 1..].iter().map(|s| s.expr()).collect();
+                    match st {
+                        IrActStmt::Exec(x, _) => {
+                            if i == last {
+                                out.push_str(&format!("{tabs}{}\n", self.eff_expr(x, ind + 1)?));
+                            } else if self.is_effectful(x) {
+                                let v = self.eff_expr(x, ind + 1)?;
+                                let d = self.fresh_dev();
+                                out.push_str(&format!("{tabs}({d}, _) = {v}\n"));
+                                self.dev = Some(d);
+                            } else {
+                                out.push_str(&format!("{tabs}_ = {}\n", self.expr(x, ind + 1)?));
+                            }
+                        }
+                        IrActStmt::Bind(n, _, x, _) => {
+                            self.no_dev_name(*n)?;
+                            if self.is_effectful(x) {
+                                let v = self.eff_expr(x, ind + 1)?;
+                                let d = self.fresh_dev();
+                                self.locals.push(*n);
+                                let b = if i == last { self.local(*n)? } else { self.binder(*n, &rest)? };
+                                out.push_str(&format!("{tabs}({d}, {b}) = {v}\n"));
+                                self.dev = Some(d);
+                            } else {
+                                let v = self.expr(x, ind + 1)?;
+                                self.locals.push(*n);
+                                let b = if i == last { self.local(*n)? } else { self.binder(*n, &rest)? };
+                                out.push_str(&format!("{tabs}{b} = {v}\n"));
+                            }
+                            if i == last {
+                                out.push_str(&format!("{tabs}({}, {})\n", self.cur_dev()?, self.local(*n)?));
+                            }
+                        }
+                    }
+                }
+                out.push_str(&format!("{}}})", "\t".repeat(ind)));
+                self.locals.truncate(mark);
+                out
+            }
+            E::Let(..) => {
+                let tabs = "\t".repeat(ind + 1);
+                let mut out = String::from("({\n");
+                let mark = self.locals.len();
+                let mut cur = e;
+                while let E::Let(n, _, v, body, _) = cur {
+                    if self.is_effectful(v) {
+                        return Err("an effectful let".into());
+                    }
+                    self.no_dev_name(*n)?;
+                    let v = self.expr(v, ind + 1)?;
+                    self.locals.push(*n);
+                    let b = self.binder(*n, &[body])?;
+                    out.push_str(&format!("{tabs}{b} = {v}\n"));
+                    cur = body;
+                }
+                out.push_str(&format!("{tabs}{}\n{}}})", self.eff_expr(cur, ind + 1)?, "\t".repeat(ind)));
+                self.locals.truncate(mark);
+                out
+            }
+            E::If(c, t, f, _, _) => format!(
+                "(if {} {{ {} }} else {{ {} }})",
+                self.expr(c, ind)?,
+                self.eff_expr(t, ind)?,
+                self.eff_expr(f, ind)?
+            ),
+            E::Name(n, _, _) => self.eff_call(*n, &[], ind)?,
+            E::Apply(..) => {
+                let mut args = Vec::new();
+                let mut head = e;
+                while let E::Apply(f, a, _, _) = head {
+                    args.push(&**a);
+                    head = f;
+                }
+                args.reverse();
+                let E::Name(n, _, _) = head else {
+                    return Err("an effectful call whose head is not a name".into());
+                };
+                self.eff_call(*n, &args, ind)?
+            }
+            E::Match(..) => return Err("a match under the Device effect".into()),
+            _ => return Err("an effectful form".into()),
+        };
+        self.dev = Some(dev);
+        Ok(out)
+    }
+
+    /// A call under the Device effect: a `[Device]` definition with the
+    /// device first, or one of the effect's operations on the Device module.
+    fn eff_call(&mut self, n: Sym, args: &[&IrExpr], ind: usize) -> Result<String, String> {
+        let mut xs = vec![self.cur_dev()?];
+        for a in args {
+            if self.is_effectful(a) {
+                return Err("an effectful argument".into());
+            }
+            xs.push(self.expr(a, ind)?);
+        }
+        let text = self.syms.text(n).to_string();
+        if self.device_defs.contains(&n) {
+            let k = self.arity[&n];
+            if args.len() != k {
+                return Err(format!("`{text}` applied to {} of {k} arguments under Device", args.len()));
+            }
+            return Ok(format!("{}({})", self.def_ref(n)?, xs.join(", ")));
+        }
+        let want = |k: usize| -> Result<(), String> {
+            if args.len() == k {
+                Ok(())
+            } else {
+                Err(format!("`{text}` applied to {} arguments, takes {k}", args.len()))
+            }
+        };
+        self.imports.insert("Device".into());
+        Ok(match text.as_str() {
+            "device-load" => {
+                want(2)?;
+                format!("Device.load({})", xs.join(", "))
+            }
+            "device-store" => {
+                want(3)?;
+                format!("Device.store({})", xs.join(", "))
+            }
+            "thread-idx-x" => {
+                want(0)?;
+                format!("Device.thread_idx_x({})", xs[0])
+            }
+            "block-idx-x" => {
+                want(0)?;
+                format!("Device.block_idx_x({})", xs[0])
+            }
+            "block-dim-x" => {
+                want(0)?;
+                format!("Device.block_dim_x({})", xs[0])
+            }
+            other => return Err(format!("Device operation `{other}`")),
+        })
     }
 
     /// A binder that nothing reads is spelled `_name`, which is Roc's way of
@@ -655,6 +951,9 @@ impl<'a> Cx<'a> {
         if self.locals.contains(&n) {
             return self.local(n);
         }
+        if self.is_device_sym(n) {
+            return Err(format!("`{}` performs the Device effect outside a statement", self.syms.text(n)));
+        }
         if self.arity.contains_key(&n) {
             return self.def_ref(n);
         }
@@ -723,6 +1022,9 @@ impl<'a> Cx<'a> {
             return Err("a call whose head is not a name".into());
         };
         let text = self.syms.text(*n).to_string();
+        if self.is_device_sym(*n) {
+            return Err(format!("`{text}` performs the Device effect outside a statement"));
+        }
         let mut xs = Vec::new();
         for a in &args {
             xs.push(self.expr(a, ind)?);

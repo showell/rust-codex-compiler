@@ -30,6 +30,16 @@ fn main() -> ExitCode {
             }
             None => ExitCode::from(2),
         },
+        Some("library") if args.len() == 2 => match library(Path::new(&args[1])) {
+            Ok(text) => {
+                let _ = std::io::stdout().lock().write_all(text.as_bytes());
+                ExitCode::SUCCESS
+            }
+            Err(why) => {
+                eprintln!("REFUSED: {why}");
+                ExitCode::from(2)
+            }
+        },
         Some("whole") if args.len() == 2 => match whole(Path::new(&args[1]), Some("Program")) {
             Ok(text) => {
                 let out = std::io::stdout();
@@ -328,6 +338,27 @@ fn whole(path: &Path, chapter: Option<&str>) -> Result<String, String> {
     let ch = dg.chapter(&parsed.tree);
     let defs = codexc::ir::emit_defs(&ch)?;
     Ok(format!("{head}{defs}))"))
+}
+
+/// The whole chapter with no root: every definition, as `rocemit` reads it.
+fn library(path: &Path) -> Result<String, String> {
+    let src = codexc::bundle::load(path)?;
+    let parsed = parser::parse(&src);
+    if !parsed.lex_errors.is_empty() || !parsed.diagnostics.is_empty() {
+        let mut st = codexc::check::UnifyState::default();
+        for d in &parsed.lex_errors {
+            st.error(codexc::check::lex_code(d.code), d.msg);
+        }
+        for (code, msg) in &parsed.diagnostics {
+            st.error(*code, msg.clone());
+        }
+        if let Some(halt) = codexc::ir::codegen_halted(&st) {
+            return Err(halt);
+        }
+    }
+    let mut dg = codexc::desugar::Desugar::new(&src);
+    let ch = dg.chapter(&parsed.tree);
+    codexc::ir::emit_library(&ch)
 }
 
 /// Every unit against its gold, whole. A unit whose body cannot be typed yet is

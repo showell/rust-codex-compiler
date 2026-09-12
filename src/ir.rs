@@ -73,6 +73,17 @@ pub fn emit_defs(ch: &Chapter) -> Result<String, String> {
     emit_defs_checked(ch, &bindings, &st, &tds, &IR_EMIT_ROOTS)
 }
 
+/// The chapter WHOLE, as `lower_whole` reads it: no roots, no pipeline, no
+/// prune. What `rocemit` sees of a library chapter, in the IR spelling.
+pub fn emit_library(ch: &Chapter) -> Result<String, String> {
+    let (bindings, st, tds) = crate::check::check_chapter_full(ch);
+    if let Some(halt) = codegen_halted(&st) {
+        return Err(halt);
+    }
+    let low = lower_whole(ch, &bindings, &st, &tds)?;
+    Ok(crate::ir_text::emit_defs(&low.syms, &low.defs))
+}
+
 /// The driver's halt line when the checker raised, else None.
 pub fn codegen_halted(st: &crate::check::UnifyState) -> Option<String> {
     let n = st.errors();

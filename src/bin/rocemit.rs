@@ -2,7 +2,8 @@
 //!
 //!     rocemit <unit.codex> <dir>      one type module per chapter, whole, and
 //!                                     the spec's app, written into <dir>; the
-//!                                     app's file name on stdout
+//!                                     app's file name on stdout, or `library`
+//!                                     for a unit with no opening
 //!
 //! The same road as `irdump whole` -- resolve, parse, desugar, check, lower --
 //! and then `roc_emit` instead of the IR text. Exit 2 on a refusal.
@@ -75,6 +76,6 @@ fn emit(path: &Path, dir: &Path) -> Result<String, String> {
             app = Some(name.clone());
         }
     }
-    let app = app.ok_or("no app among the emitted modules")?;
-    Ok(format!("{app}\n"))
+    // A library (no opening) names no app; its modules are the output.
+    Ok(app.map_or_else(|| "library\n".to_string(), |a| format!("{a}\n")))
 }
