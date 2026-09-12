@@ -107,6 +107,27 @@ fn named_types(t: &TypeExpr, out: &mut std::collections::BTreeSet<Sym>) {
     }
 }
 
+/// The types and the arithmetic no chapter declares and Roc does not have
+/// in the shape Codex means.
+///
+/// `int-mod` is Codex's Euclidean remainder, always in `[0, |b|)`; Roc's
+/// `mod_by` is FLOORED, so it takes the divisor's sign and the two answer
+/// differently for a negative divisor (7 mod -3 is 1 in Codex and -2 in
+/// Roc). They agree everywhere a divisor is positive, which is everywhere
+/// the corpus divides, and this says so anyway.
+const PRELUDE: &str = r#"# Prelude -- what no chapter declares, written by rocemit. Do not edit.
+
+Prelude :: [].{
+	Maybe(a) : [None, Just(a)]
+
+	int_mod : I64, I64 -> I64
+	int_mod = |a, b| {
+		m = I64.mod_by(a, b)
+		if m < 0 { m + I64.abs(b) } else { m }
+	}
+}
+"#;
+
 const LINE_HELPER: &str =
     "\n# The Echo platform's echo! writes no newline; a Codex line is one.\nline! = |s| echo!(Str.concat(s, \"\\n\"))\n";
 
@@ -190,10 +211,13 @@ pub fn emit_modules(
         }
         files.push((format!("{slug}.roc"), text));
     }
+    if cx.uses_cce {
+        files.push(("Cce.roc".into(), cce_module()));
+    }
     if prelude {
         files.push((
             "Prelude.roc".into(),
-            "# Prelude -- the language types no chapter declares.\n\nPrelude :: [].{\n\tMaybe(a) : [None, Just(a)]\n}\n".into(),
+            PRELUDE.into(),
         ));
     }
     Ok(files)
@@ -240,6 +264,9 @@ struct Cx<'a> {
     /// Type-variable letters, per definition signature.
     tvars: BTreeMap<u32, String>,
     uses_line: bool,
+    /// Set when the unit reaches for the alphabet, which is then emitted
+    /// beside the chapters as `Cce.roc`.
+    uses_cce: bool,
     /// Set while a right fold's body is emitted: its leaves become
     /// accumulator steps (see `def`).
     fold: Option<Fold>,
@@ -290,6 +317,7 @@ impl<'a> Cx<'a> {
             locals: Vec::new(),
             tvars: BTreeMap::new(),
             uses_line: false,
+            uses_cce: false,
             fold: None,
             device_ops: Default::default(),
             device_defs: Default::default(),
@@ -458,6 +486,8 @@ impl<'a> Cx<'a> {
     fn ty(&mut self, t: &Ty) -> Result<String, String> {
         Ok(match t {
             Ty::Integer(..) => self.int().into(),
+            // A Codex Char is its code in the alphabet (see `cce_module`).
+            Ty::Char => "I64".into(),
             Ty::Real(RealWidth::F64, _) => self.real().into(),
             Ty::Text => "Str".into(),
             Ty::Boolean => "Bool".into(),
@@ -623,6 +653,7 @@ impl<'a> Cx<'a> {
             TypeExpr::Named(n, _) => match self.syms.text(*n) {
                 "Real" => self.real().into(),
                 "Integer" => self.int().into(),
+                "Char" => "I64".into(),
                 "Text" => "Str".into(),
                 "Boolean" => "Bool".into(),
                 "Nothing" => "{}".into(),
@@ -1125,7 +1156,8 @@ impl<'a> Cx<'a> {
             E::NumLit(bits, _) => num_lit(*bits, self.wgsl),
             E::TextLit(s, _) => roc_quote(s),
             E::BoolLit(b, _) => if *b { "True".into() } else { "False".into() },
-            E::CharLit(..) => return Err("char literal".into()),
+            // The IR carries a char literal as its CODE already.
+            E::CharLit(c, _) => int_lit(*c),
             E::Name(n, _, _) => self.name_value(*n)?,
             E::Binary(op, l, r, t, _) => {
                 let (l, r) = (self.expr(l, ind)?, self.expr(r, ind)?);
@@ -1398,6 +1430,58 @@ impl<'a> Cx<'a> {
                 want(1)?;
                 "0".into()
             }
+            "int-mod" => {
+                want(2)?;
+                self.imports.insert("Prelude".into());
+                format!("Prelude.int_mod({}, {})", xs[0], xs[1])
+            }
+            "int-rem" => {
+                want(2)?;
+                format!("{int}.rem_by({}, {})", xs[0], xs[1])
+            }
+            "char-code" | "code-to-char" => {
+                want(1)?;
+                // A Char IS its code here, so both are the value.
+                xs[0].clone()
+            }
+            "char-code-at" => {
+                want(2)?;
+                self.uses_cce = true;
+                self.imports.insert("Cce".into());
+                format!("Cce.at({}, {})", xs[0], xs[1])
+            }
+            "char-at" => {
+                want(2)?;
+                self.uses_cce = true;
+                self.imports.insert("Cce".into());
+                format!("Cce.at_or_crash({}, {})", xs[0], xs[1])
+            }
+            "char-to-text" | "char-encode" => {
+                want(1)?;
+                self.uses_cce = true;
+                self.imports.insert("Cce".into());
+                format!("Cce.text({})", xs[0])
+            }
+            // The classifiers are code RANGES, not the host's idea of a
+            // letter: the alphabet is frequency-ordered (interp.rs).
+            "is-letter" => {
+                want(1)?;
+                format!("(({x} >= 13 and {x} <= 64) or ({x} >= 97 and {x} <= 127))", x = xs[0])
+            }
+            "is-digit" => {
+                want(1)?;
+                format!("({x} >= 3 and {x} <= 12)", x = xs[0])
+            }
+            "is-whitespace" => {
+                want(1)?;
+                format!("({x} >= 1 and {x} <= 2)", x = xs[0])
+            }
+            "substring" => {
+                want(3)?;
+                self.uses_cce = true;
+                self.imports.insert("Cce".into());
+                format!("Cce.substring({}, {}, {})", xs[0], xs[1], xs[2])
+            }
             // `__narrow` is the checker's marker for a value proved to fit a
             // bound; at runtime it is the value (interp.rs).
             "__narrow" => {
@@ -1416,6 +1500,11 @@ impl<'a> Cx<'a> {
                     Ty::Integer(..) => format!("{int}.to_str({})", xs[0]),
                     Ty::Boolean => format!("(if {} {{ \"True\" }} else {{ \"False\" }})", xs[0]),
                     Ty::Text => xs[0].clone(),
+                    Ty::Char => {
+                        self.uses_cce = true;
+                self.imports.insert("Cce".into());
+                        format!("Cce.text({})", xs[0])
+                    }
                     other => return Err(format!("show on a {}", crate::ir_text::render_ty(self.syms, &other))),
                 }
             }
@@ -1423,7 +1512,9 @@ impl<'a> Cx<'a> {
             // length is its byte count.
             "text-length" => {
                 want(1)?;
-                format!("U64.to_{int_lc}_wrap(Str.count_utf8_bytes({}))", xs[0])
+                self.uses_cce = true;
+                self.imports.insert("Cce".into());
+                format!("Cce.length({})", xs[0])
             }
             // `text-to-integer` trims and answers 0 for anything it cannot
             // read, as the interpreter does.
@@ -1525,7 +1616,7 @@ impl<'a> Cx<'a> {
                 self.binder(*n, scope)?
             }
             IrPat::Lit(v, ty, _) => match ty {
-                Ty::Integer(..) => v.clone(),
+                Ty::Integer(..) | Ty::Char => v.clone(),
                 Ty::Text => roc_quote(v),
                 // The IR spells it `True` / `False`; a lowercase test made
                 // every boolean pattern `False`, which Roc then called a
@@ -1785,4 +1876,142 @@ mod literals_round_trip {
     fn an_exponent_goes_through_bits() {
         assert_eq!(num_lit(1e21_f64.to_bits() as i64), format!("F64.from_bits({})", 1e21_f64.to_bits()));
     }
+}
+
+/// **THE CODEX ALPHABET, WRITTEN OUT FOR ROC.** A Codex `Char` is not a
+/// byte and not a Unicode scalar: it is a code in a private,
+/// frequency-ordered alphabet of 1..127, where `char-code 'A'` is 41 and
+/// the codes above 96 are accented Latin and Cyrillic. A Codex `Text` is a
+/// sequence of those units, one per CHARACTER, so its length and its
+/// indexing are by character and not by byte.
+///
+/// So a Char emits as its code, an `I64`, and this module is what turns a
+/// Roc `Str` into codes and back. It is GENERATED from `charcode.rs`'s own
+/// tables rather than transcribed, because that file says in as many words
+/// that the tables cannot be transcribed by hand: ten corpus programs once
+/// differed from the oracle by exactly 61 bytes, a run of NULs where the
+/// Cyrillic should have been.
+fn cce_module() -> String {
+    let mut points = [0u32; 128];
+    for (b, code) in crate::charcode::CHAR_CODE.iter().enumerate() {
+        if *code != 0 {
+            points[*code as usize] = b as u32;
+        }
+    }
+    for (i, c) in crate::charcode::CHAR_CODE_HIGH.iter().enumerate() {
+        points[crate::charcode::HIGH_BASE as usize + i] = *c as u32;
+    }
+    let codes: Vec<String> = crate::charcode::CHAR_CODE.iter().map(|c| c.to_string()).collect();
+    let pts: Vec<String> = points.iter().map(|p| p.to_string()).collect();
+    let wrap = |xs: &[String]| -> String {
+        xs.chunks(16).map(|c| format!("\t\t{}", c.join(", "))).collect::<Vec<_>>().join(",\n")
+    };
+    format!(
+        r#"# Cce -- the Codex character alphabet, written from the compiler's own
+# tables by rocemit (rust-codex-compiler). Do not edit.
+#
+# A Codex Char is its CODE in a private frequency-ordered alphabet of
+# 1..127: `char-code 'A'` is 41, not 65. Codes 97..127 are accented Latin
+# and Cyrillic, which no byte reaches. A Codex Text is a sequence of those
+# units, ONE PER CHARACTER, so `text-length` counts characters and
+# `char-code-at` indexes them.
+
+Cce :: [].{{
+	# The code of each of the first 128 Unicode code points; 0 for a point
+	# the alphabet does not name.
+	codes : List(I64)
+	codes = [
+{codes}
+	]
+
+	# The code point each code names, indexed by code; 0 for none.
+	points : List(U64)
+	points = [
+{points}
+	]
+
+	# The code of one Unicode code point, or 0.
+	of_point : U64 -> I64
+	of_point = |p|
+		if p < 128 {{ List.get(Cce.codes, p) ?? 0 }} else {{ Cce.high_of(p, 97) }}
+
+	high_of : U64, I64 -> I64
+	high_of = |p, c|
+		if c > 127 {{ 0 }}
+		else if (List.get(Cce.points, I64.to_u64_wrap(c)) ?? 0) == p {{ c }}
+		else {{ Cce.high_of(p, c + 1) }}
+
+	# A text as its codes, one per character.
+	codes_of : Str -> List(I64)
+	codes_of = |s| Cce.decode(Str.to_utf8(s), 0, [])
+
+	decode : List(U8), U64, List(I64) -> List(I64)
+	decode = |bytes, i, acc|
+		if i >= List.len(bytes) {{ acc }} else {{
+			b = U8.to_u64(List.get(bytes, i) ?? 0)
+			# The alphabet reaches no further than two UTF-8 bytes, but a
+			# text may hold anything; a character the alphabet does not
+			# name is code 0, as `char-code` answers.
+			width = if b < 128 {{ 1 }} else if b < 224 {{ 2 }} else if b < 240 {{ 3 }} else {{ 4 }}
+			point = if width == 1 {{ b }} else {{
+				Cce.tail(bytes, i + 1, i + width, Cce.lead(b, width))
+			}}
+			Cce.decode(bytes, i + width, List.append(acc, Cce.of_point(point)))
+		}}
+
+	lead : U64, U64 -> U64
+	lead = |b, width|
+		if width == 2 {{ U64.bitwise_and(b, 31) }}
+		else if width == 3 {{ U64.bitwise_and(b, 15) }}
+		else {{ U64.bitwise_and(b, 7) }}
+
+	tail : List(U8), U64, U64, U64 -> U64
+	tail = |bytes, i, stop, acc|
+		if i >= stop {{ acc }} else {{
+			b = U8.to_u64(List.get(bytes, i) ?? 0)
+			Cce.tail(bytes, i + 1, stop, acc * 64 + U64.bitwise_and(b, 63))
+		}}
+
+	# `text-length`: the count of characters.
+	length : Str -> I64
+	length = |s| U64.to_i64_wrap(List.len(Cce.codes_of(s)))
+
+	# `char-code-at`: the code of the i-th character, 0 past the end.
+	at : Str, I64 -> I64
+	at = |s, i| if i < 0 {{ 0 }} else {{ List.get(Cce.codes_of(s), I64.to_u64_wrap(i)) ?? 0 }}
+
+	# `char-at` answers a character and refuses to run past the end.
+	at_or_crash : Str, I64 -> I64
+	at_or_crash = |s, i|
+		if i < 0 {{ crash("char-at past the end") }}
+		else {{ List.get(Cce.codes_of(s), I64.to_u64_wrap(i)) ?? crash("char-at past the end") }}
+
+	# `char-to-text`, and what `show` of a Char prints.
+	text : I64 -> Str
+	text = |c| Str.from_utf8(Cce.utf8(Cce.to_point(c))) ?? ""
+
+	to_point : I64 -> U64
+	to_point = |c| if c < 0 or c > 127 {{ 0 }} else {{ List.get(Cce.points, I64.to_u64_wrap(c)) ?? 0 }}
+
+	utf8 : U64 -> List(U8)
+	utf8 = |p|
+		if p < 128 {{ [U64.to_u8_wrap(p)] }}
+		else if p < 2048 {{ [U64.to_u8_wrap(192 + U64.div_by(p, 64)), U64.to_u8_wrap(128 + U64.bitwise_and(p, 63))] }}
+		else {{ [
+			U64.to_u8_wrap(224 + U64.div_by(p, 4096)),
+			U64.to_u8_wrap(128 + U64.bitwise_and(U64.div_by(p, 64), 63)),
+			U64.to_u8_wrap(128 + U64.bitwise_and(p, 63)),
+		] }}
+
+	# `substring`, over characters.
+	substring : Str, I64, I64 -> Str
+	substring = |s, start, len| Cce.str_of(List.sublist(Cce.codes_of(s), {{ start: I64.to_u64_wrap(I64.max(start, 0)), len: I64.to_u64_wrap(I64.max(len, 0)) }}))
+
+	str_of : List(I64) -> Str
+	str_of = |cs| List.fold(cs, "", |acc, c| Str.concat(acc, Cce.text(c)))
+}}
+"#,
+        codes = wrap(&codes),
+        points = wrap(&pts)
+    )
 }
