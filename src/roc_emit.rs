@@ -139,6 +139,94 @@ fn named_types(t: &TypeExpr, out: &mut std::collections::BTreeSet<Sym>) {
 /// differently for a negative divisor (7 mod -3 is 1 in Codex and -2 in
 /// Roc). They agree everywhere a divisor is positive, which is everywhere
 /// the corpus divides, and this says so anyway.
+const MEM: &str = r#"# Mem -- Codex's address space, written by rocemit. Do not edit.
+#
+# `peek-byte`, `poke-32` and `alloc-bytes` read and write one heap. Codex
+# gives them an empty effect row, so rocemit finds the definitions that
+# touch memory by closure over the call graph and threads this record
+# through them, the way it threads a GPU device.
+#
+# PAGES, NOT ONE ARRAY: alloc-bytes hands out addresses from 6 MB up while
+# a kernel test pokes a capability table at 786,432, so a flat array would
+# be megabytes of zeros before the first useful byte. A page is 4 KB and
+# an unmapped page reads zero, which is what the Codex runtime's own
+# sparse map does.
+#
+# **EVERY WRITE TOUCHES THE PAGE TABLE EXACTLY ONCE.** A list Roc has
+# already read is shared, and a shared list is COPIED by List.set rather
+# than written in place, so a second look -- a length check on the way to
+# the store, or naming the list again in a `??` fallback -- turns each
+# store into a copy of the whole table. Measured on a 262,144-byte fill:
+# 18.3 s when the fallbacks name the list, 1.0 s when nothing looks twice.
+# That is why the table is a fixed size rather than one that grows, and
+# why every fallback here crashes instead of answering the input.
+
+Mem :: [].{
+	Mem : { pages : List(List(U8)), top : I64 }
+
+	page : I64
+	page = 4096
+
+	# 16,384 pages of 4 KB: a 64 MB space, past the runtime's own
+	# reservation. An address outside it crashes, as the runtime's
+	# bounds check does.
+	span : U64
+	span = 16384
+
+	# The runtime's bump pointer starts at 6 MB, above every address a
+	# program pokes by literal.
+	new : Mem.Mem
+	new = { pages: List.repeat([], Mem.span), top: 6291456 }
+
+	# alloc-bytes answers the old top and bumps it; nothing frees.
+	alloc : Mem.Mem, I64 -> (Mem.Mem, I64)
+	alloc = |mem, n| ({ pages: mem.pages, top: mem.top + n }, mem.top)
+
+	# peek-* answers the bytes at base+off little-endian and unsigned; a
+	# qword wraps into I64, as the runtime's does.
+	load : Mem.Mem, I64, I64, I64 -> (Mem.Mem, I64)
+	load = |mem, base, off, width| (mem, U64.to_i64_wrap(Mem.read(mem, base + off, width - 1, 0)))
+
+	read : Mem.Mem, I64, I64, U64 -> U64
+	read = |mem, addr, j, acc|
+		if j < 0 { acc } else {
+			Mem.read(mem, addr, j - 1, U64.plus_wrap(U64.times_wrap(acc, 256), U8.to_u64(Mem.byte(mem, addr + j))))
+		}
+
+	# An unmapped page, and an address outside the space, read zero.
+	byte : Mem.Mem, I64 -> U8
+	byte = |mem, a| List.get(List.get(mem.pages, Mem.page_of(a)) ?? [], Mem.off_in(a)) ?? 0
+
+	page_of : I64 -> U64
+	page_of = |a| I64.to_u64_wrap(I64.div_trunc_by(a, Mem.page))
+
+	off_in : I64 -> U64
+	off_in = |a| I64.to_u64_wrap(I64.rem_by(a, Mem.page))
+
+	# poke-* answers 0, as the runtime does; the write is the point.
+	store : Mem.Mem, I64, I64, I64, I64 -> (Mem.Mem, I64)
+	store = |mem, base, off, v, width| (Mem.write(mem, base + off, I64.to_u64_wrap(v), width), 0)
+
+	write : Mem.Mem, I64, U64, I64 -> Mem.Mem
+	write = |mem, addr, u, left|
+		if left <= 0 { mem } else {
+			Mem.write(Mem.put(mem, addr, U64.to_u8_wrap(u)), addr + 1, U64.div_trunc_by(u, 256), left - 1)
+		}
+
+	put : Mem.Mem, I64, U8 -> Mem.Mem
+	put = |mem, a, b|
+		{
+			pages: List.update(mem.pages, Mem.page_of(a), |p| Mem.poke(p, Mem.off_in(a), b)) ?? crash("Mem: address outside the 64 MB space"),
+			top: mem.top,
+		}
+
+	# The page is unmapped when the set says the offset is out of range,
+	# since an offset is always under 4,096: mapping it is the answer.
+	poke : List(U8), U64, U8 -> List(U8)
+	poke = |p, bi, b| List.set(p, bi, b) ?? (List.set(List.repeat(0.U8, 4096), bi, b) ?? crash("Mem: offset outside a page"))
+}
+"#;
+
 const PRELUDE: &str = r#"# Prelude -- what no chapter declares, written by rocemit. Do not edit.
 
 Prelude :: [].{
@@ -268,6 +356,7 @@ pub fn emit_modules(
     // Who each emitted module imports, for the prune below.
     let mut needs: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut prelude = false;
+    let mut memory = false;
     for slug in &slugs {
         module_name(slug)?;
         cx.current = slug.clone();
@@ -295,6 +384,7 @@ pub fn emit_modules(
             continue;
         }
         prelude |= cx.imports.contains("Prelude");
+        memory |= cx.imports.contains("Mem");
         let mut text = format!("# {} -- emitted from Codex by rocemit (rust-codex-compiler). Do not edit.\n", module_ident(slug));
         for m in &cx.imports {
             text.push_str(&format!("import {m}\n"));
@@ -320,6 +410,10 @@ pub fn emit_modules(
     if prelude {
         needs.insert("Prelude".into(), Vec::new());
         files.push(("Prelude.roc".into(), PRELUDE.into()));
+    }
+    if memory {
+        needs.insert("Mem".into(), Vec::new());
+        files.push(("Mem.roc".into(), MEM.into()));
     }
     // **A CHAPTER NOTHING REACHES IS NOT PART OF THE PROGRAM.** Every unit
     // is bundled with ListUtils and Tuple whether it cites them or not
@@ -411,6 +505,14 @@ struct Cx<'a> {
     /// the count of names minted for it in this definition.
     dev: Option<String>,
     dev_n: usize,
+    /// **A POKE CAN STAND ANYWHERE.** The memory builtins carry an empty
+    /// effect row, so Codex writes `show (raw-mem 786432 42)` where a
+    /// `[Device]` act would have had to bind the call with `<-`. Such a
+    /// call is lifted out to a binding ahead of the expression that reads
+    /// it; these are the bindings owed to the enclosing block, in the
+    /// order they must be written.
+    hoist: Vec<String>,
+    tmp_n: usize,
     /// **A UNIT WITH A DEVICE KERNEL COMPUTES AS THE PLUG'S WGSL DOES.** The
     /// wgsl plug lowers Integer to `i32` and Real to `f32`, and WGSL's
     /// integer arithmetic wraps, its division by zero yields the dividend
@@ -420,6 +522,42 @@ struct Cx<'a> {
     /// and `Device.div`/`Device.rem`, where a plain `+` on Roc's I32 crashes
     /// on overflow. Every other unit is I64 and F64, as safari is.
     wgsl: bool,
+}
+
+/// **NOTHING READS THE LAST ADDRESS SPACE.** main! threads `mem`, `mem1`,
+/// ... and the final one is the memory at the end of the program, which no
+/// statement follows; Roc warns on a binding nobody reads and a warning is
+/// exit 2, so that one is spelled with the underscore Roc asks for.
+fn seal_state(out: String, memory: bool, base: &str, n: usize) -> String {
+    if !memory {
+        return out;
+    }
+    let last = if n == 0 { base.to_string() } else { format!("{base}{n}") };
+    let bind = format!("({last}, ");
+    if out.matches(&bind).count() != 1 {
+        return out;
+    }
+    let rest: Vec<&str> = out.split(&bind).collect();
+    // The name is read elsewhere only if it appears outside its binding.
+    if rest.iter().any(|part| mentions(part, &last)) {
+        return out;
+    }
+    out.replace(&bind, &format!("(_{last}, "))
+}
+
+fn mentions(text: &str, name: &str) -> bool {
+    let ok = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut at = 0;
+    while let Some(i) = text[at..].find(name) {
+        let i = at + i;
+        let before = text[..i].chars().next_back().is_some_and(ok);
+        let after = text[i + name.len()..].chars().next().is_some_and(ok);
+        if !before && !after {
+            return true;
+        }
+        at = i + name.len();
+    }
+    false
 }
 
 struct Fold {
@@ -453,6 +591,8 @@ impl<'a> Cx<'a> {
             state: "Device",
             dev: None,
             dev_n: 0,
+            hoist: Vec::new(),
+            tmp_n: 0,
             wgsl: false,
         };
         for ed in &ch.effect_defs {
@@ -501,15 +641,17 @@ impl<'a> Cx<'a> {
                         break;
                     }
                 }
-                // **NOT INSTALLED YET.** The closure above is the hard
-                // half and it is done; what is missing is `Mem.roc` (a
-                // sparse page map with sized little-endian loads and a
-                // bump allocator) and threading the state out of the
-                // opening. Until those exist, installing this would emit
-                // calls to a module that is not written and turn 204
-                // honest refusals into compile errors, so the set is
-                // computed and dropped. See docs/memory-plan.md.
-                let _ = (&ops, &touch);
+                // The opening threads `Mem.new` itself (`opening`), so it
+                // stays the app's main rather than becoming a function of
+                // the memory.
+                if !touch.is_empty() {
+                    cx.state = "Mem";
+                    cx.device_ops = ops;
+                    cx.device_defs = touch;
+                    if let Some(o) = syms.find("opening") {
+                        cx.device_defs.remove(&o);
+                    }
+                }
             }
         }
         for (td, c) in ch.type_defs.iter().zip(&ch.type_def_chapters) {
@@ -1038,12 +1180,12 @@ impl<'a> Cx<'a> {
                 self.no_dev_name(p.name)?;
             }
             self.dev_n = 0;
-            self.dev = Some("dev".into());
+            self.dev = Some(self.dev_base().to_string());
             let sig = self.device_signature(d)?;
             let body = self.eff_expr(&d.body, base)?;
             self.dev = None;
             self.locals.truncate(mark);
-            let mut all = vec!["dev".to_string()];
+            let mut all = vec![self.dev_base().to_string()];
             all.extend(ps);
             return Ok(format!("{tabs}{name} : {sig}\n{tabs}{name} = |{}| {body}\n", all.join(", ")));
         }
@@ -1096,21 +1238,38 @@ impl<'a> Cx<'a> {
         }
         let mark = self.locals.len();
         let mut out = String::from("main! = |_args| {\n");
+        // **THE OPENING IS WHERE THE ADDRESS SPACE COMES FROM.** Every
+        // definition that pokes takes the memory and answers it back; the
+        // program's root is the one place that has to make one.
+        let memory = self.state == "Mem" && self.has_effect(&d.body);
+        if memory {
+            self.imports.insert("Mem".into());
+            self.dev_n = 0;
+            self.dev = Some(self.dev_base().to_string());
+            out.push_str(&format!("\t{} = Mem.new\n", self.dev_base()));
+        }
         // **AN OPENING MAY BE WRAPPED IN LETS**, and upstream runs the act
         // inside them; the bindings are main!'s own.
         let mut body = &d.body;
         while let IrExpr::Let(n, _, v, inner, _) = body {
-            let v = self.expr(v, 1)?;
+            let (lines, v) = self.hoisting(v, 1)?;
+            for l in lines {
+                out.push_str(&format!("\t{l}\n"));
+            }
             self.locals.push(*n);
             out.push_str(&format!("\t{} = {v}\n", self.local(*n)?));
             body = inner;
         }
         // **AN OPENING THAT IS A VALUE IS PRINTED**, which is what the
         // driver does with it and what every verdict in codex/test records.
-        let IrExpr::Act(stmts, _, _) = body else {
+        if !matches!(body, IrExpr::Act(..)) {
+            let (lines, x) = self.hoisting(body, 1)?;
+            for l in lines {
+                out.push_str(&format!("\t{l}\n"));
+            }
             let text = match body.ty() {
-                Ty::Text => self.expr(body, 1)?,
-                Ty::Integer(..) => format!("I64.to_str({})", self.expr(body, 1)?),
+                Ty::Text => x,
+                Ty::Integer(..) => format!("I64.to_str({x})"),
                 other => {
                     return Err(format!(
                         "an opening of type {}",
@@ -1121,24 +1280,33 @@ impl<'a> Cx<'a> {
             self.uses_line = true;
             out.push_str(&format!("\tline!({text})\n\tOk({{}})\n}}\n"));
             self.locals.truncate(mark);
-            return Ok(out);
-        };
+            self.dev = None;
+            return Ok(seal_state(out, memory, self.dev_base(), self.dev_n));
+        }
+        let IrExpr::Act(stmts, _, _) = body else { unreachable!() };
         for s in stmts {
             match s {
                 IrActStmt::Exec(e, _) => {
-                    let e = self.expr(e, 1)?;
+                    let (lines, e) = self.hoisting(e, 1)?;
+                    for l in lines {
+                        out.push_str(&format!("\t{l}\n"));
+                    }
                     out.push_str(&format!("\t{e}\n"));
                 }
                 IrActStmt::Bind(n, _, e, _) => {
-                    let e = self.expr(e, 1)?;
+                    let (lines, e) = self.hoisting(e, 1)?;
+                    for l in lines {
+                        out.push_str(&format!("\t{l}\n"));
+                    }
                     self.locals.push(*n);
                     out.push_str(&format!("\t{} = {e}\n", self.local(*n)?));
                 }
             }
         }
         self.locals.truncate(mark);
+        self.dev = None;
         out.push_str("\tOk({})\n}\n");
-        Ok(out)
+        Ok(seal_state(out, memory, self.dev_base(), self.dev_n))
     }
 
     // ---- the Device effect -----------------------------------------------
@@ -1170,23 +1338,63 @@ impl<'a> Cx<'a> {
         self.device_ops.contains(&n) || self.device_defs.contains(&n)
     }
 
-    /// The threaded device is `dev`, `dev1`, `dev2`, ...: a Codex name
-    /// spelled like one would shadow it.
+    /// The threaded state is `dev`, `dev1`, ... for a GPU device and
+    /// `mem`, `mem1`, ... for an address space: a Codex name spelled like
+    /// one would shadow it.
+    fn dev_base(&self) -> &'static str {
+        if self.state == "Mem" {
+            "mem"
+        } else {
+            "dev"
+        }
+    }
+
     fn no_dev_name(&self, n: Sym) -> Result<(), String> {
         let id = self.ident(n)?;
-        if id.starts_with("dev") && id[3..].chars().all(|c| c.is_ascii_digit()) {
-            return Err(format!("`{id}` is spelled like the threaded device"));
+        let base = self.dev_base();
+        if id.starts_with(base) && id[base.len()..].chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!("`{id}` is spelled like the threaded {}", self.state));
         }
         Ok(())
     }
 
     fn fresh_dev(&mut self) -> String {
         self.dev_n += 1;
-        format!("dev{}", self.dev_n)
+        format!("{}{}", self.dev_base(), self.dev_n)
+    }
+
+    /// A hoisted call's answer. The double underscore is not a spelling any
+    /// Codex identifier reaches.
+    fn fresh_tmp(&mut self) -> String {
+        self.tmp_n += 1;
+        format!("{}__{}", self.dev_base(), self.tmp_n)
     }
 
     fn cur_dev(&self) -> Result<String, String> {
-        self.dev.clone().ok_or_else(|| "the Device effect outside a [Device] definition".to_string())
+        self.dev.clone().ok_or_else(|| format!("the {} effect outside a threaded definition", self.state))
+    }
+
+    /// Whether an expression CONTAINS an effectful call anywhere, not only
+    /// in a position `is_effectful` looks at. In Mem mode that is the
+    /// question, since a poke can be an argument.
+    fn has_effect(&self, e: &IrExpr) -> bool {
+        let mut hit = false;
+        e.walk(&mut |x| {
+            if let IrExpr::Name(n, _, _) = x {
+                if self.is_device_sym(*n) {
+                    hit = true;
+                }
+            }
+        });
+        hit
+    }
+
+    /// Emit `e` and take the bindings it hoisted, for the caller to write
+    /// ahead of it.
+    fn hoisting(&mut self, e: &IrExpr, ind: usize) -> Result<(Vec<String>, String), String> {
+        let mark = self.hoist.len();
+        let x = self.expr(e, ind)?;
+        Ok((self.hoist.split_off(mark), x))
     }
 
     /// An expression under the Device effect, as a Roc expression whose
@@ -1199,8 +1407,19 @@ impl<'a> Cx<'a> {
         use IrExpr as E;
         let dev = self.cur_dev()?;
         if !self.is_effectful(e) {
-            return Ok(format!("({dev}, {})", self.expr(e, ind)?));
+            let (lines, x) = self.hoisting(e, ind)?;
+            if lines.is_empty() {
+                return Ok(format!("({dev}, {x})"));
+            }
+            let tabs = "\t".repeat(ind + 1);
+            let body: String = lines.iter().map(|l| format!("{tabs}{l}\n")).collect();
+            let out = format!("({{\n{body}{tabs}({}, {x})\n{}}})", self.cur_dev()?, "\t".repeat(ind));
+            self.dev = Some(dev);
+            return Ok(out);
         }
+        // A poke standing inside an argument or a condition hoists a
+        // binding, and it belongs ahead of whatever this arm builds.
+        let mark = self.hoist.len();
         let out = match e {
             E::Act(stmts, _, _) => {
                 let tabs = "\t".repeat(ind + 1);
@@ -1221,7 +1440,11 @@ impl<'a> Cx<'a> {
                                 out.push_str(&format!("{tabs}({d}, _) = {v}\n"));
                                 self.dev = Some(d);
                             } else {
-                                out.push_str(&format!("{tabs}_ = {}\n", self.expr(x, ind + 1)?));
+                                let (lines, x) = self.hoisting(x, ind + 1)?;
+                                for l in lines {
+                                    out.push_str(&format!("{tabs}{l}\n"));
+                                }
+                                out.push_str(&format!("{tabs}_ = {x}\n"));
                             }
                         }
                         IrActStmt::Bind(n, _, x, _) => {
@@ -1234,7 +1457,10 @@ impl<'a> Cx<'a> {
                                 out.push_str(&format!("{tabs}({d}, {b}) = {v}\n"));
                                 self.dev = Some(d);
                             } else {
-                                let v = self.expr(x, ind + 1)?;
+                                let (lines, v) = self.hoisting(x, ind + 1)?;
+                                for l in lines {
+                                    out.push_str(&format!("{tabs}{l}\n"));
+                                }
                                 self.locals.push(*n);
                                 let b = if i == last { self.local(*n)? } else { self.binder(*n, &rest)? };
                                 out.push_str(&format!("{tabs}{b} = {v}\n"));
@@ -1249,37 +1475,7 @@ impl<'a> Cx<'a> {
                 self.locals.truncate(mark);
                 out
             }
-            E::Let(..) => {
-                let tabs = "\t".repeat(ind + 1);
-                let mut out = String::from("({\n");
-                let mark = self.locals.len();
-                let mut cur = e;
-                while let E::Let(n, _, v, body, _) = cur {
-                    self.no_dev_name(*n)?;
-                    // **A WRITE IS OFTEN A LET NOBODY READS.** `let w =
-                    // poke-byte addr 0 v in peek-byte addr 0` is how every
-                    // fill loop in the corpus is written, so a let whose
-                    // value touches the state binds the state too.
-                    if self.is_effectful(v) {
-                        let v = self.eff_expr(v, ind + 1)?;
-                        let dn = self.fresh_dev();
-                        self.locals.push(*n);
-                        let b = self.binder(*n, &[body])?;
-                        out.push_str(&format!("{tabs}({dn}, {b}) = {v}\n"));
-                        self.dev = Some(dn);
-                        cur = body;
-                        continue;
-                    }
-                    let v = self.expr(v, ind + 1)?;
-                    self.locals.push(*n);
-                    let b = self.binder(*n, &[body])?;
-                    out.push_str(&format!("{tabs}{b} = {v}\n"));
-                    cur = body;
-                }
-                out.push_str(&format!("{tabs}{}\n{}}})", self.eff_expr(cur, ind + 1)?, "\t".repeat(ind)));
-                self.locals.truncate(mark);
-                out
-            }
+            E::Let(..) => self.eff_let(e, ind)?,
             E::If(c, t, f, _, _) => format!(
                 "(if {} {{ {} }} else {{ {} }})",
                 self.expr(c, ind)?,
@@ -1303,20 +1499,70 @@ impl<'a> Cx<'a> {
             E::Match(..) => return Err("a match under the Device effect".into()),
             _ => return Err("an effectful form".into()),
         };
+        let out = if self.hoist.len() > mark {
+            let tabs = "\t".repeat(ind + 1);
+            let lines: String = self.hoist.split_off(mark).iter().map(|l| format!("{tabs}{l}\n")).collect();
+            format!("({{\n{lines}{tabs}{out}\n{}}})", "\t".repeat(ind))
+        } else {
+            out
+        };
         self.dev = Some(dev);
+        Ok(out)
+    }
+
+    /// A let chain under the threaded state, as a pair-valued block. Both
+    /// the effectful path and a poke standing inside an ordinary
+    /// expression come here, so it is a method rather than an arm.
+    fn eff_let(&mut self, e: &IrExpr, ind: usize) -> Result<String, String> {
+        use IrExpr as E;
+            let tabs = "\t".repeat(ind + 1);
+            let mut out = String::from("({\n");
+            let mark = self.locals.len();
+            let mut cur = e;
+            while let E::Let(n, _, v, body, _) = cur {
+                self.no_dev_name(*n)?;
+                // **A WRITE IS OFTEN A LET NOBODY READS.** `let w =
+                // poke-byte addr 0 v in peek-byte addr 0` is how every
+                // fill loop in the corpus is written, so a let whose
+                // value touches the state binds the state too.
+                if self.is_effectful(v) {
+                    let v = self.eff_expr(v, ind + 1)?;
+                    let dn = self.fresh_dev();
+                    self.locals.push(*n);
+                    let b = self.binder(*n, &[body])?;
+                    out.push_str(&format!("{tabs}({dn}, {b}) = {v}\n"));
+                    self.dev = Some(dn);
+                    cur = body;
+                    continue;
+                }
+                let (lines, v) = self.hoisting(v, ind + 1)?;
+                for l in lines {
+                    out.push_str(&format!("{tabs}{l}\n"));
+                }
+                self.locals.push(*n);
+                let b = self.binder(*n, &[body])?;
+                out.push_str(&format!("{tabs}{b} = {v}\n"));
+                cur = body;
+            }
+            out.push_str(&format!("{tabs}{}\n{}}})", self.eff_expr(cur, ind + 1)?, "\t".repeat(ind)));
+        self.locals.truncate(mark);
         Ok(out)
     }
 
     /// A call under the Device effect: a `[Device]` definition with the
     /// device first, or one of the effect's operations on the Device module.
     fn eff_call(&mut self, n: Sym, args: &[&IrExpr], ind: usize) -> Result<String, String> {
-        let mut xs = vec![self.cur_dev()?];
+        // **THE ARGUMENTS RUN FIRST.** In Mem mode one of them may poke,
+        // and the state this call is handed has to be the one those writes
+        // left behind, so it is read after they are emitted, not before.
+        let mut xs = Vec::new();
         for a in args {
-            if self.is_effectful(a) {
+            if self.is_effectful(a) && self.state != "Mem" {
                 return Err("an effectful argument".into());
             }
             xs.push(self.expr(a, ind)?);
         }
+        xs.insert(0, self.cur_dev()?);
         let text = self.syms.text(n).to_string();
         if self.device_defs.contains(&n) {
             let k = self.arity[&n];
@@ -1411,6 +1657,15 @@ impl<'a> Cx<'a> {
             // The IR carries a char literal as its CODE already.
             E::CharLit(c, _) => int_lit(*c),
             E::Name(n, _, _) => self.name_value(*n)?,
+            // **A SHORT-CIRCUIT OPERAND IS NOT ALWAYS EVALUATED**, so a
+            // poke in one cannot be hoisted ahead of the operator.
+            E::Binary(op, _, r, _, _)
+                if self.state == "Mem"
+                    && matches!(op, IrBinOp::And | IrBinOp::Or)
+                    && self.has_effect(r) =>
+            {
+                return Err("a short-circuit operand that touches memory".into())
+            }
             E::Binary(op, l, r, t, _) => {
                 let (l, r) = (self.expr(l, ind)?, self.expr(r, ind)?);
                 // **THE OVERFLOW MODE IS ON THE TYPE.** A field declared
@@ -1444,12 +1699,49 @@ impl<'a> Cx<'a> {
                     format!("(-{x})")
                 }
             }
+            // **A CONDITIONAL THAT POKES CANNOT BE HOISTED OUT OF**: only
+            // one branch runs, so the write stays inside it and the whole
+            // if answers the state alongside its value, as a `[Device]`
+            // definition does.
+            E::If(c, t, f, _, _)
+                if self.state == "Mem"
+                    && self.dev.is_some()
+                    && (self.has_effect(t) || self.has_effect(f)) =>
+            {
+                let c = self.expr(c, ind)?;
+                let entry = self.cur_dev()?;
+                let tt = self.eff_expr(t, ind)?;
+                self.dev = Some(entry.clone());
+                let ff = self.eff_expr(f, ind)?;
+                self.dev = Some(entry);
+                let d = self.fresh_dev();
+                let tmp = self.fresh_tmp();
+                self.hoist.push(format!("({d}, {tmp}) = (if {c} {{ {tt} }} else {{ {ff} }})"));
+                self.dev = Some(d);
+                tmp
+            }
             E::If(c, t, f, _, _) => format!(
                 "(if {} {{ {} }} else {{ {} }})",
                 self.expr(c, ind)?,
                 self.expr(t, ind)?,
                 self.expr(f, ind)?
             ),
+            E::Match(_, bs, _, _) if self.state == "Mem" && bs.iter().any(|b| self.has_effect(&b.body)) => {
+                return Err("a match arm that touches memory".into())
+            }
+            // **A BLOCK KEEPS ITS OWN BINDINGS**, so a poke inside one
+            // cannot be lifted past it; the block answers the state
+            // alongside its value instead, and the binding of the pair is
+            // what the enclosing expression hoists. Without this the
+            // writes happen and the memory that holds them is dropped.
+            E::Let(..) if self.state == "Mem" && self.dev.is_some() && self.has_effect(e) => {
+                let block = self.eff_let(e, ind)?;
+                let d = self.fresh_dev();
+                let tmp = self.fresh_tmp();
+                self.hoist.push(format!("({d}, {tmp}) = {block}"));
+                self.dev = Some(d);
+                tmp
+            }
             E::Let(..) => self.let_block(e, ind)?,
             E::Apply(..) => self.apply(e, ind)?,
             E::Lambda(..) => return Err("lambda".into()),
@@ -1526,6 +1818,14 @@ impl<'a> Cx<'a> {
             return self.local(n);
         }
         if self.is_device_sym(n) {
+            if self.state == "Mem" && self.dev.is_some() {
+                let call = self.eff_call(n, &[], 0)?;
+                let d = self.fresh_dev();
+                let t = self.fresh_tmp();
+                self.hoist.push(format!("({d}, {t}) = {call}"));
+                self.dev = Some(d);
+                return Ok(t);
+            }
             return Err(format!("`{}` performs the Device effect outside a statement", self.syms.text(n)));
         }
         if self.arity.contains_key(&n) {
@@ -1597,13 +1897,20 @@ impl<'a> Cx<'a> {
         let mark = self.locals.len();
         let mut cur = e;
         while let IrExpr::Let(n, _, v, body, _) = cur {
-            let v = self.expr(v, ind + 1)?;
+            let (lines, v) = self.hoisting(v, ind + 1)?;
+            for l in lines {
+                out.push_str(&format!("{tabs}{l}\n"));
+            }
             self.locals.push(*n);
             let b = self.binder(*n, &[body])?;
             out.push_str(&format!("{tabs}{b} = {v}\n"));
             cur = body;
         }
-        out.push_str(&format!("{tabs}{}\n{}}})", self.expr(cur, ind + 1)?, "\t".repeat(ind)));
+        let (lines, tail) = self.hoisting(cur, ind + 1)?;
+        for l in lines {
+            out.push_str(&format!("{tabs}{l}\n"));
+        }
+        out.push_str(&format!("{tabs}{tail}\n{}}})", "\t".repeat(ind)));
         self.locals.truncate(mark);
         Ok(out)
     }
@@ -1681,6 +1988,16 @@ impl<'a> Cx<'a> {
         let n = &self.instance_base(*n);
         let text = self.syms.text(*n).to_string();
         if self.is_device_sym(*n) {
+            if self.state == "Mem" && self.dev.is_some() {
+                // The arguments emit first, so whatever they hoist is
+                // already in the buffer ahead of this line.
+                let call = self.eff_call(*n, &args, ind)?;
+                let d = self.fresh_dev();
+                let t = self.fresh_tmp();
+                self.hoist.push(format!("({d}, {t}) = {call}"));
+                self.dev = Some(d);
+                return Ok(t);
+            }
             return Err(format!("`{text}` performs the Device effect outside a statement"));
         }
         let mut xs = Vec::new();
