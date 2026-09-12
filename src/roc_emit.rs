@@ -178,6 +178,11 @@ Prelude :: [].{
 	approx_eq : F64, F64 -> Bool
 	approx_eq = |x, y| I64.abs(I64.minus_wrap(Prelude.ordinal(x), Prelude.ordinal(y))) <= 4
 
+	# `a ^ b` with a negative exponent is 0, where Roc's pow crashes
+	# (codex/test's ops/int-pow: `ipow 5 (0 - 2)` is 0).
+	int_pow : I64, I64 -> I64
+	int_pow = |a, b| if b < 0 { 0 } else { I64.pow(a, b) }
+
 	int_mod : I64, I64 -> I64
 	int_mod = |a, b| {
 		m = I64.mod_by(a, b)
@@ -785,20 +790,62 @@ impl<'a> Cx<'a> {
     /// the equality already, so the nominal declaration carries it as a
     /// forwarder and `==` works on the type wherever it appears
     /// (codex/test's shell-build-keep).
-    fn methods(&mut self, n: Sym, base: usize) -> Result<String, String> {
+    fn methods(&mut self, td: &TypeDef, base: usize) -> Result<String, String> {
+        let n = match td {
+            TypeDef::Record(n, ..) | TypeDef::Variant(n, ..) | TypeDef::Unit(n, ..) => *n,
+        };
         if !self.recursive.contains(&n) {
             return Ok(String::new());
         }
-        let Some(eq) = self.derived_eq.get(&n).copied() else {
-            return Ok(String::new());
-        };
-        let Some(d) = self.defs.iter().find(|d| d.name == eq) else {
-            return Ok(String::new());
-        };
-        let sig = self.signature(d)?;
-        let call = self.def_ref(eq)?;
         let t = "\t".repeat(base + 1);
-        Ok(format!(".{{\n{t}is_eq : {sig}\n{t}is_eq = |a, b| {call}(a, b)\n{}}}", "\t".repeat(base)))
+        let ty = self.type_ref(n);
+        // Codex derives an equality for a type its programs compare, and
+        // that one is the method. A type only compared INSIDE another's
+        // equality has none derived, so one is written here from the
+        // shape: `CborMapEntry` holds two `CborValue`s and nothing
+        // compares it directly (codex/test's lib/cbor-test).
+        if let Some(eq) = self.derived_eq.get(&n).copied() {
+            if let Some(d) = self.defs.iter().find(|d| d.name == eq) {
+                let sig = self.signature(d)?;
+                let call = self.def_ref(eq)?;
+                return Ok(format!(".{{\n{t}is_eq : {sig}\n{t}is_eq = |a, b| {call}(a, b)\n{}}}", "\t".repeat(base)));
+            }
+        }
+        let body = match td {
+            TypeDef::Record(_, ps, fields, _, _) if ps.is_empty() && !fields.is_empty() => {
+                let mut parts = Vec::new();
+                for f in fields {
+                    let f = self.ident(f.name)?;
+                    parts.push(format!("a.{f} == b.{f}"));
+                }
+                parts.join(" and ")
+            }
+            TypeDef::Variant(_, ps, ctors, _) if ps.is_empty() && !ctors.is_empty() => {
+                let mut arms = Vec::new();
+                for c in ctors {
+                    let tag = self.tag(c.name)?;
+                    if c.fields.is_empty() {
+                        arms.push(format!("{t}\t{tag} => (match b {{ {tag} => True\n{t}\t\t_ => False }})"));
+                    } else {
+                        let xs: Vec<String> = (0..c.fields.len()).map(|i| format!("x{i}")).collect();
+                        let ys: Vec<String> = (0..c.fields.len()).map(|i| format!("y{i}")).collect();
+                        let cmp: Vec<String> = xs.iter().zip(&ys).map(|(x, y)| format!("{x} == {y}")).collect();
+                        arms.push(format!(
+                            "{t}\t{tag}({}) => (match b {{ {tag}({}) => {}\n{t}\t\t_ => False }})",
+                            xs.join(", "),
+                            ys.join(", "),
+                            cmp.join(" and ")
+                        ));
+                    }
+                }
+                format!("match a {{\n{}\n{t}}}", arms.join("\n"))
+            }
+            _ => return Ok(String::new()),
+        };
+        Ok(format!(
+            ".{{\n{t}is_eq : {ty}, {ty} -> Bool\n{t}is_eq = |a, b| {body}\n{}}}",
+            "\t".repeat(base)
+        ))
     }
 
     /// The name of a list parameter this body writes with `list-set-at`.
@@ -849,7 +896,7 @@ impl<'a> Cx<'a> {
                 }
                 let col = self.colon(*n);
                 let body = if fs.is_empty() { "{}".to_string() } else { format!("{{ {} }}", fs.join(", ")) };
-                format!("{tabs}{} {col} {body}{}\n", head(*n, ps)?, self.methods(*n, base)?)
+                format!("{tabs}{} {col} {body}{}\n", head(*n, ps)?, self.methods(td, base)?)
             }
             TypeDef::Variant(n, ps, ctors, _) => {
                 let mut cs = Vec::new();
@@ -873,7 +920,7 @@ impl<'a> Cx<'a> {
                     head(*n, ps)?,
                     self.colon(*n),
                     cs.join(", "),
-                    self.methods(*n, base)?
+                    self.methods(td, base)?
                 )
             }
             TypeDef::Unit(n, ..) => return Err(format!("unit type `{}`", self.syms.text(*n))),
@@ -1260,9 +1307,22 @@ impl<'a> Cx<'a> {
                 }
                 self.binary(*op, l, r, wrap)?
             }
+            // **A NEGATED LITERAL IS ONE LITERAL.** The lowest integer is
+            // written `-9223372036854775808`, which is a negate over a
+            // literal that does not fit, so the IR carries it already
+            // wrapped and negating again overflows (codex/test's
+            // ops/int-wrapping-spelling).
+            E::Negate(x, _, _) if matches!(&**x, E::IntLit(..)) => {
+                let E::IntLit(v, _) = &**x else { unreachable!() };
+                int_lit(v.wrapping_neg())
+            }
             E::Negate(x, t, _) => {
                 let x = self.expr(x, ind)?;
-                if self.wgsl && matches!(t, Ty::Integer(..)) {
+                // Negating the lowest integer overflows, and a wrapping
+                // type says to wrap rather than crash: codex/test's
+                // ops/int-wrapping-spelling negates I64.lowest on purpose.
+                let wrap = self.wgsl || matches!(t, Ty::Integer(_, _, crate::check::Overflow::Wrapping));
+                if wrap && matches!(t, Ty::Integer(..)) {
                     format!("{}.minus_wrap(0, {x})", self.int())
                 } else {
                     format!("(-{x})")
@@ -1466,7 +1526,10 @@ impl<'a> Cx<'a> {
             B::DivNum => format!("({l} / {r})"),
             B::DivInt => format!("{int}.div_trunc_by({l}, {r})"),
             B::RemInt => format!("{int}.rem_by({l}, {r})"),
-            B::PowInt => format!("{int}.pow({l}, {r})"),
+            B::PowInt => {
+                self.imports.insert("Prelude".into());
+                format!("Prelude.int_pow({l}, {r})")
+            }
             B::Eq => format!("({l} == {r})"),
             B::NotEq => format!("({l} != {r})"),
             B::Lt => format!("({l} < {r})"),

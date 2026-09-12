@@ -1,9 +1,10 @@
 //! Roc from a Codex unit.
 //!
 //!     rocemit <unit.codex> <dir>      one type module per chapter, whole, and
-//!                                     the spec's app, written into <dir>; the
-//!                                     app's file name on stdout, or `library`
-//!                                     for a unit with no opening
+//!                                     the spec's app, written into <dir>.
+//!
+//! Two lines on stdout: the app's file name, or `library` for a unit with
+//! no opening, and a digest of everything written.
 //!
 //! The same road as `irdump whole` -- resolve, parse, desugar, check, lower --
 //! and then `roc_emit` instead of the IR text. Exit 2 on a refusal.
@@ -76,6 +77,17 @@ fn emit(path: &Path, dir: &Path) -> Result<String, String> {
             app = Some(name.clone());
         }
     }
-    // A library (no opening) names no app; its modules are the output.
-    Ok(app.map_or_else(|| "library\n".to_string(), |a| format!("{a}\n")))
+    // **THE DIGEST IS PRINTED HERE BECAUSE THE FILES ARE ALREADY IN HAND.**
+    // A harness that wants to know whether this emission differs from the
+    // last one would otherwise read every file back and hash it, which for
+    // a thousand units is a thousand extra processes; this costs nothing.
+    let mut digest: u64 = 0xcbf29ce484222325;
+    for (name, text) in &files {
+        for b in name.as_bytes().iter().chain(text.as_bytes()) {
+            digest ^= *b as u64;
+            digest = digest.wrapping_mul(0x100000001b3);
+        }
+    }
+    let app = app.unwrap_or_else(|| "library".to_string());
+    Ok(format!("{app}\n{digest:016x}\n"))
 }
