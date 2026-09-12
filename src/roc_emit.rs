@@ -26,19 +26,6 @@ const KEYWORDS: [&str; 18] = [
     "match", "module", "or", "return", "var", "where", "while",
 ];
 
-/// A constant with this many literal leaves is a data table, baked elsewhere.
-pub const BAKED_AT: usize = 256;
-
-fn leaf_literals(e: &IrExpr) -> usize {
-    let mut n = 0;
-    e.walk(&mut |x| {
-        if matches!(x, IrExpr::IntLit(..) | IrExpr::NumLit(..) | IrExpr::TextLit(..) | IrExpr::BoolLit(..)) {
-            n += 1;
-        }
-    });
-    n
-}
-
 const LINE_HELPER: &str =
     "\n# The Echo platform's echo! writes no newline; a Codex line is one.\nline! = |s| echo!(Str.concat(s, \"\\n\"))\n";
 
@@ -49,10 +36,8 @@ const LINE_HELPER: &str =
 /// items are the chapter's type definitions and definitions; another module
 /// reaches them as `Slug.name`. Roc's module documentation recommends
 /// exactly this shape for a namespace of functions, and it is what lets the
-/// screensaver itself import the same chapters the specs grade.
-///
-/// A baked constant is a forwarder to `<Slug>Data.name`, a module the stills
-/// baker writes; the app is the spec's own definitions and `main!`.
+/// screensaver itself import the same chapters the specs grade. The app is
+/// the spec's own definitions and `main!`.
 pub fn emit_modules(
     ch: &Chapter,
     tds: &TypeDefs,
@@ -67,6 +52,7 @@ pub fn emit_modules(
     let device_defs = cx.device_defs.clone();
     let is_main = |d: &IrDef| syms.text(d.name) == "opening" && !device_defs.contains(&d.name);
     let app_slug = defs.iter().find(|d| is_main(d)).map(|a| a.origin.clone()).unwrap_or_default();
+    cx.app = app_slug.clone();
     let mut slugs: Vec<String> = Vec::new();
     for d in defs {
         if d.origin.is_empty() {
@@ -101,7 +87,7 @@ pub fn emit_modules(
                 continue;
             }
             items.push('\n');
-            items.push_str(&cx.def_or_baked(d, base)?);
+            items.push_str(&cx.def(d, base)?);
         }
         if items.is_empty() && main.is_none() {
             continue;
@@ -153,6 +139,9 @@ struct Cx<'a> {
     maybe: Sym,
     /// The chapter being emitted, and the modules its text has reached for.
     current: String,
+    /// The chapter holding the opening, emitted as the app rather than a
+    /// type module; empty for a library.
+    app: String,
     imports: std::collections::BTreeSet<String>,
     /// Names bound by the enclosing parameters, lets and patterns.
     locals: Vec<Sym>,
@@ -201,6 +190,7 @@ impl<'a> Cx<'a> {
             type_module: BTreeMap::new(),
             maybe: syms.find("Maybe").unwrap_or_default(),
             current: String::new(),
+            app: String::new(),
             imports: Default::default(),
             locals: Vec::new(),
             tvars: BTreeMap::new(),
@@ -274,6 +264,12 @@ impl<'a> Cx<'a> {
             None => String::new(),
         };
         if m.is_empty() {
+            return name;
+        }
+        // The app is not a type module: its own types are bare, since there
+        // is no `App.` to qualify them by. A chapter module's are qualified
+        // even at home (Cat.Cat, above).
+        if m == self.current && m == self.app {
             return name;
         }
         if m != self.current {
@@ -569,30 +565,8 @@ impl<'a> Cx<'a> {
     /// A definition, or the line that says a data table was left to a baker.
     ///
     /// **A DATA TABLE IS NOT EMITTED, AND THE OMISSION IS WRITTEN DOWN.**
-    /// Roc's checker is superlinear in the literal elements of a FILE
-    /// (measured: 1k, 2k, 4k points check in 3.6, 9.9, 31 seconds, as
-    /// records or as floats, in one list or many) and the same data as a
-    /// string checks in half a second. So a constant that is a literal of
-    /// BAKED_AT or more leaves is left to a baker that spells it as a
-    /// string: the definition forwards to `<Slug>Data.name`, the module the
-    /// baker writes, under a line that says so. A missing baked name is
-    /// Roc's undefined-name error, never a silent hole.
-    fn def_or_baked(&mut self, d: &IrDef, base: usize) -> Result<String, String> {
-        let leaves = leaf_literals(&d.body);
-        if !d.params.is_empty() || leaves < BAKED_AT {
-            return self.def(d, base);
-        }
-        let sig = self.signature(d)?;
-        let name = self.ident(d.name)?;
-        let tabs = "\t".repeat(base);
-        let data = format!("{}Data", d.origin);
-        let from = self.qualified(&data, name.clone());
-        Ok(format!(
-            "{tabs}# baked: {name} : {sig} -- {} {leaves} literals\n{tabs}{name} : {sig}\n{tabs}{name} = {from}\n",
-            d.origin
-        ))
-    }
-
+    /// A definition, whole; a data table of thousands of literals is emitted
+    /// as the literal it is, since the nightly's checker is linear in them.
     fn def(&mut self, d: &IrDef, base: usize) -> Result<String, String> {
         let name = self.ident(d.name)?;
         let sig = self.signature(d)?;
