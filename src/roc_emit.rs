@@ -35,6 +35,24 @@ const KEYWORDS: [&str; 25] = [
 /// with a trailing underscore, since a declared `Box` reads as the
 /// builtin's and Roc asks it for a type argument (codex/test's
 /// literal-subpattern, tco-direct-arg-reads).
+/// Modules Roc's builtins already declare: a chapter with one of these
+/// names cannot be imported, since the name is taken before the program
+/// starts (codex/test's forewords/encode-json-numbers declares Json).
+/// Read from `src/build/roc/Builtin.roc`'s own declarations.
+const ROC_MODULES: [&str; 22] = [
+    "Builtin", "BLAKE3", "Box", "Crypto", "Dec", "Digest", "Encoding", "Hasher", "HttpHeader", "Iter", "Json",
+    "List", "Num", "Numeral", "Range", "SHA256", "Set", "Str", "Stream", "F32", "F64", "Bool",
+];
+
+/// A chapter's Roc module name: its own, unless Roc has taken it.
+fn module_ident(slug: &str) -> String {
+    if ROC_MODULES.contains(&slug) {
+        format!("{slug}_")
+    } else {
+        slug.to_string()
+    }
+}
+
 const ROC_TYPES: [&str; 26] = [
     "Box", "List", "Str", "Bool", "Dict", "Set", "Result", "Try", "Num", "Int", "Frac", "Dec", "U8", "U16", "U32", "U64",
     "U128", "I8", "I16", "I32", "I64", "I128", "F32", "F64", "Iter", "Hasher",
@@ -180,6 +198,10 @@ Prelude :: [].{
 
 	# `a ^ b` with a negative exponent is 0, where Roc's pow crashes
 	# (codex/test's ops/int-pow: `ipow 5 (0 - 2)` is 0).
+	# An empty separator splits into one piece, the whole text (interp.rs).
+	text_split : Str, Str -> List(Str)
+	text_split = |t, sep| if sep == "" { [t] } else { Str.split_on(t, sep) }
+
 	int_pow : I64, I64 -> I64
 	int_pow = |a, b| if b < 0 { 0 } else { I64.pow(a, b) }
 
@@ -267,7 +289,7 @@ pub fn emit_modules(
             continue;
         }
         prelude |= cx.imports.contains("Prelude");
-        let mut text = format!("# {slug} -- emitted from Codex by rocemit (rust-codex-compiler). Do not edit.\n");
+        let mut text = format!("# {} -- emitted from Codex by rocemit (rust-codex-compiler). Do not edit.\n", module_ident(slug));
         for m in &cx.imports {
             text.push_str(&format!("import {m}\n"));
         }
@@ -280,10 +302,10 @@ pub fn emit_modules(
             text.push_str(&main);
         } else {
             let helper = if cx.uses_line { LINE_HELPER_INDENTED } else { "" };
-            text.push_str(&format!("\n{slug} :: [].{{\n{helper}{items}}}\n"));
+            text.push_str(&format!("\n{} :: [].{{\n{helper}{items}}}\n", module_ident(slug)));
         }
-        needs.insert(slug.clone(), cx.imports.iter().cloned().collect());
-        files.push((format!("{slug}.roc"), text));
+        needs.insert(module_ident(slug), cx.imports.iter().cloned().collect());
+        files.push((format!("{}.roc", module_ident(slug)), text));
     }
     if cx.uses_cce {
         needs.insert("Cce".into(), Vec::new());
@@ -305,7 +327,7 @@ pub fn emit_modules(
     // from, and its modules are the output.
     if !app_slug.is_empty() {
         let mut seen: std::collections::BTreeSet<String> = Default::default();
-        let mut stack = vec![app_slug.clone()];
+        let mut stack = vec![module_ident(&app_slug)];
         while let Some(m) = stack.pop() {
             if !seen.insert(m.clone()) {
                 continue;
@@ -317,10 +339,11 @@ pub fn emit_modules(
     Ok(files)
 }
 
-/// A chapter slug as a Roc module name: capitalised, alphanumeric.
-fn module_name(slug: &str) -> Result<&str, String> {
+/// A chapter slug as a Roc module name: capitalised, alphanumeric, and not
+/// one Roc has already taken.
+fn module_name(slug: &str) -> Result<String, String> {
     if slug.starts_with(|c: char| c.is_ascii_uppercase()) && slug.chars().all(|c| c.is_ascii_alphanumeric()) {
-        Ok(slug)
+        Ok(module_ident(slug))
     } else {
         Err(format!("chapter `{slug}` is not a Roc module name"))
     }
@@ -493,8 +516,8 @@ impl<'a> Cx<'a> {
         if module.is_empty() || module == self.current {
             return name;
         }
-        self.imports.insert(module.to_string());
-        format!("{module}.{name}")
+        self.imports.insert(module_ident(module));
+        format!("{}.{name}", module_ident(module))
     }
 
     /// A definition's name as a reference.
@@ -530,9 +553,9 @@ impl<'a> Cx<'a> {
             return name;
         }
         if m != self.current {
-            self.imports.insert(m.clone());
+            self.imports.insert(module_ident(&m));
         }
-        format!("{m}.{name}")
+        format!("{}.{name}", module_ident(&m))
     }
 
     // ---- names ----------------------------------------------------------
@@ -1675,6 +1698,31 @@ impl<'a> Cx<'a> {
                 want(2)?;
                 format!("{int}.rem_by({}, {})", xs[0], xs[1])
             }
+            // `List Integer -> Text`, the bytes as written: raw UTF-8,
+            // not the CCE alphabet, and a byte that is not valid UTF-8
+            // becomes the replacement character (interp.rs).
+            "raw-bytes-to-text" => {
+                want(1)?;
+                format!("Str.from_utf8_lossy(List.map({}, |b| {int}.to_u8_wrap(b)))", xs[0])
+            }
+            "text-split" => {
+                want(2)?;
+                self.imports.insert("Prelude".into());
+                format!("Prelude.text_split({}, {})", xs[0], xs[1])
+            }
+            "list-insert-at" => {
+                want(3)?;
+                format!(
+                    "(List.insert({}, {int}.to_u64_wrap({}), {}) ?? crash(\"list-insert-at past the end\"))",
+                    xs[0], xs[1], xs[2]
+                )
+            }
+            "text-compare" => {
+                want(2)?;
+                self.uses_cce = true;
+                self.imports.insert("Cce".into());
+                format!("Cce.compare({}, {})", xs[0], xs[1])
+            }
             "char-code" | "code-to-char" => {
                 want(1)?;
                 // A Char IS its code here, so both are the value.
@@ -2254,6 +2302,23 @@ Cce :: [].{{
 			U64.to_u8_wrap(128 + U64.bitwise_and(U64.div_by(p, 64), 63)),
 			U64.to_u8_wrap(128 + U64.bitwise_and(p, 63)),
 		] }}
+
+	# `text-compare` is over CCE units, which is this alphabet's order and
+	# not ASCII's: -1, 0 or 1.
+	compare : Str, Str -> I64
+	compare = |a, b| Cce.compare_codes(Cce.codes_of(a), Cce.codes_of(b), 0)
+
+	compare_codes : List(I64), List(I64), U64 -> I64
+	compare_codes = |xs, ys, i| {{
+		x = List.get(xs, i)
+		y = List.get(ys, i)
+		match (x, y) {{
+			(Err(_), Err(_)) => 0
+			(Err(_), Ok(_)) => -1
+			(Ok(_), Err(_)) => 1
+			(Ok(a), Ok(b)) => if a < b {{ -1 }} else if a > b {{ 1 }} else {{ Cce.compare_codes(xs, ys, i + 1) }}
+		}}
+	}}
 
 	# `substring`, over characters.
 	substring : Str, I64, I64 -> Str
