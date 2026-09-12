@@ -62,11 +62,11 @@ pub fn emit_modules(
     let mut cx = Cx::new(ch, tds, syms, defs);
     // **A UNIT WITH NO OPENING IS A LIBRARY**: every chapter a module, no
     // app. That is what a GPU kernel chapter is.
-    let app_slug = defs
-        .iter()
-        .find(|d| syms.text(d.name) == "opening")
-        .map(|a| a.origin.clone())
-        .unwrap_or_default();
+    // A `[Device]` opening (GlobeKernels has one, for the wgsl plug's root)
+    // is a kernel like any other, not a main.
+    let device_defs = cx.device_defs.clone();
+    let is_main = |d: &IrDef| syms.text(d.name) == "opening" && !device_defs.contains(&d.name);
+    let app_slug = defs.iter().find(|d| is_main(d)).map(|a| a.origin.clone()).unwrap_or_default();
     let mut slugs: Vec<String> = Vec::new();
     for d in defs {
         if d.origin.is_empty() {
@@ -96,7 +96,7 @@ pub fn emit_modules(
         }
         let mut main = None;
         for d in defs.iter().filter(|d| d.origin == *slug) {
-            if syms.text(d.name) == "opening" {
+            if is_main(d) {
                 main = Some(cx.opening(d)?);
                 continue;
             }
@@ -398,7 +398,12 @@ impl<'a> Cx<'a> {
                 }
             }
         }
-        let r = self.ty(cur)?;
+        // A nullary `[Device] T` is effectful in its type; the device
+        // signature carries the effect, so the result is the T.
+        let r = match cur {
+            Ty::Effectful(_, _, inner) if self.has_device(cur) => self.ty(inner)?,
+            _ => self.ty(cur)?,
+        };
         Ok((ps, r))
     }
 
