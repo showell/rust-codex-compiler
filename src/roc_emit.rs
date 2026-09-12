@@ -152,15 +152,28 @@ const MEM: &str = r#"# Mem -- Codex's address space, written by rocemit. Do not 
 # an unmapped page reads zero, which is what the Codex runtime's own
 # sparse map does.
 #
-# **EVERY WRITE TOUCHES THE PAGE TABLE EXACTLY ONCE.** A list Roc has
-# already read is shared, and a shared list is COPIED by List.set rather
-# than written in place, so a second look -- a length check on the way to
-# the store, or naming the list again in a `??` fallback -- turns each
-# store into a copy of the whole table. Measured on a 262,144-byte fill:
-# 18.3 s when the fallbacks name the list, 1.0 s when nothing looks twice.
-# That is why the table is a fixed size rather than one that grows, and
-# why every fallback here crashes instead of answering the input.
-
+# **A LIST STILL REACHABLE AFTER A WRITE IS COPIED.** Roc writes into a
+# list in place when its reference count is 1, so `List.set(p, i, v) ?? p`
+# -- whose fallback names the list it is setting -- keeps that list live
+# past the set and copies it on every store. Every fallback here crashes
+# instead. On the shipped module that one spelling on the page table is
+# 137.8 s of CPU against 3.5 s.
+#
+# **AND A NESTED LIST IS NOT UNIQUE INSIDE List.update.** The closure does
+# not receive a uniquely owned page, so a byte written through
+# `List.update(pages, p, |page| List.set(page, off, b))` memcpies the
+# whole 4 KB page: a quarter-megabyte fill moved a gigabyte. `put` below
+# TAKES the page out of the table with List.replace, leaving an empty
+# placeholder, writes it while it is genuinely its own, and puts it back.
+# Measured on the 262,144-byte fill: 3.47 s of CPU against 0.32 s.
+#
+# Reading a list costs nothing. A length check on the way to a store is
+# free -- List.set already calls List.len on the list it writes -- so the
+# page table is a fixed size for two other reasons: a program allocates
+# from 6 MB up and pokes literal addresses near zero, so a flat array
+# would be megabytes of zeros; and `List.repeat([], 16384)` is nearly
+# free where a flat 64 MB array is MATERIALISED by the compile-time
+# evaluator.
 Mem :: [].{
 	Mem : { pages : List(List(U8)), top : I64 }
 
@@ -175,8 +188,17 @@ Mem :: [].{
 
 	# The runtime's bump pointer starts at 6 MB, above every address a
 	# program pokes by literal.
-	new : Mem.Mem
-	new = { pages: List.repeat([], Mem.span), top: 6291456 }
+	# **THE BUMP POINTER COMES FROM THE COMMAND LINE**, which is a strange
+	# thing to write and the reason is the compiler. Roc evaluates a call
+	# whose arguments are all known while it builds, with no step limit
+	# and no memory limit (roc-lang/roc#11334), so a Codex program that
+	# fills a framebuffer was being RENDERED during the build -- eight of
+	# them reached the OOM killer at 7 GB. `z` is the argument count,
+	# which is zero at run time and unknowable at build time, so every
+	# value that comes out of this memory is out of the evaluator's reach
+	# and the program runs where it was meant to.
+	new : I64 -> Mem.Mem
+	new = |z| { pages: List.repeat([], Mem.span), top: 6291456 + z }
 
 	# alloc-bytes answers the old top and bumps it; nothing frees.
 	alloc : Mem.Mem, I64 -> (Mem.Mem, I64)
@@ -214,11 +236,14 @@ Mem :: [].{
 		}
 
 	put : Mem.Mem, I64, U8 -> Mem.Mem
-	put = |mem, a, b|
+	put = |mem, a, b| {
+		p = Mem.page_of(a)
+		taken = List.replace(mem.pages, p, []) ?? crash("Mem: address outside the 64 MB space")
 		{
-			pages: List.update(mem.pages, Mem.page_of(a), |p| Mem.poke(p, Mem.off_in(a), b)) ?? crash("Mem: address outside the 64 MB space"),
+			pages: List.set(taken.list, p, Mem.poke(taken.prev, Mem.off_in(a), b)) ?? crash("Mem: address outside the 64 MB space"),
 			top: mem.top,
 		}
+	}
 
 	# The page is unmapped when the set says the offset is out of range,
 	# since an offset is always under 4,096: mapping it is the answer.
@@ -1237,16 +1262,19 @@ impl<'a> Cx<'a> {
             return Err("opening takes parameters".into());
         }
         let mark = self.locals.len();
-        let mut out = String::from("main! = |_args| {\n");
+        // `args` is read only to keep the memory out of the compiler's
+        // reach (see `Mem.new`); every other opening leaves it unused.
+        let memory_first = self.state == "Mem" && self.has_effect(&d.body);
+        let mut out = String::from(if memory_first { "main! = |args| {\n" } else { "main! = |_args| {\n" });
         // **THE OPENING IS WHERE THE ADDRESS SPACE COMES FROM.** Every
         // definition that pokes takes the memory and answers it back; the
         // program's root is the one place that has to make one.
-        let memory = self.state == "Mem" && self.has_effect(&d.body);
+        let memory = memory_first;
         if memory {
             self.imports.insert("Mem".into());
             self.dev_n = 0;
             self.dev = Some(self.dev_base().to_string());
-            out.push_str(&format!("\t{} = Mem.new\n", self.dev_base()));
+            out.push_str(&format!("\t{} = Mem.new(U64.to_i64_wrap(List.len(args)))\n", self.dev_base()));
         }
         // **AN OPENING MAY BE WRAPPED IN LETS**, and upstream runs the act
         // inside them; the bindings are main!'s own.
