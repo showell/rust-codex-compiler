@@ -1496,7 +1496,7 @@ impl<'a> Cx<'a> {
                 };
                 self.eff_call(*n, &args, ind)?
             }
-            E::Match(..) => return Err("a match under the Device effect".into()),
+            E::Match(..) => self.eff_match(e, ind)?,
             _ => return Err("an effectful form".into()),
         };
         let out = if self.hoist.len() > mark {
@@ -1507,6 +1507,40 @@ impl<'a> Cx<'a> {
             out
         };
         self.dev = Some(dev);
+        Ok(out)
+    }
+
+    // **EACH ARM ANSWERS THE STATE WITH ITS VALUE.** Only one arm
+    // runs, so a write inside one cannot be lifted ahead of the
+    // match; the whole match is pair-valued instead, exactly as a
+    // conditional is. The scrutinee is emitted before any arm, so
+    // whatever it hoists is already owed to the enclosing block.
+    fn eff_match(&mut self, e: &IrExpr, ind: usize) -> Result<String, String> {
+        use IrExpr as E;
+        let E::Match(sc, bs, _, _) = e else {
+            return Err("eff_match on something else".into());
+        };
+
+            let tabs = "\t".repeat(ind + 1);
+            let mut out = format!("(match {} {{\n", self.expr(sc, ind)?);
+            let entry = self.cur_dev()?;
+            for b in bs {
+                let mark = self.locals.len();
+                let pat = self.pattern(&b.pattern, &[&b.body, &b.guard])?;
+                let guard = match &b.guard {
+                    E::BoolLit(true, _) => String::new(),
+                    g => format!(" if {}", self.expr(g, ind + 1)?),
+                };
+                if self.has_effect(&b.guard) {
+                    return Err("a match guard that touches memory".into());
+                }
+                self.dev = Some(entry.clone());
+                let body = self.eff_expr(&b.body, ind + 1)?;
+                self.locals.truncate(mark);
+                out.push_str(&format!("{tabs}{pat}{guard} => {body}\n"));
+            }
+        self.dev = Some(entry);
+        out.push_str(&format!("{}}})", "\t".repeat(ind)));
         Ok(out)
     }
 
@@ -1658,13 +1692,28 @@ impl<'a> Cx<'a> {
             E::CharLit(c, _) => int_lit(*c),
             E::Name(n, _, _) => self.name_value(*n)?,
             // **A SHORT-CIRCUIT OPERAND IS NOT ALWAYS EVALUATED**, so a
-            // poke in one cannot be hoisted ahead of the operator.
-            E::Binary(op, _, r, _, _)
+            // poke in one cannot be hoisted ahead of the operator. Write
+            // out the conditional the operator means -- `a and b` is `if a
+            // then b else False` -- and thread the state through it.
+            E::Binary(op, l, r, _, _)
                 if self.state == "Mem"
+                    && self.dev.is_some()
                     && matches!(op, IrBinOp::And | IrBinOp::Or)
                     && self.has_effect(r) =>
             {
-                return Err("a short-circuit operand that touches memory".into())
+                let l = self.expr(l, ind)?;
+                let entry = self.cur_dev()?;
+                let rr = self.eff_expr(r, ind)?;
+                self.dev = Some(entry.clone());
+                let (yes, no) = match op {
+                    IrBinOp::And => (rr, format!("({entry}, False)")),
+                    _ => (format!("({entry}, True)"), rr),
+                };
+                let d = self.fresh_dev();
+                let tmp = self.fresh_tmp();
+                self.hoist.push(format!("({d}, {tmp}) = (if {l} {{ {yes} }} else {{ {no} }})"));
+                self.dev = Some(d);
+                tmp
             }
             E::Binary(op, l, r, t, _) => {
                 let (l, r) = (self.expr(l, ind)?, self.expr(r, ind)?);
@@ -1726,8 +1775,17 @@ impl<'a> Cx<'a> {
                 self.expr(t, ind)?,
                 self.expr(f, ind)?
             ),
-            E::Match(_, bs, _, _) if self.state == "Mem" && bs.iter().any(|b| self.has_effect(&b.body)) => {
-                return Err("a match arm that touches memory".into())
+            E::Match(_, bs, _, _)
+                if self.state == "Mem"
+                    && self.dev.is_some()
+                    && bs.iter().any(|b| self.has_effect(&b.body)) =>
+            {
+                let block = self.eff_match(e, ind)?;
+                let d = self.fresh_dev();
+                let tmp = self.fresh_tmp();
+                self.hoist.push(format!("({d}, {tmp}) = {block}"));
+                self.dev = Some(d);
+                tmp
             }
             // **A BLOCK KEEPS ITS OWN BINDINGS**, so a poke inside one
             // cannot be lifted past it; the block answers the state
