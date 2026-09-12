@@ -26,6 +26,23 @@ const KEYWORDS: [&str; 18] = [
     "match", "module", "or", "return", "var", "where", "while",
 ];
 
+/// Roc's own type names: a chapter that declares one of these spells it
+/// with a trailing underscore, since a declared `Box` reads as the
+/// builtin's and Roc asks it for a type argument (codex/test's
+/// literal-subpattern, tco-direct-arg-reads).
+const ROC_TYPES: [&str; 26] = [
+    "Box", "List", "Str", "Bool", "Dict", "Set", "Result", "Try", "Num", "Int", "Frac", "Dec", "U8", "U16", "U32", "U64",
+    "U128", "I8", "I16", "I32", "I64", "I128", "F32", "F64", "Iter", "Hasher",
+];
+
+fn type_name(t: &str) -> String {
+    if ROC_TYPES.contains(&t) {
+        format!("{t}_")
+    } else {
+        t.to_string()
+    }
+}
+
 /// Every `Named` in a type expression, however deep.
 fn named_types(t: &TypeExpr, out: &mut std::collections::BTreeSet<Sym>) {
     match t {
@@ -158,6 +175,7 @@ fn module_name(slug: &str) -> Result<&str, String> {
 struct Cx<'a> {
     syms: &'a SymTab,
     tds: &'a TypeDefs,
+    defs: &'a [IrDef],
     /// Every emitted definition and its parameter count: a call must be
     /// saturated, because Roc calls are.
     arity: BTreeMap<Sym, usize>,
@@ -176,6 +194,10 @@ struct Cx<'a> {
     /// bare, here and in every other module, so only the definition's
     /// spelling changes (verified on the nightly).
     recursive: std::collections::BTreeSet<Sym>,
+    /// The chapter's derived `__eq_<T>`, by the type it compares. A nominal
+    /// type has no structural `==`, so the one Codex derived is attached to
+    /// it as the `is_eq` method Roc's `==` dispatches to.
+    derived_eq: BTreeMap<Sym, Sym>,
     imports: std::collections::BTreeSet<String>,
     /// Names bound by the enclosing parameters, lets and patterns.
     locals: Vec<Sym>,
@@ -215,10 +237,11 @@ struct Fold {
 }
 
 impl<'a> Cx<'a> {
-    fn new(ch: &Chapter, tds: &'a TypeDefs, syms: &'a SymTab, defs: &[IrDef]) -> Cx<'a> {
+    fn new(ch: &Chapter, tds: &'a TypeDefs, syms: &'a SymTab, defs: &'a [IrDef]) -> Cx<'a> {
         let mut cx = Cx {
             syms,
             tds,
+            defs,
             arity: defs.iter().map(|d| (d.name, d.params.len())).collect(),
             def_module: BTreeMap::new(),
             type_module: BTreeMap::new(),
@@ -226,6 +249,7 @@ impl<'a> Cx<'a> {
             current: String::new(),
             app: String::new(),
             recursive: Default::default(),
+            derived_eq: BTreeMap::new(),
             imports: Default::default(),
             locals: Vec::new(),
             tvars: BTreeMap::new(),
@@ -295,6 +319,13 @@ impl<'a> Cx<'a> {
             }
         }
         cx.recursive = mentions.iter().filter(|(n, ms)| ms.contains(n)).map(|(n, _)| *n).collect();
+        for d in defs {
+            if let Some(t) = syms.text(d.name).strip_prefix("__eq_") {
+                if let Some(n) = syms.find(t).filter(|n| cx.type_module.contains_key(n)) {
+                    cx.derived_eq.insert(n, d.name);
+                }
+            }
+        }
         cx
     }
 
@@ -325,7 +356,7 @@ impl<'a> Cx<'a> {
     /// crashes at compile time. `Cat.Cat` resolves to the alias from inside
     /// and outside alike.
     fn type_ref(&mut self, n: Sym) -> String {
-        let name = self.syms.text(n).to_string();
+        let name = type_name(self.syms.text(n));
         let m = match self.type_module.get(&n) {
             Some(m) => m.clone(),
             None if n == self.maybe => "Prelude".to_string(),
@@ -398,7 +429,7 @@ impl<'a> Cx<'a> {
             Ty::List(e) => format!("List({})", self.ty(e)?),
             Ty::Fun(..) => {
                 let (ps, r) = self.fun_parts(t)?;
-                format!("({} -> {})", ps.join(", "), r)
+                format!("({} {r})", ps.join(", "))
             }
             Ty::Var(id) => {
                 let next = self.tvars.len();
@@ -425,10 +456,12 @@ impl<'a> Cx<'a> {
     /// written saturated, so the whole chain is one signature.
     fn fun_parts(&mut self, t: &Ty) -> Result<(Vec<String>, String), String> {
         let mut ps = Vec::new();
+        let mut eff = false;
         let mut cur = t;
         loop {
             match cur {
-                Ty::Fun(p, _, r) => {
+                Ty::Fun(p, row, r) => {
+                    eff |= !row.labels.is_empty();
                     ps.push(self.ty(p)?);
                     cur = r;
                 }
@@ -436,13 +469,18 @@ impl<'a> Cx<'a> {
                 _ => break,
             }
         }
-        Ok((ps, self.ty(cur)?))
+        let r = self.ty(cur)?;
+        Ok((ps, if eff { format!("=> {r}") } else { format!("-> {r}") }))
     }
 
     /// A definition's signature: `k` parameters peel `k` arrows.
     fn signature(&mut self, d: &IrDef) -> Result<String, String> {
-        let (ps, r) = self.arrows(d)?;
-        let sig = if ps.is_empty() { r } else { format!("{} -> {}", ps.join(", "), r) };
+        let (ps, r, eff) = self.arrows(d)?;
+        // **AN EFFECTFUL FUNCTION'S ARROW IS `=>`.** Roc marks the effect on
+        // the type, as Codex marks it on the row; a `[Console] Nothing`
+        // annotated `->` is a type error at every call (scope-console).
+        let arrow = if eff { "=>" } else { "->" };
+        let sig = if ps.is_empty() { r } else { format!("{} {arrow} {}", ps.join(", "), r) };
         let wants = self.eq_wants(d)?;
         Ok(if wants.is_empty() { sig } else { format!("{sig} where [{}]", wants.join(", ")) })
     }
@@ -450,7 +488,7 @@ impl<'a> Cx<'a> {
     /// A `[Device]` definition's signature: the device first, and the pair
     /// last.
     fn device_signature(&mut self, d: &IrDef) -> Result<String, String> {
-        let (ps, r) = self.arrows(d)?;
+        let (ps, r, _) = self.arrows(d)?;
         let mut all = vec!["Device.Device".to_string()];
         all.extend(ps);
         let sig = format!("{} -> (Device.Device, {r})", all.join(", "));
@@ -458,11 +496,13 @@ impl<'a> Cx<'a> {
         Ok(if wants.is_empty() { sig } else { format!("{sig} where [{}]", wants.join(", ")) })
     }
 
-    /// `k` parameters peel `k` arrows: the parameter types and the result.
-    fn arrows(&mut self, d: &IrDef) -> Result<(Vec<String>, String), String> {
+    /// `k` parameters peel `k` arrows: the parameter types, the result, and
+    /// whether any of those arrows performs an effect.
+    fn arrows(&mut self, d: &IrDef) -> Result<(Vec<String>, String, bool), String> {
         self.tvars.clear();
         let mut cur = &d.ty;
         let mut ps = Vec::new();
+        let mut eff = false;
         for _ in 0..d.params.len() {
             loop {
                 match cur {
@@ -471,7 +511,8 @@ impl<'a> Cx<'a> {
                 }
             }
             match cur {
-                Ty::Fun(p, _, r) => {
+                Ty::Fun(p, row, r) => {
+                    eff |= !row.labels.is_empty();
                     ps.push(self.ty(p)?);
                     cur = r;
                 }
@@ -491,7 +532,7 @@ impl<'a> Cx<'a> {
             Ty::Effectful(_, _, inner) if self.has_device(cur) => self.ty(inner)?,
             _ => self.ty(cur)?,
         };
-        Ok((ps, r))
+        Ok((ps, r, eff))
     }
 
     /// **`==` ON A TYPE VARIABLE NEEDS A `where` CLAUSE.** Roc's equality
@@ -582,6 +623,28 @@ impl<'a> Cx<'a> {
         })
     }
 
+    /// **A NOMINAL TYPE HAS NO STRUCTURAL `==`.** An alias is compared
+    /// field by field; a `:=` type is asked for its `is_eq` method, and a
+    /// list or record holding one is compared through that. Codex derives
+    /// the equality already, so the nominal declaration carries it as a
+    /// forwarder and `==` works on the type wherever it appears
+    /// (codex/test's shell-build-keep).
+    fn methods(&mut self, n: Sym, base: usize) -> Result<String, String> {
+        if !self.recursive.contains(&n) {
+            return Ok(String::new());
+        }
+        let Some(eq) = self.derived_eq.get(&n).copied() else {
+            return Ok(String::new());
+        };
+        let Some(d) = self.defs.iter().find(|d| d.name == eq) else {
+            return Ok(String::new());
+        };
+        let sig = self.signature(d)?;
+        let call = self.def_ref(eq)?;
+        let t = "\t".repeat(base + 1);
+        Ok(format!(".{{\n{t}is_eq : {sig}\n{t}is_eq = |a, b| {call}(a, b)\n{}}}", "\t".repeat(base)))
+    }
+
     /// `:` for a plain alias, `:=` for one that stands on a cycle.
     fn colon(&self, n: Sym) -> &'static str {
         if self.recursive.contains(&n) { ":=" } else { ":" }
@@ -590,7 +653,7 @@ impl<'a> Cx<'a> {
     fn type_def(&mut self, td: &TypeDef, base: usize) -> Result<String, String> {
         let syms = self.syms;
         let head = |n: Sym, ps: &[Sym]| -> Result<String, String> {
-            let name = syms.text(n).to_string();
+            let name = type_name(syms.text(n));
             if ps.is_empty() {
                 return Ok(name);
             }
@@ -605,11 +668,8 @@ impl<'a> Cx<'a> {
                     fs.push(format!("{} : {}", self.ident(f.name)?, self.texpr(&f.type_expr)?));
                 }
                 let col = self.colon(*n);
-                if fs.is_empty() {
-                    format!("{tabs}{} {col} {{}}\n", head(*n, ps)?)
-                } else {
-                    format!("{tabs}{} {col} {{ {} }}\n", head(*n, ps)?, fs.join(", "))
-                }
+                let body = if fs.is_empty() { "{}".to_string() } else { format!("{{ {} }}", fs.join(", ")) };
+                format!("{tabs}{} {col} {body}{}\n", head(*n, ps)?, self.methods(*n, base)?)
             }
             TypeDef::Variant(n, ps, ctors, _) => {
                 let mut cs = Vec::new();
@@ -628,7 +688,13 @@ impl<'a> Cx<'a> {
                         cs.push(format!("{tag}({})", fs.join(", ")));
                     }
                 }
-                format!("{tabs}{} {} [{}]\n", head(*n, ps)?, self.colon(*n), cs.join(", "))
+                format!(
+                    "{tabs}{} {} [{}]{}\n",
+                    head(*n, ps)?,
+                    self.colon(*n),
+                    cs.join(", "),
+                    self.methods(*n, base)?
+                )
             }
             TypeDef::Unit(n, ..) => return Err(format!("unit type `{}`", self.syms.text(*n))),
         })
@@ -676,20 +742,23 @@ impl<'a> Cx<'a> {
         let out = if !ps.is_empty() && is_right_fold(&d.body, d.name) {
             let acc = self.syms.find("acc").filter(|a| self.locals.contains(a)).map_or("acc", |_| "acc_");
             let helper = format!("{name}_acc");
+            // `fun_parts` gives the result with its arrow ("-> List(a)"),
+            // which is what the helper's signature ends with.
             let (params, ret) = self.fun_parts(&d.ty)?;
             let _ = params;
+            let bare = ret.trim_start_matches(['-', '=', '>', ' ']).to_string();
             let mut hsig: Vec<String> = Vec::new();
             for p in &d.params {
                 hsig.push(self.ty(&p.ty)?);
             }
-            hsig.push(ret.clone());
+            hsig.push(bare.clone());
             self.fold = Some(Fold { name: d.name, helper: helper.clone(), acc: acc.to_string() });
             let body = self.expr(&d.body, base)?;
             self.fold = None;
             format!(
                 "{tabs}# {name} builds its list by appending a recursive call; emitted as an accumulator loop, which is linear where the direct shape is quadratic.\n\
                  {tabs}{name} : {sig}\n{tabs}{name} = |{ps}| {helper}({ps}, [])\n\n\
-                 {tabs}{helper} : {hsig} -> {ret}\n{tabs}{helper} = |{ps}, {acc}| {body}\n",
+                 {tabs}{helper} : {hsig} {ret}\n{tabs}{helper} = |{ps}, {acc}| {body}\n",
                 ps = ps.join(", "),
                 hsig = hsig.join(", ")
             )
@@ -1347,6 +1416,27 @@ impl<'a> Cx<'a> {
                 Ty::Boolean => if v.eq_ignore_ascii_case("true") { "True".into() } else { "False".into() },
                 other => return Err(format!("literal pattern of type {}", crate::ir_text::render_ty(self.syms, other))),
             },
+            // **A CODEX LIST IS MATCHED WITH Cons AND Nil, A ROC LIST WITH
+            // BRACKETS.** The two constructors are the language's, not a
+            // chapter's, so a ctor pattern whose type is a list spells the
+            // Roc pattern (codex/test's list-pattern).
+            IrPat::Ctor(n, subs, ty, _) if matches!(ty, Ty::List(_)) => {
+                match (self.syms.text(*n), subs.as_slice()) {
+                    ("Nil", []) => "[]".to_string(),
+                    ("Cons", [h, t]) => {
+                        let head = self.pattern(h, scope)?;
+                        let tail = self.pattern(t, scope)?;
+                        // A tail nothing reads is `..` alone; `.. as _` is
+                        // not a pattern Roc parses.
+                        if tail == "_" {
+                            format!("[{head}, ..]")
+                        } else {
+                            format!("[{head}, .. as {tail}]")
+                        }
+                    }
+                    (other, _) => return Err(format!("`{other}` as a list pattern")),
+                }
+            }
             IrPat::Ctor(n, subs, _, _) => {
                 let tag = self.tag(*n)?;
                 if subs.is_empty() {
