@@ -50,12 +50,20 @@ Nine, six of them in `test/errors/`, and none at all in the compiler, foreword,
 plugs or os. Each error node carries the NAME of the CST kind it could not
 translate, so the list is actionable rather than a count.
 
-## The CCE round trip: codexrun and rocemit agree, and bare metal does not
+## The CCE round trip: fixed in codexrun, still open in rocemit
 
-Measured at Update 60. These codex/test programs print differently from their
-`.expected`, and `codexrun` prints the same wrong lines the Roc arm does. The
-defect is therefore on the side the two arms share (the front end, or a builtin
-rule both mirror), not in either one:
+**codexrun now holds a Text as CCE units** (`interp::Str`, `charcode.rs`):
+framing, the unit builtins, `show` of a Char as its code, x86's print loop byte
+for byte, `print-text` raw, `read-file-uni` as x86 reads. The five programs
+below match their verdicts under it, and a before/after run over codex/test
+moved six programs to match and none away. **rocemit still models a Text as a
+`Str` of characters**, so the Roc ladder still fails four of them; the plan
+(`List(U8)`, one helper per zig `cx_*` text part) is the essay
+`notes/codex-text-in-roc.md`.
+
+What was measured at Update 60, before the fix. These programs printed
+differently from their `.expected`, and `codexrun` printed the same wrong lines
+the Roc arm did, so the defect was on the side the two arms share:
 
     ops/unicode-bytes-roundtrip    65 -> units [75], back 41   (expected [41], back 65)
                                    192 -> units [0]            (expected [193 128])

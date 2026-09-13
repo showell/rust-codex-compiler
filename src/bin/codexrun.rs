@@ -28,9 +28,10 @@ fn main() -> ExitCode {
         Some("sweep") if args.len() == 3 => sweep(Path::new(&args[1]), Path::new(&args[2])),
         Some("bench") if args.len() >= 2 => bench(&args[1..]),
         Some("ramp") if args.len() == 2 => ramp(Path::new(&args[1])),
+        // The output is bytes: `print-text` writes units raw, as x86 does.
         Some(p) if args.len() == 1 => match run(Path::new(p)) {
             Ok(out) => {
-                print!("{out}");
+                let _ = std::io::Write::write_all(&mut std::io::stdout(), &out);
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -56,11 +57,11 @@ fn main() -> ExitCode {
 /// enough for the corpus. A stack overflow ABORTS the process, so without this
 /// one program takes the whole sweep with it -- which is what the first sweep
 /// after the builtins landed did.
-fn run(path: &Path) -> Result<String, String> {
+fn run(path: &Path) -> Result<Vec<u8>, String> {
     run_in_thread(path, None)
 }
 
-fn run_in_thread(path: &Path, budget: Option<u64>) -> Result<String, String> {
+fn run_in_thread(path: &Path, budget: Option<u64>) -> Result<Vec<u8>, String> {
     let p = path.to_path_buf();
     std::thread::Builder::new()
         .stack_size(512 * 1024 * 1024)
@@ -74,7 +75,7 @@ fn run_in_thread(path: &Path, budget: Option<u64>) -> Result<String, String> {
 /// a whole ride and legitimately needs hundreds of millions of steps.
 const SWEEP_BUDGET: u64 = 60_000_000;
 
-fn run_bounded(path: &Path, budget: Option<u64>) -> Result<String, String> {
+fn run_bounded(path: &Path, budget: Option<u64>) -> Result<Vec<u8>, String> {
     timed(path, budget).map(|(out, ..)| out)
 }
 
@@ -109,7 +110,7 @@ fn timed(path: &Path, budget: Option<u64>) -> Result<Run, String> {
         }
         // The partial output comes back with the error: seeing which line it
         // reached is most of the diagnosis.
-        Err(e) => Err(format!("{}\n--- output before the error ---\n{}", e.0, it.out)),
+        Err(e) => Err(format!("{}\n--- output before the error ---\n{}", e.0, String::from_utf8_lossy(&it.out))),
     }
 }
 
@@ -129,7 +130,7 @@ fn ramp(path: &Path) -> ExitCode {
     heapwatch::reset();
     match run_timed_in_thread(path) {
         Ok((out, steps, secs, mapped, hwm, hwm_in)) => {
-            print!("{out}");
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), &out);
             eprintln!(
                 "ramp {name} steps={steps} secs={secs:.3} peak-mb={:.1} flat-mb={:.1} cursor-mb={:.1} peak-in={hwm_in}",
                 heapwatch::mb(heapwatch::peak()),
@@ -183,7 +184,7 @@ fn bench(paths: &[String]) -> ExitCode {
 
 /// What one run cost: output, steps, seconds, flat-memory bytes mapped, and
 /// the furthest the allocator's cursor reached.
-type Run = (String, u64, f64, usize, i64, String);
+type Run = (Vec<u8>, u64, f64, usize, i64, String);
 
 fn run_timed_in_thread(path: &Path) -> Result<Run, String> {
     let p = path.to_path_buf();
@@ -220,11 +221,12 @@ fn sweep(units: &Path, tests: &Path) -> ExitCode {
         ran += 1;
         let want = std::fs::read_to_string(exp).unwrap_or_default();
         let verdict = match run_in_thread(&unit, Some(SWEEP_BUDGET)) {
-            Ok(got) if got == want => {
+            Ok(got) if got == want.as_bytes() => {
                 matched += 1;
                 "ok".to_string()
             }
             Ok(got) => {
+                let got = String::from_utf8_lossy(&got);
                 let first = want
                     .lines()
                     .zip(got.lines())
@@ -292,7 +294,7 @@ fn check(path: &Path, expected: &Path) -> ExitCode {
         }
     };
     let got = match run(path) {
-        Ok(o) => o,
+        Ok(o) => String::from_utf8_lossy(&o).into_owned(),
         Err(e) => {
             println!("FAILED to run {}", path.display());
             println!("{e}");

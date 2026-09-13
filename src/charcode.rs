@@ -233,6 +233,210 @@ pub fn char_literal_code(raw: &str) -> i64 {
     }
 }
 
+// ---- units: framing, printing, reading --------------------------------------
+//
+// A Codex Text is a sequence of CCE UNITS, 0..=255. A code 0..=127 is one
+// unit; a code point outside the alphabet is FRAMED as 2, 3 or 4 units with
+// bands at 128, 2176 and 67712 (`cce-encode-into`, Foreword CCE). The tables
+// and conversions below are the zig plug's prelude parts, which Steve named as
+// the template; printing and file reading follow x86, which the verdicts were
+// captured on, where the two differ.
+
+/// The code point a code 0..=127 names: the zig prelude's `cce_table`.
+pub fn tier0_point(code: u8) -> u32 {
+    if code == 0 { 0 } else { code_to_char(code as i64) as u32 }
+}
+
+/// Tier 1, codes 128..=2175: `cce_t1_code`, `cce_t1_size`, `cce_t1_uni`.
+const T1_CODE: [u32; 11] = [128, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1792, 2048];
+const T1_SIZE: [u32; 11] = [256, 128, 128, 128, 128, 128, 128, 128, 512, 256, 128];
+const T1_UNI: [u32; 11] = [128, 1024, 880, 1536, 1424, 2304, 3584, 4352, 19968, 12352, 8704];
+/// Tier 2, codes from 2176, cumulative: `cce_t2_uni`, `cce_t2_size`.
+const T2_UNI: [u32; 10] = [12288, 12352, 12448, 19968, 13312, 44032, 3584, 8192, 127744, 9728];
+const T2_SIZE: [u32; 10] = [64, 96, 96, 20992, 6592, 11172, 256, 512, 1024, 256];
+
+/// `cx_cp_to_cce`: the code for a code point, tier 0 first. A code point no
+/// tier covers is `?`, code 68, as bare metal substitutes it.
+pub fn code_of_point(cp: u32) -> u32 {
+    if let Some(code) = (0..128u8).find(|c| tier0_point(*c) == cp) {
+        return code as u32;
+    }
+    for ((start, size), uni) in T1_CODE.iter().zip(T1_SIZE).zip(T1_UNI) {
+        if cp >= uni && cp < uni + size {
+            return start + (cp - uni);
+        }
+    }
+    let mut base = 2176;
+    for (uni, size) in T2_UNI.iter().zip(T2_SIZE) {
+        if cp >= *uni && cp < uni + size {
+            return base + (cp - uni);
+        }
+        base += size;
+    }
+    68
+}
+
+/// `cx_cce_frame`: a code as 1..=4 units.
+pub fn frame(code: u32, out: &mut Vec<u8>) {
+    if code < 128 {
+        out.push(code as u8);
+    } else if code < 2176 {
+        let v = code - 128;
+        out.extend([(192 + (v >> 6)) as u8, (128 + (v & 63)) as u8]);
+    } else if code < 67712 {
+        let v = code - 2176;
+        out.extend([(224 + (v >> 12)) as u8, (128 + ((v >> 6) & 63)) as u8, (128 + (v & 63)) as u8]);
+    } else {
+        let v = code - 67712;
+        out.extend([
+            (240 + (v >> 18)) as u8,
+            (128 + ((v >> 12) & 63)) as u8,
+            (128 + ((v >> 6) & 63)) as u8,
+            (128 + (v & 63)) as u8,
+        ]);
+    }
+}
+
+/// A Rust string as the units a Codex literal holds: every character through
+/// `code_of_point`, framed.
+pub fn units_of(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        frame(code_of_point(c as u32), &mut out);
+    }
+    out
+}
+
+/// x86's `tier1-slice-bases`: the code point starting each 128-code slice of
+/// tier 1, indexed by `(code - 128) >> 7`. **Slice 0 starts at U+00C0 where
+/// the encoding's tier 1 starts at U+0080**, so codes 128..=383 print 64 code
+/// points above the character that framed them. That is x86's table, emulated.
+const X86_T1_BASES: [u64; 16] =
+    [192, 320, 1024, 880, 1536, 1424, 2304, 3584, 4352, 19968, 20096, 20224, 20352, 12352, 12480, 8704];
+
+/// x86's `tier2-rodata`: per slice, the code it ends before (two bytes) and
+/// the delta to its code point (four bytes, added unsigned in a 64-bit
+/// register).
+const X86_T2: [[u8; 6]; 10] = [
+    [192, 8, 128, 39, 0, 0],
+    [32, 9, 128, 39, 0, 0],
+    [128, 9, 128, 39, 0, 0],
+    [128, 91, 128, 68, 0, 0],
+    [64, 117, 128, 216, 255, 255],
+    [228, 160, 192, 54, 0, 0],
+    [228, 161, 28, 109, 255, 255],
+    [228, 163, 28, 126, 255, 255],
+    [228, 167, 28, 79, 1, 0],
+    [228, 168, 28, 126, 255, 255],
+];
+
+/// **What x86's print loop writes for these units** (`emit-print-text-loop`,
+/// `__cce_print_multi`, `emit-cce-utf8-output`), byte for byte.
+///
+/// A unit below 128 is its tier-0 code point, in one byte or two. A unit whose
+/// top nibble is 1110 starts a 3-unit tier-2 frame, found by scanning the
+/// slice table, U+FFFD when none holds it, written as 3 bytes below 65536 and
+/// 4 above. Every other unit from 128 is taken as a 2-unit tier-1 frame,
+/// continuations and 4-unit leads included. Each byte is the low byte of the
+/// shifted value, as the register writes it; a unit past the end reads as 0.
+pub fn print_bytes(units: &[u8], out: &mut Vec<u8>) {
+    let at = |k: usize| units.get(k).copied().unwrap_or(0) as u64;
+    let mut i = 0;
+    while i < units.len() {
+        let b0 = units[i] as u64;
+        if b0 < 128 {
+            let cp = tier0_point(b0 as u8) as u64;
+            if cp < 128 {
+                out.push(cp as u8);
+            } else {
+                out.extend([((cp >> 6) | 192) as u8, ((cp & 63) | 128) as u8]);
+            }
+            i += 1;
+        } else if b0 & 240 == 224 {
+            let code = 2176 + ((b0 & 15) << 12) + ((at(i + 1) & 63) << 6) + (at(i + 2) & 63);
+            let cp = X86_T2
+                .iter()
+                .find(|e| code < (e[0] as u64 | (e[1] as u64) << 8))
+                .map_or(65533, |e| code + u32::from_le_bytes([e[2], e[3], e[4], e[5]]) as u64);
+            if cp < 65536 {
+                out.extend([((cp >> 12) | 224) as u8, (((cp >> 6) & 63) | 128) as u8, ((cp & 63) | 128) as u8]);
+            } else {
+                out.extend([
+                    ((cp >> 18) | 240) as u8,
+                    (((cp >> 12) & 63) | 128) as u8,
+                    (((cp >> 6) & 63) | 128) as u8,
+                    ((cp & 63) | 128) as u8,
+                ]);
+            }
+            i += 3;
+        } else {
+            let v = ((b0 & 31) << 6) + (at(i + 1) & 63);
+            let cp = X86_T1_BASES[(v >> 7) as usize] + (v & 127);
+            if cp < 128 {
+                out.push(cp as u8);
+            } else if cp < 2048 {
+                out.extend([((cp >> 6) | 192) as u8, ((cp & 63) | 128) as u8]);
+            } else {
+                out.extend([((cp >> 12) | 224) as u8, (((cp >> 6) & 63) | 128) as u8, ((cp & 63) | 128) as u8]);
+            }
+            i += 2;
+        }
+    }
+}
+
+/// **What x86's `read-file-uni` makes of a file's bytes.** A byte below 128
+/// is the code the alphabet gives it (`?` where it gives none), a carriage
+/// return is dropped, NUL or EOT ends the text, and a byte from 128 is kept
+/// raw -- the compiler frames it later, in `utf8-to-cce`.
+pub fn read_file_units(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    for &b in bytes {
+        match b {
+            0 | 4 => break,
+            13 => {}
+            b if b < 128 => out.push(code_of_point(b as u32) as u8),
+            b => out.push(b),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    /// `encode-json-escapes` on bare metal: `u00C0  len=4 units= 15 193 128 32`.
+    #[test]
+    fn a_character_outside_the_alphabet_is_framed() {
+        assert_eq!(units_of("aÀb"), vec![15, 193, 128, 32]);
+        assert_eq!(units_of("é"), vec![97], "é is tier 0");
+        assert_eq!(units_of("€"), vec![233, 168, 144], "unicode-bytes-roundtrip's 8364");
+        assert_eq!(units_of("\t"), vec![68], "no tier covers a tab: `?`");
+    }
+
+    #[test]
+    fn printing_follows_x86s_tables() {
+        let mut out = Vec::new();
+        print_bytes(&units_of("hi é"), &mut out);
+        assert_eq!(out, "hi é".as_bytes());
+        let mut out = Vec::new();
+        print_bytes(&[193, 128], &mut out);
+        assert_eq!(out, "Ā".as_bytes(), "x86's slice 0 starts at U+00C0");
+        // € is tier-2 slice 7, whose delta is negative. x86 adds it unsigned in
+        // a 64-bit register (`add-rr` carries REX.W), so the code point lands
+        // above 2^32 and goes out as a 4-byte sequence whose low bits are
+        // U+20AC: overlong.
+        let mut out = Vec::new();
+        print_bytes(&[233, 168, 144], &mut out);
+        assert_eq!(out, vec![0xF0, 0x82, 0x82, 0xAC]);
+    }
+
+    #[test]
+    fn reading_a_file_keeps_high_bytes_raw_and_drops_cr() {
+        assert_eq!(read_file_units(b"A\r\n\xc3\xa9\x00B"), vec![41, 1, 195, 169]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

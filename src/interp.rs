@@ -21,12 +21,10 @@
 //! flat, so nothing here resolves a name or parses a literal while the program
 //! is running.
 
-use crate::charcode::{char_code, code_to_char};
 use crate::ast::*;
 use crate::code::{Arm, Code, Compiler, Names, PatCode, Stmt};
 use crate::symbol::{Sym, SymTab};
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -35,7 +33,8 @@ pub enum Value {
     Int(i64),
     Real(f64),
     Text(Rc<Str>),
-    Char(char),
+    /// A CCE code, as upstream's Char is.
+    Char(i64),
     Bool(bool),
     /// A LIST IS SHARED AND ITS SLOTS ARE WRITABLE, because Codex's is.
     ///
@@ -171,121 +170,84 @@ impl<T> std::ops::Deref for Cell<T> {
 #[derive(Debug)]
 pub struct Str {
     pub addr: i64,
-    s: String,
-    /// **Where the multi-byte characters are, and nothing else.**
-    ///
-    /// A Codex `Text` is a sequence of CCE units, one per character, so
-    /// `text-length "café!"` is 5 where the UTF-8 is six bytes. Byte index and
-    /// unit index therefore disagree, but only ever BY THE EXTRA BYTES OF THE
-    /// CHARACTERS BEFORE YOU -- so recording those is enough to convert
-    /// between them, and recording anything else is waste.
-    ///
-    /// Each entry is `(unit index of a multi-byte character, total extra bytes
-    /// contributed up to and including it)`, so the byte offset of unit `i` is
-    /// `i` plus the running total of the last entry before it.
-    ///
-    /// **THIS IS SIZED BY THE EXCEPTIONS, NOT BY THE TEXT.** One cited chapter
-    /// carrying a Cyrillic section title makes a whole compilation unit
-    /// non-ASCII: `gopfish-scene` is 709 KB with FIFTEEN characters above
-    /// ASCII in it, two thousandths of a percent. Walking `char_indices()` per
-    /// lookup made every `substring` against that source O(n) and took the
-    /// program from 35 seconds to 179; a table with a slot per unit fixed the
-    /// speed by spending 2.8 MB to describe fifteen letters. This holds
-    /// fifteen entries.
-    marks: Box<[(u32, u32)]>,
+    /// **A Codex Text is CCE UNITS, 0..=255, and nothing else.** A character
+    /// outside the alphabet is framed as 2..=4 units (`charcode::frame`), so
+    /// `text-length "aÀb"` is 4 and `char-code-at` answers a unit. Every
+    /// upstream backend holds a text this way: x86 as a length and bytes, the
+    /// zig plug as a `[]const u8`.
+    units: Box<[u8]>,
 }
 
 impl Str {
-    /// The one place the marks are decided, so they cannot disagree with `s`.
-    pub fn new(addr: i64, s: String) -> Str {
-        // The ASCII case allocates nothing and is the case that matters: the
-        // compiler's own source is ASCII and the lexer indexes it constantly.
-        let marks: Box<[(u32, u32)]> = if s.is_ascii() {
-            Box::new([])
-        } else {
-            let mut v = Vec::new();
-            let mut extra: u32 = 0;
-            for (unit, c) in s.chars().enumerate() {
-                let len = c.len_utf8();
-                if len > 1 {
-                    extra += len as u32 - 1;
-                    v.push((unit as u32, extra));
-                }
-            }
-            v.into_boxed_slice()
-        };
-        Str { addr, s, marks }
+    pub fn new(addr: i64, units: Vec<u8>) -> Str {
+        Str { addr, units: units.into_boxed_slice() }
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.s
-    }
-
-    /// The length in CCE units: characters, not bytes.
-    pub fn units(&self) -> usize {
-        self.s.len() - self.marks.last().map_or(0, |(_, e)| *e as usize)
-    }
-
-    /// The byte offset of a unit index, clamped to the ends.
-    fn byte_of(&self, unit: usize) -> usize {
-        let n = self.units();
-        if unit >= n {
-            return self.s.len();
-        }
-        if self.marks.is_empty() {
-            return unit;
-        }
-        let before = self.marks.partition_point(|(u, _)| (*u as usize) < unit);
-        unit + if before == 0 { 0 } else { self.marks[before - 1].1 as usize }
-    }
-
-    /// The character at a unit index.
-    pub fn unit_at(&self, i: i64) -> Option<char> {
-        if i < 0 || i as usize >= self.units() {
-            return None;
-        }
-        self.s[self.byte_of(i as usize)..].chars().next()
+    pub fn units(&self) -> &[u8] {
+        &self.units
     }
 
     /// `len` units from `start`, clamped as upstream clamps.
-    ///
-    /// **Slicing on unit boundaries is the point**: the byte-indexed version
-    /// cut multi-byte sequences in half and re-encoded the halves through
-    /// `from_utf8_lossy`, so a one-unit slice of `café` came back three bytes
-    /// long as U+FFFD.
-    pub fn unit_slice(&self, start: i64, len: i64) -> &str {
-        let n = self.units() as i64;
+    pub fn unit_slice(&self, start: i64, len: i64) -> &[u8] {
+        let n = self.units.len() as i64;
         let a = start.clamp(0, n) as usize;
-        let z = (a + len.max(0) as usize).min(n as usize);
-        &self.s[self.byte_of(a)..self.byte_of(z)]
+        let z = a.saturating_add(len.max(0) as usize).min(n as usize);
+        &self.units[a..z]
     }
 
-    #[cfg(test)]
-    pub fn mark_count(&self) -> usize {
-        self.marks.len()
+    /// The text as x86's console prints it, for messages and for `show` of a
+    /// value that holds one.
+    pub fn printed(&self) -> String {
+        let mut out = Vec::with_capacity(self.units.len());
+        crate::charcode::print_bytes(&self.units, &mut out);
+        String::from_utf8_lossy(&out).into_owned()
     }
 }
 
-/// **TWO TEXTS ARE EQUAL WHEN THEY READ THE SAME**, whatever their addresses.
+/// **TWO TEXTS ARE EQUAL WHEN THEIR UNITS ARE**, whatever their addresses.
 /// Codex compares texts by content and always has; the address answers a
 /// different question and `address-of` is where it is asked.
 impl PartialEq for Str {
     fn eq(&self, other: &Str) -> bool {
-        self.s == other.s
-    }
-}
-
-impl std::ops::Deref for Str {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.s
+        self.units == other.units
     }
 }
 
 impl std::fmt::Display for Str {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.s)
+        f.write_str(&self.printed())
     }
+}
+
+/// Where `needle` first occurs in `hay` at or after `from`; an empty needle is
+/// found at once.
+fn find_units(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(from.min(hay.len()));
+    }
+    hay.get(from..)?.windows(needle.len()).position(|w| w == needle).map(|p| p + from)
+}
+
+/// Every occurrence of `from`, left to right, replaced by `to`, as
+/// `str::replace` does.
+fn replace_units(s: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    if from.is_empty() {
+        let mut out = to.to_vec();
+        for u in s {
+            out.push(*u);
+            out.extend_from_slice(to);
+        }
+        return out;
+    }
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while let Some(p) = find_units(s, from, i) {
+        out.extend_from_slice(&s[i..p]);
+        out.extend_from_slice(to);
+        i = p + from.len();
+    }
+    out.extend_from_slice(&s[i..]);
+    out
 }
 
 pub type Env = Rc<Scope>;
@@ -427,7 +389,7 @@ pub struct Interp {
     /// to every caller of the other. Reported, not used: resolving them is
     /// `crate::code`'s job and it happens before the run.
     pub collisions: Vec<String>,
-    pub out: String,
+    pub out: Vec<u8>,
     /// How much work the run did, which is the only speed number that is not
     /// about this machine on this day.
     pub steps: u64,
@@ -861,7 +823,7 @@ impl Interp {
             syms: ch.syms.clone(),
             root,
             collisions,
-            out: String::new(),
+            out: Vec::new(),
             steps: 0,
             depth: 0,
             limit: STEP_LIMIT,
@@ -1488,9 +1450,9 @@ impl Interp {
         Value::Ctor(name, Rc::new(Cell { addr, cached: std::cell::Cell::new(false), v: fields }))
     }
 
-    fn text(&mut self, s: String) -> R<Value> {
-        let addr = self.bump.alloc(s.len() as i64);
-        Ok(Value::Text(Rc::new(Str::new(addr, s))))
+    fn text(&mut self, units: Vec<u8>) -> R<Value> {
+        let addr = self.bump.alloc(units.len() as i64);
+        Ok(Value::Text(Rc::new(Str::new(addr, units))))
     }
 
     fn builtin(&mut self, name: &str, args: Vec<Value>) -> R<Value> {
@@ -1499,60 +1461,66 @@ impl Interp {
 
         match (name, args.as_slice()) {
             // -- console ------------------------------------------------------
+            // **PRINTING IS WHERE UNITS BECOME UTF-8**, decoded as x86's print
+            // loop decodes them (`charcode::print_bytes`). `print-text` writes
+            // the units raw, as x86 does: that is the IR-CCE wire.
             ("print-line-uni" | "print-line", [v]) => {
                 // Spelled BEFORE the write: `show` reads the table and the
                 // write takes the output buffer, and they are the same `self`.
-                let line = show(&self.syms, v);
-                let _ = writeln!(self.out, "{line}");
+                let units = show_units(&self.syms, v);
+                crate::charcode::print_bytes(&units, &mut self.out);
+                self.out.push(b'\n');
                 Ok(Unit)
             }
-            ("print-uni" | "print" | "print-text", [v]) => {
-                let part = show(&self.syms, v);
-                let _ = write!(self.out, "{part}");
+            ("print-uni" | "print", [v]) => {
+                let units = show_units(&self.syms, v);
+                crate::charcode::print_bytes(&units, &mut self.out);
                 Ok(Unit)
             }
-            // Each integer mod 256, as the zig plug's `cx_write_binary` writes
-            // it. The output here is text, so bytes that are not UTF-8 are
-            // refused rather than mangled.
+            ("print-text", [v]) => {
+                let units = show_units(&self.syms, v);
+                self.out.extend_from_slice(&units);
+                Ok(Unit)
+            }
+            // Each integer mod 256, raw, as the zig plug's `cx_write_binary`
+            // writes it.
             ("write-binary", [List(xs)]) => {
-                let mut bytes = Vec::new();
                 for v in xs.borrow().iter() {
                     let Int(i) = v else {
                         return err(format!("write-binary given a list holding {}", type_name(v)));
                     };
-                    bytes.push(i.rem_euclid(256) as u8);
+                    self.out.push(i.rem_euclid(256) as u8);
                 }
-                let Ok(s) = String::from_utf8(bytes) else {
-                    return err("write-binary: bytes that are not UTF-8 cannot join this interpreter's text output".to_string());
-                };
-                self.out.push_str(&s);
                 Ok(Unit)
             }
 
             // -- text ---------------------------------------------------------
             ("show" | "integer-to-text", [v]) => {
-                let t = show(&self.syms, v);
+                let t = show_units(&self.syms, v);
                 self.text(t)
             }
-            ("text-length", [Text(t)]) => Ok(Int(t.units() as i64)),
-            ("char-at", [Text(t), Int(i)]) => t
-                .unit_at(*i)
-                .map(Char)
+            ("text-length", [Text(t)]) => Ok(Int(t.units().len() as i64)),
+            ("char-at", [Text(t), Int(i)]) => usize::try_from(*i)
+                .ok()
+                .and_then(|k| t.units().get(k))
+                .map(|u| Char(*u as i64))
                 .ok_or_else(|| Error(format!("char-at {i} past the end"))),
-            // `char-code-at` indexes CCE UNITS -- characters -- and `char-code`
-            // is the private frequency alphabet, not ASCII: `char-code 'A'` is
-            // 41 and `char-code 'é'` is 97. Indexing BYTES here answered 0
-            // twice for every non-ASCII character, and `code-to-char 0` is NUL,
-            // which is what put a run of NULs where ten corpus programs' IR
-            // should carry the section title `Cyrillic (CCE 113-127 -> а о е)`.
+            // `char-code-at` answers a UNIT, and a Char is its code, so
+            // `char-code` and `code-to-char` are the identity, as on every
+            // upstream backend. The code is the private frequency alphabet,
+            // not ASCII: `char-code 'A'` is 41.
             ("char-code-at", [Text(t), Int(i)]) => {
-                Ok(Int(t.unit_at(*i).map(char_code).unwrap_or(0)))
+                Ok(Int(usize::try_from(*i).ok().and_then(|k| t.units().get(k)).map_or(0, |u| *u as i64)))
             }
-            ("char-code", [Char(c)]) => Ok(Int(char_code(*c))),
-            ("code-to-char", [Int(c)]) => Ok(Char(code_to_char(*c))),
-            ("char-to-text" | "char-encode", [Char(c)]) => {
-                let t = c.to_string();
-                self.text(t)
+            ("char-code", [Char(c)]) => Ok(Int(*c)),
+            ("code-to-char", [Int(c)]) => Ok(Char(*c)),
+            // One unit, the code's low byte, as `cx_char_to_text` makes it...
+            ("char-to-text", [Char(c)]) => self.text(vec![*c as u8]),
+            // ...where `char-encode` frames the code (`cx_char_encode`).
+            ("char-encode", [Char(c)]) => {
+                let mut units = Vec::new();
+                crate::charcode::frame(*c as u32, &mut units);
+                self.text(units)
             }
             ("substring", [Text(t), Int(start), Int(len)]) => {
                 let piece = t.unit_slice(*start, *len);
@@ -1563,26 +1531,27 @@ impl Interp {
                 // way. Counting exactly that shape measures the bytes this arm
                 // copies BECAUSE its durability test cannot answer, and no
                 // ordinary substring is caught by it.
-                if piece.len() == t.as_str().len() {
+                if piece.len() == t.units().len() {
                     self.rematerialised += 1;
                     self.rematerialised_bytes += piece.len() as u64;
                 }
-                let owned = piece.to_string();
+                let owned = piece.to_vec();
                 self.text(owned)
             }
-            ("text-contains", [Text(a), Text(b)]) => Ok(Bool(a.contains(b.as_str()))),
-            ("text-starts-with", [Text(a), Text(b)]) => Ok(Bool(a.starts_with(b.as_str()))),
-            ("text-ends-with", [Text(a), Text(b)]) => Ok(Bool(a.ends_with(b.as_str()))),
+            // Unit by unit and blind to frames, as `cx_text_contains` and its
+            // siblings are.
+            ("text-contains", [Text(a), Text(b)]) => Ok(Bool(find_units(a.units(), b.units(), 0).is_some())),
+            ("text-starts-with", [Text(a), Text(b)]) => Ok(Bool(a.units().starts_with(b.units()))),
+            ("text-ends-with", [Text(a), Text(b)]) => Ok(Bool(a.units().ends_with(b.units()))),
             ("text-replace", [Text(a), Text(b), Text(c)]) => {
-                let r = a.replace(b.as_str(), c.as_str());
+                let r = replace_units(a.units(), b.units(), c.units());
                 self.text(r)
             }
-            ("text-to-integer", [Text(t)]) => Ok(Int(t.trim().parse().unwrap_or(0))),
-            // `text-compare` is over CCE bytes, which is char-code order and
-            // not ASCII order.
+            ("text-to-integer", [Text(t)]) => Ok(Int(t.printed().trim().parse().unwrap_or(0))),
+            // `text-compare` is unsigned unit order, as `cx_text_compare`.
             ("text-compare", [Text(a), Text(b)]) => {
-                let (x, y) = (crate::preamble::cce_key(a), crate::preamble::cce_key(b));
-                Ok(Int(match x.cmp(&y) {
+                let (x, y) = (a.units(), b.units());
+                Ok(Int(match x.cmp(y) {
                     std::cmp::Ordering::Less => -1,
                     std::cmp::Ordering::Equal => 0,
                     std::cmp::Ordering::Greater => 1,
@@ -1602,26 +1571,15 @@ impl Interp {
             // coincidence and disagree above it. `is-whitespace` is the one
             // that shows it: a tab and a carriage return are NOT whitespace
             // here, because the alphabet gives them no code at all.
-            ("is-letter", [Char(c)]) => {
-                let k = char_code(*c);
-                Ok(Bool((13..=64).contains(&k) || (97..=127).contains(&k)))
-            }
-            ("is-digit", [Char(c)]) => Ok(Bool((3..=12).contains(&char_code(*c)))),
-            ("is-whitespace", [Char(c)]) => {
-                Ok(Bool((1..=2).contains(&char_code(*c))))
-            }
+            ("is-letter", [Char(c)]) => Ok(Bool((13..=64).contains(c) || (97..=127).contains(c))),
+            ("is-digit", [Char(c)]) => Ok(Bool((3..=12).contains(c))),
+            ("is-whitespace", [Char(c)]) => Ok(Bool((1..=2).contains(c))),
             // `List Integer -> Text`, the bytes as written.
             // **EACH BYTE IS A CCE UNIT, NOT UTF-8.** Upstream hands this
             // builtin codes already (`utf8-to-cce-loop` in X86_64State.codex),
-            // and its helper copies them in. A unit above 127 frames a
-            // character outside the alphabet and has no character here, so it
-            // reads back as 0 (docs/known-gaps.md).
+            // and its helper copies each low byte in.
             ("raw-bytes-to-text", [List(xs)]) => {
-                let t: String = xs
-                    .borrow()
-                    .iter()
-                    .map(|v| code_to_char(if let Int(i) = v { (*i as u8) as i64 } else { 0 }))
-                    .collect();
+                let t: Vec<u8> = xs.borrow().iter().map(|v| if let Int(i) = v { *i as u8 } else { 0 }).collect();
                 self.text(t)
             }
 
@@ -1713,10 +1671,17 @@ impl Interp {
                 Ok(Int(((*a as u64) >> (*b as u32 & 63)) as i64))
             }
             ("text-split", [Text(t), Text(sep)]) => {
-                let parts: Vec<String> = if sep.is_empty() {
-                    vec![t.as_str().to_string()]
+                let (t, sep) = (t.units(), sep.units());
+                let parts: Vec<Vec<u8>> = if sep.is_empty() {
+                    vec![t.to_vec()]
                 } else {
-                    t.split(sep.as_str()).map(|p| p.to_string()).collect()
+                    let (mut parts, mut i) = (Vec::new(), 0);
+                    while let Some(p) = find_units(t, sep, i) {
+                        parts.push(t[i..p].to_vec());
+                        i = p + sep.len();
+                    }
+                    parts.push(t[i..].to_vec());
+                    parts
                 };
                 let mut out = Vec::with_capacity(parts.len());
                 for part in parts {
@@ -1824,10 +1789,10 @@ impl Interp {
             ("variant-tag", [Int(i)]) => Ok(Int(*i)),
             ("tag-equal", [Ctor(a, _), Ctor(b, _)]) => Ok(Bool(a == b)),
             ("text-concat-list", [List(xs)]) => {
-                let mut out = String::new();
+                let mut out = Vec::new();
                 for x in xs.borrow().iter() {
                     match x {
-                        Text(t) => out.push_str(t),
+                        Text(t) => out.extend_from_slice(t.units()),
                         other => return err(format!("text-concat-list over {}", type_name(other))),
                     }
                 }
@@ -1880,7 +1845,7 @@ impl Interp {
             //
             // A literal the parse refuses is not a hosting gap: the lexer only
             // reaches here with text it has already accepted as a Real.
-            ("text-to-double-bits", [Text(t)]) => match t.trim().parse::<f64>() {
+            ("text-to-double-bits", [Text(t)]) => match t.printed().trim().parse::<f64>() {
                 Ok(f) => Ok(Int(f.to_bits() as i64)),
                 Err(_) => err(format!("text-to-double-bits on {t:?}, which is not a Real")),
             },
@@ -1894,12 +1859,13 @@ impl Interp {
             // any other text -- the source a compile is about is the single
             // biggest thing `copy-sx-text` will be asked about, and it has to
             // be able to answer.
-            ("read-file-uni", [Text(path)]) => match std::fs::read(path.as_str()) {
+            ("read-file-uni", [Text(path)]) => match std::fs::read(path.printed()) {
+                // What x86's reader makes of the bytes: `charcode::read_file_units`.
                 Ok(bytes) => {
-                    let t = String::from_utf8_lossy(&bytes).into_owned();
+                    let t = crate::charcode::read_file_units(&bytes);
                     self.text(t)
                 }
-                Err(e) => err(format!("read-file-uni {:?}: {e}", path.as_str())),
+                Err(e) => err(format!("read-file-uni {:?}: {e}", path.printed())),
             },
 
             // **A HOSTED COMPILER HAS NO SELF TYPE TABLE, and answers the
@@ -1978,7 +1944,7 @@ impl Interp {
                 // and the one reason the interpreter keeps a mutable one. A
                 // field named by a text nothing else mentions is a new symbol.
                 let n = *n;
-                let key = self.syms.intern(field);
+                let key = self.syms.intern(&field.printed());
                 let bound = self.bounds.get(&(n, key));
                 let v = match (v, bound) {
                     (Int(i), Some(b)) => Int(apply_bound(*i, b)),
@@ -2074,15 +2040,16 @@ pub(crate) fn literal(text: &str, kind: LiteralKind) -> R<Value> {
         // **ALREADY DECODED.** The desugarer resolved the escapes and stripped
         // the quotes (`Desugar::literal_value`), so there is no escape rule
         // here to get out of step with the one upstream uses.
+        // A literal holds the units its characters frame to, as the compiler's
+        // `utf8-to-cce` makes them when it reads the source.
         LiteralKind::TextLit => {
-            let addr = crate::bump::intern_literal(text.len() as i64);
-            Ok(Value::Text(Rc::new(Str::new(addr, text.to_string()))))
+            let units = crate::charcode::units_of(text);
+            let addr = crate::bump::intern_literal(units.len() as i64);
+            Ok(Value::Text(Rc::new(Str::new(addr, units))))
         }
         // A char literal arrives as its CHAR-CODE in decimal, which is what
         // `lower-literal` reads too.
-        LiteralKind::CharLit => {
-            Ok(Value::Char(code_to_char(text.parse().unwrap_or(0))))
-        }
+        LiteralKind::CharLit => Ok(Value::Char(text.parse().unwrap_or(0))),
     }
 }
 
@@ -2098,9 +2065,9 @@ pub(crate) fn literal(text: &str, kind: LiteralKind) -> R<Value> {
 /// that.
 fn binary(syms: &SymTab, bump: &mut crate::bump::Bump, op: BinaryOp, a: Value, b: Value) -> R<Value> {
     // Nested fns rather than closures: two closures cannot both hold the bump.
-    fn cat(bump: &mut crate::bump::Bump, s: String) -> Value {
-        let addr = bump.alloc(s.len() as i64);
-        Text(Rc::new(Str::new(addr, s)))
+    fn cat(bump: &mut crate::bump::Bump, units: Vec<u8>) -> Value {
+        let addr = bump.alloc(units.len() as i64);
+        Text(Rc::new(Str::new(addr, units)))
     }
     fn mklist(bump: &mut crate::bump::Bump, cells: Vec<Value>) -> Value {
         let addr = bump.alloc(words(cells.len()));
@@ -2141,9 +2108,9 @@ fn binary(syms: &SymTab, bump: &mut crate::bump::Bump, op: BinaryOp, a: Value, b
         (OpNotEq, _, _) => Bool(!equal(&a, &b)),
         (OpDefEq, _, _) => Bool(equal(&a, &b)),
         // `&` is one operator with four meanings, chosen by what it is given.
-        (OpAnd | OpAppend, Text(x), Text(y)) => cat(bump, format!("{x}{y}")),
-        (OpAnd | OpAppend, Text(x), _) => cat(bump, format!("{x}{}", show(syms, &b))),
-        (OpAnd | OpAppend, _, Text(y)) => cat(bump, format!("{}{y}", show(syms, &a))),
+        (OpAnd | OpAppend, Text(x), Text(y)) => cat(bump, [x.units(), y.units()].concat()),
+        (OpAnd | OpAppend, Text(x), _) => cat(bump, [x.units(), &show_units(syms, &b)[..]].concat()),
+        (OpAnd | OpAppend, _, Text(y)) => cat(bump, [&show_units(syms, &a)[..], y.units()].concat()),
         (OpAnd | OpAppend, List(x), List(y)) => {
             let mut out = x.borrow().clone();
             out.extend(y.borrow().iter().cloned());
@@ -2173,7 +2140,7 @@ fn equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Int(x), Int(y)) => x == y,
         (Real(x), Real(y)) => x == y,
-        (Text(x), Text(y)) => x.as_str() == y.as_str(),
+        (Text(x), Text(y)) => x.units() == y.units(),
         (Char(x), Char(y)) => x == y,
         (Bool(x), Bool(y)) => x == y,
         (Unit, Unit) => true,
@@ -2235,11 +2202,22 @@ fn matches_pat(v: &Value, p: &PatCode, vals: &mut Vec<Value>) -> bool {
     }
 }
 
+/// `show` as the units a Codex text holds: a text is itself, and anything else
+/// is its printed form in the alphabet. `cx_show_int` writes digits as 3..=12
+/// and minus as 73, which is what the alphabet gives them.
+pub fn show_units(syms: &SymTab, v: &Value) -> Vec<u8> {
+    match v {
+        Value::Text(t) => t.units().to_vec(),
+        other => crate::charcode::units_of(&show(syms, other)),
+    }
+}
+
 pub fn show(syms: &SymTab, v: &Value) -> String {
     match v {
         Value::Int(i) => i.to_string(),
         Value::Real(f) => format!("{f}"),
-        Value::Text(t) => t.as_str().to_string(),
+        Value::Text(t) => t.printed(),
+        // A Char shows as its code, as upstream's `show` does.
         Value::Char(c) => c.to_string(),
         Value::Bool(b) => if *b { "True" } else { "False" }.to_string(),
         Value::Unit => String::new(),
@@ -2312,14 +2290,14 @@ mod tests {
         let ch = dg.chapter(&parsed.tree);
         let mut it = Interp::new(&ch);
         it.run().unwrap_or_else(|e| panic!("{}", e.0));
-        it.out
+        String::from_utf8_lossy(&it.out).into_owned()
     }
 
     /// The two writes codexir's own harness makes, in program order.
     #[test]
     fn write_binary_and_print_text_write_in_program_order() {
         let src = "Chapter: T\n\nSection: E\n\n  opening : [Console] Nothing = act\n    write-binary [104, 105, 266]\n    print-text \"x\"\n  end\n";
-        assert_eq!(out(src), "hi\nx");
+        assert_eq!(out(src), "hi\n$", "`print-text` writes `x`'s unit, 36, raw");
     }
 
     /// Code 41 is `A` in the alphabet; a byte handed to raw-bytes-to-text is
@@ -2333,15 +2311,17 @@ mod tests {
         assert_eq!(lines.next(), Some("41"), "{out}");
     }
 
+    /// The output is bytes: `write-binary` and `print-text` write what they
+    /// are given, where `print-line-uni` decodes units as x86's console does.
     #[test]
-    fn write_binary_refuses_bytes_that_are_not_utf8() {
-        let src = b"Chapter: T\n\nSection: E\n\n  opening : [Console] Nothing = act\n    write-binary [255]\n  end\n".to_vec();
+    fn write_binary_and_print_text_write_raw_bytes() {
+        let src = b"Chapter: T\n\nSection: E\n\n  opening : [Console] Nothing = act\n    write-binary [255]\n    print-text \"A\"\n  end\n".to_vec();
         let parsed = crate::parser::parse(&src);
         let mut dg = crate::desugar::Desugar::new(&src);
         let ch = dg.chapter(&parsed.tree);
         let mut it = Interp::new(&ch);
-        let e = it.run().err().unwrap();
-        assert!(e.0.contains("not UTF-8"), "{}", e.0);
+        it.run().unwrap_or_else(|e| panic!("{}", e.0));
+        assert_eq!(it.out, vec![255, 41], "`A` is unit 41, written raw");
     }
 
     const BOX: &str = "Chapter: T\n\nSection: S\n\n  Box = record {\n    n : Integer,\n    m : Integer\n  }\n\n";
@@ -3196,30 +3176,26 @@ mod tests {
     /// A megabyte of ASCII with one `é` in it costs ONE entry, and every unit
     /// after that `é` still resolves to the right byte.
     #[test]
-    fn the_unit_index_costs_one_entry_per_multibyte_character() {
-        let ascii = Str::new(0, "a".repeat(1_000_000));
-        assert_eq!(ascii.mark_count(), 0, "pure ASCII indexes nothing at all");
-        assert_eq!(ascii.units(), 1_000_000);
+    fn a_text_is_units_and_a_framed_character_is_several() {
+        let t = Str::new(0, crate::charcode::units_of("aÀb"));
+        assert_eq!(t.units(), &[15, 193, 128, 32], "encode-json-escapes' units on bare metal");
+        assert_eq!(t.unit_slice(1, 2), &[193, 128]);
+        assert_eq!(t.unit_slice(-5, 99), t.units(), "clamped at both ends");
+        let c = Str::new(0, crate::charcode::units_of("Cyrillic (CCE 113-127 -> а о е)"));
+        assert_eq!(c.units().len(), 31, "tier-0 Cyrillic is one unit a letter");
+        assert_eq!(c.printed(), "Cyrillic (CCE 113-127 -> а о е)");
+    }
 
-        let mut big = "a".repeat(500_000);
-        big.push('é');
-        big.push_str(&"b".repeat(500_000));
-        let t = Str::new(0, big);
-        assert_eq!(t.mark_count(), 1, "one multi-byte character, one entry");
-        assert_eq!(t.units(), 1_000_001);
-        assert_eq!(t.unit_at(500_000), Some('é'));
-        assert_eq!(t.unit_at(500_001), Some('b'), "units after it still land right");
-        assert_eq!(t.unit_at(1_000_000), Some('b'));
-        assert_eq!(t.unit_at(1_000_001), None, "one past the end is past the end");
-        assert_eq!(t.unit_slice(499_999, 3), "aéb");
-
-        // The Cyrillic that started this: fifteen characters, fifteen entries,
-        // whatever the size of the text they sit in.
-        let title = format!("{}Cyrillic (CCE 113-127 -> а о е и н т с р в л к м д п у){}",
-                            "x".repeat(10_000), "y".repeat(10_000));
-        let c = Str::new(0, title);
-        assert_eq!(c.mark_count(), 15);
-        assert_eq!(c.unit_slice(10_000, 8), "Cyrillic");
+    /// `ops/unicode-bytes-roundtrip`'s rows, and a Char showing its code.
+    #[test]
+    fn framed_units_survive_the_unit_builtins() {
+        let says = |expr: &str| out(&mem_body(&format!("print-line-uni ({expr})"))).trim().to_string();
+        assert_eq!(says(r#"show (text-length "aÀb")"#), "4");
+        assert_eq!(says(r#"show (char-code-at "aÀb" 1)"#), "193");
+        assert_eq!(says(r#"show (char-code-at (raw-bytes-to-text [193, 128]) 1)"#), "128");
+        assert_eq!(says("show (code-to-char 41)"), "41", "a Char shows its code");
+        assert_eq!(says("char-to-text (code-to-char 41)"), "A");
+        assert_eq!(says(r#"show (text-length (char-encode (code-to-char 192)))"#), "2");
     }
 
     fn mem_body(body: &str) -> String {
