@@ -45,6 +45,14 @@ const MEMORY_OPS: [&str; 9] = [
     "peek-byte", "peek-16", "peek-32", "peek-qword", "poke-byte", "poke-16", "poke-32", "poke-qword", "alloc-bytes",
 ];
 
+/// The port builtins the machine answers: PCI configuration space, through
+/// 0xCF8 and 0xCFC. A unit that reaches one threads `Machine` where it would
+/// have threaded `Mem`, and the memory builtins become the machine's doors
+/// too. The Machine module is not written here: it is roc-apps' model of
+/// codex-vm's devices (machine/roc), and whatever runs the program supplies
+/// it beside the emitted modules.
+const PORT_OPS: [&str; 2] = ["port-out-32", "port-in-32"];
+
 const ROC_MODULES: [&str; 22] = [
     "Builtin", "BLAKE3", "Box", "Crypto", "Dec", "Digest", "Encoding", "Hasher", "HttpHeader", "Iter", "Json",
     "List", "Num", "Numeral", "Range", "SHA256", "Set", "Str", "Stream", "F32", "F64", "Bool",
@@ -383,6 +391,18 @@ pub fn emit_modules(
     let mut memory = false;
     for slug in &slugs {
         module_name(slug)?;
+        // **THE STATE'S MODULES SIT BESIDE THE CHAPTERS'.** `Mem` is written
+        // here and the machine's modules (`Machine`, `MachinePci`, ...) are
+        // copied in by whatever runs the program, so a chapter spelled like
+        // one would be overwritten by it or overwrite it.
+        let taken = match cx.state {
+            "Mem" => slug == "Mem",
+            "Machine" => slug.starts_with("Machine"),
+            _ => false,
+        };
+        if taken {
+            return Err(format!("chapter module `{slug}` is a name the threaded {} holds", cx.state));
+        }
         cx.current = slug.clone();
         cx.imports.clear();
         // The helper is per MODULE now: a chapter with a [Console] act
@@ -548,10 +568,11 @@ struct Cx<'a> {
     device_ops: std::collections::BTreeSet<Sym>,
     device_defs: std::collections::BTreeSet<Sym>,
     /// **THE STATE THIS UNIT THREADS.** `Device` for a GPU kernel, whose
-    /// type says so, or `Mem` for a program that reads and writes an
-    /// address space, whose type does NOT: Codex gives `peek-byte` and
-    /// friends an empty effect row, so the definitions that touch memory
-    /// are found by closure over the call graph instead (`new`).
+    /// type says so; `Mem` for a program that reads and writes an address
+    /// space, whose type does NOT: Codex gives `peek-byte` and friends an
+    /// empty effect row, so the definitions that touch memory are found by
+    /// closure over the call graph instead (`new`); and `Machine` when that
+    /// closure reaches a port as well (`PORT_OPS`).
     state: &'static str,
     /// The name holding the state at this point of an effectful body, and
     /// the count of names minted for it in this definition.
@@ -663,13 +684,17 @@ impl<'a> Cx<'a> {
             }
         }
         cx.wgsl = !cx.device_defs.is_empty();
-        // No kernel, so look for memory. A definition touches memory if it
-        // calls one of the builtins or calls something that does, and the
-        // closure runs until nothing new joins.
+        // No kernel, so look for memory and ports. A definition touches them
+        // if it calls one of the builtins or calls something that does, and
+        // the closure runs until nothing new joins. A port reached anywhere
+        // makes the state the machine.
         if cx.device_defs.is_empty() {
-            let ops: std::collections::BTreeSet<Sym> = MEMORY_OPS.iter().filter_map(|b| syms.find(b)).collect();
+            let ports: std::collections::BTreeSet<Sym> = PORT_OPS.iter().filter_map(|b| syms.find(b)).collect();
+            let ops: std::collections::BTreeSet<Sym> =
+                MEMORY_OPS.iter().filter_map(|b| syms.find(b)).chain(ports.iter().copied()).collect();
             if !ops.is_empty() {
                 let mut touch: std::collections::BTreeSet<Sym> = Default::default();
+                let mut machine = false;
                 loop {
                     let mut grew = false;
                     for d in defs {
@@ -682,6 +707,7 @@ impl<'a> Cx<'a> {
                                 if ops.contains(n) || touch.contains(n) {
                                     hit = true;
                                 }
+                                machine |= ports.contains(n);
                             }
                         });
                         if hit {
@@ -693,11 +719,10 @@ impl<'a> Cx<'a> {
                         break;
                     }
                 }
-                // The opening threads `Mem.new` itself (`opening`), so it
-                // stays the app's main rather than becoming a function of
-                // the memory.
+                // The opening makes the state itself (`opening`), so it stays
+                // the app's main rather than becoming a function of the state.
                 if !touch.is_empty() {
-                    cx.state = "Mem";
+                    cx.state = if machine { "Machine" } else { "Mem" };
                     cx.device_ops = ops;
                     cx.device_defs = touch;
                     if let Some(o) = syms.find("opening") {
@@ -1291,17 +1316,24 @@ impl<'a> Cx<'a> {
         let mark = self.locals.len();
         // `args` is read only to keep the memory out of the compiler's
         // reach (see `Mem.new`); every other opening leaves it unused.
-        let memory_first = self.state == "Mem" && self.has_effect(&d.body);
+        let memory_first = self.by_closure() && self.has_effect(&d.body);
         let mut out = String::from(if memory_first { "main! = |args| {\n" } else { "main! = |_args| {\n" });
         // **THE OPENING IS WHERE THE ADDRESS SPACE COMES FROM.** Every
         // definition that pokes takes the memory and answers it back; the
         // program's root is the one place that has to make one.
         let memory = memory_first;
         if memory {
-            self.imports.insert("Mem".into());
+            self.imports.insert(self.state.into());
             self.dev_n = 0;
             self.dev = Some(self.dev_base().to_string());
-            out.push_str(&format!("\t{} = Mem.new(U64.to_i64_wrap(List.len(args)))\n", self.dev_base()));
+            // The machine comes from the command line, as codex-vm's devices
+            // do; an address space alone needs nothing from it.
+            let make = if self.state == "Machine" {
+                "Machine.boot(args)"
+            } else {
+                "Mem.new(U64.to_i64_wrap(List.len(args)))"
+            };
+            out.push_str(&format!("\t{} = {make}\n", self.dev_base()));
         }
         // **AN OPENING MAY BE WRAPPED IN LETS**, and upstream runs the act
         // inside them; the bindings are main!'s own.
@@ -1411,15 +1443,22 @@ impl<'a> Cx<'a> {
         self.device_ops.contains(&n) || self.device_defs.contains(&n)
     }
 
-    /// The threaded state is `dev`, `dev1`, ... for a GPU device and
-    /// `mem`, `mem1`, ... for an address space: a Codex name spelled like
-    /// one would shadow it.
+    /// The threaded state is `dev`, `dev1`, ... for a GPU device, `mem`,
+    /// `mem1`, ... for an address space, and `machine`, `machine1`, ... for
+    /// the machine: a Codex name spelled like one would shadow it.
     fn dev_base(&self) -> &'static str {
-        if self.state == "Mem" {
-            "mem"
-        } else {
-            "dev"
+        match self.state {
+            "Mem" => "mem",
+            "Machine" => "machine",
+            _ => "dev",
         }
+    }
+
+    /// Whether the state was found by closure over the call graph -- an
+    /// address space, or the machine when a port is reached too -- rather
+    /// than read off a `[Device]` type.
+    fn by_closure(&self) -> bool {
+        self.state != "Device"
     }
 
     fn no_dev_name(&self, n: Sym) -> Result<(), String> {
@@ -1664,7 +1703,7 @@ impl<'a> Cx<'a> {
         // left behind, so it is read after they are emitted, not before.
         let mut xs = Vec::new();
         for a in args {
-            if self.is_effectful(a) && self.state != "Mem" {
+            if self.is_effectful(a) && !self.by_closure() {
                 return Err("an effectful argument".into());
             }
             xs.push(self.expr(a, ind)?);
@@ -1686,7 +1725,18 @@ impl<'a> Cx<'a> {
             }
         };
         self.imports.insert(self.state.into());
-        if self.state == "Mem" {
+        if self.by_closure() {
+            let s = self.state;
+            // `port-out-32` answers 0 and `port-in-32` the register read, as
+            // on x86; only the machine threads a port.
+            if text == "port-out-32" {
+                want(2)?;
+                return Ok(format!("{s}.port_out_32({})", xs.join(", ")));
+            }
+            if text == "port-in-32" {
+                want(1)?;
+                return Ok(format!("{s}.port_in_32({})", xs.join(", ")));
+            }
             // base, offset [, value]; a load answers the value and a store
             // answers 0, as the interpreter does.
             let width = |b: &str| -> Option<&'static str> {
@@ -1705,13 +1755,13 @@ impl<'a> Cx<'a> {
                     return Err(format!("`{text}` applied to {} arguments, takes {want}", args.len()));
                 }
                 let f = if load { "load" } else { "store" };
-                return Ok(format!("Mem.{f}({}, {w})", xs.join(", ")));
+                return Ok(format!("{s}.{f}({}, {w})", xs.join(", ")));
             }
             if text == "alloc-bytes" {
                 if args.len() != 1 {
                     return Err("`alloc-bytes` takes one argument".into());
                 }
-                return Ok(format!("Mem.alloc({})", xs.join(", ")));
+                return Ok(format!("{s}.alloc({})", xs.join(", ")));
             }
         }
         Ok(match text.as_str() {
@@ -1769,7 +1819,7 @@ impl<'a> Cx<'a> {
             // out the conditional the operator means -- `a and b` is `if a
             // then b else False` -- and thread the state through it.
             E::Binary(op, l, r, _, _)
-                if self.state == "Mem"
+                if self.by_closure()
                     && self.dev.is_some()
                     && matches!(op, IrBinOp::And | IrBinOp::Or)
                     && self.has_effect(r) =>
@@ -1826,7 +1876,7 @@ impl<'a> Cx<'a> {
             // if answers the state alongside its value, as a `[Device]`
             // definition does.
             E::If(c, t, f, _, _)
-                if self.state == "Mem"
+                if self.by_closure()
                     && self.dev.is_some()
                     && (self.has_effect(t) || self.has_effect(f)) =>
             {
@@ -1849,7 +1899,7 @@ impl<'a> Cx<'a> {
                 self.expr(f, ind)?
             ),
             E::Match(_, bs, _, _)
-                if self.state == "Mem"
+                if self.by_closure()
                     && self.dev.is_some()
                     && bs.iter().any(|b| self.has_effect(&b.body)) =>
             {
@@ -1865,7 +1915,7 @@ impl<'a> Cx<'a> {
             // alongside its value instead, and the binding of the pair is
             // what the enclosing expression hoists. Without this the
             // writes happen and the memory that holds them is dropped.
-            E::Let(..) if self.state == "Mem" && self.dev.is_some() && self.has_effect(e) => {
+            E::Let(..) if self.by_closure() && self.dev.is_some() && self.has_effect(e) => {
                 let block = self.eff_let(e, ind)?;
                 let d = self.fresh_dev();
                 let tmp = self.fresh_tmp();
@@ -1959,7 +2009,7 @@ impl<'a> Cx<'a> {
             return self.local(n);
         }
         if self.is_device_sym(n) {
-            if self.state == "Mem" && self.dev.is_some() {
+            if self.by_closure() && self.dev.is_some() {
                 let call = self.eff_call(n, &[], 0)?;
                 let d = self.fresh_dev();
                 let t = self.fresh_tmp();
@@ -2129,7 +2179,7 @@ impl<'a> Cx<'a> {
         let n = &self.instance_base(*n);
         let text = self.syms.text(*n).to_string();
         if self.is_device_sym(*n) {
-            if self.state == "Mem" && self.dev.is_some() {
+            if self.by_closure() && self.dev.is_some() {
                 // The arguments emit first, so whatever they hoist is
                 // already in the buffer ahead of this line.
                 let call = self.eff_call(*n, &args, ind)?;
