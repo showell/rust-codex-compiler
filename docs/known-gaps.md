@@ -50,6 +50,30 @@ Nine, six of them in `test/errors/`, and none at all in the compiler, foreword,
 plugs or os. Each error node carries the NAME of the CST kind it could not
 translate, so the list is actionable rather than a count.
 
+## The CCE round trip: codexrun and rocemit agree, and bare metal does not
+
+Measured at Update 60. These codex/test programs print differently from their
+`.expected`, and `codexrun` prints the same wrong lines the Roc arm does. The
+defect is therefore on the side the two arms share (the front end, or a builtin
+rule both mirror), not in either one:
+
+    ops/unicode-bytes-roundtrip    65 -> units [75], back 41   (expected [41], back 65)
+                                   192 -> units [0]            (expected [193 128])
+    ops/char-encode-bands          128 len=1 decoded=0         (expected a round trip)
+    forewords/encode-json-escapes  u00C0 len=3 units 15 0 32   (expected len=4, 15 193 128 32)
+    validation-rules               greek=ERR                   (expected greek=ok)
+    lib/utf8-cce-test              utf8-3byte-one-char=fail    (expected ok)
+
+The round trip is Codex, in `codex/foreword/core/CCE.codex` (`cce-encode` and
+its helpers), run by both arms through the same builtins. Two things to test
+first:
+- The expected outputs carry Text units 128..255, while `charcode.rs` holds
+  that the alphabet ends at 127 and maps nothing above it.
+- ASCII is wrong too: 65 comes back as unit 75.
+
+Cause not located. `arm64-http-test` also differs under both arms (`method=7'(`)
+and may share the cause; that is not measured.
+
 ## `literal_main` must differ
 
 Not a gap -- a required disagreement, and `safari/run.sh` fails if it ever

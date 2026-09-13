@@ -25,10 +25,10 @@ use std::collections::BTreeMap;
 /// header's own vocabulary is reserved everywhere, not only in a header:
 /// `targets` as a parameter name is a parse error in the middle of a
 /// module (codex/test's magic-sim-fixes).
-const KEYWORDS: [&str; 25] = [
-    "and", "app", "as", "crash", "dbg", "else", "expect", "exposes", "exposing", "for", "if", "import", "in",
-    "match", "module", "or", "packages", "platform", "provides", "requires", "return", "targets", "var", "where",
-    "while",
+const KEYWORDS: [&str; 34] = [
+    "and", "app", "as", "break", "crash", "dbg", "else", "expect", "exposes", "exposing", "for", "generates", "has",
+    "hosted", "if", "implements", "import", "imports", "in", "interface", "match", "module", "or", "package",
+    "packages", "platform", "provides", "requires", "return", "targets", "var", "where", "while", "with",
 ];
 
 /// Roc's own type names: a chapter that declares one of these spells it
@@ -366,20 +366,15 @@ pub fn emit_modules(
     let app_slug = defs.iter().find(|d| is_main(d)).map(|a| module_slug(&a.origin)).unwrap_or_default();
     cx.app = app_slug.clone();
     let mut slugs: Vec<String> = Vec::new();
+    let mut chapter_of: BTreeMap<String, String> = BTreeMap::new();
     for d in defs {
         if d.origin.is_empty() {
             return Err(format!("`{}` belongs to no chapter", syms.text(d.name)));
         }
-        let s = module_slug(&d.origin);
-        if !slugs.contains(&s) {
-            slugs.push(s);
-        }
+        claim_module(&mut slugs, &mut chapter_of, &d.origin)?;
     }
     for c in &ch.type_def_chapters {
-        let s = module_slug(c);
-        if !slugs.contains(&s) {
-            slugs.push(s);
-        }
+        claim_module(&mut slugs, &mut chapter_of, c)?;
     }
     let mut files = Vec::new();
     // Who each emitted module imports, for the prune below.
@@ -468,11 +463,32 @@ pub fn emit_modules(
     Ok(files)
 }
 
-/// The module a chapter becomes. A cited chapter's header is `Quire--Name`, and
-/// its module is `Name`: a unit carries a chapter name once (the resolver
-/// refuses a clash), so the quire adds nothing a module name needs.
+/// The module a chapter becomes: its name without the quire, its words run
+/// together, each capitalised. A cited chapter's header is `Quire--Name` and a
+/// program's is written as prose (`With-Timeout Test`), while a Roc module
+/// name is one capitalised alphanumeric word. Two chapters that come out the
+/// same are refused where the modules are collected (`claim_module`).
 fn module_slug(chapter: &str) -> String {
-    chapter.rsplit_once("--").map_or(chapter, |(_, name)| name).to_string()
+    let name = chapter.rsplit_once("--").map_or(chapter, |(_, name)| name);
+    name.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(|w| w[..1].to_ascii_uppercase() + &w[1..])
+        .collect()
+}
+
+/// Add `chapter`'s module to `slugs`, refusing a second chapter that comes out
+/// as the same module: their definitions would share one file.
+fn claim_module(slugs: &mut Vec<String>, chapter_of: &mut BTreeMap<String, String>, chapter: &str) -> Result<(), String> {
+    let s = module_slug(chapter);
+    match chapter_of.get(&s) {
+        Some(c) if c != chapter => Err(format!("chapters `{c}` and `{chapter}` are both module `{s}`")),
+        Some(_) => Ok(()),
+        None => {
+            chapter_of.insert(s.clone(), chapter.to_string());
+            slugs.push(s);
+            Ok(())
+        }
+    }
 }
 
 /// A chapter slug as a Roc module name: capitalised, alphanumeric, and not
@@ -1323,14 +1339,32 @@ impl<'a> Cx<'a> {
             return Ok(seal_state(out, memory, self.dev_base(), self.dev_n));
         }
         let IrExpr::Act(stmts, _, _) = body else { unreachable!() };
-        for s in stmts {
+        for (i, s) in stmts.iter().enumerate() {
             match s {
                 IrActStmt::Exec(e, _) => {
+                    let ty = e.ty();
                     let (lines, e) = self.hoisting(e, 1)?;
                     for l in lines {
                         out.push_str(&format!("\t{l}\n"));
                     }
-                    out.push_str(&format!("\t{e}\n"));
+                    // **AN ACT'S LAST VALUE IS THE OPENING'S**, and it is
+                    // printed like a value opening's: `opening : [Console]
+                    // Integer` ends `0`, and its verdict ends with that 0.
+                    let last = i + 1 == stmts.len();
+                    match ty {
+                        Ty::Integer(..) if last => {
+                            self.uses_line = true;
+                            out.push_str(&format!("\tline!(I64.to_str({e}))\n"));
+                        }
+                        Ty::Text if last => {
+                            self.uses_line = true;
+                            out.push_str(&format!("\tline!({e})\n"));
+                        }
+                        Ty::Boolean | Ty::Real(..) if last => {
+                            return Err(format!("an opening of type {}", crate::ir_text::render_ty(self.syms, &ty)));
+                        }
+                        _ => out.push_str(&format!("\t{e}\n")),
+                    }
                 }
                 IrActStmt::Bind(n, _, e, _) => {
                     let (lines, e) = self.hoisting(e, 1)?;
@@ -1888,6 +1922,16 @@ impl<'a> Cx<'a> {
                             let (lo, hi) = (*lo, *hi);
                             format!("{int}.min({int}.max({v}, {lo}), {hi})", int = self.int())
                         }
+                        // A wrapping field wraps into its range where it is
+                        // built, `lo + (v - lo) rem_euclid span` as the
+                        // interpreter's `apply_bound`; `mod_by` is floored,
+                        // which is Euclidean for a positive span.
+                        Some(Ty::Integer(lo, hi, crate::check::Overflow::Wrapping))
+                            if (*hi as i128 - *lo as i128 + 1) <= i64::MAX as i128 =>
+                        {
+                            let (lo, span) = (*lo, *hi - *lo + 1);
+                            format!("({lo} + {int}.mod_by({v} - ({lo}), {span}))", int = self.int())
+                        }
                         _ => v,
                     };
                     items.push(format!("{}: {}", self.ident(f.name)?, v));
@@ -2394,7 +2438,28 @@ impl<'a> Cx<'a> {
                     xs[0], xs[1]
                 )
             }
-            "print-line-uni" => {
+            // The builtin spelling of a unary minus, emitted as `E::Negate` is.
+            "negate" => {
+                want(1)?;
+                let t = args[0].ty();
+                let wrap = self.wgsl || matches!(t, Ty::Integer(_, _, crate::check::Overflow::Wrapping));
+                if wrap && matches!(t, Ty::Integer(..)) {
+                    format!("{}.minus_wrap(0, {})", self.int(), xs[0])
+                } else {
+                    format!("(-{})", xs[0])
+                }
+            }
+            // Containment and prefix are the same question over UTF-8 as over
+            // characters: a UTF-8 sequence cannot start inside another.
+            "text-contains" => {
+                want(2)?;
+                format!("Str.contains({}, {})", xs[0], xs[1])
+            }
+            "text-starts-with" => {
+                want(2)?;
+                format!("Str.starts_with({}, {})", xs[0], xs[1])
+            }
+            "print-line-uni" | "print-line" => {
                 want(1)?;
                 self.uses_line = true;
                 format!("line!({})", xs[0])
@@ -2682,6 +2747,37 @@ mod literals_round_trip {
     #[test]
     fn an_exponent_goes_through_bits() {
         assert_eq!(num_lit(1e21_f64.to_bits() as i64, false), format!("F64.from_bits({})", 1e21_f64.to_bits()));
+    }
+}
+
+#[cfg(test)]
+mod module_names {
+    use super::{claim_module, module_name, module_slug};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn a_chapter_name_becomes_one_capitalised_word() {
+        assert_eq!(module_slug("Foreword--ListUtils"), "ListUtils");
+        assert_eq!(module_slug("With-Timeout Test"), "WithTimeoutTest");
+        assert_eq!(module_slug("TextSearch Test"), "TextSearchTest");
+        assert_eq!(module_slug("List O1 Probe"), "ListO1Probe");
+        assert_eq!(module_name(&module_slug("Bounded Integer Ops")).unwrap(), "BoundedIntegerOps");
+    }
+
+    #[test]
+    fn a_name_with_no_roc_module_in_it_is_still_refused() {
+        assert!(module_name(&module_slug("2048 Board")).is_err());
+        assert!(module_name(&module_slug("Привет")).is_err());
+    }
+
+    #[test]
+    fn two_chapters_that_become_one_module_are_refused() {
+        let (mut slugs, mut of) = (Vec::new(), BTreeMap::new());
+        claim_module(&mut slugs, &mut of, "Core--Maybe").unwrap();
+        claim_module(&mut slugs, &mut of, "Core--Maybe").unwrap();
+        let e = claim_module(&mut slugs, &mut of, "Emit--Maybe").unwrap_err();
+        assert!(e.contains("`Core--Maybe`") && e.contains("`Emit--Maybe`"), "{e}");
+        assert_eq!(slugs, vec!["Maybe"]);
     }
 }
 
