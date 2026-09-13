@@ -1506,9 +1506,26 @@ impl Interp {
                 let _ = writeln!(self.out, "{line}");
                 Ok(Unit)
             }
-            ("print-uni" | "print", [v]) => {
+            ("print-uni" | "print" | "print-text", [v]) => {
                 let part = show(&self.syms, v);
                 let _ = write!(self.out, "{part}");
+                Ok(Unit)
+            }
+            // Each integer mod 256, as the zig plug's `cx_write_binary` writes
+            // it. The output here is text, so bytes that are not UTF-8 are
+            // refused rather than mangled.
+            ("write-binary", [List(xs)]) => {
+                let mut bytes = Vec::new();
+                for v in xs.borrow().iter() {
+                    let Int(i) = v else {
+                        return err(format!("write-binary given a list holding {}", type_name(v)));
+                    };
+                    bytes.push(i.rem_euclid(256) as u8);
+                }
+                let Ok(s) = String::from_utf8(bytes) else {
+                    return err("write-binary: bytes that are not UTF-8 cannot join this interpreter's text output".to_string());
+                };
+                self.out.push_str(&s);
                 Ok(Unit)
             }
 
@@ -2289,6 +2306,24 @@ mod tests {
         let mut it = Interp::new(&ch);
         it.run().unwrap_or_else(|e| panic!("{}", e.0));
         it.out
+    }
+
+    /// The two writes codexir's own harness makes, in program order.
+    #[test]
+    fn write_binary_and_print_text_write_in_program_order() {
+        let src = "Chapter: T\n\nSection: E\n\n  opening : [Console] Nothing = act\n    write-binary [104, 105, 266]\n    print-text \"x\"\n  end\n";
+        assert_eq!(out(src), "hi\nx");
+    }
+
+    #[test]
+    fn write_binary_refuses_bytes_that_are_not_utf8() {
+        let src = b"Chapter: T\n\nSection: E\n\n  opening : [Console] Nothing = act\n    write-binary [255]\n  end\n".to_vec();
+        let parsed = crate::parser::parse(&src);
+        let mut dg = crate::desugar::Desugar::new(&src);
+        let ch = dg.chapter(&parsed.tree);
+        let mut it = Interp::new(&ch);
+        let e = it.run().err().unwrap();
+        assert!(e.0.contains("not UTF-8"), "{}", e.0);
     }
 
     const BOX: &str = "Chapter: T\n\nSection: S\n\n  Box = record {\n    n : Integer,\n    m : Integer\n  }\n\n";
