@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ONE COMPILER, ONE SOURCE, TWO HOSTS -- and nothing else allowed to vary.
 
-    CODEX_ROOT=<checkout> ./ladder/hosts.py <subject.codex> [program ...]
+    ./ladder/hosts.py <subject.codex> [program ...]
 
 THE CONTROL IS `codexir`, NOT THE BANK. `codexir` is built from
 `generated/codexir-subject.codex`; `subject.codex` is that same file with its
@@ -152,8 +152,6 @@ def refuse_a_stale_binary(*bins):
 def main():
     if len(sys.argv) < 3:
         raise SystemExit(__doc__)
-    if "CODEX_ROOT" not in os.environ:
-        raise SystemExit("set CODEX_ROOT to the checkout the SUBJECT was built from")
     subject = pathlib.Path(sys.argv[1]).read_text()
     for b in (BIN, CODEXIR):
         if not b.is_file():
