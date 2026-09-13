@@ -577,6 +577,10 @@ struct Cx<'a> {
     /// the definitions whose type carries the effect.
     device_ops: std::collections::BTreeSet<Sym>,
     device_defs: std::collections::BTreeSet<Sym>,
+    /// The definitions whose signature takes `=>`. Roc spells an effectful
+    /// function's name with a trailing `!`, so `def` and `def_ref` read the
+    /// name off this set (`takes_bang`).
+    bang_defs: std::collections::BTreeSet<Sym>,
     /// **THE STATE THIS UNIT THREADS.** `Device` for a GPU kernel, whose
     /// type says so; `Mem` for a program that reads and writes an address
     /// space, whose type does NOT: Codex gives `peek-byte` and friends an
@@ -671,6 +675,7 @@ impl<'a> Cx<'a> {
             fold: None,
             device_ops: Default::default(),
             device_defs: Default::default(),
+            bang_defs: Default::default(),
             state: "Device",
             dev: None,
             dev_n: 0,
@@ -790,6 +795,7 @@ impl<'a> Cx<'a> {
                 }
             }
         }
+        cx.bang_defs = defs.iter().filter(|d| cx.takes_bang(d)).map(|d| d.name).collect();
         cx
     }
 
@@ -807,8 +813,8 @@ impl<'a> Cx<'a> {
     fn def_ref(&mut self, n: Sym) -> Result<String, String> {
         let m = self.def_module.get(&n).cloned().unwrap_or_default();
         let mut id = self.ident(n)?;
-        // A threaded definition under the machine is named with `!` (`def`).
-        if self.state == "Machine" && self.device_defs.contains(&n) {
+        // An effectful definition is named with `!` (`def`).
+        if self.bang_defs.contains(&n) {
             id.push('!');
         }
         Ok(self.qualified(&m, id))
@@ -974,9 +980,9 @@ impl<'a> Cx<'a> {
     /// the threaded state answers is not one: the state carries it.
     fn arrows(&mut self, d: &IrDef) -> Result<(Vec<String>, String, bool), String> {
         self.tvars.clear();
+        let eff = self.effect_left(d);
         let mut cur = &d.ty;
         let mut ps = Vec::new();
-        let mut eff = false;
         for _ in 0..d.params.len() {
             loop {
                 match cur {
@@ -985,8 +991,7 @@ impl<'a> Cx<'a> {
                 }
             }
             match cur {
-                Ty::Fun(p, row, r) => {
-                    eff |= row.labels.iter().any(|(l, _)| !self.threads(l));
+                Ty::Fun(p, _, r) => {
                     ps.push(self.ty(p)?);
                     cur = r;
                 }
@@ -1004,15 +1009,47 @@ impl<'a> Cx<'a> {
         // effectful in its type; the state's signature carries the effect, so
         // the result is the T.
         let r = match cur {
-            Ty::Effectful(names, _, inner)
-                if self.has_device(cur) || names.iter().any(|n| self.threads(self.syms.text(*n))) =>
-            {
-                eff |= names.iter().any(|n| !self.threads(self.syms.text(*n)));
-                self.ty(inner)?
-            }
+            Ty::Effectful(names, _, inner) if self.state_carries(cur, names) => self.ty(inner)?,
             _ => self.ty(cur)?,
         };
         Ok((ps, r, eff))
+    }
+
+    /// Whether any of a definition's `k` arrows, or the effectful result a
+    /// state carries, leaves an effect the threaded state does not answer.
+    fn effect_left(&self, d: &IrDef) -> bool {
+        let mut cur = &d.ty;
+        let mut eff = false;
+        for _ in 0..d.params.len() {
+            while let Ty::ForAll(_, b) | Ty::ForAllEff(_, b) = cur {
+                cur = b;
+            }
+            let Ty::Fun(_, row, r) = cur else { return eff };
+            eff |= row.labels.iter().any(|(l, _)| !self.threads(l));
+            cur = r;
+        }
+        if let Ty::Effectful(names, _, _) = cur {
+            if self.state_carries(cur, names) {
+                eff |= names.iter().any(|n| !self.threads(self.syms.text(*n)));
+            }
+        }
+        eff
+    }
+
+    /// A nullary `[Device] T`, or `[Device.Block] T` under the machine: the
+    /// state's signature carries the effect.
+    fn state_carries(&self, t: &Ty, names: &[Sym]) -> bool {
+        self.has_device(t) || names.iter().any(|n| self.threads(self.syms.text(*n)))
+    }
+
+    /// Whether a definition's signature takes `=>`, as `signature` and
+    /// `device_signature` write it.
+    fn takes_bang(&self, d: &IrDef) -> bool {
+        if self.device_defs.contains(&d.name) {
+            self.effect_left(d) || self.state == "Machine"
+        } else {
+            !d.params.is_empty() && self.effect_left(d)
+        }
     }
 
     /// Whether the threaded state answers an effect: `Device` for a GPU
@@ -1266,9 +1303,8 @@ impl<'a> Cx<'a> {
     /// A definition, whole; a data table of thousands of literals is emitted
     /// as the literal it is, since the nightly's checker is linear in them.
     fn def(&mut self, d: &IrDef, base: usize) -> Result<String, String> {
-        // Under the machine a threaded definition is an effect, and Roc
-        // spells an effect's name with `!` (`def_ref` agrees).
-        let bang = if self.state == "Machine" && self.device_defs.contains(&d.name) { "!" } else { "" };
+        // Roc spells an effectful function's name with `!` (`def_ref` agrees).
+        let bang = if self.bang_defs.contains(&d.name) { "!" } else { "" };
         let name = format!("{}{bang}", self.ident(d.name)?);
         // A write to a list parameter, in a definition that answers
         // something else, is a mutation the caller reads back (see
@@ -1313,7 +1349,7 @@ impl<'a> Cx<'a> {
         // operand of an append at a leaf of the if-tree, and nowhere else.
         let out = if !ps.is_empty() && is_right_fold(&d.body, d.name) {
             let acc = self.syms.find("acc").filter(|a| self.locals.contains(a)).map_or("acc", |_| "acc_");
-            let helper = format!("{name}_acc");
+            let helper = format!("{}_acc{bang}", self.ident(d.name)?);
             // `fun_parts` gives the result with its arrow ("-> List(a)"),
             // which is what the helper's signature ends with.
             let (params, ret) = self.fun_parts(&d.ty)?;
@@ -1344,6 +1380,37 @@ impl<'a> Cx<'a> {
         };
         self.locals.truncate(mark);
         Ok(out)
+    }
+
+    /// The effects an opening declares, as x86's boot reads them off its type
+    /// (`manifest-opening-effects`): the rows of its arrows, then an effectful
+    /// result's names, each once.
+    fn opening_effects(&self, t: &Ty) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut cur = t;
+        loop {
+            let names: Vec<&str> = match cur {
+                Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => {
+                    cur = b;
+                    continue;
+                }
+                Ty::Fun(_, row, r) => {
+                    cur = r;
+                    row.labels.iter().map(|(l, _)| l.as_str()).collect()
+                }
+                Ty::Effectful(names, _, inner) => {
+                    cur = inner;
+                    names.iter().map(|n| self.syms.text(*n)).collect()
+                }
+                _ => break,
+            };
+            for n in names {
+                if !out.iter().any(|o| o == n) {
+                    out.push(n.to_string());
+                }
+            }
+        }
+        out
     }
 
     /// `opening : [Console] Nothing = act ...` is `main!`.
@@ -1377,11 +1444,14 @@ impl<'a> Cx<'a> {
             self.dev_n = 0;
             self.dev = Some(self.dev_base().to_string());
             // The machine comes from the command line, as codex-vm's devices
-            // do; an address space alone needs nothing from it.
+            // do, and from the effects the opening declares, which x86's boot
+            // writes into the boot process's capability word; an address space
+            // alone needs nothing from either.
             let make = if self.state == "Machine" {
-                "Machine.boot!(args)"
+                let effs: Vec<String> = self.opening_effects(&d.ty).iter().map(|e| format!("\"{e}\"")).collect();
+                format!("Machine.boot!(args, [{}])", effs.join(", "))
             } else {
-                "Mem.new(U64.to_i64_wrap(List.len(args)))"
+                "Mem.new(U64.to_i64_wrap(List.len(args)))".to_string()
             };
             out.push_str(&format!("\t{} = {make}\n", self.dev_base()));
         }
@@ -1394,7 +1464,7 @@ impl<'a> Cx<'a> {
                 out.push_str(&format!("\t{l}\n"));
             }
             self.locals.push(*n);
-            out.push_str(&format!("\t{} = {v}\n", self.local(*n)?));
+            out.push_str(&format!("\t{} = {v}\n", self.binder(*n, &[inner])?));
             body = inner;
         }
         // **AN OPENING THAT IS A VALUE IS PRINTED**, which is what the
@@ -1454,7 +1524,8 @@ impl<'a> Cx<'a> {
                         out.push_str(&format!("\t{l}\n"));
                     }
                     self.locals.push(*n);
-                    out.push_str(&format!("\t{} = {e}\n", self.local(*n)?));
+                    let rest: Vec<&IrExpr> = stmts[i + 1..].iter().map(|s| s.expr()).collect();
+                    out.push_str(&format!("\t{} = {e}\n", self.binder(*n, &rest)?));
                 }
             }
         }
@@ -1848,8 +1919,11 @@ impl<'a> Cx<'a> {
 
     /// A binder that nothing reads is spelled `_name`, which is Roc's way of
     /// saying so; an unused variable is a warning, and a warning is exit 2.
+    /// A heap mark handed only to `__heap-restore` is read by nothing, since
+    /// the restore is emitted as `0`.
     fn binder(&self, n: Sym, scope: &[&IrExpr]) -> Result<String, String> {
-        let used = scope.iter().any(|e| uses(e, n));
+        let restore = self.syms.find("__heap-restore");
+        let used = scope.iter().any(|e| reads(e, n, restore));
         let id = self.local(n)?;
         Ok(if used { id } else { format!("_{id}") })
     }
@@ -2758,6 +2832,23 @@ fn uses(e: &IrExpr, n: Sym) -> bool {
         }
     });
     found
+}
+
+/// Whether the emitted text reads `n`: a mention anywhere but as the
+/// argument of `restore`, whose argument is not emitted.
+fn reads(e: &IrExpr, n: Sym, restore: Option<Sym>) -> bool {
+    let (mut all, mut marks) = (0, 0);
+    e.walk(&mut |x| match x {
+        IrExpr::Name(m, _, _) if *m == n => all += 1,
+        IrExpr::Apply(f, a, _, _)
+            if matches!(**f, IrExpr::Name(r, _, _) if Some(r) == restore)
+                && matches!(**a, IrExpr::Name(m, _, _) if m == n) =>
+        {
+            marks += 1
+        }
+        _ => {}
+    });
+    all > marks
 }
 
 /// A Codex name as a Roc identifier: kebab to snake, keywords suffixed. A
