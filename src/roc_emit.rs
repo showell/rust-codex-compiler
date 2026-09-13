@@ -45,13 +45,23 @@ const MEMORY_OPS: [&str; 9] = [
     "peek-byte", "peek-16", "peek-32", "peek-qword", "poke-byte", "poke-16", "poke-32", "poke-qword", "alloc-bytes",
 ];
 
-/// The port builtins the machine answers: PCI configuration space, through
-/// 0xCF8 and 0xCFC. A unit that reaches one threads `Machine` where it would
-/// have threaded `Mem`, and the memory builtins become the machine's doors
-/// too. The Machine module is not written here: it is roc-apps' model of
-/// codex-vm's devices (machine/roc), and whatever runs the program supplies
-/// it beside the emitted modules.
-const PORT_OPS: [&str; 2] = ["port-out-32", "port-in-32"];
+/// The builtins the machine answers: PCI configuration space through 0xCF8
+/// and 0xCFC, the block device, and the running process's id and scope. A
+/// unit that reaches one threads `Machine` where it would have threaded
+/// `Mem`, and the memory builtins become the machine's doors too. The Machine
+/// module is not written here: it is roc-apps' model of codex-vm and the
+/// kernel (machine/roc), and whatever runs the program supplies it beside the
+/// emitted modules.
+const MACHINE_OPS: [&str; 8] = [
+    "port-out-32",
+    "port-in-32",
+    "block-read-sector",
+    "block-write-sector",
+    "block-sector-count",
+    "block-select",
+    "process-get-pid",
+    "process-get-scope",
+];
 
 const ROC_MODULES: [&str; 22] = [
     "Builtin", "BLAKE3", "Box", "Crypto", "Dec", "Digest", "Encoding", "Hasher", "HttpHeader", "Iter", "Json",
@@ -572,7 +582,7 @@ struct Cx<'a> {
     /// space, whose type does NOT: Codex gives `peek-byte` and friends an
     /// empty effect row, so the definitions that touch memory are found by
     /// closure over the call graph instead (`new`); and `Machine` when that
-    /// closure reaches a port as well (`PORT_OPS`).
+    /// closure reaches a port or the block device as well (`MACHINE_OPS`).
     state: &'static str,
     /// The name holding the state at this point of an effectful body, and
     /// the count of names minted for it in this definition.
@@ -684,14 +694,14 @@ impl<'a> Cx<'a> {
             }
         }
         cx.wgsl = !cx.device_defs.is_empty();
-        // No kernel, so look for memory and ports. A definition touches them
-        // if it calls one of the builtins or calls something that does, and
-        // the closure runs until nothing new joins. A port reached anywhere
-        // makes the state the machine.
+        // No kernel, so look for memory and devices. A definition touches
+        // them if it calls one of the builtins or calls something that does,
+        // and the closure runs until nothing new joins. A device builtin
+        // reached anywhere makes the state the machine.
         if cx.device_defs.is_empty() {
-            let ports: std::collections::BTreeSet<Sym> = PORT_OPS.iter().filter_map(|b| syms.find(b)).collect();
+            let devices: std::collections::BTreeSet<Sym> = MACHINE_OPS.iter().filter_map(|b| syms.find(b)).collect();
             let ops: std::collections::BTreeSet<Sym> =
-                MEMORY_OPS.iter().filter_map(|b| syms.find(b)).chain(ports.iter().copied()).collect();
+                MEMORY_OPS.iter().filter_map(|b| syms.find(b)).chain(devices.iter().copied()).collect();
             if !ops.is_empty() {
                 let mut touch: std::collections::BTreeSet<Sym> = Default::default();
                 let mut machine = false;
@@ -707,7 +717,7 @@ impl<'a> Cx<'a> {
                                 if ops.contains(n) || touch.contains(n) {
                                     hit = true;
                                 }
-                                machine |= ports.contains(n);
+                                machine |= devices.contains(n);
                             }
                         });
                         if hit {
@@ -942,18 +952,21 @@ impl<'a> Cx<'a> {
     }
 
     /// A `[Device]` definition's signature: the device first, and the pair
-    /// last.
+    /// last. The arrow is `=>` when an effect the state does not answer is
+    /// left over: a definition that reads the disk and prints.
     fn device_signature(&mut self, d: &IrDef) -> Result<String, String> {
-        let (ps, r, _) = self.arrows(d)?;
+        let (ps, r, eff) = self.arrows(d)?;
         let mut all = vec![format!("{s}.{s}", s = self.state)];
         all.extend(ps);
-        let sig = format!("{} -> ({s}.{s}, {r})", all.join(", "), s = self.state);
+        let arrow = if eff { "=>" } else { "->" };
+        let sig = format!("{} {arrow} ({s}.{s}, {r})", all.join(", "), s = self.state);
         let wants = self.eq_wants(d)?;
         Ok(if wants.is_empty() { sig } else { format!("{sig} where [{}]", wants.join(", ")) })
     }
 
     /// `k` parameters peel `k` arrows: the parameter types, the result, and
-    /// whether any of those arrows performs an effect.
+    /// whether any of those arrows performs an effect Roc must see. An effect
+    /// the threaded state answers is not one: the state carries it.
     fn arrows(&mut self, d: &IrDef) -> Result<(Vec<String>, String, bool), String> {
         self.tvars.clear();
         let mut cur = &d.ty;
@@ -968,7 +981,7 @@ impl<'a> Cx<'a> {
             }
             match cur {
                 Ty::Fun(p, row, r) => {
-                    eff |= !row.labels.is_empty();
+                    eff |= row.labels.iter().any(|(l, _)| !self.threads(l));
                     ps.push(self.ty(p)?);
                     cur = r;
                 }
@@ -982,13 +995,30 @@ impl<'a> Cx<'a> {
                 }
             }
         }
-        // A nullary `[Device] T` is effectful in its type; the device
-        // signature carries the effect, so the result is the T.
+        // A nullary `[Device] T`, or `[Device.Block] T` under the machine, is
+        // effectful in its type; the state's signature carries the effect, so
+        // the result is the T.
         let r = match cur {
-            Ty::Effectful(_, _, inner) if self.has_device(cur) => self.ty(inner)?,
+            Ty::Effectful(names, _, inner)
+                if self.has_device(cur) || names.iter().any(|n| self.threads(self.syms.text(*n))) =>
+            {
+                eff |= names.iter().any(|n| !self.threads(self.syms.text(*n)));
+                self.ty(inner)?
+            }
             _ => self.ty(cur)?,
         };
         Ok((ps, r, eff))
+    }
+
+    /// Whether the threaded state answers an effect: `Device` for a GPU
+    /// kernel, the `Device.` family (`Device.Block`, `Device.Port`) for the
+    /// machine. `Mem` answers none, since the memory builtins carry none.
+    fn threads(&self, label: &str) -> bool {
+        match self.state {
+            "Device" => label == "Device",
+            "Machine" => label.starts_with("Device."),
+            _ => false,
+        }
     }
 
     /// **`==` ON A TYPE VARIABLE NEEDS A `where` CLAUSE.** Roc's equality
@@ -1313,6 +1343,18 @@ impl<'a> Cx<'a> {
         if !d.params.is_empty() {
             return Err("opening takes parameters".into());
         }
+        // **THE MACHINE RUNS ONE UNSCOPED PROCESS.** x86 stores the opening's
+        // FileSystem and Network scopes as the boot process's before it runs,
+        // and `process-get-scope` answers them; the machine answers the empty
+        // scope, which admits every path, so an opening that declares one is
+        // refused rather than run with its scope dropped.
+        if self.state == "Machine" {
+            if let Ty::Effectful(names, scopes, _) = &d.ty {
+                if let Some((n, s)) = names.iter().zip(scopes).find(|(_, s)| !s.is_empty()) {
+                    return Err(format!("an opening scoped to {} \"{s}\"", self.syms.text(*n)));
+                }
+            }
+        }
         let mark = self.locals.len();
         // `args` is read only to keep the memory out of the compiler's
         // reach (see `Mem.new`); every other opening leaves it unused.
@@ -1455,8 +1497,8 @@ impl<'a> Cx<'a> {
     }
 
     /// Whether the state was found by closure over the call graph -- an
-    /// address space, or the machine when a port is reached too -- rather
-    /// than read off a `[Device]` type.
+    /// address space, or the machine when a device builtin is reached too --
+    /// rather than read off a `[Device]` type.
     fn by_closure(&self) -> bool {
         self.state != "Device"
     }
@@ -1727,15 +1769,19 @@ impl<'a> Cx<'a> {
         self.imports.insert(self.state.into());
         if self.by_closure() {
             let s = self.state;
-            // `port-out-32` answers 0 and `port-in-32` the register read, as
-            // on x86; only the machine threads a port.
-            if text == "port-out-32" {
-                want(2)?;
-                return Ok(format!("{s}.port_out_32({})", xs.join(", ")));
-            }
-            if text == "port-in-32" {
-                want(1)?;
-                return Ok(format!("{s}.port_in_32({})", xs.join(", ")));
+            // A device builtin is the machine's door of the same name, and the
+            // door answers as x86 does: `port-out-32`, a block write and a
+            // select answer 0, and a block read answers the address of the
+            // sector it bump-allocated. Only the machine threads one.
+            let door = match text.as_str() {
+                "port-out-32" | "block-write-sector" => Some(2),
+                "port-in-32" | "block-read-sector" | "block-select" | "process-get-scope" => Some(1),
+                "block-sector-count" | "process-get-pid" => Some(0),
+                _ => None,
+            };
+            if let Some(k) = door {
+                want(k)?;
+                return Ok(format!("{s}.{}({})", text.replace('-', "_"), xs.join(", ")));
             }
             // base, offset [, value]; a load answers the value and a store
             // answers 0, as the interpreter does.
@@ -2507,6 +2553,10 @@ impl<'a> Cx<'a> {
             "text-contains" => {
                 want(2)?;
                 format!("Str.contains({}, {})", xs[0], xs[1])
+            }
+            "text-concat-list" => {
+                want(1)?;
+                format!("Str.join_with({}, \"\")", xs[0])
             }
             "text-starts-with" => {
                 want(2)?;
