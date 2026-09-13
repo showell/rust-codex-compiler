@@ -2662,17 +2662,17 @@ mod literals_round_trip {
     #[test]
     fn the_fourth_case_keeps_its_digits() {
         let bits = 0.012500000000000011_f64.to_bits() as i64;
-        assert_eq!(num_lit(bits), "0.012500000000000011");
+        assert_eq!(num_lit(bits, false), "0.012500000000000011");
     }
 
     #[test]
     fn a_negative_is_parenthesised() {
-        assert_eq!(num_lit((-0.25_f64).to_bits() as i64), "(-0.25)");
+        assert_eq!(num_lit((-0.25_f64).to_bits() as i64, false), "(-0.25)");
     }
 
     #[test]
     fn an_exponent_goes_through_bits() {
-        assert_eq!(num_lit(1e21_f64.to_bits() as i64), format!("F64.from_bits({})", 1e21_f64.to_bits()));
+        assert_eq!(num_lit(1e21_f64.to_bits() as i64, false), format!("F64.from_bits({})", 1e21_f64.to_bits()));
     }
 }
 
