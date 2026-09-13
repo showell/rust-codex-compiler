@@ -1611,10 +1611,17 @@ impl Interp {
                 Ok(Bool((1..=2).contains(&char_code(*c))))
             }
             // `List Integer -> Text`, the bytes as written.
+            // **EACH BYTE IS A CCE UNIT, NOT UTF-8.** Upstream hands this
+            // builtin codes already (`utf8-to-cce-loop` in X86_64State.codex),
+            // and its helper copies them in. A unit above 127 frames a
+            // character outside the alphabet and has no character here, so it
+            // reads back as 0 (docs/known-gaps.md).
             ("raw-bytes-to-text", [List(xs)]) => {
-                let bytes: Vec<u8> =
-                    xs.borrow().iter().map(|v| if let Int(i) = v { *i as u8 } else { 0 }).collect();
-                let t = String::from_utf8_lossy(&bytes).into_owned();
+                let t: String = xs
+                    .borrow()
+                    .iter()
+                    .map(|v| code_to_char(if let Int(i) = v { (*i as u8) as i64 } else { 0 }))
+                    .collect();
                 self.text(t)
             }
 
@@ -2313,6 +2320,17 @@ mod tests {
     fn write_binary_and_print_text_write_in_program_order() {
         let src = "Chapter: T\n\nSection: E\n\n  opening : [Console] Nothing = act\n    write-binary [104, 105, 266]\n    print-text \"x\"\n  end\n";
         assert_eq!(out(src), "hi\nx");
+    }
+
+    /// Code 41 is `A` in the alphabet; a byte handed to raw-bytes-to-text is
+    /// a code, not ASCII (where 41 would be `)`).
+    #[test]
+    fn raw_bytes_are_cce_units() {
+        let src = "Chapter: T\n\nSection: E\n\n  opening : [Console] Nothing = act\n    print-line-uni (raw-bytes-to-text [41, 42])\n    print-line-uni (show (char-code-at (raw-bytes-to-text [41]) 0))\n  end\n";
+        let out = out(src);
+        let mut lines = out.lines();
+        assert_eq!(lines.next().map(|l| l.chars().next()), Some(Some('A')), "{out}");
+        assert_eq!(lines.next(), Some("41"), "{out}");
     }
 
     #[test]

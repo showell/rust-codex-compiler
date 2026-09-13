@@ -2252,9 +2252,12 @@ impl<'a> Cx<'a> {
             // `List Integer -> Text`, the bytes as written: raw UTF-8,
             // not the CCE alphabet, and a byte that is not valid UTF-8
             // becomes the replacement character (interp.rs).
-            "raw-bytes-to-text" => {
+            // Each byte is a CCE unit, as the interpreter's rule says.
+            "raw-bytes-to-text" if !self.wgsl => {
                 want(1)?;
-                format!("Str.from_utf8_lossy(List.map({}, |b| {int}.to_u8_wrap(b)))", xs[0])
+                self.uses_cce = true;
+                self.imports.insert("Cce".into());
+                format!("Cce.str_of(List.map({}, |b| I64.bitwise_and(b, 255)))", xs[0])
             }
             "text-split" => {
                 want(2)?;

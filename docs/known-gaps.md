@@ -64,15 +64,18 @@ rule both mirror), not in either one:
     validation-rules               greek=ERR                   (expected greek=ok)
     lib/utf8-cce-test              utf8-3byte-one-char=fail    (expected ok)
 
-The round trip is Codex, in `codex/foreword/core/CCE.codex` (`cce-encode` and
-its helpers), run by both arms through the same builtins. Two things to test
-first:
-- The expected outputs carry Text units 128..255, while `charcode.rs` holds
-  that the alphabet ends at 127 and maps nothing above it.
-- ASCII is wrong too: 65 comes back as unit 75.
+The round trip is Codex, in `codex/foreword/core/CCE.codex`: it maps each code
+point into the alphabet, frames one outside it into units 128..255, and hands
+the list to the builtin `raw-bytes-to-text`.
 
-Cause not located. `arm64-http-test` also differs under both arms (`method=7'(`)
-and may share the cause; that is not measured.
+**Half of it was that builtin, and is fixed.** Both arms decoded its bytes as
+UTF-8, where upstream copies them in as units, so ASCII broke too (65 came back
+as unit 75). With that fixed, every row inside the alphabet matches, and
+`arm64-http-test` passes.
+
+**The other half is the representation.** A Text here is a string of real
+characters, and a lone framing unit 128..255 has none: it reads back as 0. The
+rows that remain are exactly those units (192 is `[0 0]` against `[193 128]`).
 
 ## `literal_main` must differ
 
