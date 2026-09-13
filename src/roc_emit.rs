@@ -46,15 +46,20 @@ const MEMORY_OPS: [&str; 9] = [
 ];
 
 /// The builtins the machine answers: PCI configuration space through 0xCF8
-/// and 0xCFC, the block device, and the running process's id and scope. A
-/// unit that reaches one threads `Machine` where it would have threaded
-/// `Mem`, and the memory builtins become the machine's doors too. The Machine
-/// module is not written here: it is roc-apps' model of codex-vm and the
-/// kernel (machine/roc), and whatever runs the program supplies it beside the
-/// emitted modules.
-const MACHINE_OPS: [&str; 8] = [
+/// and 0xCFC, the MMIO pair (a load and a store, like the memory builtins,
+/// answered by whatever backs the address), the block device, and the running
+/// process's id and scope. A unit that reaches one threads `Machine` where it
+/// would have threaded `Mem`, and the memory builtins become the machine's
+/// doors too. The Machine module is not written here: it is roc-apps' model of
+/// codex-vm and the kernel (machine/roc), and whatever runs the program
+/// supplies it beside the emitted modules.
+const MACHINE_OPS: [&str; 12] = [
     "port-out-32",
     "port-in-32",
+    "read-mmio",
+    "poke-mmio",
+    "read-mmio-32",
+    "poke-mmio-32",
     "block-read-sector",
     "block-write-sector",
     "block-sector-count",
@@ -1869,15 +1874,15 @@ impl<'a> Cx<'a> {
             // answers 0, as the interpreter does.
             let width = |b: &str| -> Option<&'static str> {
                 match b {
-                    "peek-byte" | "poke-byte" => Some("1"),
+                    "peek-byte" | "poke-byte" | "read-mmio" | "poke-mmio" => Some("1"),
                     "peek-16" | "poke-16" => Some("2"),
-                    "peek-32" | "poke-32" => Some("4"),
+                    "peek-32" | "poke-32" | "read-mmio-32" | "poke-mmio-32" => Some("4"),
                     "peek-qword" | "poke-qword" => Some("8"),
                     _ => None,
                 }
             };
             if let Some(w) = width(&text) {
-                let load = text.starts_with("peek");
+                let load = text.starts_with("peek") || text.starts_with("read");
                 let want = if load { 2 } else { 3 };
                 if args.len() != want {
                     return Err(format!("`{text}` applied to {} arguments, takes {want}", args.len()));
