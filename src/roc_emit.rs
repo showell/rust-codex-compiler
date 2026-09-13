@@ -363,20 +363,22 @@ pub fn emit_modules(
     // is a kernel like any other, not a main.
     let device_defs = cx.device_defs.clone();
     let is_main = |d: &IrDef| syms.text(d.name) == "opening" && !device_defs.contains(&d.name);
-    let app_slug = defs.iter().find(|d| is_main(d)).map(|a| a.origin.clone()).unwrap_or_default();
+    let app_slug = defs.iter().find(|d| is_main(d)).map(|a| module_slug(&a.origin)).unwrap_or_default();
     cx.app = app_slug.clone();
     let mut slugs: Vec<String> = Vec::new();
     for d in defs {
         if d.origin.is_empty() {
             return Err(format!("`{}` belongs to no chapter", syms.text(d.name)));
         }
-        if !slugs.contains(&d.origin) {
-            slugs.push(d.origin.clone());
+        let s = module_slug(&d.origin);
+        if !slugs.contains(&s) {
+            slugs.push(s);
         }
     }
     for c in &ch.type_def_chapters {
-        if !slugs.contains(c) {
-            slugs.push(c.clone());
+        let s = module_slug(c);
+        if !slugs.contains(&s) {
+            slugs.push(s);
         }
     }
     let mut files = Vec::new();
@@ -394,12 +396,12 @@ pub fn emit_modules(
         let mut items = String::new();
         let base = if *slug == app_slug { 0 } else { 1 };
         for (td, c) in ch.type_defs.iter().zip(&ch.type_def_chapters) {
-            if c == slug {
+            if module_slug(c) == *slug {
                 items.push_str(&cx.type_def(td, base)?);
             }
         }
         let mut main = None;
-        for d in defs.iter().filter(|d| d.origin == *slug) {
+        for d in defs.iter().filter(|d| module_slug(&d.origin) == *slug) {
             if is_main(d) {
                 main = Some(cx.opening(d)?);
                 continue;
@@ -464,6 +466,13 @@ pub fn emit_modules(
         files.retain(|(name, _)| seen.contains(name.trim_end_matches(".roc")));
     }
     Ok(files)
+}
+
+/// The module a chapter becomes. A cited chapter's header is `Quire--Name`, and
+/// its module is `Name`: a unit carries a chapter name once (the resolver
+/// refuses a clash), so the quire adds nothing a module name needs.
+fn module_slug(chapter: &str) -> String {
+    chapter.rsplit_once("--").map_or(chapter, |(_, name)| name).to_string()
 }
 
 /// A chapter slug as a Roc module name: capitalised, alphanumeric, and not
@@ -685,10 +694,10 @@ impl<'a> Cx<'a> {
             let n = match td {
                 TypeDef::Record(n, ..) | TypeDef::Variant(n, ..) | TypeDef::Unit(n, ..) => *n,
             };
-            cx.type_module.insert(n, c.clone());
+            cx.type_module.insert(n, module_slug(c));
         }
         for d in defs {
-            cx.def_module.insert(d.name, d.origin.clone());
+            cx.def_module.insert(d.name, module_slug(&d.origin));
         }
         // Who mentions whom, over the declared types alone, and then who
         // reaches themselves: one round of closure per type is enough for a

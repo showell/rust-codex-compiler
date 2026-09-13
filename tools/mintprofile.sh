@@ -5,9 +5,8 @@
 # resulting sequences is the per-definition cost. Diff the two profiles and you
 # have every diverging definition in the file, not just the first.
 set -u
-# Both sides must see the SAME truncated bytes: the oracle reads its stdin raw,
-# so ours must not re-resolve the chapters a prefix cut (see bundle::load).
-export CODEXC_RAW=1
+# Both sides see the SAME truncated bytes: checkdump reads its file raw, as the
+# oracle reads its stdin.
 U="$1"
 OURS="${CHECKDUMP:-$HOME/build/rust-target/release/checkdump}"
 ORAC="${CODEXCHECK:-$HOME/showell_repos/codex-zig-transpiler/generated/local/codexcheck}"

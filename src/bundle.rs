@@ -19,20 +19,26 @@
 //! `codex/foreword/core/Hamt.codex`. So the registry is DATA, read like the
 //! chapters are, and this module parses it rather than asking another tool to.
 //!
-//! WHAT IT REFUSES OR REPORTS, which is where a second opinion earns its keep.
-//! The Python resolver answers a case-insensitive lookup silently, because the
-//! registry is a PowerShell hashtable and those are case-insensitive. That is
-//! faithful, and it is also how `UI` spelled `Ui` fourteen times went unnoticed
-//! until it had silently dropped whole programs from every sweep. Here the
-//! lookup still succeeds -- refusing would help nobody -- and it SAYS SO. Same
-//! for a registered directory that does not exist, and for a cite that names a
-//! chapter no file provides.
+//! THE RULES, one each, with no second way in:
+//!
+//! - **The program names its checkout.** A file inside a Cobblestone checkout
+//!   resolves against that checkout; a project outside one names it with a
+//!   `checkout <path>` line in its `quires.tsv`. The environment is never read.
+//! - **A cited chapter is written under its quire**, `Chapter: Foreword--Maybe`,
+//!   as upstream's compile step writes it. The program's own chapter keeps its
+//!   header.
+//! - **A cite is present only under its own quire.** The same chapter name
+//!   carried under another prefix, or plain, is a CLASH and the unit is
+//!   refused. Upstream's two resolvers answer that case differently -- one
+//!   skips the cite, the other adds a second copy -- so it is refused here
+//!   rather than decided.
+//! - **Resolving a resolved unit changes nothing, and needs no checkout.**
 //!
 //! THE ORDER IS LOAD-BEARING AND IT IS UPSTREAM'S. Dependencies before the
 //! thing that cites them, transitively, each one once, depth first. Two
 //! chapters the desugarer needs and no author would think to cite -- ListUtils,
 //! because `for x in xs` becomes `map-list`, and Tuple, because a tuple literal
-//! becomes `MkTup<N>` -- lead every unit unless the source already embeds them.
+//! becomes `MkTup<N>` -- lead every unit.
 
 use crate::cst::NodeKind;
 use crate::parser;
@@ -43,6 +49,9 @@ use std::path::{Path, PathBuf};
 
 /// The two chapters every unit gets whether or not anything cites them.
 const IMPLICIT: [(&str, &str); 2] = [("Foreword", "ListUtils"), ("Foreword", "Tuple")];
+
+/// What makes a directory a Cobblestone checkout: the compiler's driver.
+const MARKER: &str = "codex/compiler/opening.codex";
 
 /// Something worth saying out loud about a bundle that was still produced.
 ///
@@ -73,12 +82,10 @@ pub enum Complaint {
     /// every program reaches transitively.
     ///
     /// **REPORTED AND FATAL, because the compiled program is NOT the same
-    /// either way.** This comment used to say that it was -- that a carriage
-    /// return is trivia and only the bytes differ -- and that was measured
-    /// wrong: `codexir` halts with CDX1000 when an unmapped byte lands inside
-    /// a TYPE, and a `Chapter:` line ending in CRLF puts the return inside the
-    /// chapter name, where it defeats the cite that names the chapter without
-    /// one. Both failures read as something else entirely.
+    /// either way.** `codexir` halts with CDX1000 when an unmapped byte lands
+    /// inside a TYPE, and a `Chapter:` line ending in CRLF puts the return
+    /// inside the chapter name, where it defeats the cite that names the
+    /// chapter without one. Both failures read as something else entirely.
     ///
     /// The bytes are still kept as they were read. What changed is that the
     /// bundler will not WRITE a unit it knows cannot compile.
@@ -92,6 +99,13 @@ pub enum Complaint {
     /// resolving somewhere other than where the checkout says is not something
     /// to decide in silence.
     ShadowedQuire { quire: String, local: PathBuf, upstream: PathBuf },
+}
+
+impl Complaint {
+    /// A unit with this complaint is missing a chapter it cites.
+    pub fn is_broken(&self) -> bool {
+        matches!(self, Complaint::UnregisteredQuire { .. } | Complaint::NoSuchChapter { .. })
+    }
 }
 
 impl fmt::Display for Complaint {
@@ -133,19 +147,17 @@ impl Quires {
     ///
     /// The local file is how a project that is not the depot names its own
     /// quires -- safari's `Safari`, `Judge` and `Gold` are its own directories.
-    /// One `name<TAB>relative/dir` per line, `#` to end of line is a comment.
+    /// One `name<space>relative/dir` per line, `#` to end of line is a comment,
+    /// and a `checkout <path>` line names the checkout (see [`project_of`]).
     /// It is a FILE rather than a flag because the answer belongs to the
     /// project, not to the invocation.
     ///
     /// **THE LOCAL FILE WINS, and upstream having never heard of these names is
     /// not something to rely on.** It stopped being true at Update 55, which
     /// took safari's `port/` into the checkout as `apps/safari/port` under the
-    /// name `Safari`. Appending the local entries and taking the first match
-    /// silently resolved every safari cite to upstream's snapshot instead: the
-    /// Python resolver assigns into a dict and had always given the project the
-    /// last word, so the two bundlers disagreed on 34 of 35 targets the day the
-    /// pin moved. A shadowed name is removed here rather than merely outranked,
-    /// so that spelling it in a different case cannot reach the loser either.
+    /// name `Safari`. A shadowed name is removed here rather than merely
+    /// outranked, so that spelling it in a different case cannot reach the loser
+    /// either.
     pub fn read(codex: &Path, local: Option<&Path>) -> Result<Self, String> {
         let mut entries = Vec::new();
         let map = codex.join("build").join("quire-map.ps1");
@@ -164,13 +176,10 @@ impl Quires {
             let base = path.parent().unwrap_or(Path::new("."));
             let mut mine: Vec<(String, PathBuf)> = Vec::new();
             for (n, line) in text.lines().enumerate() {
-                let line = line.split('#').next().unwrap_or("").trim();
-                if line.is_empty() {
-                    continue;
-                }
-                let mut it = line.split_whitespace();
-                match (it.next(), it.next(), it.next()) {
-                    (Some(q), Some(d), None) => mine.push((q.to_string(), base.join(d))),
+                let words: Vec<&str> = line.split('#').next().unwrap_or("").split_whitespace().collect();
+                match words.as_slice() {
+                    [] | ["checkout", ..] => continue,
+                    [q, d] => mine.push((q.to_string(), base.join(d))),
                     _ => return Err(format!("{}:{}: want `Quire<space>dir`", path.display(), n + 1)),
                 }
             }
@@ -284,145 +293,245 @@ pub fn cites_of(src: &[u8]) -> Vec<(String, String)> {
     out
 }
 
-/// The chapters a source already carries, as `Chapter: Quire--Name`.
-///
-/// A bundle satisfies a cite by CONTAINING the chapter, so a source that
-/// already embeds one must not be handed a second copy.
-fn embedded(src: &[u8]) -> BTreeSet<(String, String)> {
-    let text = String::from_utf8_lossy(src);
-    let mut out = BTreeSet::new();
-    for line in text.lines() {
-        let Some(rest) = line.trim_start().strip_prefix("Chapter:") else { continue };
-        if let Some((q, n)) = rest.trim().split_once("--") {
-            out.insert((q.trim().to_string(), n.trim().to_string()));
-        }
-    }
-    out
+/// Where a program's cited chapters come from.
+pub struct Project {
+    /// The checkout the cites resolve against, if the program names one.
+    pub checkout: Option<PathBuf>,
+    /// The project's own quire file, the nearest `quires.tsv` above the program.
+    pub quires: Option<PathBuf>,
 }
 
-/// The chapter names a source already carries, by NAME alone.
+/// The checkout and the quire file for the program at `path`.
 ///
-/// **Name and not quire::name, which is upstream's own rule** -- the generator
-/// for `quire-map.ps1` says so where `Get-PresentChapterNames` is written, and
-/// it is the same flat namespace that makes `Pond` and `DuckPond` two different
-/// spellings of one idea. A cite is satisfied when the chapter is PRESENT.
-///
-/// A line scan rather than a parse: this runs before the decision to resolve at
-/// all, and on an already-resolved unit it is the only work done.
-pub fn present_chapters(src: &[u8]) -> BTreeSet<String> {
-    let text = String::from_utf8_lossy(src);
-    let mut out = BTreeSet::new();
-    for line in text.lines() {
-        let Some(rest) = line.strip_prefix("Chapter:") else { continue };
-        let name = rest.trim().trim_end_matches('\r');
-        // `Quire--Name` in a bundle written by the depot; plain elsewhere.
-        out.insert(name.rsplit("--").next().unwrap_or(name).trim().to_string());
-    }
-    out
-}
-
-/// The project's own quire file, found by walking up from the file being read.
-///
-/// A project's quires belong to the project, so finding them should not need an
-/// argument. `CODEX_QUIRES` overrides.
-pub fn local_quires(near: &Path) -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("CODEX_QUIRES") {
-        return Some(PathBuf::from(p));
-    }
-    let mut d = near.canonicalize().ok();
+/// **THE PROGRAM NAMES ITS CHECKOUT; NOTHING ELSE IS ASKED.** A file inside a
+/// Cobblestone checkout resolves against that checkout, found by walking up to
+/// the directory holding the compiler's driver. A project outside one says which
+/// checkout it means with a `checkout <path>` line in its `quires.tsv`. The two
+/// may not disagree. The environment is never read: a variable exported for
+/// another tree once resolved a unit against it without a word.
+pub fn project_of(path: &Path) -> Result<Project, String> {
+    let file = path.canonicalize().map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let (mut tree, mut quires) = (None, None);
+    let mut d = file.parent().map(Path::to_path_buf);
     while let Some(dir) = d {
-        let cand = dir.join("quires.tsv");
-        if cand.is_file() {
-            return Some(cand);
+        if tree.is_none() && dir.join(MARKER).is_file() {
+            tree = Some(dir.clone());
+        }
+        if quires.is_none() && dir.join("quires.tsv").is_file() {
+            quires = Some(dir.join("quires.tsv"));
         }
         d = dir.parent().map(Path::to_path_buf);
     }
-    None
+    let named = match &quires {
+        Some(q) => checkout_line(q)?,
+        None => None,
+    };
+    let checkout = match (tree, named) {
+        (Some(t), Some(n)) if t != n => {
+            return Err(format!(
+                "{} lives in the checkout {}, and {} names {}",
+                path.display(),
+                t.display(),
+                quires.as_deref().unwrap_or(Path::new("quires.tsv")).display(),
+                n.display()
+            ))
+        }
+        (Some(t), _) => Some(t),
+        (None, n) => n,
+    };
+    Ok(Project { checkout, quires })
 }
 
-/// Read a program, resolving anything it cites that is not already there.
-///
-/// **THIS IS WHY BUNDLING IS NOT A SEPARATE PROCESS.** Resolving cites is a
-/// compiler phase -- it is what every other language calls finding the modules
-/// -- and the only reason it lived in another tool was that the other tool was
-/// written first. Handed a root chapter this resolves it; handed a unit that
-/// already carries its chapters, every cite is satisfied by presence and this
-/// returns the bytes unchanged, so it is idempotent and the corpus's
-/// pre-resolved units cost one line scan.
-///
-/// The registry is read LAZILY, only when something actually needs resolving,
-/// so a resolved unit runs with no checkout in sight and `CODEX_ROOT` unset.
-///
-/// **`CODEXC_RAW=1` READS THE BYTES AS THEY ARE AND RESOLVES NOTHING**, which
-/// is what `codexcheck` and `codexir` do with their stdin. A tool that
-/// truncates a resolved unit -- `tools/whodunit.sh`, `tools/mintprofile.sh`
-/// -- cuts implicit and cited chapters out of the prefix, and without this
-/// switch the prefix is quietly re-resolved against the ambient checkout,
-/// on whatever branch it is on, while the oracle sees the truncated bytes.
-/// Both sides must see the same program or the comparison compares nothing.
-pub fn load(path: &Path) -> Result<Vec<u8>, String> {
-    let src = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    if std::env::var_os("CODEXC_RAW").is_some() {
-        return Ok(src);
-    }
-    let present = present_chapters(&src);
-    let wanted: Vec<(String, String)> = IMPLICIT
-        .iter()
-        .map(|(q, c)| (q.to_string(), c.to_string()))
-        .chain(cites_of(&src))
-        .filter(|(_, c)| !present.contains(c))
-        .collect();
-    if wanted.is_empty() {
-        return Ok(src);
-    }
-    let root = std::env::var("CODEX_ROOT").map_err(|_| {
-        format!(
-            "{} cites {} chapter(s) it does not carry, and CODEX_ROOT is not set",
-            path.display(),
-            wanted.len()
-        )
-    })?;
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let qs = Quires::read(Path::new(&root), local_quires(dir).as_deref())?;
-    let b = resolve(path, &qs)?;
-    for c in &b.complaints {
-        if matches!(c, Complaint::UnregisteredQuire { .. } | Complaint::NoSuchChapter { .. }) {
-            eprintln!("{c}");
+/// The `checkout <path>` line of a quire file, if it has one. The path is
+/// relative to the file, or starts with `~/`.
+fn checkout_line(file: &Path) -> Result<Option<PathBuf>, String> {
+    let text = std::fs::read_to_string(file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+    let base = file.parent().unwrap_or(Path::new("."));
+    let mut found = None;
+    for (n, line) in text.lines().enumerate() {
+        let words: Vec<&str> = line.split('#').next().unwrap_or("").split_whitespace().collect();
+        let where_ = || format!("{}:{}", file.display(), n + 1);
+        match words.as_slice() {
+            ["checkout", p] => {
+                if found.is_some() {
+                    return Err(format!("{}: a second `checkout` line", where_()));
+                }
+                let raw = match p.strip_prefix("~/") {
+                    Some(rest) => PathBuf::from(
+                        std::env::var_os("HOME").ok_or_else(|| format!("{}: `~` with no HOME", where_()))?,
+                    )
+                    .join(rest),
+                    None => base.join(p),
+                };
+                let dir = raw.canonicalize().map_err(|e| format!("{}: checkout {}: {e}", where_(), raw.display()))?;
+                if !dir.join(MARKER).is_file() {
+                    return Err(format!("{}: {} is not a Cobblestone checkout (no {MARKER})", where_(), dir.display()));
+                }
+                found = Some(dir);
+            }
+            ["checkout", ..] => return Err(format!("{}: want `checkout <path>`", where_())),
+            _ => {}
         }
     }
-    Ok(b.text.into_bytes())
+    Ok(found)
+}
+
+/// Whether a cited chapter is already in the unit.
+enum Presence {
+    Present,
+    Missing,
+    /// Not under the cite's quire, and under several other headers, which are
+    /// named.
+    Ambiguous(Vec<String>),
+}
+
+/// The chapter headers a source carries, and the chapters added to it so far.
+///
+/// **A CITE FINDS ITS CHAPTER THE WAY THE COMPILER'S SCOPER DOES**
+/// (`find-slug-for-cite-name`, ChapterScoper.codex): `Chapter: Quire--Name`
+/// first; failing that, the one chapter of that name under any prefix or none;
+/// and no answer when there are several. A prefix is not always the quire.
+/// Upstream's plug bundler writes `Parsmi--Build Settings` for the chapter the
+/// compiler cites as `Codex chapter Build Settings`, and a unit written by an
+/// older bundler carries a plain `Chapter: ListUtils`.
+///
+/// Headers compare by `cite-key`, spaces removed and case ignored: a cite may
+/// name the file, `ByteHelpers`, where the header says `Byte Helpers`.
+struct Carried {
+    /// (key, header as written)
+    headers: Vec<(String, String)>,
+}
+
+impl Carried {
+    fn read(src: &[u8]) -> Carried {
+        let text = String::from_utf8_lossy(src);
+        let headers = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("Chapter:"))
+            .map(|rest| {
+                let header = rest.trim().trim_end_matches('\r').to_string();
+                (cite_key(&header), header)
+            })
+            .collect();
+        Carried { headers }
+    }
+
+    fn of(&self, quire: &str, name: &str) -> Presence {
+        let exact = cite_key(&format!("{quire}--{name}"));
+        if self.headers.iter().any(|(k, _)| *k == exact) {
+            return Presence::Present;
+        }
+        let bare = cite_key(name);
+        let suffix = format!("--{bare}");
+        let mut keys: Vec<&str> = Vec::new();
+        let mut named = Vec::new();
+        for (k, header) in &self.headers {
+            if (*k == bare || k.ends_with(&suffix)) && !keys.contains(&k.as_str()) {
+                keys.push(k);
+                named.push(header.clone());
+            }
+        }
+        match named.len() {
+            0 => Presence::Missing,
+            1 => Presence::Present,
+            _ => Presence::Ambiguous(named),
+        }
+    }
+
+    fn add(&mut self, quire: &str, name: &str) {
+        let header = format!("{quire}--{name}");
+        self.headers.push((cite_key(&header), header));
+    }
+}
+
+/// `cite-key`: spaces removed, ASCII letters lowered.
+fn cite_key(s: &str) -> String {
+    s.chars().filter(|c| *c != ' ').map(|c| c.to_ascii_lowercase()).collect()
+}
+
+fn ambiguous(who: &str, quire: &str, chapter: &str, headers: &[String]) -> String {
+    let named: Vec<String> = headers.iter().map(|h| format!("`Chapter: {h}`")).collect();
+    format!(
+        "{who} cites {quire} chapter {chapter}; the unit carries no `Chapter: {quire}--{chapter}` and {} chapters \
+         of that name ({}), so the cite does not say which",
+        named.len(),
+        named.join(", ")
+    )
+}
+
+/// What `src` cites, and ListUtils and Tuple, that it does not carry yet.
+fn missing(who: &str, src: &[u8], carried: &Carried) -> Result<Vec<(String, String)>, String> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let wanted = IMPLICIT.iter().map(|(q, c)| (q.to_string(), c.to_string())).chain(cites_of(src));
+    for (quire, chapter) in wanted {
+        match carried.of(&quire, &chapter) {
+            Presence::Present => {}
+            Presence::Ambiguous(headers) => return Err(ambiguous(who, &quire, &chapter, &headers)),
+            Presence::Missing => {
+                if !out.iter().any(|(q, c)| q.eq_ignore_ascii_case(&quire) && c.eq_ignore_ascii_case(&chapter)) {
+                    out.push((quire, chapter));
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub struct Bundle {
     pub text: String,
     pub complaints: Vec<Complaint>,
+    /// How many chapters resolving added. Zero means the source was a unit.
+    pub added: usize,
 }
 
 /// Assemble `root` and everything it cites, dependencies first, each once.
-pub fn resolve(root: &Path, quires: &Quires) -> Result<Bundle, String> {
+pub fn resolve(root: &Path) -> Result<Bundle, String> {
     let src = std::fs::read(root).map_err(|e| format!("cannot read {}: {e}", root.display()))?;
-    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
-    seen.insert(root.to_path_buf());
-    let mut complaints = quires.registry_complaints();
-    let mut parts: Vec<String> = Vec::new();
-
-    let here = embedded(&src);
-    let present = present_chapters(&src);
-    let mut cites: Vec<(String, String)> = IMPLICIT
-        .iter()
-        .map(|(q, c)| (q.to_string(), c.to_string()))
-        .filter(|qc| !here.contains(qc))
-        .collect();
-    cites.extend(cites_of(&src));
-    // A chapter the source already carries is not fetched again. On a root
-    // chapter this changes nothing; on a unit it is what makes resolving
-    // idempotent.
-    cites.retain(|(_, c)| !present.contains(c));
-
     let who = name_of(root);
-    walk(&who, &cites, quires, &mut seen, &mut complaints, &mut parts)?;
-    parts.push(tidy(&String::from_utf8_lossy(&src)));
-    Ok(Bundle { text: parts.join("\n"), complaints })
+    let carried = Carried::read(&src);
+    let wanted = missing(&who, &src, &carried)?;
+    if wanted.is_empty() {
+        return Ok(Bundle { text: String::from_utf8_lossy(&src).into_owned(), complaints: Vec::new(), added: 0 });
+    }
+    let project = project_of(root)?;
+    let Some(checkout) = project.checkout else {
+        let names: Vec<String> = wanted.iter().map(|(q, c)| format!("{q} chapter {c}")).collect();
+        return Err(format!(
+            "{} cites what it does not carry ({}) and names no checkout: it is not inside one, and no quires.tsv \
+             above it has a `checkout` line",
+            root.display(),
+            names.join(", ")
+        ));
+    };
+    let quires = Quires::read(&checkout, project.quires.as_deref())?;
+    let mut w = Walk { quires: &quires, carried, seen: BTreeSet::new(), complaints: quires.registry_complaints(), parts: Vec::new() };
+    w.walk(&who, &wanted)?;
+    let added = w.parts.len();
+    w.parts.push(tidy(&String::from_utf8_lossy(&src)));
+    Ok(Bundle { text: w.parts.join("\n"), complaints: w.complaints, added })
+}
+
+/// Read a program as a unit: resolved if it is a root, as it is if it is
+/// already whole.
+///
+/// **RESOLVING IS A COMPILER PHASE, NOT ANOTHER TOOL'S JOB**, so every tool
+/// that reads a program reads it through here. A unit short a chapter it cites
+/// is refused rather than handed on, and so is a unit carrying a carriage
+/// return, which cannot compile.
+pub fn load(path: &Path) -> Result<Vec<u8>, String> {
+    let src = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if missing(&name_of(path), &src, &Carried::read(&src))?.is_empty() {
+        return Ok(src);
+    }
+    let b = resolve(path)?;
+    let broken: Vec<String> = b.complaints.iter().filter(|c| c.is_broken()).map(|c| c.to_string()).collect();
+    if !broken.is_empty() {
+        return Err(broken.join("; "));
+    }
+    if b.text.contains('\r') {
+        return Err(format!("{}: the unit carries a carriage return and cannot be compiled", path.display()));
+    }
+    Ok(b.text.into_bytes())
 }
 
 fn name_of(p: &Path) -> String {
@@ -435,68 +544,143 @@ fn name_of(p: &Path) -> String {
 /// **THE TRIM TAKES CR AS WELL AS LF, AND THAT IS NOT COSMETIC.** A chapter
 /// committed with CRLF ends `\r\n\r\n`; trimming only `\n` stops at the `\r`
 /// and keeps a blank line that a text-mode reader -- which never sees a `\r` at
-/// all -- has already removed. So the two bundlers differed by a whole line on
-/// every CRLF chapter, and the cause looked like an ordering bug rather than
-/// what it was. Trimming trailing blank lines is a question about blank lines,
-/// and the answer should not depend on which bytes spell one.
+/// all -- has already removed. Trimming trailing blank lines is a question
+/// about blank lines, and the answer should not depend on which bytes spell one.
 fn tidy(text: &str) -> String {
     format!("{}\n", text.trim_end_matches(['\n', '\r']))
 }
 
-fn walk(
-    who: &str,
-    cites: &[(String, String)],
-    quires: &Quires,
-    seen: &mut BTreeSet<PathBuf>,
-    complaints: &mut Vec<Complaint>,
-    parts: &mut Vec<String>,
-) -> Result<(), String> {
-    for (quire, chapter) in cites {
-        let Some((dir, registered)) = quires.dir(quire) else {
-            complaints.push(Complaint::UnregisteredQuire {
-                who: who.to_string(),
-                quire: quire.clone(),
-                chapter: chapter.clone(),
-            });
-            continue;
-        };
-        if registered != quire {
-            complaints.push(Complaint::QuireCase {
-                who: who.to_string(),
-                cited: quire.clone(),
-                registered: registered.to_string(),
-            });
+/// A cited chapter's text with its header written under its quire.
+fn under_quire(text: &str, quire: &str) -> String {
+    let mut out = String::with_capacity(text.len() + quire.len() + 2);
+    let mut renamed = false;
+    for line in text.split_inclusive('\n') {
+        match line.strip_prefix("Chapter:") {
+            Some(rest) if !renamed => {
+                let (name, end) = match rest.find(['\r', '\n']) {
+                    Some(i) => (&rest[..i], &rest[i..]),
+                    None => (rest, ""),
+                };
+                out.push_str(&format!("Chapter: {quire}--{}{end}", name.trim()));
+                renamed = true;
+            }
+            _ => out.push_str(line),
         }
-        let dep = dir.join(format!("{chapter}.codex"));
-        if !dep.is_file() {
-            complaints.push(Complaint::NoSuchChapter {
-                who: who.to_string(),
-                quire: quire.clone(),
-                chapter: chapter.clone(),
-                looked: dep,
-            });
-            continue;
-        }
-        if !seen.insert(dep.clone()) {
-            continue;
-        }
-        let src = std::fs::read(&dep).map_err(|e| format!("cannot read {}: {e}", dep.display()))?;
-        if src.contains(&b'\r') {
-            complaints.push(Complaint::CarriageReturns {
-                chapter: chapter.clone(),
-                path: dep.clone(),
-            });
-        }
-        let sub = cites_of(&src);
-        walk(&name_of(&dep), &sub, quires, seen, complaints, parts)?;
-        parts.push(tidy(&String::from_utf8_lossy(&src)));
     }
-    Ok(())
+    out
+}
+
+/// The header a chapter file declares, or the cited name if it declares none.
+fn header_of(text: &str, cited: &str) -> String {
+    text.lines()
+        .find_map(|l| l.strip_prefix("Chapter:"))
+        .map(|r| r.trim().trim_end_matches('\r').to_string())
+        .unwrap_or_else(|| cited.to_string())
+}
+
+struct Walk<'a> {
+    quires: &'a Quires,
+    carried: Carried,
+    seen: BTreeSet<PathBuf>,
+    complaints: Vec<Complaint>,
+    parts: Vec<String>,
+}
+
+impl Walk<'_> {
+    fn walk(&mut self, who: &str, cites: &[(String, String)]) -> Result<(), String> {
+        for (quire, chapter) in cites {
+            match self.carried.of(quire, chapter) {
+                Presence::Present => continue,
+                Presence::Ambiguous(headers) => return Err(ambiguous(who, quire, chapter, &headers)),
+                Presence::Missing => {}
+            }
+            let Some((dir, registered)) = self.quires.dir(quire) else {
+                self.complaints.push(Complaint::UnregisteredQuire {
+                    who: who.to_string(),
+                    quire: quire.clone(),
+                    chapter: chapter.clone(),
+                });
+                continue;
+            };
+            if registered != quire {
+                self.complaints.push(Complaint::QuireCase {
+                    who: who.to_string(),
+                    cited: quire.clone(),
+                    registered: registered.to_string(),
+                });
+            }
+            let dep = dir.join(format!("{chapter}.codex"));
+            if !dep.is_file() {
+                self.complaints.push(Complaint::NoSuchChapter {
+                    who: who.to_string(),
+                    quire: quire.clone(),
+                    chapter: chapter.clone(),
+                    looked: dep,
+                });
+                continue;
+            }
+            if !self.seen.insert(dep.clone()) {
+                continue;
+            }
+            let src = std::fs::read(&dep).map_err(|e| format!("cannot read {}: {e}", dep.display()))?;
+            if src.contains(&b'\r') {
+                self.complaints.push(Complaint::CarriageReturns {
+                    chapter: chapter.clone(),
+                    path: dep.clone(),
+                });
+            }
+            let text = String::from_utf8_lossy(&src).into_owned();
+            // Carried before its own cites are walked, so a cycle back to it
+            // finds it present.
+            self.carried.add(quire, chapter);
+            let header = header_of(&text, chapter);
+            if !header.eq_ignore_ascii_case(chapter) {
+                self.carried.add(quire, &header);
+            }
+            let sub = cites_of(&src);
+            self.walk(&name_of(&dep), &sub)?;
+            self.parts.push(tidy(&under_quire(&text, quire)));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh directory under the system temp dir, removed first if a failed
+    /// run left one behind.
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("codexc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// A checkout with the driver marker, a registry, and three small forewords.
+    fn checkout(root: &Path) {
+        write(&root.join(MARKER), "Chapter: Opening\n");
+        write(
+            &root.join("build/quire-map.ps1"),
+            "$QuireDirs = @{\n    'Foreword' = 'codex\\foreword\\core'; 'Parsmi' = 'codex\\parsmi'\n}\n",
+        );
+        for name in ["ListUtils", "Tuple", "Maybe"] {
+            write(
+                &root.join(format!("codex/foreword/core/{name}.codex")),
+                &format!("Chapter: {name}\n\nSection: S\n  x-{} : Integer = 1\n", name.to_ascii_lowercase()),
+            );
+        }
+    }
+
+    fn headers(text: &str) -> Vec<&str> {
+        text.lines().filter_map(|l| l.strip_prefix("Chapter: ")).collect()
+    }
 
     #[test]
     fn quire_map_reads_multiple_pairs_per_line() {
@@ -512,23 +696,18 @@ mod tests {
 
     /// Update 55 took safari's `port/` into the checkout under the name the
     /// project already used, and appending the local entries meant every safari
-    /// cite resolved to upstream's snapshot instead. The Python resolver
-    /// assigns into a dict, so it had always given the project the last word;
-    /// the two bundlers disagreed on 34 of 35 targets the day the pin moved.
+    /// cite resolved to upstream's snapshot instead.
     #[test]
     fn the_projects_own_quire_file_beats_the_checkouts_and_says_so() {
-        let dir = std::env::temp_dir().join(format!("codexc-quires-{}", std::process::id()));
-        let build = dir.join("build");
-        std::fs::create_dir_all(&build).unwrap();
-        std::fs::write(
-            build.join("quire-map.ps1"),
+        let dir = scratch("quires");
+        write(
+            &dir.join("build/quire-map.ps1"),
             "$QuireDirs = @{\n    'Safari' = 'apps\\safari\\port'\n    'OS' = 'codex\\os'\n}",
-        )
-        .unwrap();
+        );
         let local = dir.join("quires.tsv");
         // Spelled in a different case on purpose: shadowing removes the loser
         // rather than outranking it, so no spelling can reach the checkout's.
-        std::fs::write(&local, "safari port\n").unwrap();
+        write(&local, "safari port\n");
 
         let q = Quires::read(&dir, Some(&local)).unwrap();
         assert_eq!(q.dir("Safari").unwrap().0, dir.join("port"));
@@ -564,10 +743,128 @@ mod tests {
     }
 
     #[test]
-    fn embedded_chapters_are_recognised_by_their_double_dash() {
-        let src = b"Chapter: Foreword--ListUtils\nChapter: Main\n";
-        let e = embedded(src);
-        assert!(e.contains(&("Foreword".to_string(), "ListUtils".to_string())));
-        assert_eq!(e.len(), 1);
+    fn a_cite_finds_its_quire_first_then_the_one_chapter_of_its_name() {
+        let c = Carried::read(
+            b"Chapter: Foreword--ListUtils\nChapter: Main\nChapter: Parsmi--Build Settings\n\
+              Chapter: Emit--Console\nChapter: Kernel--Console\n",
+        );
+        assert!(matches!(c.of("Foreword", "ListUtils"), Presence::Present));
+        assert!(matches!(c.of("foreword", "listutils"), Presence::Present));
+        assert!(matches!(c.of("Parsmi", "ListUtils"), Presence::Present));
+        assert!(matches!(c.of("Foreword", "Main"), Presence::Present));
+        assert!(matches!(c.of("Codex", "Build Settings"), Presence::Present));
+        assert!(matches!(c.of("Codex", "BuildSettings"), Presence::Present));
+        assert!(matches!(c.of("Emit", "Console"), Presence::Present));
+        assert!(matches!(c.of("OS", "Console"), Presence::Ambiguous(h) if h == ["Emit--Console", "Kernel--Console"]));
+        assert!(matches!(c.of("Foreword", "Maybe"), Presence::Missing));
+    }
+
+    #[test]
+    fn the_checkout_is_the_tree_the_program_lives_in() {
+        let dir = scratch("tree");
+        checkout(&dir);
+        let prog = dir.join("codex/test/probe.codex");
+        write(&prog, "Chapter: Probe\n");
+        assert_eq!(project_of(&prog).unwrap().checkout, Some(dir.canonicalize().unwrap()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_project_outside_a_checkout_names_it_in_its_quire_file() {
+        let dir = scratch("named");
+        checkout(&dir.join("co"));
+        write(&dir.join("proj/quires.tsv"), "# ours\nSafari port\ncheckout ../co\n");
+        let prog = dir.join("proj/spec/p.codex");
+        write(&prog, "Chapter: P\n");
+        let p = project_of(&prog).unwrap();
+        assert_eq!(p.checkout, Some(dir.join("co").canonicalize().unwrap()));
+        let q = Quires::read(p.checkout.as_deref().unwrap(), p.quires.as_deref()).unwrap();
+        assert!(q.dir("Safari").is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_quire_file_that_names_another_checkout_than_the_tree_is_refused() {
+        let dir = scratch("disagree");
+        checkout(&dir.join("a"));
+        checkout(&dir.join("b"));
+        write(&dir.join("a/codex/test/quires.tsv"), "checkout ../../../b\n");
+        let prog = dir.join("a/codex/test/p.codex");
+        write(&prog, "Chapter: P\n");
+        let e = project_of(&prog).err().unwrap();
+        assert!(e.contains("lives in the checkout"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cited_chapters_go_under_their_quire_and_the_program_keeps_its_header() {
+        let dir = scratch("under");
+        checkout(&dir);
+        let prog = dir.join("codex/test/root.codex");
+        write(&prog, "Chapter: Root\n  cites Foreword chapter Maybe\n\nSection: S\n  r : Integer = 2\n");
+        let b = resolve(&prog).unwrap();
+        assert_eq!(headers(&b.text), vec!["Foreword--ListUtils", "Foreword--Tuple", "Foreword--Maybe", "Root"]);
+        assert_eq!(b.added, 3);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolving_a_unit_changes_nothing_and_needs_no_checkout() {
+        let dir = scratch("unit");
+        checkout(&dir.join("co"));
+        let prog = dir.join("co/codex/test/root.codex");
+        write(&prog, "Chapter: Root\n  cites Foreword chapter Maybe\n\nSection: S\n  r : Integer = 2\n");
+        let unit = dir.join("elsewhere/root.codex");
+        write(&unit, &resolve(&prog).unwrap().text);
+        let before = std::fs::read(&unit).unwrap();
+        assert_eq!(load(&unit).unwrap(), before);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_unit_with_plain_headers_is_whole() {
+        let dir = scratch("plain");
+        let unit = dir.join("u.codex");
+        write(&unit, "Chapter: ListUtils\n\nChapter: Tuple\n\nChapter: Main\n  cites Foreword chapter ListUtils\n");
+        assert_eq!(load(&unit).unwrap(), std::fs::read(&unit).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_chapter_under_another_prefix_answers_the_cite() {
+        let dir = scratch("prefix");
+        checkout(&dir);
+        let prog = dir.join("codex/test/root.codex");
+        write(
+            &prog,
+            "Chapter: Parsmi--Maybe\n\nChapter: Root\n  cites Foreword chapter Maybe\n\nSection: S\n  r : Integer = 2\n",
+        );
+        let b = resolve(&prog).unwrap();
+        assert_eq!(headers(&b.text), vec!["Foreword--ListUtils", "Foreword--Tuple", "Parsmi--Maybe", "Root"]);
+        assert_eq!(b.added, 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn two_chapters_of_the_cited_name_under_other_prefixes_are_refused() {
+        let dir = scratch("ambiguous");
+        let unit = dir.join("u.codex");
+        write(&unit, "Chapter: Core--Maybe\n\nChapter: Emit--Maybe\n\nChapter: Root\n  cites Foreword chapter Maybe\n");
+        let e = load(&unit).err().unwrap();
+        assert!(e.contains("`Chapter: Core--Maybe`") && e.contains("`Chapter: Emit--Maybe`"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_unit_short_a_chapter_with_no_checkout_is_refused() {
+        let dir = scratch("nocheckout");
+        let unit = dir.join("u.codex");
+        write(
+            &unit,
+            "Chapter: Foreword--ListUtils\n\nChapter: Foreword--Tuple\n\nChapter: Main\n  cites Foreword chapter Maybe\n",
+        );
+        let e = load(&unit).err().unwrap();
+        assert!(e.contains("names no checkout") && e.contains("Foreword chapter Maybe"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

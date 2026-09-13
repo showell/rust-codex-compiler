@@ -141,30 +141,29 @@ oracle, and `and` failed to short-circuit under all of them.
 The fourth arm built on it -- what it proves, why it needs no gold, and the one
 unit that must DISAGREE -- is `safari/README.md`.
 
-## The bundle gate: two resolvers, one checkout
+## Resolver agreement: ours against upstream's compile step
 
-    bundle diff <units-dir> <roots-dir>
+    tools/resolver_agree.py <checkout>
 
-The ladder's `bundle_gate.sh` and safari's `harness/bundle_gate.sh` drive it.
-Today: **1,196 corpus units identical, 35 differing only in line endings, 0
-differing, 0 without a root**; and **35 of 35** safari targets identical.
+For every program under `<checkout>/codex/test` except `apps/`, the chapter
+headers of `bundle one`'s unit against the unit `build/compile.ps1` builds:
+`Resolve-CiteOrder` and `Format-CiteChapters`, run by `tools/r2_headers.ps1` in
+one pwsh process from the checkout's own `quire-map.ps1`. Headers carry the
+quire (`Foreword--Maybe`) and the order, so equal header lists mean the same
+chapters, from the same quires, in the same order.
 
-**What it cannot see.** It compares the two resolvers against each other, so a
-mistake BOTH make is invisible to it -- the same shape as any differential.
-What kills that risk here is that the two share no code and reach the registry
-by different routes; what does not is that both take the registry as truth.
-A quire mapped to the wrong directory would be read identically by both.
+**What it cannot see.** Bytes: upstream separates chapters with two blank lines
+and this compiler with one, so it compares headers and not text. And any
+mistake both resolvers make, which is the shape of every differential. The two
+share no code, but both take the registry as truth, so a quire mapped to the
+wrong directory reads the same to both.
 
-**It must resolve the Python units at the same instant.** Against a units
-directory banked days earlier, 33 units differed on the first run and not one
-was a bundler disagreeing -- they were upstream's prose edits in between. The
-script regenerates rather than reusing, and that is not an optimisation to skip.
-
-**The 35 line-ending units are upstream's, filed as issue 124.** Twenty chapters
-carry `\r\r\n` on their `Chapter:` line. Python reads with universal newlines,
-where a lone CR is also a break, so it sees a blank line where reading bytes
-sees two carriage returns on one line. The gate translates both sides the way a
-text-mode reader would before calling a difference real.
+**Upstream is the reference, not the answer.** Upstream's build script and its
+compiler answer "is this chapter already here" differently. `Resolve-CiteOrder`
+fetches a Foreword chapter again when the unit carries it under another prefix;
+the scoper's `find-slug-for-cite-name` takes the one chapter of that name. Ours
+follows the compiler, so a program carrying such a chapter disagrees here by
+design. Each disagreement is read, and named, before it is called a defect.
 
 ## The self-host -- `./selfhost_gate.sh`
 
