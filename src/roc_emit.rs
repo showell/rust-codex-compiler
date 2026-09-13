@@ -806,7 +806,11 @@ impl<'a> Cx<'a> {
     /// A definition's name as a reference.
     fn def_ref(&mut self, n: Sym) -> Result<String, String> {
         let m = self.def_module.get(&n).cloned().unwrap_or_default();
-        let id = self.ident(n)?;
+        let mut id = self.ident(n)?;
+        // A threaded definition under the machine is named with `!` (`def`).
+        if self.state == "Machine" && self.device_defs.contains(&n) {
+            id.push('!');
+        }
         Ok(self.qualified(&m, id))
     }
 
@@ -953,12 +957,13 @@ impl<'a> Cx<'a> {
 
     /// A `[Device]` definition's signature: the device first, and the pair
     /// last. The arrow is `=>` when an effect the state does not answer is
-    /// left over: a definition that reads the disk and prints.
+    /// left over (a definition that reads the disk and prints), and always
+    /// under the machine, whose block doors may be the host's.
     fn device_signature(&mut self, d: &IrDef) -> Result<String, String> {
         let (ps, r, eff) = self.arrows(d)?;
         let mut all = vec![format!("{s}.{s}", s = self.state)];
         all.extend(ps);
-        let arrow = if eff { "=>" } else { "->" };
+        let arrow = if eff || self.state == "Machine" { "=>" } else { "->" };
         let sig = format!("{} {arrow} ({s}.{s}, {r})", all.join(", "), s = self.state);
         let wants = self.eq_wants(d)?;
         Ok(if wants.is_empty() { sig } else { format!("{sig} where [{}]", wants.join(", ")) })
@@ -1261,7 +1266,10 @@ impl<'a> Cx<'a> {
     /// A definition, whole; a data table of thousands of literals is emitted
     /// as the literal it is, since the nightly's checker is linear in them.
     fn def(&mut self, d: &IrDef, base: usize) -> Result<String, String> {
-        let name = self.ident(d.name)?;
+        // Under the machine a threaded definition is an effect, and Roc
+        // spells an effect's name with `!` (`def_ref` agrees).
+        let bang = if self.state == "Machine" && self.device_defs.contains(&d.name) { "!" } else { "" };
+        let name = format!("{}{bang}", self.ident(d.name)?);
         // A write to a list parameter, in a definition that answers
         // something else, is a mutation the caller reads back (see
         // `writes_a_param`).
@@ -1371,7 +1379,7 @@ impl<'a> Cx<'a> {
             // The machine comes from the command line, as codex-vm's devices
             // do; an address space alone needs nothing from it.
             let make = if self.state == "Machine" {
-                "Machine.boot(args)"
+                "Machine.boot!(args)"
             } else {
                 "Mem.new(U64.to_i64_wrap(List.len(args)))"
             };
@@ -1772,7 +1780,9 @@ impl<'a> Cx<'a> {
             // A device builtin is the machine's door of the same name, and the
             // door answers as x86 does: `port-out-32`, a block write and a
             // select answer 0, and a block read answers the address of the
-            // sector it bump-allocated. Only the machine threads one.
+            // sector it bump-allocated. Only the machine threads one. A block
+            // door is an effect, spelled with `!`: the disk may be the host's
+            // (roc-apps machine/native).
             let door = match text.as_str() {
                 "port-out-32" | "block-write-sector" => Some(2),
                 "port-in-32" | "block-read-sector" | "block-select" | "process-get-scope" => Some(1),
@@ -1781,7 +1791,8 @@ impl<'a> Cx<'a> {
             };
             if let Some(k) = door {
                 want(k)?;
-                return Ok(format!("{s}.{}({})", text.replace('-', "_"), xs.join(", ")));
+                let bang = if text.starts_with("block-") { "!" } else { "" };
+                return Ok(format!("{s}.{}{bang}({})", text.replace('-', "_"), xs.join(", ")));
             }
             // base, offset [, value]; a load answers the value and a store
             // answers 0, as the interpreter does.
