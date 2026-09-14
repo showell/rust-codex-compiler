@@ -106,38 +106,6 @@ fn type_name(t: &str) -> String {
     }
 }
 
-/// **CODEX WRITES A LIST IN PLACE; ROC ANSWERS A NEW ONE.** The two agree
-/// wherever the program uses the answer, and diverge wherever it uses the
-/// list it wrote through another name. Two shapes say the write was for
-/// its effect, and both are refused rather than emitted wrongly:
-///
-/// - a definition that writes one of its own list parameters and answers
-///   something that is not a list (the foreword's `cb-shl1-step` doubles a
-///   bignum in place and answers the carry, and its caller reads the
-///   doubled list);
-/// - a `let` whose value is such a write and whose name nothing reads.
-///
-/// The verdicts that pin the behaviour are `codex/test/edalias` and
-/// `cryptobig`, and both were answering quietly wrong numbers before this.
-/// A definition's result: `k` parameters peel `k` arrows.
-fn result_ty(t: &Ty, k: usize) -> Ty {
-    let mut cur = t.clone();
-    for _ in 0..k {
-        loop {
-            match cur {
-                Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => cur = *b,
-                _ => break,
-            }
-        }
-        match cur {
-            Ty::Fun(_, _, r) => cur = *r,
-            other => return other,
-        }
-    }
-    cur
-}
-
-/// Every `Named` in a type expression, however deep.
 /// Whether a type expression holds a function (or an effect) anywhere in it.
 fn holds_fun(t: &TypeExpr) -> bool {
     match t {
@@ -149,6 +117,7 @@ fn holds_fun(t: &TypeExpr) -> bool {
     }
 }
 
+/// Every `Named` in a type expression, however deep.
 fn named_types(t: &TypeExpr, out: &mut std::collections::BTreeSet<Sym>) {
     match t {
         TypeExpr::Named(n, _) => {
@@ -614,6 +583,9 @@ struct Cx<'a> {
     /// Declared types that hold a function, in a field or through a declared
     /// type they mention. Roc has no `==` for them (`unwritable_eq`).
     fun_holding: std::collections::BTreeSet<Sym>,
+    /// The definitions `roc_in_place` refuses, and why; worked out on first
+    /// use.
+    in_place: Option<BTreeMap<Sym, String>>,
     imports: std::collections::BTreeSet<String>,
     /// Names bound by the enclosing parameters, lets and patterns.
     locals: Vec<Sym>,
@@ -729,6 +701,7 @@ impl<'a> Cx<'a> {
             recursive: Default::default(),
             derived_eq: BTreeMap::new(),
             fun_holding: Default::default(),
+            in_place: None,
             imports: Default::default(),
             locals: Vec::new(),
             tvars: BTreeMap::new(),
@@ -1293,30 +1266,6 @@ impl<'a> Cx<'a> {
         ))
     }
 
-    /// The name of a list parameter this body writes with `list-set-at`.
-    fn written_param(&self, body: &IrExpr, params: &[Sym]) -> Option<String> {
-        let mut found = None;
-        body.walk(&mut |x| {
-            let mut head = x;
-            let mut args: Vec<&IrExpr> = Vec::new();
-            while let IrExpr::Apply(f, a, _, _) = head {
-                args.push(a);
-                head = f;
-            }
-            args.reverse();
-            if let IrExpr::Name(n, _, _) = head {
-                if args.len() == 3 && self.syms.text(*n) == "list-set-at" {
-                    if let IrExpr::Name(t, _, _) = args[0] {
-                        if params.contains(t) && found.is_none() {
-                            found = Some(self.syms.text(*t).to_string());
-                        }
-                    }
-                }
-            }
-        });
-        found
-    }
-
     /// `:` for a plain alias, `:=` for one that stands on a cycle.
     fn colon(&self, n: Sym) -> &'static str {
         if self.recursive.contains(&n) { ":=" } else { ":" }
@@ -1388,16 +1337,13 @@ impl<'a> Cx<'a> {
         // Roc spells an effectful function's name with `!` (`def_ref` agrees).
         let bang = if self.bang_defs.contains(&d.name) { "!" } else { "" };
         let name = format!("{}{bang}", self.ident(d.name)?);
-        // A write to a list parameter, in a definition that answers
-        // something else, is a mutation the caller reads back (see
-        // `writes_a_param`).
-        let ps: Vec<Sym> = d.params.iter().map(|p| p.name).collect();
-        let (_, ret, _) = self.arrows(d)?;
-        if !matches!(result_ty(&d.ty, d.params.len()), Ty::List(_)) {
-            let _ = &ret;
-            if let Some(t) = self.written_param(&d.body, &ps) {
-                return Err(format!("`{}` writes its list parameter `{t}` and answers something else", self.syms.text(d.name)));
-            }
+        // An in-place list write Roc's value lists cannot follow
+        // (`roc_in_place`).
+        if self.in_place.is_none() {
+            self.in_place = Some(crate::roc_in_place::refusals(self.defs, self.syms));
+        }
+        if let Some(why) = self.in_place.as_ref().and_then(|r| r.get(&d.name)) {
+            return Err(why.clone());
         }
         let sig = self.signature(d)?;
         let mark = self.locals.len();
