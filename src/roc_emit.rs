@@ -2240,8 +2240,16 @@ impl<'a> Cx<'a> {
             }
             return Err(format!("`{}` performs the Device effect outside a statement", self.syms.text(n)));
         }
-        if self.arity.contains_key(&n) {
-            return self.def_ref(n);
+        if let Some(&k) = self.arity.get(&n) {
+            let f = self.def_ref(n)?;
+            // A definition that answers a function takes its own `k`
+            // parameters, then the answer's; as a value it takes them all at
+            // once, as every Roc function value does (`partial`).
+            let takes = self.defs.iter().find(|d| d.name == n).map_or(0, |d| arrows_of(&d.ty));
+            if k > 0 && takes > k {
+                return Ok(self.partial(&f, Vec::new(), k, takes, 0));
+            }
+            return Ok(f);
         }
         let t = self.syms.text(n);
         if t.starts_with(|c: char| c.is_ascii_uppercase()) {
@@ -2394,7 +2402,7 @@ impl<'a> Cx<'a> {
             head = f;
         }
         args.reverse();
-        let IrExpr::Name(n, _, _) = head else {
+        let IrExpr::Name(n, head_ty, _) = head else {
             return Err("a call whose head is not a name".into());
         };
         let n = &self.instance_base(*n);
@@ -2417,12 +2425,15 @@ impl<'a> Cx<'a> {
             xs.push(self.expr(a, ind)?);
         }
         if self.locals.contains(n) {
+            let takes = arrows_of(head_ty);
+            if xs.len() < takes {
+                let missing = takes - xs.len();
+                let f = self.local(*n)?;
+                return Ok(self.partial(&f, xs, missing, missing, ind));
+            }
             return Ok(format!("{}({})", self.local(*n)?, xs.join(", ")));
         }
         if let Some(&k) = self.arity.get(n) {
-            if xs.len() < k {
-                return Err(format!("`{text}` applied to {} of {k} arguments", xs.len()));
-            }
             // **AN EFFECTFUL FUNCTION HANDED TO A PURE PARAMETER.** Codex's
             // `list-map` carries its argument's effect; the emitted one
             // takes a pure function, and Roc has no effect variable to
@@ -2453,6 +2464,11 @@ impl<'a> Cx<'a> {
                     cur = r;
                 }
             }
+            if xs.len() < k {
+                let own = k - xs.len();
+                let f = self.def_ref(*n)?;
+                return Ok(self.partial(&f, xs, own, own.max(arrows_of(&e.ty())), ind));
+            }
             let first = format!("{}({})", self.def_ref(*n)?, xs[..k].join(", "));
             return Ok(if xs.len() == k { first } else { format!("{first}({})", xs[k..].join(", ")) });
         }
@@ -2460,6 +2476,29 @@ impl<'a> Cx<'a> {
             return Ok(format!("{}({})", self.tag(*n)?, xs.join(", ")));
         }
         self.builtin(&text, &args, xs)
+    }
+
+    /// **A PARTIAL APPLICATION IS A CLOSURE OVER THE REST.** A function value
+    /// is uncurried in Roc (`fun_parts`), so the closure takes every
+    /// parameter its type flattens to: `own` of them go to `f`, and the rest
+    /// to what `f` answers. Each argument is bound once, outside the closure,
+    /// so it is evaluated where the application is and not at every call.
+    fn partial(&mut self, f: &str, xs: Vec<String>, own: usize, rest: usize, ind: usize) -> String {
+        let tabs = "\t".repeat(ind + 1);
+        let mut out = String::from("({\n");
+        let mut given = Vec::new();
+        for x in xs {
+            let t = self.fresh_tmp();
+            out.push_str(&format!("{tabs}{t} = {x}\n"));
+            given.push(t);
+        }
+        let ps: Vec<String> = (0..rest).map(|_| self.fresh_tmp()).collect();
+        let mut call = format!("{f}({})", given.iter().chain(&ps[..own]).cloned().collect::<Vec<_>>().join(", "));
+        if rest > own {
+            call = format!("{call}({})", ps[own..].join(", "));
+        }
+        out.push_str(&format!("{tabs}|{}| {call}\n{}}})", ps.join(", "), "\t".repeat(ind)));
+        out
     }
 
     fn builtin(&mut self, name: &str, args: &[&IrExpr], xs: Vec<String>) -> Result<String, String> {
@@ -2922,6 +2961,16 @@ fn uses(e: &IrExpr, n: Sym) -> bool {
         }
     });
     found
+}
+
+/// How many parameters a function type takes in Roc, where `fun_parts`
+/// writes the whole curried chain as one signature.
+fn arrows_of(t: &Ty) -> usize {
+    match t {
+        Ty::Fun(_, _, r) => 1 + arrows_of(r),
+        Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => arrows_of(b),
+        _ => 0,
+    }
 }
 
 /// A type with its unit taken off: the number a unit value is at run time.
