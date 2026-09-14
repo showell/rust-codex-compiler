@@ -41,9 +41,10 @@ const KEYWORDS: [&str; 34] = [
 /// Read from `src/build/roc/Builtin.roc`'s own declarations.
 /// The builtins that read and write the address space. A poke answers 0
 /// and is bound to a name nobody reads; the write is the point.
-const MEMORY_OPS: [&str; 14] = [
+const MEMORY_OPS: [&str; 16] = [
     "peek-byte", "peek-16", "peek-32", "peek-qword", "poke-byte", "poke-16", "poke-32", "poke-qword", "alloc-bytes",
-    "__heap-advance", "atomic-load", "atomic-store", "atomic-exchange", "__buf-write-bytes",
+    "__heap-advance", "atomic-load", "atomic-store", "atomic-exchange", "__buf-write-byte", "__buf-write-bytes",
+    "__buf-read-bytes",
 ];
 
 /// The builtins the machine answers: PCI configuration space through 0xCF8
@@ -54,7 +55,8 @@ const MEMORY_OPS: [&str; 14] = [
 /// builtins become the machine's doors too. The Machine module is not written
 /// here: it is roc-apps' model of codex-vm and the kernel (machine/roc), and
 /// whatever runs the program supplies it beside the emitted modules.
-const MACHINE_OPS: [&str; 28] = [
+const MACHINE_OPS: [&str; 29] = [
+    "process-yield",
     "net-send-raw",
     "net-recv-raw",
     "net-status",
@@ -288,6 +290,11 @@ Mem :: [].{
 	exchange : Mem.Mem, I64, I64 -> (Mem.Mem, I64)
 	exchange = |mem, addr, v| (Mem.write(mem, addr, I64.to_u64_wrap(v), 8), U64.to_i64_wrap(Mem.read(mem, addr, 7, 0)))
 
+	# `__buf-write-byte base off v`: the low byte of `v` at base + off;
+	# answers off + 1.
+	write_byte : Mem.Mem, I64, I64, I64 -> (Mem.Mem, I64)
+	write_byte = |mem, base, off, v| (Mem.write(mem, base + off, I64.to_u64_wrap(v), 1), off + 1)
+
 	# `__buf-write-bytes base off bytes`: the low byte of each element from
 	# base + off on; answers off plus the count, the offset past the last.
 	write_bytes : Mem.Mem, I64, I64, List(I64) -> (Mem.Mem, I64)
@@ -299,6 +306,21 @@ Mem :: [].{
 			Err(_) => mem
 			Ok(b) => Mem.write_each(Mem.write(mem, at + U64.to_i64_wrap(i), I64.to_u64_wrap(b), 1), at, bytes, i + 1)
 		}
+
+	# `__buf-read-bytes base off count`: the `count` bytes from base + off on,
+	# each as an unsigned value; a count of zero or less reads none.
+	read_bytes : Mem.Mem, I64, I64, I64 -> (Mem.Mem, List(I64))
+	read_bytes = |mem, base, off, count| (mem, Mem.read_each(mem, base + off, count, List.with_capacity(I64.to_u64_wrap(I64.max(count, 0)))))
+
+	read_each : Mem.Mem, I64, I64, List(I64) -> List(I64)
+	read_each = |mem, at, count, acc| {
+		i = U64.to_i64_wrap(List.len(acc))
+		if i >= count {
+			acc
+		} else {
+			Mem.read_each(mem, at, count, List.append(acc, U64.to_i64_wrap(Mem.read(mem, at + i, 0, 0))))
+		}
+	}
 
 	write : Mem.Mem, I64, U64, I64 -> Mem.Mem
 	write = |mem, addr, u, left|
@@ -1980,7 +2002,7 @@ impl<'a> Cx<'a> {
                 | "process-set-scope" => Some(2),
                 "port-in-32" | "port-in-byte" | "port-in-16" | "block-read-sector" | "block-select" | "process-get-scope"
                 | "process-get-cap" | "process-get-network-scope" => Some(1),
-                "block-sector-count" | "process-get-pid" | "uefi-read-key-ex" | "uefi-read-key" => Some(0),
+                "block-sector-count" | "process-get-pid" | "process-yield" | "uefi-read-key-ex" | "uefi-read-key" => Some(0),
                 _ => None,
             };
             if let Some(k) = door {
@@ -2030,9 +2052,17 @@ impl<'a> Cx<'a> {
                 want(1)?;
                 return Ok(format!("{s}.advance({})", xs.join(", ")));
             }
+            if text == "__buf-write-byte" {
+                want(3)?;
+                return Ok(format!("{s}.write_byte({})", xs.join(", ")));
+            }
             if text == "__buf-write-bytes" {
                 want(3)?;
                 return Ok(format!("{s}.write_bytes({})", xs.join(", ")));
+            }
+            if text == "__buf-read-bytes" {
+                want(3)?;
+                return Ok(format!("{s}.read_bytes({})", xs.join(", ")));
             }
             // `atomic-exchange addr v` swaps the qword at the address for `v`
             // and answers the old one, x86's xchg.
