@@ -41,9 +41,9 @@ const KEYWORDS: [&str; 34] = [
 /// Read from `src/build/roc/Builtin.roc`'s own declarations.
 /// The builtins that read and write the address space. A poke answers 0
 /// and is bound to a name nobody reads; the write is the point.
-const MEMORY_OPS: [&str; 13] = [
+const MEMORY_OPS: [&str; 14] = [
     "peek-byte", "peek-16", "peek-32", "peek-qword", "poke-byte", "poke-16", "poke-32", "poke-qword", "alloc-bytes",
-    "__heap-advance", "atomic-load", "atomic-store", "atomic-exchange",
+    "__heap-advance", "atomic-load", "atomic-store", "atomic-exchange", "__buf-write-bytes",
 ];
 
 /// The builtins the machine answers: PCI configuration space through 0xCF8
@@ -54,7 +54,11 @@ const MEMORY_OPS: [&str; 13] = [
 /// builtins become the machine's doors too. The Machine module is not written
 /// here: it is roc-apps' model of codex-vm and the kernel (machine/roc), and
 /// whatever runs the program supplies it beside the emitted modules.
-const MACHINE_OPS: [&str; 24] = [
+const MACHINE_OPS: [&str; 28] = [
+    "net-send-raw",
+    "net-recv-raw",
+    "net-status",
+    "net-get-hwaddr",
     "port-out-byte",
     "port-in-byte",
     "port-out-16",
@@ -283,6 +287,18 @@ Mem :: [].{
 	# is the answer.
 	exchange : Mem.Mem, I64, I64 -> (Mem.Mem, I64)
 	exchange = |mem, addr, v| (Mem.write(mem, addr, I64.to_u64_wrap(v), 8), U64.to_i64_wrap(Mem.read(mem, addr, 7, 0)))
+
+	# `__buf-write-bytes base off bytes`: the low byte of each element from
+	# base + off on; answers off plus the count, the offset past the last.
+	write_bytes : Mem.Mem, I64, I64, List(I64) -> (Mem.Mem, I64)
+	write_bytes = |mem, base, off, bytes| (Mem.write_each(mem, base + off, bytes, 0), off + U64.to_i64_wrap(List.len(bytes)))
+
+	write_each : Mem.Mem, I64, List(I64), U64 -> Mem.Mem
+	write_each = |mem, at, bytes, i|
+		match List.get(bytes, i) {
+			Err(_) => mem
+			Ok(b) => Mem.write_each(Mem.write(mem, at + U64.to_i64_wrap(i), I64.to_u64_wrap(b), 1), at, bytes, i + 1)
+		}
 
 	write : Mem.Mem, I64, U64, I64 -> Mem.Mem
 	write = |mem, addr, u, left|
@@ -1131,7 +1147,7 @@ impl<'a> Cx<'a> {
     fn threads(&self, label: &str) -> bool {
         match self.state {
             "Device" => label == "Device",
-            "Machine" => label.starts_with("Device.") || label == "Capability",
+            "Machine" => label.starts_with("Device.") || label == "Capability" || label.starts_with("Network."),
             _ => false,
         }
     }
@@ -1957,6 +1973,9 @@ impl<'a> Cx<'a> {
             // doors, which reach the IDE channel and through it the disk.
             let door = match text.as_str() {
                 "port-in-16-block" | "port-out-16-block" => Some(3),
+                "net-send-raw" => Some(2),
+                "net-recv-raw" | "net-get-hwaddr" => Some(1),
+                "net-status" => Some(0),
                 "port-out-32" | "port-out-byte" | "port-out-16" | "block-write-sector" | "process-restrict-cap"
                 | "process-set-scope" => Some(2),
                 "port-in-32" | "port-in-byte" | "port-in-16" | "block-read-sector" | "block-select" | "process-get-scope"
@@ -1966,7 +1985,13 @@ impl<'a> Cx<'a> {
             };
             if let Some(k) = door {
                 want(k)?;
-                let bang = if text.starts_with("block-") || text.starts_with("port-in-16") || text.starts_with("port-out-16") || text.ends_with("-byte") {
+                let bang = if text.starts_with("block-")
+                    || text.starts_with("port-in-16")
+                    || text.starts_with("port-out-16")
+                    || text.ends_with("-byte")
+                    || text == "net-send-raw"
+                    || text == "net-recv-raw"
+                {
                     "!"
                 } else {
                     ""
@@ -2004,6 +2029,10 @@ impl<'a> Cx<'a> {
             if text == "__heap-advance" {
                 want(1)?;
                 return Ok(format!("{s}.advance({})", xs.join(", ")));
+            }
+            if text == "__buf-write-bytes" {
+                want(3)?;
+                return Ok(format!("{s}.write_bytes({})", xs.join(", ")));
             }
             // `atomic-exchange addr v` swaps the qword at the address for `v`
             // and answers the old one, x86's xchg.
