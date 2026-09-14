@@ -55,7 +55,11 @@ const MEMORY_OPS: [&str; 16] = [
 /// builtins become the machine's doors too. The Machine module is not written
 /// here: it is roc-apps' model of codex-vm and the kernel (machine/roc), and
 /// whatever runs the program supplies it beside the emitted modules.
-const MACHINE_OPS: [&str; 29] = [
+const MACHINE_OPS: [&str; 33] = [
+    "gpu-out",
+    "gpu-in",
+    "gpu-mem-write",
+    "gpu-mem-read",
     "process-yield",
     "net-send-raw",
     "net-recv-raw",
@@ -1173,7 +1177,9 @@ impl<'a> Cx<'a> {
     fn threads(&self, label: &str) -> bool {
         match self.state {
             "Device" => label == "Device",
-            "Machine" => label.starts_with("Device.") || label == "Capability" || label.starts_with("Network."),
+            "Machine" => {
+                label.starts_with("Device.") || label == "Capability" || label.starts_with("Network.") || label.starts_with("Gpu")
+            }
             _ => false,
         }
     }
@@ -2021,7 +2027,14 @@ impl<'a> Cx<'a> {
             // door is an effect, spelled with `!`: the disk may be the host's
             // (roc-apps machine/native). So are the byte and 16-bit port
             // doors, which reach the IDE channel and through it the disk.
-            let door = match text.as_str() {
+            // `gpu-out` and `gpu-in` are port-out-32 and port-in-32 under the
+            // Gpu.Compute row, as x86 emits them; the port decides the rest.
+            let name = match text.as_str() {
+                "gpu-out" => "port-out-32",
+                "gpu-in" => "port-in-32",
+                t => t,
+            };
+            let door = match name {
                 "port-in-16-block" | "port-out-16-block" => Some(3),
                 "net-send-raw" => Some(2),
                 "net-recv-raw" | "net-get-hwaddr" => Some(1),
@@ -2046,7 +2059,7 @@ impl<'a> Cx<'a> {
                 } else {
                     ""
                 };
-                return Ok(format!("{s}.{}{bang}({})", text.replace('-', "_"), xs.join(", ")));
+                return Ok(format!("{s}.{}{bang}({})", name.replace('-', "_"), xs.join(", ")));
             }
             // base, offset [, value]; a load answers the value and a store
             // answers 0, as the interpreter does.
@@ -2054,18 +2067,25 @@ impl<'a> Cx<'a> {
                 match b {
                     "peek-byte" | "poke-byte" | "read-mmio" | "poke-mmio" => Some("1"),
                     "peek-16" | "poke-16" => Some("2"),
-                    "peek-32" | "poke-32" | "read-mmio-32" | "poke-mmio-32" => Some("4"),
+                    "peek-32" | "poke-32" | "read-mmio-32" | "poke-mmio-32" | "gpu-mem-read" | "gpu-mem-write" => Some("4"),
                     "peek-qword" | "poke-qword" => Some("8"),
                     _ => None,
                 }
             };
             if let Some(w) = width(&text) {
-                let load = text.starts_with("peek") || text.starts_with("read");
+                let load = text.starts_with("peek") || text.starts_with("read") || text == "gpu-mem-read";
                 let want = if load { 2 } else { 3 };
                 if args.len() != want {
                     return Err(format!("`{text}` applied to {} arguments, takes {want}", args.len()));
                 }
-                let f = if load { "load" } else { "store" };
+                // The byte-width MMIO pair is the one memory builtin x86 does
+                // not check against the GPU's page.
+                let f = match (load, text.as_str()) {
+                    (true, "read-mmio") => "load_unguarded",
+                    (false, "poke-mmio") => "store_unguarded",
+                    (true, _) => "load",
+                    (false, _) => "store",
+                };
                 return Ok(format!("{s}.{f}({}, {w})", xs.join(", ")));
             }
             if text == "alloc-bytes" {
@@ -2106,11 +2126,14 @@ impl<'a> Cx<'a> {
                 if args.len() != want {
                     return Err(format!("`{text}` applied to {} arguments, takes {want}", args.len()));
                 }
-                // The state leads `xs`, as it does for every door.
+                // The state leads `xs`, as it does for every door. x86's atomic
+                // helpers do not check the GPU's page, so on the machine they
+                // take the unguarded doors.
+                let (l, st) = if s == "Machine" { ("load_unguarded", "store_unguarded") } else { ("load", "store") };
                 return Ok(if load {
-                    format!("{s}.load({}, {}, 0, 8)", xs[0], xs[1])
+                    format!("{s}.{l}({}, {}, 0, 8)", xs[0], xs[1])
                 } else {
-                    format!("{s}.store({}, {}, 0, {}, 8)", xs[0], xs[1], xs[2])
+                    format!("{s}.{st}({}, {}, 0, {}, 8)", xs[0], xs[1], xs[2])
                 });
             }
         }
