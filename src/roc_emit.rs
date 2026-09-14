@@ -41,7 +41,7 @@ const KEYWORDS: [&str; 34] = [
 /// Read from `src/build/roc/Builtin.roc`'s own declarations.
 /// The builtins that read and write the address space. A poke answers 0
 /// and is bound to a name nobody reads; the write is the point.
-const MEMORY_OPS: [&str; 16] = [
+pub const MEMORY_OPS: [&str; 16] = [
     "peek-byte", "peek-16", "peek-32", "peek-qword", "poke-byte", "poke-16", "poke-32", "poke-qword", "alloc-bytes",
     "__heap-advance", "atomic-load", "atomic-store", "atomic-exchange", "__buf-write-byte", "__buf-write-bytes",
     "__buf-read-bytes",
@@ -55,7 +55,7 @@ const MEMORY_OPS: [&str; 16] = [
 /// builtins become the machine's doors too. The Machine module is not written
 /// here: it is roc-apps' model of codex-vm and the kernel (machine/roc), and
 /// whatever runs the program supplies it beside the emitted modules.
-const MACHINE_OPS: [&str; 33] = [
+pub const MACHINE_OPS: [&str; 33] = [
     "gpu-out",
     "gpu-in",
     "gpu-mem-write",
@@ -2917,21 +2917,16 @@ impl<'a> Cx<'a> {
                 want(2)?;
                 format!("I32.shr_zf_wrap({}, I32.to_u8_wrap({}))", xs[0], xs[1])
             }
-            // Roc's I64 has no shift; a shift by b is a wrapping multiply or
-            // an unsigned divide by 2^b, which is what the interpreter does.
+            // The interpreter shifts the word's bits by the count's low six
+            // bits, and both right shifts fill with zeros. Roc's shifts take
+            // the count modulo the width, so a count's low byte is enough.
             "bit-shl" => {
                 want(2)?;
-                format!(
-                    "U64.to_i64_wrap(U64.times_wrap(I64.to_u64_wrap({}), U64.pow(2, I64.to_u64_wrap({}))))",
-                    xs[0], xs[1]
-                )
+                format!("I64.shl_wrap({}, I64.to_u8_wrap({}))", xs[0], xs[1])
             }
             "bit-shr" | "bit-shru" => {
                 want(2)?;
-                format!(
-                    "U64.to_i64_wrap(U64.div_by(I64.to_u64_wrap({}), U64.pow(2, I64.to_u64_wrap({}))))",
-                    xs[0], xs[1]
-                )
+                format!("I64.shr_zf_wrap({}, I64.to_u8_wrap({}))", xs[0], xs[1])
             }
             // The builtin spelling of a unary minus, emitted as `E::Negate` is.
             // x86's `abs` tests the sign and negates with a wrapping `neg`
