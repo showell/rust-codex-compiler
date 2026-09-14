@@ -41,19 +41,22 @@ const KEYWORDS: [&str; 34] = [
 /// Read from `src/build/roc/Builtin.roc`'s own declarations.
 /// The builtins that read and write the address space. A poke answers 0
 /// and is bound to a name nobody reads; the write is the point.
-const MEMORY_OPS: [&str; 9] = [
+const MEMORY_OPS: [&str; 11] = [
     "peek-byte", "peek-16", "peek-32", "peek-qword", "poke-byte", "poke-16", "poke-32", "poke-qword", "alloc-bytes",
+    "atomic-load", "atomic-store",
 ];
 
 /// The builtins the machine answers: PCI configuration space through 0xCF8
 /// and 0xCFC, the MMIO pair (a load and a store, like the memory builtins,
-/// answered by whatever backs the address), the block device, and the running
-/// process's id and scope. A unit that reaches one threads `Machine` where it
-/// would have threaded `Mem`, and the memory builtins become the machine's
-/// doors too. The Machine module is not written here: it is roc-apps' model of
-/// codex-vm and the kernel (machine/roc), and whatever runs the program
-/// supplies it beside the emitted modules.
-const MACHINE_OPS: [&str; 12] = [
+/// answered by whatever backs the address), the block device, the keyboard's
+/// two reads, and the running process's id and scope. A unit that reaches one
+/// threads `Machine` where it would have threaded `Mem`, and the memory
+/// builtins become the machine's doors too. The Machine module is not written
+/// here: it is roc-apps' model of codex-vm and the kernel (machine/roc), and
+/// whatever runs the program supplies it beside the emitted modules.
+const MACHINE_OPS: [&str; 14] = [
+    "uefi-read-key-ex",
+    "uefi-read-key",
     "port-out-32",
     "port-in-32",
     "read-mmio",
@@ -1862,7 +1865,7 @@ impl<'a> Cx<'a> {
             let door = match text.as_str() {
                 "port-out-32" | "block-write-sector" => Some(2),
                 "port-in-32" | "block-read-sector" | "block-select" | "process-get-scope" => Some(1),
-                "block-sector-count" | "process-get-pid" => Some(0),
+                "block-sector-count" | "process-get-pid" | "uefi-read-key-ex" | "uefi-read-key" => Some(0),
                 _ => None,
             };
             if let Some(k) = door {
@@ -1895,6 +1898,21 @@ impl<'a> Cx<'a> {
                     return Err("`alloc-bytes` takes one argument".into());
                 }
                 return Ok(format!("{s}.alloc({})", xs.join(", ")));
+            }
+            // `atomic-load addr` and `atomic-store addr v` are a qword at the
+            // address, x86's mov and xchg; the store answers 0.
+            if text == "atomic-load" || text == "atomic-store" {
+                let load = text == "atomic-load";
+                let want = if load { 1 } else { 2 };
+                if args.len() != want {
+                    return Err(format!("`{text}` applied to {} arguments, takes {want}", args.len()));
+                }
+                // The state leads `xs`, as it does for every door.
+                return Ok(if load {
+                    format!("{s}.load({}, {}, 0, 8)", xs[0], xs[1])
+                } else {
+                    format!("{s}.store({}, {}, 0, {}, 8)", xs[0], xs[1], xs[2])
+                });
             }
         }
         Ok(match text.as_str() {
