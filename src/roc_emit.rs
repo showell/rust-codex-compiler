@@ -1962,7 +1962,18 @@ impl<'a> Cx<'a> {
         if self.device_defs.contains(&n) {
             let k = self.arity[&n];
             if args.len() != k {
-                return Err(format!("`{text}` applied to {} of {k} arguments under Device", args.len()));
+                // **A FUNCTION VALUE CARRIES NO STATE.** Short of its arguments,
+                // the call is a closure, and a closure is handed on and entered
+                // where nothing threads the device, memory or machine it reaches.
+                let what = match self.state {
+                    "Machine" => "the machine",
+                    "Mem" => "memory",
+                    _ => "the device",
+                };
+                return Err(format!(
+                    "a function value from `{text}` ({} of {k} arguments), which reaches {what}; a function value carries no state",
+                    args.len()
+                ));
             }
             return Ok(format!("{}({})", self.def_ref(n)?, xs.join(", ")));
         }
