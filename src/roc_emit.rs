@@ -203,6 +203,12 @@ const MEM: &str = r#"# Mem -- Codex's address space, written by rocemit. Do not 
 # touch memory by closure over the call graph and threads this value
 # through them, the way it threads a GPU device.
 #
+# **A DOOR THAT READS OR WRITES IS AN EFFECT**, spelled `!` and typed `=>`,
+# and so is every definition that reaches one: a platform may keep the bytes
+# itself (roc-apps framebuffer/roc/Mem.roc). This one keeps them in the value,
+# so its doors are pure underneath. The bump pointer's doors (`alloc`,
+# `advance`, `mark`, `release`) are pure everywhere: the value carries it.
+#
 # **A PERSISTENT TRIE, NOT AN ARRAY OF PAGES.** An array is O(1) per write
 # when the reference count cooperates and O(page) when it does not, and
 # nothing in the source says which one you got: the difference between
@@ -272,8 +278,8 @@ Mem :: [].{
 		Branch(kids) => Mem.byte_at(List.get(kids, Mem.part(a, level)) ?? Empty, a, level - 1)
 	}
 
-	load : Mem.Mem, I64, I64, I64 -> (Mem.Mem, I64)
-	load = |mem, base, off, width| (mem, U64.to_i64_wrap(Mem.read(mem, base + off, width - 1, 0)))
+	load! : Mem.Mem, I64, I64, I64 => (Mem.Mem, I64)
+	load! = |mem, base, off, width| (mem, U64.to_i64_wrap(Mem.read(mem, base + off, width - 1, 0)))
 
 	read : Mem.Mem, I64, I64, U64 -> U64
 	read = |mem, addr, j, acc|
@@ -286,23 +292,23 @@ Mem :: [].{
 
 	# ---- writing --------------------------------------------------------
 
-	store : Mem.Mem, I64, I64, I64, I64 -> (Mem.Mem, I64)
-	store = |mem, base, off, v, width| (Mem.write(mem, base + off, I64.to_u64_wrap(v), width), 0)
+	store! : Mem.Mem, I64, I64, I64, I64 => (Mem.Mem, I64)
+	store! = |mem, base, off, v, width| (Mem.write(mem, base + off, I64.to_u64_wrap(v), width), 0)
 
 	# `atomic-exchange`: the qword at the address becomes `v`, and the old one
 	# is the answer.
-	exchange : Mem.Mem, I64, I64 -> (Mem.Mem, I64)
-	exchange = |mem, addr, v| (Mem.write(mem, addr, I64.to_u64_wrap(v), 8), U64.to_i64_wrap(Mem.read(mem, addr, 7, 0)))
+	exchange! : Mem.Mem, I64, I64 => (Mem.Mem, I64)
+	exchange! = |mem, addr, v| (Mem.write(mem, addr, I64.to_u64_wrap(v), 8), U64.to_i64_wrap(Mem.read(mem, addr, 7, 0)))
 
 	# `__buf-write-byte base off v`: the low byte of `v` at base + off;
 	# answers off + 1.
-	write_byte : Mem.Mem, I64, I64, I64 -> (Mem.Mem, I64)
-	write_byte = |mem, base, off, v| (Mem.write(mem, base + off, I64.to_u64_wrap(v), 1), off + 1)
+	write_byte! : Mem.Mem, I64, I64, I64 => (Mem.Mem, I64)
+	write_byte! = |mem, base, off, v| (Mem.write(mem, base + off, I64.to_u64_wrap(v), 1), off + 1)
 
 	# `__buf-write-bytes base off bytes`: the low byte of each element from
 	# base + off on; answers off plus the count, the offset past the last.
-	write_bytes : Mem.Mem, I64, I64, List(I64) -> (Mem.Mem, I64)
-	write_bytes = |mem, base, off, bytes| (Mem.write_each(mem, base + off, bytes, 0), off + U64.to_i64_wrap(List.len(bytes)))
+	write_bytes! : Mem.Mem, I64, I64, List(I64) => (Mem.Mem, I64)
+	write_bytes! = |mem, base, off, bytes| (Mem.write_each(mem, base + off, bytes, 0), off + U64.to_i64_wrap(List.len(bytes)))
 
 	write_each : Mem.Mem, I64, List(I64), U64 -> Mem.Mem
 	write_each = |mem, at, bytes, i|
@@ -313,8 +319,8 @@ Mem :: [].{
 
 	# `__buf-read-bytes base off count`: the `count` bytes from base + off on,
 	# each as an unsigned value; a count of zero or less reads none.
-	read_bytes : Mem.Mem, I64, I64, I64 -> (Mem.Mem, List(I64))
-	read_bytes = |mem, base, off, count| (mem, Mem.read_each(mem, base + off, count, List.with_capacity(I64.to_u64_wrap(I64.max(count, 0)))))
+	read_bytes! : Mem.Mem, I64, I64, I64 => (Mem.Mem, List(I64))
+	read_bytes! = |mem, base, off, count| (mem, Mem.read_each(mem, base + off, count, List.with_capacity(I64.to_u64_wrap(I64.max(count, 0)))))
 
 	read_each : Mem.Mem, I64, I64, List(I64) -> List(I64)
 	read_each = |mem, at, count, acc| {
@@ -1081,12 +1087,13 @@ impl<'a> Cx<'a> {
     /// A `[Device]` definition's signature: the device first, and the pair
     /// last. The arrow is `=>` when an effect the state does not answer is
     /// left over (a definition that reads the disk and prints), and always
-    /// under the machine, whose block doors may be the host's.
+    /// when the state is memory or the machine, whose doors may be the host's.
+    /// A GPU kernel's Device is plain arithmetic, called from pure code.
     fn device_signature(&mut self, d: &IrDef) -> Result<String, String> {
         let (ps, r, eff) = self.arrows(d)?;
         let mut all = vec![format!("{s}.{s}", s = self.state)];
         all.extend(ps);
-        let arrow = if eff || self.state == "Machine" { "=>" } else { "->" };
+        let arrow = if eff || self.state != "Device" { "=>" } else { "->" };
         let sig = format!("{} {arrow} ({s}.{s}, {r})", all.join(", "), s = self.state);
         let wants = self.eq_wants(d)?;
         Ok(if wants.is_empty() { sig } else { format!("{sig} where [{}]", wants.join(", ")) })
@@ -1163,7 +1170,7 @@ impl<'a> Cx<'a> {
     /// `device_signature` write it.
     fn takes_bang(&self, d: &IrDef) -> bool {
         if self.device_defs.contains(&d.name) {
-            self.effect_left(d) || self.state == "Machine"
+            self.effect_left(d) || self.state != "Device"
         } else {
             !d.params.is_empty() && self.effect_left(d)
         }
@@ -2010,6 +2017,10 @@ impl<'a> Cx<'a> {
         self.imports.insert(self.state.into());
         if self.by_closure() {
             let s = self.state;
+            // A memory door that reads or writes is an effect under `Mem`: the
+            // platform may keep the bytes (see `MEM`). The machine's memory is
+            // part of its value, so its doors stay pure.
+            let mem_bang = if s == "Mem" { "!" } else { "" };
             // A heap mark is the bump pointer, as x86's r10 is: `__heap-save`
             // answers it and `__heap-restore` rewinds to it, answering 0.
             if text == "__heap-save" {
@@ -2086,7 +2097,7 @@ impl<'a> Cx<'a> {
                     (true, _) => "load",
                     (false, _) => "store",
                 };
-                return Ok(format!("{s}.{f}({}, {w})", xs.join(", ")));
+                return Ok(format!("{s}.{f}{mem_bang}({}, {w})", xs.join(", ")));
             }
             if text == "alloc-bytes" {
                 if args.len() != 1 {
@@ -2102,21 +2113,21 @@ impl<'a> Cx<'a> {
             }
             if text == "__buf-write-byte" {
                 want(3)?;
-                return Ok(format!("{s}.write_byte({})", xs.join(", ")));
+                return Ok(format!("{s}.write_byte{mem_bang}({})", xs.join(", ")));
             }
             if text == "__buf-write-bytes" {
                 want(3)?;
-                return Ok(format!("{s}.write_bytes({})", xs.join(", ")));
+                return Ok(format!("{s}.write_bytes{mem_bang}({})", xs.join(", ")));
             }
             if text == "__buf-read-bytes" {
                 want(3)?;
-                return Ok(format!("{s}.read_bytes({})", xs.join(", ")));
+                return Ok(format!("{s}.read_bytes{mem_bang}({})", xs.join(", ")));
             }
             // `atomic-exchange addr v` swaps the qword at the address for `v`
             // and answers the old one, x86's xchg.
             if text == "atomic-exchange" {
                 want(2)?;
-                return Ok(format!("{s}.exchange({}, {}, {})", xs[0], xs[1], xs[2]));
+                return Ok(format!("{s}.exchange{mem_bang}({}, {}, {})", xs[0], xs[1], xs[2]));
             }
             // `atomic-load addr` and `atomic-store addr v` are a qword at the
             // address, x86's mov and xchg; the store answers 0.
@@ -2131,9 +2142,9 @@ impl<'a> Cx<'a> {
                 // take the unguarded doors.
                 let (l, st) = if s == "Machine" { ("load_unguarded", "store_unguarded") } else { ("load", "store") };
                 return Ok(if load {
-                    format!("{s}.{l}({}, {}, 0, 8)", xs[0], xs[1])
+                    format!("{s}.{l}{mem_bang}({}, {}, 0, 8)", xs[0], xs[1])
                 } else {
-                    format!("{s}.{st}({}, {}, 0, {}, 8)", xs[0], xs[1], xs[2])
+                    format!("{s}.{st}{mem_bang}({}, {}, 0, {}, 8)", xs[0], xs[1], xs[2])
                 });
             }
         }
