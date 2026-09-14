@@ -455,13 +455,17 @@ const LINE_HELPER: &str =
 /// exactly this shape for a namespace of functions, and it is what lets the
 /// screensaver itself import the same chapters the specs grade. The app is
 /// the spec's own definitions and `main!`.
+/// `vm_flags` says the unit brings codex-vm flags (a `.vmargs` beside it): it
+/// asks for devices only the machine answers, so it threads `Machine` even
+/// where its code reaches memory alone.
 pub fn emit_modules(
     ch: &Chapter,
     tds: &TypeDefs,
     syms: &SymTab,
     defs: &[IrDef],
+    vm_flags: bool,
 ) -> Result<Vec<(String, String)>, String> {
-    let mut cx = Cx::new(ch, tds, syms, defs);
+    let mut cx = Cx::new(ch, tds, syms, defs, vm_flags);
     // **A UNIT WITH NO OPENING IS A LIBRARY**: every chapter a module, no
     // app. That is what a GPU kernel chapter is.
     // A `[Device]` opening (GlobeKernels has one, for the wgsl plug's root)
@@ -755,7 +759,7 @@ struct Fold {
 }
 
 impl<'a> Cx<'a> {
-    fn new(ch: &Chapter, tds: &'a TypeDefs, syms: &'a SymTab, defs: &'a [IrDef]) -> Cx<'a> {
+    fn new(ch: &Chapter, tds: &'a TypeDefs, syms: &'a SymTab, defs: &'a [IrDef], vm_flags: bool) -> Cx<'a> {
         let mut cx = Cx {
             syms,
             tds,
@@ -840,7 +844,7 @@ impl<'a> Cx<'a> {
                 // The opening makes the state itself (`opening`), so it stays
                 // the app's main rather than becoming a function of the state.
                 if !touch.is_empty() {
-                    cx.state = if machine { "Machine" } else { "Mem" };
+                    cx.state = if machine || vm_flags { "Machine" } else { "Mem" };
                     cx.device_ops = ops;
                     cx.device_defs = touch;
                     if let Some(o) = syms.find("opening") {
@@ -1608,7 +1612,9 @@ impl<'a> Cx<'a> {
                 }
             };
             self.uses_line = true;
-            out.push_str(&format!("\tline!({text})\n\tOk({{}})\n}}\n"));
+            out.push_str(&format!("\tline!({text})\n"));
+            self.halt(&mut out, memory);
+            out.push_str("\tOk({})\n}\n");
             self.locals.truncate(mark);
             self.dev = None;
             return Ok(seal_state(out, memory, self.dev_base(), self.dev_n));
@@ -1653,9 +1659,20 @@ impl<'a> Cx<'a> {
             }
         }
         self.locals.truncate(mark);
+        self.halt(&mut out, memory);
         self.dev = None;
         out.push_str("\tOk({})\n}\n");
         Ok(seal_state(out, memory, self.dev_base(), self.dev_n))
+    }
+
+    /// **THE LAST MACHINE GOES TO `halt!`**, where a platform that shows the
+    /// screen reads the framebuffer the run left; elsewhere it does nothing.
+    fn halt(&self, out: &mut String, memory: bool) {
+        if memory && self.state == "Machine" {
+            if let Some(m) = &self.dev {
+                out.push_str(&format!("\tMachine.halt!({m})\n"));
+            }
+        }
     }
 
     // ---- the Device effect -----------------------------------------------

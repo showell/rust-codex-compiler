@@ -61,7 +61,10 @@ fn emit(path: &Path, dir: &Path) -> Result<String, String> {
     // its inlining pipeline are the IR wire's rules; a chapter module that
     // fifty apps import wants every definition and one text.
     let low = codexc::ir::lower_whole(&ch, &bindings, &st, &tds)?;
-    let files = codexc::roc_emit::emit_modules(&ch, &tds, &low.syms, &low.defs)?;
+    // A test's codex-vm flags sit beside it as `.vmargs`; a unit that brings
+    // them asks for the machine's devices.
+    let vm_flags = path.with_extension("vmargs").exists();
+    let files = codexc::roc_emit::emit_modules(&ch, &tds, &low.syms, &low.defs, vm_flags)?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     // The directory holds ONLY this unit's modules: a file from an earlier
     // emission of a chapter that has since gone would still be imported.
