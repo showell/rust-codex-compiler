@@ -54,11 +54,13 @@ const MEMORY_OPS: [&str; 13] = [
 /// builtins become the machine's doors too. The Machine module is not written
 /// here: it is roc-apps' model of codex-vm and the kernel (machine/roc), and
 /// whatever runs the program supplies it beside the emitted modules.
-const MACHINE_OPS: [&str; 22] = [
+const MACHINE_OPS: [&str; 24] = [
     "port-out-byte",
     "port-in-byte",
     "port-out-16",
     "port-in-16",
+    "port-in-16-block",
+    "port-out-16-block",
     "process-get-cap",
     "process-restrict-cap",
     "process-set-scope",
@@ -1951,8 +1953,10 @@ impl<'a> Cx<'a> {
             // select answer 0, and a block read answers the address of the
             // sector it bump-allocated. Only the machine threads one. A block
             // door is an effect, spelled with `!`: the disk may be the host's
-            // (roc-apps machine/native).
+            // (roc-apps machine/native). So are the byte and 16-bit port
+            // doors, which reach the IDE channel and through it the disk.
             let door = match text.as_str() {
+                "port-in-16-block" | "port-out-16-block" => Some(3),
                 "port-out-32" | "port-out-byte" | "port-out-16" | "block-write-sector" | "process-restrict-cap"
                 | "process-set-scope" => Some(2),
                 "port-in-32" | "port-in-byte" | "port-in-16" | "block-read-sector" | "block-select" | "process-get-scope"
@@ -1962,7 +1966,11 @@ impl<'a> Cx<'a> {
             };
             if let Some(k) = door {
                 want(k)?;
-                let bang = if text.starts_with("block-") { "!" } else { "" };
+                let bang = if text.starts_with("block-") || text.starts_with("port-in-16") || text.starts_with("port-out-16") || text.ends_with("-byte") {
+                    "!"
+                } else {
+                    ""
+                };
                 return Ok(format!("{s}.{}{bang}({})", text.replace('-', "_"), xs.join(", ")));
             }
             // base, offset [, value]; a load answers the value and a store
