@@ -138,6 +138,17 @@ fn result_ty(t: &Ty, k: usize) -> Ty {
 }
 
 /// Every `Named` in a type expression, however deep.
+/// Whether a type expression holds a function (or an effect) anywhere in it.
+fn holds_fun(t: &TypeExpr) -> bool {
+    match t {
+        TypeExpr::Fun(..) | TypeExpr::Effect(..) => true,
+        TypeExpr::Named(..) => false,
+        TypeExpr::App(f, args, _) => holds_fun(f) || args.iter().any(holds_fun),
+        TypeExpr::BoundedInt(b, ..) | TypeExpr::Linear(b, _) | TypeExpr::Constrained(_, _, b, _) => holds_fun(b),
+        TypeExpr::PropEq(a, b, _) | TypeExpr::Forall(_, a, b, _) => holds_fun(a) || holds_fun(b),
+    }
+}
+
 fn named_types(t: &TypeExpr, out: &mut std::collections::BTreeSet<Sym>) {
     match t {
         TypeExpr::Named(n, _) => {
@@ -463,6 +474,13 @@ pub fn emit_modules(
                 main = Some(cx.opening(d)?);
                 continue;
             }
+            // **NO `==` ON A TYPE THAT HOLDS A FUNCTION.** Codex derives one
+            // for every declared sum; Roc cannot compare functions, and it
+            // checks a definition even when nothing calls it. A call that
+            // does reach one is refused (`unwritable_eq`).
+            if cx.unwritable_eq(d.name).is_some() {
+                continue;
+            }
             items.push('\n');
             items.push_str(&cx.def(d, base)?);
         }
@@ -589,6 +607,9 @@ struct Cx<'a> {
     /// type has no structural `==`, so the one Codex derived is attached to
     /// it as the `is_eq` method Roc's `==` dispatches to.
     derived_eq: BTreeMap<Sym, Sym>,
+    /// Declared types that hold a function, in a field or through a declared
+    /// type they mention. Roc has no `==` for them (`unwritable_eq`).
+    fun_holding: std::collections::BTreeSet<Sym>,
     imports: std::collections::BTreeSet<String>,
     /// Names bound by the enclosing parameters, lets and patterns.
     locals: Vec<Sym>,
@@ -703,6 +724,7 @@ impl<'a> Cx<'a> {
             app: String::new(),
             recursive: Default::default(),
             derived_eq: BTreeMap::new(),
+            fun_holding: Default::default(),
             imports: Default::default(),
             locals: Vec::new(),
             tvars: BTreeMap::new(),
@@ -807,6 +829,9 @@ impl<'a> Cx<'a> {
                 named_types(t, &mut out);
             }
             out.retain(|m| cx.type_module.contains_key(m));
+            if ts.iter().any(holds_fun) {
+                cx.fun_holding.insert(n);
+            }
             mentions.insert(n, out);
         }
         loop {
@@ -825,6 +850,8 @@ impl<'a> Cx<'a> {
             }
         }
         cx.recursive = mentions.iter().filter(|(n, ms)| ms.contains(n)).map(|(n, _)| *n).collect();
+        let direct = cx.fun_holding.clone();
+        cx.fun_holding.extend(mentions.iter().filter(|(_, ms)| ms.iter().any(|m| direct.contains(m))).map(|(n, _)| *n));
         for d in defs {
             if let Some(t) = syms.text(d.name).strip_prefix("__eq_") {
                 if let Some(n) = syms.find(t).filter(|n| cx.type_module.contains_key(n)) {
@@ -1192,6 +1219,12 @@ impl<'a> Cx<'a> {
         })
     }
 
+    /// The type of a derived `__eq_` definition Roc cannot write, because the
+    /// type holds a function.
+    fn unwritable_eq(&self, d: Sym) -> Option<Sym> {
+        self.derived_eq.iter().find(|(t, e)| **e == d && self.fun_holding.contains(*t)).map(|(t, _)| *t)
+    }
+
     /// **A NOMINAL TYPE HAS NO STRUCTURAL `==`.** An alias is compared
     /// field by field; a `:=` type is asked for its `is_eq` method, and a
     /// list or record holding one is compared through that. Codex derives
@@ -1202,7 +1235,7 @@ impl<'a> Cx<'a> {
         let n = match td {
             TypeDef::Record(n, ..) | TypeDef::Variant(n, ..) | TypeDef::Unit(n, ..) => *n,
         };
-        if !self.recursive.contains(&n) {
+        if !self.recursive.contains(&n) || self.fun_holding.contains(&n) {
             return Ok(String::new());
         }
         let t = "\t".repeat(base + 1);
@@ -2403,7 +2436,20 @@ impl<'a> Cx<'a> {
         }
         args.reverse();
         let IrExpr::Name(n, head_ty, _) = head else {
-            return Err("a call whose head is not a name".into());
+            // **A CALL ON A VALUE.** A closure kept in a record field, or any
+            // other expression that answers a function, is entered with
+            // every flattened parameter at once, as a local is.
+            let f = format!("({})", self.expr(head, ind)?);
+            let mut xs = Vec::new();
+            for a in &args {
+                xs.push(self.expr(a, ind)?);
+            }
+            let takes = arrows_of(&head.ty());
+            if xs.len() < takes {
+                let missing = takes - xs.len();
+                return Ok(self.partial(&f, xs, missing, missing, ind));
+            }
+            return Ok(format!("{f}({})", xs.join(", ")));
         };
         let n = &self.instance_base(*n);
         let text = self.syms.text(*n).to_string();
@@ -2434,6 +2480,9 @@ impl<'a> Cx<'a> {
             return Ok(format!("{}({})", self.local(*n)?, xs.join(", ")));
         }
         if let Some(&k) = self.arity.get(n) {
+            if let Some(t) = self.unwritable_eq(*n) {
+                return Err(format!("`==` on `{}`, which holds a function", self.syms.text(t)));
+            }
             // **AN EFFECTFUL FUNCTION HANDED TO A PURE PARAMETER.** Codex's
             // `list-map` carries its argument's effect; the emitted one
             // takes a pure function, and Roc has no effect variable to
