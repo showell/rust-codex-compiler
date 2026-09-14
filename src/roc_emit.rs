@@ -939,6 +939,7 @@ impl<'a> Cx<'a> {
             Ty::Text => "Str".into(),
             Ty::Boolean => "Bool".into(),
             Ty::Nothing => "{}".into(),
+            Ty::Unit(n, _) => self.type_ref(*n),
             Ty::List(e) => format!("List({})", self.ty(e)?),
             Ty::Fun(..) => {
                 let (ps, r) = self.fun_parts(t)?;
@@ -1330,7 +1331,11 @@ impl<'a> Cx<'a> {
                     self.methods(td, base)?
                 )
             }
-            TypeDef::Unit(n, ..) => return Err(format!("unit type `{}`", self.syms.text(*n))),
+            // **A UNIT IS ITS BASE NUMBER.** Lowering elides a unit's
+            // constructor and keeps the unit on the value, and the desugarer
+            // writes each family member's constructor and extractor as plain
+            // arithmetic, so at run time a `Duration` is the Integer it wraps.
+            TypeDef::Unit(n, base, _) => format!("{tabs}{} : {}\n", head(*n, &[])?, self.texpr(base)?),
         })
     }
 
@@ -1515,7 +1520,7 @@ impl<'a> Cx<'a> {
             for l in lines {
                 out.push_str(&format!("\t{l}\n"));
             }
-            let text = match body.ty() {
+            let text = match strip_unit(&body.ty()).clone() {
                 Ty::Text => x,
                 Ty::Integer(..) => format!("I64.to_str({x})"),
                 other => {
@@ -1535,7 +1540,7 @@ impl<'a> Cx<'a> {
         for (i, s) in stmts.iter().enumerate() {
             match s {
                 IrActStmt::Exec(e, _) => {
-                    let ty = e.ty();
+                    let ty = strip_unit(&e.ty()).clone();
                     let (lines, e) = self.hoisting(e, 1)?;
                     for l in lines {
                         out.push_str(&format!("\t{l}\n"));
@@ -2600,7 +2605,7 @@ impl<'a> Cx<'a> {
             // boolean is `True` or `False` (interp::show).
             "show" | "integer-to-text" => {
                 want(1)?;
-                match args[0].ty() {
+                match strip_unit(&args[0].ty()).clone() {
                     Ty::Integer(..) => format!("{int}.to_str({})", xs[0]),
                     Ty::Boolean => format!("(if {} {{ \"True\" }} else {{ \"False\" }})", xs[0]),
                     Ty::Text => xs[0].clone(),
@@ -2748,7 +2753,7 @@ impl<'a> Cx<'a> {
                 self.locals.push(*n);
                 self.binder(*n, scope)?
             }
-            IrPat::Lit(v, ty, _) => match ty {
+            IrPat::Lit(v, ty, _) => match strip_unit(ty) {
                 Ty::Integer(..) | Ty::Char => v.clone(),
                 Ty::Text => roc_quote(v),
                 // The IR spells it `True` / `False`; a lowercase test made
@@ -2917,6 +2922,14 @@ fn uses(e: &IrExpr, n: Sym) -> bool {
         }
     });
     found
+}
+
+/// A type with its unit taken off: the number a unit value is at run time.
+fn strip_unit(t: &Ty) -> &Ty {
+    match t {
+        Ty::Unit(_, inner) => strip_unit(inner),
+        other => other,
+    }
 }
 
 /// Whether the emitted text reads `n`: a mention anywhere but as the

@@ -376,7 +376,7 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
             let fty = f.ty();
             let arg_ty = peel_fun_param(&fty);
             let ret_ty = peel_fun_return(&fty);
-            let a = expr(a, &arg_ty, cx)?;
+            let a = try_unit_convert(expr(a, &arg_ty, cx)?, &arg_ty, *s, cx);
             let resolved = lt::subst_from_arg(&arg_ty, &a.ty(), &ret_ty);
             let res = match resolved {
                 Ty::Error | Ty::NoExpect => expected_or_recorded(want, cx, *s),
@@ -927,6 +927,22 @@ fn eq_dispatch(
 /// `lower-unit-ctor-value`: a let's body is rewritten inside the let; a node
 /// with a type slot takes the unit type; a literal, which has none, is bound
 /// to `__unit-<offset>` so the name can carry it.
+/// `try-unit-convert` (IR/Lowering.codex:533): an argument of unit `A` where
+/// unit `B` is expected becomes a call of `A-to-B` on it.
+fn try_unit_convert(arg: IrExpr, expected: &Ty, sp: crate::ast::Span, cx: &Lower) -> IrExpr {
+    let actual = arg.ty();
+    let (Ty::Unit(from, _), Ty::Unit(to, _)) = (&actual, expected) else { return arg };
+    if from == to {
+        return arg;
+    }
+    let conv = {
+        let text = format!("{}-to-{}", cx.syms.borrow().text(*from), cx.syms.borrow().text(*to));
+        cx.syms.borrow_mut().intern(&text)
+    };
+    let fty = Ty::Fun(Box::new(actual.clone()), crate::check::EffectRow::default(), Box::new(expected.clone()));
+    IrExpr::Apply(Box::new(IrExpr::Name(conv, fty, sp)), Box::new(arg), expected.clone(), sp)
+}
+
 fn lower_unit_ctor_value(arg: IrExpr, unit_ty: &Ty, sp: crate::ast::Span, cx: &Lower) -> IrExpr {
     match arg {
         IrExpr::Let(n, t, v, b, s) => IrExpr::Let(n, t, v, Box::new(lower_unit_ctor_value(*b, unit_ty, sp, cx)), s),
