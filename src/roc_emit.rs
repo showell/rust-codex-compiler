@@ -387,6 +387,10 @@ Prelude :: [].{
 	int_pow : I64, I64 -> I64
 	int_pow = |a, b| if b < 0 { 0 } else { I64.pow(a, b) }
 
+	# x86's abs negates with a wrapping neg: the most negative integer answers itself.
+	int_abs : I64 -> I64
+	int_abs = |a| if a < 0 { I64.minus_wrap(0, a) } else { a }
+
 	int_mod : I64, I64 -> I64
 	int_mod = |a, b| {
 		m = I64.mod_by(a, b)
@@ -2801,6 +2805,17 @@ impl<'a> Cx<'a> {
                 )
             }
             // The builtin spelling of a unary minus, emitted as `E::Negate` is.
+            // x86's `abs` tests the sign and negates with a wrapping `neg`
+            // (emit-abs-builtin), so the most negative integer answers itself.
+            "abs" => {
+                want(1)?;
+                if self.wgsl {
+                    format!("(if {x} < 0 {{ I32.minus_wrap(0, {x}) }} else {{ {x} }})", x = xs[0])
+                } else {
+                    self.imports.insert("Prelude".into());
+                    format!("Prelude.int_abs({})", xs[0])
+                }
+            }
             "negate" => {
                 want(1)?;
                 let t = args[0].ty();
