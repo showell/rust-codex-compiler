@@ -54,7 +54,11 @@ const MEMORY_OPS: [&str; 11] = [
 /// builtins become the machine's doors too. The Machine module is not written
 /// here: it is roc-apps' model of codex-vm and the kernel (machine/roc), and
 /// whatever runs the program supplies it beside the emitted modules.
-const MACHINE_OPS: [&str; 14] = [
+const MACHINE_OPS: [&str; 18] = [
+    "process-get-cap",
+    "process-restrict-cap",
+    "process-set-scope",
+    "process-get-network-scope",
     "uefi-read-key-ex",
     "uefi-read-key",
     "port-out-32",
@@ -1061,12 +1065,14 @@ impl<'a> Cx<'a> {
     }
 
     /// Whether the threaded state answers an effect: `Device` for a GPU
-    /// kernel, the `Device.` family (`Device.Block`, `Device.Port`) for the
-    /// machine. `Mem` answers none, since the memory builtins carry none.
+    /// kernel; for the machine, the `Device.` family (`Device.Block`,
+    /// `Device.Port`) and `Capability`, whose builtins read and write the
+    /// process table it keeps. `Mem` answers none, since the memory builtins
+    /// carry none.
     fn threads(&self, label: &str) -> bool {
         match self.state {
             "Device" => label == "Device",
-            "Machine" => label.starts_with("Device."),
+            "Machine" => label.starts_with("Device.") || label == "Capability",
             _ => false,
         }
     }
@@ -1863,8 +1869,9 @@ impl<'a> Cx<'a> {
             // door is an effect, spelled with `!`: the disk may be the host's
             // (roc-apps machine/native).
             let door = match text.as_str() {
-                "port-out-32" | "block-write-sector" => Some(2),
-                "port-in-32" | "block-read-sector" | "block-select" | "process-get-scope" => Some(1),
+                "port-out-32" | "block-write-sector" | "process-restrict-cap" | "process-set-scope" => Some(2),
+                "port-in-32" | "block-read-sector" | "block-select" | "process-get-scope" | "process-get-cap"
+                | "process-get-network-scope" => Some(1),
                 "block-sector-count" | "process-get-pid" | "uefi-read-key-ex" | "uefi-read-key" => Some(0),
                 _ => None,
             };
