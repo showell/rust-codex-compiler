@@ -2126,6 +2126,8 @@ impl<'a> Cx<'a> {
             // (roc-apps machine/native). So is every port door: the byte and
             // 16-bit ones reach the IDE channel and through it the disk, and
             // the 32-bit ones the GPU a platform may keep (roc-apps framebuffer).
+            // So are the UEFI key reads, which take the key cell out of memory a
+            // platform may keep.
             // `gpu-out` and `gpu-in` are port-out-32 and port-in-32 under the
             // Gpu.Compute row, as x86 emits them; the port decides the rest.
             let name = match text.as_str() {
@@ -2149,6 +2151,7 @@ impl<'a> Cx<'a> {
                 want(k)?;
                 let bang = if text.starts_with("block-")
                     || name.starts_with("port-")
+                    || text.starts_with("uefi-read-key")
                     || text == "net-send-raw"
                     || text == "net-recv-raw"
                 {
