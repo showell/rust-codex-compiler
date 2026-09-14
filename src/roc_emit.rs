@@ -437,6 +437,20 @@ Prelude :: [].{
 	int_pow : I64, I64 -> I64
 	int_pow = |a, b| if b < 0 { 0 } else { I64.pow(a, b) }
 
+	# `base` with `pushed` appended last to first: the list a definition builds
+	# by pushing onto its own recursive call, which rocemit writes as a loop
+	# that gathers the pushed elements outermost first.
+	push_backwards : List(a), List(a) -> List(a)
+	push_backwards = |base, pushed| {
+		var $out = base
+		var $i = List.len(pushed)
+		while $i > 0 {
+			$i = $i - 1
+			$out = List.append($out, List.get(pushed, $i) ?? crash("Prelude: an index outside a list"))
+		}
+		$out
+	}
+
 	# x86's abs negates with a wrapping neg: the most negative integer answers itself.
 	int_abs : I64 -> I64
 	int_abs = |a| if a < 0 { I64.minus_wrap(0, a) } else { a }
@@ -768,10 +782,14 @@ fn mentions(text: &str, name: &str) -> bool {
     false
 }
 
+#[derive(Clone)]
 struct Fold {
     name: Sym,
     helper: String,
     acc: String,
+    /// Built by pushing onto the recursive call (`is_push_fold`), not by
+    /// appending it (`is_right_fold`).
+    push: bool,
 }
 
 impl<'a> Cx<'a> {
@@ -1573,7 +1591,14 @@ impl<'a> Cx<'a> {
         // costs milliseconds (measured, roc-apps probe/cons). The shape is
         // recognised, not guessed: every recursive call sits as the right
         // operand of an append at a leaf of the if-tree, and nowhere else.
-        let out = if !ps.is_empty() && is_right_fold(&d.body, d.name) {
+        //
+        // **SO IS A LIST BUILT BY PUSHING ONTO A RECURSIVE CALL**, `list-push
+        // (f rest) x`. That recursion is as deep as the list is long, and
+        // GlyphRasterizer's 4x4 supersampled glyph buffer overflows a browser's
+        // stack with it. The loop gathers the pushed elements outermost first,
+        // so a base case takes them back to front (`Prelude.push_backwards`).
+        let push_fold = !ps.is_empty() && is_push_fold(&d.body, d.name, &self.push_syms());
+        let out = if !ps.is_empty() && (push_fold || is_right_fold(&d.body, d.name)) {
             let acc = self.syms.find("acc").filter(|a| self.locals.contains(a)).map_or("acc", |_| "acc_");
             let helper = format!("{}_acc{bang}", self.ident(d.name)?);
             // `fun_parts` gives the result with its arrow ("-> List(a)"),
@@ -1586,11 +1611,16 @@ impl<'a> Cx<'a> {
                 hsig.push(self.ty(&p.ty)?);
             }
             hsig.push(bare.clone());
-            self.fold = Some(Fold { name: d.name, helper: helper.clone(), acc: acc.to_string() });
+            self.fold = Some(Fold { name: d.name, helper: helper.clone(), acc: acc.to_string(), push: push_fold });
             let body = self.expr(&d.body, base)?;
             self.fold = None;
+            let why = if push_fold {
+                "pushing onto a recursive call; emitted as an accumulator loop, which needs no stack as deep as the list is long"
+            } else {
+                "appending a recursive call; emitted as an accumulator loop, which is linear where the direct shape is quadratic"
+            };
             format!(
-                "{tabs}# {name} builds its list by appending a recursive call; emitted as an accumulator loop, which is linear where the direct shape is quadratic.\n\
+                "{tabs}# {name} builds its list by {why}.\n\
                  {tabs}{name} : {sig}\n{tabs}{name} = |{ps}| {helper}({ps}, [])\n\n\
                  {tabs}{helper} : {hsig} {ret}\n{tabs}{helper} = |{ps}, {acc}| {body}\n",
                 ps = ps.join(", "),
@@ -3126,7 +3156,7 @@ impl<'a> Cx<'a> {
         match e {
             E::If(c, t, f, _, _) => {
                 let c = self.expr(c, ind)?;
-                self.fold = Some(Fold { name: fold.name, helper: fold.helper.clone(), acc: fold.acc.clone() });
+                self.fold = Some(fold.clone());
                 let t = self.expr(t, ind);
                 let f = t.and_then(|t| self.expr(f, ind).map(|f| (t, f)));
                 self.fold = None;
@@ -3145,12 +3175,32 @@ impl<'a> Cx<'a> {
                     out.push_str(&format!("{tabs}{b} = {v}\n"));
                     cur = body;
                 }
-                self.fold = Some(Fold { name: fold.name, helper: fold.helper.clone(), acc: fold.acc.clone() });
+                self.fold = Some(fold.clone());
                 let last = self.expr(cur, ind + 1);
                 self.fold = None;
                 out.push_str(&format!("{tabs}{}\n{}}})", last?, "\t".repeat(ind)));
                 self.locals.truncate(mark);
                 Ok(out)
+            }
+            E::Apply(f, x, _, _) if fold.push && pushed_onto_self(f, fold.name, &self.push_syms()) => {
+                let E::Apply(_, list, _, _) = &**f else { unreachable!() };
+                let grown = format!("List.append({}, {})", fold.acc, self.expr(x, ind)?);
+                let mut args = Vec::new();
+                let mut head = &**list;
+                while let E::Apply(g, a, _, _) = head {
+                    args.push(&**a);
+                    head = g;
+                }
+                args.reverse();
+                let mut xs = Vec::new();
+                for a in args {
+                    xs.push(self.expr(a, ind)?);
+                }
+                Ok(format!("{}({}, {grown})", fold.helper, xs.join(", ")))
+            }
+            other if fold.push => {
+                self.imports.insert("Prelude".into());
+                Ok(format!("Prelude.push_backwards({}, {})", self.expr(other, ind)?, fold.acc))
             }
             E::Binary(IrBinOp::AppendList, l, r, _, _) if is_self_call(r, fold.name) => {
                 let grown = self.grow(&fold.acc, l, ind)?;
@@ -3169,6 +3219,11 @@ impl<'a> Cx<'a> {
             }
             other => self.grow(&fold.acc, other, ind),
         }
+    }
+
+    /// The builtins that push onto a list (`is_push_fold`).
+    fn push_syms(&self) -> Vec<Sym> {
+        ["list-push", "list-snoc"].iter().filter_map(|b| self.syms.find(b)).collect()
     }
 
     /// The accumulator with a list added at its end. **`List.append` PER
@@ -3226,6 +3281,42 @@ fn is_right_fold(body: &IrExpr, name: Sym) -> bool {
     }
     let mut found = false;
     matches!(body.ty(), Ty::List(_)) && leaves(body, name, &mut found) && found
+}
+
+/// Whether `name` builds its list by pushing onto its own recursive call,
+/// `list-push (name ..) x`: every recursive call is the list a push extends,
+/// at a leaf of the if-tree, and nowhere else. `push` holds the builtins that
+/// push (`list-push`, `list-snoc`).
+fn is_push_fold(body: &IrExpr, name: Sym, push: &[Sym]) -> bool {
+    fn leaves(e: &IrExpr, name: Sym, push: &[Sym], found: &mut bool) -> bool {
+        use IrExpr as E;
+        match e {
+            E::If(c, t, f, _, _) => !calls(c, name) && leaves(t, name, push, found) && leaves(f, name, push, found),
+            E::Let(_, _, v, b, _) => !calls(v, name) && leaves(b, name, push, found),
+            E::Apply(f, x, _, _) if pushed_onto_self(f, name, push) => {
+                let E::Apply(_, list, _, _) = &**f else { return false };
+                let mut args_ok = true;
+                let mut head = &**list;
+                while let E::Apply(g, a, _, _) = head {
+                    args_ok &= !calls(a, name);
+                    head = g;
+                }
+                *found = true;
+                !calls(x, name) && args_ok
+            }
+            other => !calls(other, name),
+        }
+    }
+    let mut found = false;
+    matches!(body.ty(), Ty::List(_)) && leaves(body, name, push, &mut found) && found
+}
+
+/// Whether `f` is a push applied to a recursive call: `list-push (name ..)`.
+fn pushed_onto_self(f: &IrExpr, name: Sym, push: &[Sym]) -> bool {
+    match f {
+        IrExpr::Apply(h, list, _, _) => matches!(&**h, IrExpr::Name(n, _, _) if push.contains(n)) && is_self_call(list, name),
+        _ => false,
+    }
 }
 
 fn uses(e: &IrExpr, n: Sym) -> bool {
