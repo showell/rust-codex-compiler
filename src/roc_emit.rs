@@ -137,7 +137,6 @@ fn result_ty(t: &Ty, k: usize) -> Ty {
     cur
 }
 
-/// Every `Named` in a type expression, however deep.
 /// Whether a type expression holds a function (or an effect) anywhere in it.
 fn holds_fun(t: &TypeExpr) -> bool {
     match t {
@@ -149,6 +148,7 @@ fn holds_fun(t: &TypeExpr) -> bool {
     }
 }
 
+/// Every `Named` in a type expression, however deep.
 fn named_types(t: &TypeExpr, out: &mut std::collections::BTreeSet<Sym>) {
     match t {
         TypeExpr::Named(n, _) => {
