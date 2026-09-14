@@ -467,15 +467,18 @@ const LINE_HELPER: &str =
 /// the spec's own definitions and `main!`.
 /// `vm_flags` says the unit brings codex-vm flags (a `.vmargs` beside it): it
 /// asks for devices only the machine answers, so it threads `Machine` even
-/// where its code reaches memory alone.
+/// where its code reaches memory alone. `by_reach` picks the state from what
+/// the opening reaches, for a platform whose host stops at an address it does
+/// not back (see the closure in `Cx::new`).
 pub fn emit_modules(
     ch: &Chapter,
     tds: &TypeDefs,
     syms: &SymTab,
     defs: &[IrDef],
     vm_flags: bool,
+    by_reach: bool,
 ) -> Result<Vec<(String, String)>, String> {
-    let mut cx = Cx::new(ch, tds, syms, defs, vm_flags);
+    let mut cx = Cx::new(ch, tds, syms, defs, vm_flags, by_reach);
     // **A UNIT WITH NO OPENING IS A LIBRARY**: every chapter a module, no
     // app. That is what a GPU kernel chapter is.
     // A `[Device]` opening (GlobeKernels has one, for the wgsl plug's root)
@@ -692,6 +695,9 @@ struct Cx<'a> {
     /// function's name with a trailing `!`, so `def` and `def_ref` read the
     /// name off this set (`takes_bang`).
     bang_defs: std::collections::BTreeSet<Sym>,
+    /// Definitions the opening cannot reach that reach a device builtin, in a
+    /// unit that runs without the machine, each with the builtin it reaches.
+    stubbed: BTreeMap<Sym, Sym>,
     /// **THE STATE THIS UNIT THREADS.** `Device` for a GPU kernel, whose
     /// type says so; `Mem` for a program that reads and writes an address
     /// space, whose type does NOT: Codex gives `peek-byte` and friends an
@@ -769,7 +775,7 @@ struct Fold {
 }
 
 impl<'a> Cx<'a> {
-    fn new(ch: &Chapter, tds: &'a TypeDefs, syms: &'a SymTab, defs: &'a [IrDef], vm_flags: bool) -> Cx<'a> {
+    fn new(ch: &Chapter, tds: &'a TypeDefs, syms: &'a SymTab, defs: &'a [IrDef], vm_flags: bool, by_reach: bool) -> Cx<'a> {
         let mut cx = Cx {
             syms,
             tds,
@@ -792,6 +798,7 @@ impl<'a> Cx<'a> {
             device_ops: Default::default(),
             device_defs: Default::default(),
             bang_defs: Default::default(),
+            stubbed: Default::default(),
             state: "Device",
             dev: None,
             dev_n: 0,
@@ -826,7 +833,6 @@ impl<'a> Cx<'a> {
                 MEMORY_OPS.iter().filter_map(|b| syms.find(b)).chain(devices.iter().copied()).collect();
             if !ops.is_empty() {
                 let mut touch: std::collections::BTreeSet<Sym> = Default::default();
-                let mut machine = false;
                 loop {
                     let mut grew = false;
                     for d in defs {
@@ -839,7 +845,6 @@ impl<'a> Cx<'a> {
                                 if ops.contains(n) || touch.contains(n) {
                                     hit = true;
                                 }
-                                machine |= devices.contains(n);
                             }
                         });
                         if hit {
@@ -851,10 +856,71 @@ impl<'a> Cx<'a> {
                         break;
                     }
                 }
+                // **A DEVICE BUILTIN ANYWHERE IN THE UNIT ASKS FOR THE MACHINE**,
+                // because a program can also reach a device through a memory
+                // address no builtin names: e1000-tx-deadline reads the HPET
+                // with `peek-32`, and under `Mem` that address is RAM and its
+                // clock never moves. A chapter is emitted whole, so a unit that
+                // cites one for a drawing function brings its PCI scan along,
+                // and gets the machine.
+                //
+                // `by_reach` is for a platform whose host stops a read or
+                // write at an address it does not back (roc-apps framebuffer):
+                // there a unit threads the machine only when a chain of names
+                // from the opening arrives at a device builtin (`bin/reaches`
+                // prints the chain), and a definition the opening cannot reach
+                // is written as a crash naming the builtin it reaches. A
+                // library has no opening, and every definition counts.
+                let mut wired: BTreeMap<Sym, Sym> = BTreeMap::new();
+                loop {
+                    let mut grew = false;
+                    for d in defs {
+                        if wired.contains_key(&d.name) {
+                            continue;
+                        }
+                        let mut via = None;
+                        d.body.walk(&mut |x| {
+                            if let IrExpr::Name(n, _, _) = x {
+                                if via.is_none() {
+                                    via = if devices.contains(n) { Some(*n) } else { wired.get(n).copied() };
+                                }
+                            }
+                        });
+                        if let Some(b) = via {
+                            wired.insert(d.name, b);
+                            grew = true;
+                        }
+                    }
+                    if !grew {
+                        break;
+                    }
+                }
+                let by_name: BTreeMap<Sym, &IrDef> = defs.iter().map(|d| (d.name, d)).collect();
+                let reached: std::collections::BTreeSet<Sym> = match syms.find("opening").filter(|o| by_name.contains_key(o)) {
+                    Some(open) => {
+                        let mut seen = std::collections::BTreeSet::from([open]);
+                        let mut stack = vec![open];
+                        while let Some(n) = stack.pop() {
+                            by_name[&n].body.walk(&mut |x| {
+                                if let IrExpr::Name(m, _, _) = x {
+                                    if by_name.contains_key(m) && seen.insert(*m) {
+                                        stack.push(*m);
+                                    }
+                                }
+                            });
+                        }
+                        seen
+                    }
+                    None => by_name.keys().copied().collect(),
+                };
+                let machine = vm_flags || if by_reach { reached.iter().any(|n| wired.contains_key(n)) } else { !wired.is_empty() };
                 // The opening makes the state itself (`opening`), so it stays
                 // the app's main rather than becoming a function of the state.
                 if !touch.is_empty() {
-                    cx.state = if machine || vm_flags { "Machine" } else { "Mem" };
+                    cx.state = if machine { "Machine" } else { "Mem" };
+                    if !machine {
+                        cx.stubbed = wired;
+                    }
                     cx.device_ops = ops;
                     cx.device_defs = touch;
                     if let Some(o) = syms.find("opening") {
@@ -989,7 +1055,11 @@ impl<'a> Cx<'a> {
         // `Module.name`, so only a definition of THIS module can collide --
         // and a module's text must not depend on which spec is attached.
         let collides = self.arity.contains_key(&n) && self.def_module.get(&n).is_some_and(|m| *m == self.current);
-        Ok(if collides { format!("{id}_") } else { id })
+        // A local spelled like the threaded state's own names (`mem`,
+        // `machine2`) would shadow them, so it takes the underscore too.
+        let base = self.dev_base();
+        let state_like = id.starts_with(base) && id[base.len()..].chars().all(|c| c.is_ascii_digit());
+        Ok(if collides || state_like { format!("{id}_") } else { id })
     }
 
     fn tag(&self, n: Sym) -> Result<String, String> {
@@ -1179,12 +1249,14 @@ impl<'a> Cx<'a> {
     /// Whether the threaded state answers an effect: `Device` for a GPU
     /// kernel; for the machine, the `Device.` family (`Device.Block`,
     /// `Device.Port`) and `Capability`, whose builtins read and write the
-    /// process table it keeps. `Mem` answers none, since the memory builtins
-    /// carry none.
+    /// process table it keeps. `Mem` carries the same rows: a unit runs
+    /// without the machine only when its opening reaches no device builtin, so
+    /// under `Mem` such a row is declared on a definition that never performs
+    /// it, or on one written as a crash (`stubbed`).
     fn threads(&self, label: &str) -> bool {
         match self.state {
             "Device" => label == "Device",
-            "Machine" => {
+            "Machine" | "Mem" => {
                 label.starts_with("Device.") || label == "Capability" || label.starts_with("Network.") || label.starts_with("Gpu")
             }
             _ => false,
@@ -1466,6 +1538,21 @@ impl<'a> Cx<'a> {
         let tabs = "\t".repeat(base);
         if self.device_defs.contains(&d.name) {
             self.imports.insert(self.state.into());
+            // **A DEFINITION THE OPENING CANNOT REACH MAY NAME A DEVICE THE
+            // STATE DOES NOT HAVE.** `Mem` has no door for a port or a sector,
+            // so the body is a crash naming the device builtin it reaches, under
+            // the signature a caller would see.
+            if let Some(b) = self.stubbed.get(&d.name).copied() {
+                self.locals.truncate(mark);
+                let sig = self.device_signature(d)?;
+                let blanks = vec!["_"; d.params.len() + 1].join(", ");
+                let what = format!(
+                    "`{}` reaches `{}`, a device builtin this program's opening never calls, and the program runs without the machine",
+                    self.syms.text(d.name),
+                    self.syms.text(b)
+                );
+                return Ok(format!("{tabs}{name} : {sig}\n{tabs}{name} = |{blanks}| crash(\"{what}\")\n"));
+            }
             for p in &d.params {
                 self.no_dev_name(p.name)?;
             }
@@ -1741,7 +1828,7 @@ impl<'a> Cx<'a> {
     }
 
     fn no_dev_name(&self, n: Sym) -> Result<(), String> {
-        let id = self.ident(n)?;
+        let id = self.local(n)?;
         let base = self.dev_base();
         if id.starts_with(base) && id[base.len()..].chars().all(|c| c.is_ascii_digit()) {
             return Err(format!("`{id}` is spelled like the threaded {}", self.state));
@@ -2017,10 +2104,10 @@ impl<'a> Cx<'a> {
         self.imports.insert(self.state.into());
         if self.by_closure() {
             let s = self.state;
-            // A memory door that reads or writes is an effect under `Mem`: the
-            // platform may keep the bytes (see `MEM`). The machine's memory is
-            // part of its value, so its doors stay pure.
-            let mem_bang = if s == "Mem" { "!" } else { "" };
+            // A memory door that reads or writes is an effect, under the machine
+            // as under `Mem`: a platform may keep the bytes, and the GPU they
+            // feed (see `MEM`, and roc-apps framebuffer/roc/Machine.roc).
+            let mem_bang = "!";
             // A heap mark is the bump pointer, as x86's r10 is: `__heap-save`
             // answers it and `__heap-restore` rewinds to it, answering 0.
             if text == "__heap-save" {
@@ -2036,8 +2123,9 @@ impl<'a> Cx<'a> {
             // select answer 0, and a block read answers the address of the
             // sector it bump-allocated. Only the machine threads one. A block
             // door is an effect, spelled with `!`: the disk may be the host's
-            // (roc-apps machine/native). So are the byte and 16-bit port
-            // doors, which reach the IDE channel and through it the disk.
+            // (roc-apps machine/native). So is every port door: the byte and
+            // 16-bit ones reach the IDE channel and through it the disk, and
+            // the 32-bit ones the GPU a platform may keep (roc-apps framebuffer).
             // `gpu-out` and `gpu-in` are port-out-32 and port-in-32 under the
             // Gpu.Compute row, as x86 emits them; the port decides the rest.
             let name = match text.as_str() {
@@ -2060,9 +2148,7 @@ impl<'a> Cx<'a> {
             if let Some(k) = door {
                 want(k)?;
                 let bang = if text.starts_with("block-")
-                    || text.starts_with("port-in-16")
-                    || text.starts_with("port-out-16")
-                    || text.ends_with("-byte")
+                    || name.starts_with("port-")
                     || text == "net-send-raw"
                     || text == "net-recv-raw"
                 {

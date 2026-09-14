@@ -2,9 +2,16 @@
 //!
 //!     rocemit <unit.codex> <dir>      one type module per chapter, whole, and
 //!                                     the spec's app, written into <dir>.
+//!     rocemit --by-reach <unit.codex> <dir>
 //!
 //! Two lines on stdout: the app's file name, or `library` for a unit with
 //! no opening, and a digest of everything written.
+//!
+//! `--by-reach` picks the threaded state from what the opening can reach, not
+//! from every definition in the unit's chapters. It is for a platform whose
+//! host stops a read or write at an address it does not back (roc-apps
+//! framebuffer): a program can reach a device through a memory address no
+//! builtin names, which only the host can see.
 //!
 //! The same road as `irdump whole` -- resolve, parse, desugar, check, lower --
 //! and then `roc_emit` instead of the IR text. Exit 2 on a refusal.
@@ -16,10 +23,14 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let result = match args.as_slice() {
-        [path, dir] => emit(Path::new(path), Path::new(dir)),
+    let (by_reach, rest) = match args.split_first() {
+        Some((flag, rest)) if flag == "--by-reach" => (true, rest),
+        _ => (false, &args[..]),
+    };
+    let result = match rest {
+        [path, dir] => emit(Path::new(path), Path::new(dir), by_reach),
         _ => {
-            eprintln!("usage: rocemit <unit.codex> <dir>");
+            eprintln!("usage: rocemit [--by-reach] <unit.codex> <dir>");
             return ExitCode::from(2);
         }
     };
@@ -36,7 +47,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn emit(path: &Path, dir: &Path) -> Result<String, String> {
+fn emit(path: &Path, dir: &Path, by_reach: bool) -> Result<String, String> {
     let src = codexc::bundle::load(path)?;
     let parsed = parser::parse(&src);
     if !parsed.lex_errors.is_empty() || !parsed.diagnostics.is_empty() {
@@ -64,7 +75,7 @@ fn emit(path: &Path, dir: &Path) -> Result<String, String> {
     // A test's codex-vm flags sit beside it as `.vmargs`; a unit that brings
     // them asks for the machine's devices.
     let vm_flags = path.with_extension("vmargs").exists();
-    let files = codexc::roc_emit::emit_modules(&ch, &tds, &low.syms, &low.defs, vm_flags)?;
+    let files = codexc::roc_emit::emit_modules(&ch, &tds, &low.syms, &low.defs, vm_flags, by_reach)?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     // The directory holds ONLY this unit's modules: a file from an earlier
     // emission of a chapter that has since gone would still be imported.
