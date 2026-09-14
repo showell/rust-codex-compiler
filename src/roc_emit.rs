@@ -41,9 +41,9 @@ const KEYWORDS: [&str; 34] = [
 /// Read from `src/build/roc/Builtin.roc`'s own declarations.
 /// The builtins that read and write the address space. A poke answers 0
 /// and is bound to a name nobody reads; the write is the point.
-const MEMORY_OPS: [&str; 12] = [
+const MEMORY_OPS: [&str; 13] = [
     "peek-byte", "peek-16", "peek-32", "peek-qword", "poke-byte", "poke-16", "poke-32", "poke-qword", "alloc-bytes",
-    "atomic-load", "atomic-store", "atomic-exchange",
+    "__heap-advance", "atomic-load", "atomic-store", "atomic-exchange",
 ];
 
 /// The builtins the machine answers: PCI configuration space through 0xCF8
@@ -216,6 +216,17 @@ Mem :: [].{
 
 	alloc : Mem.Mem, I64 -> (Mem.Mem, I64)
 	alloc = |mem, n| ({ root: mem.root, top: mem.top + n }, mem.top)
+
+	# `__heap-advance`: the bump pointer moves past `n` bytes.
+	advance : Mem.Mem, I64 -> (Mem.Mem, {})
+	advance = |mem, n| ({ root: mem.root, top: mem.top + n }, {})
+
+	# `__heap-save` answers the bump pointer, and `__heap-restore` rewinds to it.
+	mark : Mem.Mem -> (Mem.Mem, I64)
+	mark = |mem| (mem, mem.top)
+
+	release : Mem.Mem, I64 -> (Mem.Mem, I64)
+	release = |mem, h| ({ root: mem.root, top: h }, 0)
 
 	# The index into the node at `level`: level 0 is the leaf's byte.
 	part : U64, I64 -> U64
@@ -613,6 +624,10 @@ struct Cx<'a> {
     /// the count of names minted for it in this definition.
     dev: Option<String>,
     dev_n: usize,
+    /// Set while emitting a definition or opening that threads memory: there
+    /// a heap mark is the bump pointer (`__heap-save` answers it and
+    /// `__heap-restore` rewinds to it), and elsewhere, with no heap, it is 0.
+    heap_live: bool,
     /// **A POKE CAN STAND ANYWHERE.** The memory builtins carry an empty
     /// effect row, so Codex writes `show (raw-mem 786432 42)` where a
     /// `[Device]` act would have had to bind the call with `<-`. Such a
@@ -700,6 +715,7 @@ impl<'a> Cx<'a> {
             state: "Device",
             dev: None,
             dev_n: 0,
+            heap_live: false,
             hoist: Vec::new(),
             tmp_n: 0,
             wgsl: false,
@@ -1326,6 +1342,7 @@ impl<'a> Cx<'a> {
     /// A definition, whole; a data table of thousands of literals is emitted
     /// as the literal it is, since the nightly's checker is linear in them.
     fn def(&mut self, d: &IrDef, base: usize) -> Result<String, String> {
+        self.heap_live = self.by_closure() && self.device_defs.contains(&d.name);
         // Roc spells an effectful function's name with `!` (`def_ref` agrees).
         let bang = if self.bang_defs.contains(&d.name) { "!" } else { "" };
         let name = format!("{}{bang}", self.ident(d.name)?);
@@ -1462,6 +1479,7 @@ impl<'a> Cx<'a> {
         // definition that pokes takes the memory and answers it back; the
         // program's root is the one place that has to make one.
         let memory = memory_first;
+        self.heap_live = memory;
         if memory {
             self.imports.insert(self.state.into());
             self.dev_n = 0;
@@ -1568,13 +1586,13 @@ impl<'a> Cx<'a> {
         use IrExpr as E;
         match e {
             E::Act(..) => true,
-            E::Name(n, _, _) => self.is_device_sym(*n),
+            E::Name(n, _, _) => self.is_device_sym(*n) || self.is_heap_mark(*n),
             E::Apply(..) => {
                 let mut head = e;
                 while let E::Apply(f, _, _, _) = head {
                     head = f;
                 }
-                matches!(head, E::Name(n, _, _) if self.is_device_sym(*n))
+                matches!(head, E::Name(n, _, _) if self.is_device_sym(*n) || self.is_heap_mark(*n))
             }
             E::Let(_, _, _, body, _) => self.is_effectful(body),
             E::If(_, t, f, _, _) => self.is_effectful(t) || self.is_effectful(f),
@@ -1585,6 +1603,11 @@ impl<'a> Cx<'a> {
 
     fn is_device_sym(&self, n: Sym) -> bool {
         self.device_ops.contains(&n) || self.device_defs.contains(&n)
+    }
+
+    /// `__heap-save` or `__heap-restore` where memory is threaded (`heap_live`).
+    fn is_heap_mark(&self, n: Sym) -> bool {
+        self.heap_live && matches!(self.syms.text(n), "__heap-save" | "__heap-restore")
     }
 
     /// The threaded state is `dev`, `dev1`, ... for a GPU device, `mem`,
@@ -1871,6 +1894,16 @@ impl<'a> Cx<'a> {
         self.imports.insert(self.state.into());
         if self.by_closure() {
             let s = self.state;
+            // A heap mark is the bump pointer, as x86's r10 is: `__heap-save`
+            // answers it and `__heap-restore` rewinds to it, answering 0.
+            if text == "__heap-save" {
+                want(0)?;
+                return Ok(format!("{s}.mark({})", xs[0]));
+            }
+            if text == "__heap-restore" {
+                want(1)?;
+                return Ok(format!("{s}.release({}, {})", xs[0], xs[1]));
+            }
             // A device builtin is the machine's door of the same name, and the
             // door answers as x86 does: `port-out-32`, a block write and a
             // select answer 0, and a block read answers the address of the
@@ -1915,6 +1948,12 @@ impl<'a> Cx<'a> {
                     return Err("`alloc-bytes` takes one argument".into());
                 }
                 return Ok(format!("{s}.alloc({})", xs.join(", ")));
+            }
+            // `__heap-advance n` moves the bump pointer past `n` bytes and
+            // answers Nothing: `alloc-bytes` without the address.
+            if text == "__heap-advance" {
+                want(1)?;
+                return Ok(format!("{s}.advance({})", xs.join(", ")));
             }
             // `atomic-exchange addr v` swaps the qword at the address for `v`
             // and answers the old one, x86's xchg.
@@ -1968,7 +2007,7 @@ impl<'a> Cx<'a> {
     /// A heap mark handed only to `__heap-restore` is read by nothing, since
     /// the restore is emitted as `0`.
     fn binder(&self, n: Sym, scope: &[&IrExpr]) -> Result<String, String> {
-        let restore = self.syms.find("__heap-restore");
+        let restore = if self.heap_live { None } else { self.syms.find("__heap-restore") };
         let used = scope.iter().any(|e| reads(e, n, restore));
         let id = self.local(n)?;
         Ok(if used { id } else { format!("_{id}") })
