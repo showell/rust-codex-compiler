@@ -22,7 +22,7 @@
 //! is running.
 
 use crate::ast::*;
-use crate::code::{Arm, Code, Compiler, Names, PatCode, Stmt};
+use crate::code::{signature, Arm, Code, Compiler, Names, PatCode, Static, Stmt};
 use crate::symbol::{Sym, SymTab};
 use std::collections::HashMap;
 use std::cell::RefCell;
@@ -780,6 +780,23 @@ impl Interp {
             };
         }
 
+        // What each definition declares, which is how compilation tells an
+        // integer operation that wraps from one that traps.
+        names.records = ch
+            .type_defs
+            .iter()
+            .filter_map(|t| match t {
+                TypeDef::Record(name, ..) => Some(*name),
+                _ => None,
+            })
+            .collect();
+        let results: Vec<(u32, usize, Static)> =
+            fun_defs.iter().map(|(i, d)| (*i, d.params.len(), signature(d, &names, &ch.syms).1)).collect();
+        names.results = results.into_iter().map(|(i, arity, t)| (i, (arity, t))).collect();
+        let const_types: Vec<Static> =
+            const_defs_src.iter().map(|d| signature(d, &names, &ch.syms).1).collect();
+        names.const_types = const_types.into_iter().enumerate().map(|(i, t)| (i as u32, t)).collect();
+
         // Pass 2: compile. The tables are complete, so a body can name
         // anything the unit defines regardless of where it sits.
         let impure = impure_names(&ch.syms, &const_defs_src, &fun_defs);
@@ -929,7 +946,7 @@ impl Interp {
                 Step::Done(v) => Ok(v),
                 Step::Call(c, applied) => self.call(c, applied),
             },
-            Code::Binary(l, op, r) => {
+            Code::Binary(l, op, r, wraps) => {
                 // `and` and `or` SHORT-CIRCUIT, and programs depend on it for
                 // safety rather than speed:
                 //
@@ -950,7 +967,7 @@ impl Interp {
                 let b = self.eval(r, env)?;
                 {
                     let Interp { syms, bump, .. } = self;
-                    binary(syms, bump, *op, a, b)
+                    binary(syms, bump, *op, *wraps, a, b)
                 }
             }
             Code::Unary(x) => match self.eval(x, env)? {
@@ -1667,9 +1684,10 @@ impl Interp {
             ("bit-xor", [Int(a), Int(b)]) => Ok(Int(a ^ b)),
             ("bit-not", [Int(a)]) => Ok(Int(!a)),
             ("bit-shl", [Int(a), Int(b)]) => Ok(Int(((*a as u64) << (*b as u32 & 63)) as i64)),
-            ("bit-shr" | "bit-shru", [Int(a), Int(b)]) => {
-                Ok(Int(((*a as u64) >> (*b as u32 & 63)) as i64))
-            }
+            // `bit-shr` is x86's `sar`, which carries the sign down, and
+            // `bit-shru` is `shr`, which shifts in zeros (`Builtins.codex`).
+            ("bit-shr", [Int(a), Int(b)]) => Ok(Int(*a >> (*b as u32 & 63))),
+            ("bit-shru", [Int(a), Int(b)]) => Ok(Int(((*a as u64) >> (*b as u32 & 63)) as i64)),
             ("text-split", [Text(t), Text(sep)]) => {
                 let (t, sep) = (t.units(), sep.units());
                 let parts: Vec<Vec<u8>> = if sep.is_empty() {
@@ -1996,12 +2014,15 @@ fn ordinal(f: f64) -> i64 {
 fn apply_bound(v: i64, b: &FieldBound) -> i64 {
     match b.mode {
         OverflowMode::Clamping => v.clamp(b.lo, b.hi),
+        // A wrapping band is a hardware width, so its span is a power of two
+        // and the differences can wrap in 64 bits without moving the residue.
+        // The full i64 band's span wraps to 0: every value is already in it.
         OverflowMode::Wrapping => {
-            let span = b.hi - b.lo + 1;
+            let span = b.hi.wrapping_sub(b.lo).wrapping_add(1);
             if span <= 0 {
                 v
             } else {
-                b.lo + (v - b.lo).rem_euclid(span)
+                b.lo + v.wrapping_sub(b.lo).rem_euclid(span)
             }
         }
         // `error` is a compile-time refusal, not a runtime one.
@@ -2063,7 +2084,7 @@ pub(crate) fn literal(text: &str, kind: LiteralKind) -> R<Value> {
 /// The borrow is split rather than the table cloned: `syms` and `bump` are
 /// disjoint fields, and Rust will let both be borrowed at once when it can see
 /// that.
-fn binary(syms: &SymTab, bump: &mut crate::bump::Bump, op: BinaryOp, a: Value, b: Value) -> R<Value> {
+fn binary(syms: &SymTab, bump: &mut crate::bump::Bump, op: BinaryOp, wraps: bool, a: Value, b: Value) -> R<Value> {
     // Nested fns rather than closures: two closures cannot both hold the bump.
     fn cat(bump: &mut crate::bump::Bump, units: Vec<u8>) -> Value {
         let addr = bump.alloc(units.len() as i64);
@@ -2076,9 +2097,9 @@ fn binary(syms: &SymTab, bump: &mut crate::bump::Bump, op: BinaryOp, a: Value, b
     use BinaryOp::*;
     use Value::*;
     Ok(match (op, &a, &b) {
-        (OpAdd, Int(x), Int(y)) => Int(x + y),
-        (OpSub, Int(x), Int(y)) => Int(x - y),
-        (OpMul, Int(x), Int(y)) => Int(x * y),
+        (OpAdd, Int(x), Int(y)) => Int(int_op(*x, *y, wraps, "+", i64::overflowing_add)?),
+        (OpSub, Int(x), Int(y)) => Int(int_op(*x, *y, wraps, "-", i64::overflowing_sub)?),
+        (OpMul, Int(x), Int(y)) => Int(int_op(*x, *y, wraps, "*", i64::overflowing_mul)?),
         (OpDiv, Int(x), Int(y)) if *y != 0 => Int(x / y),
         (OpDiv, Int(_), Int(_)) => return err("division by zero"),
         (OpPow, Int(x), Int(y)) => Int(x.pow(*y as u32)),
@@ -2133,6 +2154,17 @@ fn binary(syms: &SymTab, bump: &mut crate::bump::Bump, op: BinaryOp, a: Value, b
             ))
         }
     })
+}
+
+/// `+`, `-` and `*` on Integers. **A plain Integer TRAPS on overflow**: x86
+/// follows the operation with `jno; ud2` (COMPILER-36), and the run dies with
+/// `!EXC=06` rather than going on with a wrong number. An operation whose type
+/// is a `wrapping` band keeps the machine's wrapped result.
+fn int_op(x: i64, y: i64, wraps: bool, sign: &str, op: fn(i64, i64) -> (i64, bool)) -> R<i64> {
+    match op(x, y) {
+        (_, true) if !wraps => err(format!("{x} {sign} {y} overflows a plain Integer, which traps (!EXC=06)")),
+        (v, _) => Ok(v),
+    }
 }
 
 fn equal(a: &Value, b: &Value) -> bool {
@@ -2215,7 +2247,7 @@ pub fn show_units(syms: &SymTab, v: &Value) -> Vec<u8> {
 pub fn show(syms: &SymTab, v: &Value) -> String {
     match v {
         Value::Int(i) => i.to_string(),
-        Value::Real(f) => format!("{f}"),
+        Value::Real(f) => real_text(*f),
         Value::Text(t) => t.printed(),
         // A Char shows as its code, as upstream's `show` does.
         Value::Char(c) => c.to_string(),
@@ -2240,6 +2272,47 @@ pub fn show(syms: &SymTab, v: &Value) -> String {
         }
         Value::Fun(_) => "<function>".to_string(),
     }
+}
+
+/// A Real as x86's `__real_to_text` writes it, step for step: the integer part
+/// as `cvttsd2si` truncates it, a dot, then fraction digits, each the
+/// truncation of the remainder times ten, until the remainder is zero or there
+/// are fifteen, with trailing zeros dropped down to one. So 4000.0 prints
+/// `4000.0`. A magnitude `cvttsd2si` cannot hold -- NaN, an infinity, 2^63 or
+/// more -- truncates to the integer indefinite, and `div` prints it unsigned,
+/// as 9223372036854775808.
+fn real_text(f: f64) -> String {
+    fn cvttsd2si(x: f64) -> i64 {
+        if (-9223372036854775808.0..9223372036854775808.0).contains(&x) { x as i64 } else { i64::MIN }
+    }
+    let bits = f.to_bits();
+    let mut out = String::from(if bits >> 63 == 1 { "-" } else { "" });
+    let mag = bits & (u64::MAX >> 1);
+    if mag == 0 {
+        out.push_str("0.0");
+        return out;
+    }
+    let x = f64::from_bits(mag);
+    let ip = cvttsd2si(x);
+    let mut frac = x - ip as f64;
+    out.push_str(&(ip as u64).to_string());
+    out.push('.');
+    // Each digit is stored as its unit, the low byte of `d + 3`.
+    let mut units: Vec<u8> = Vec::with_capacity(15);
+    while units.len() < 15 {
+        frac *= 10.0;
+        let d = cvttsd2si(frac);
+        frac -= d as f64;
+        units.push(d.wrapping_add(3) as u8);
+        if frac.to_bits() == 0 {
+            break;
+        }
+    }
+    while units.len() > 1 && units.last() == Some(&3) {
+        units.pop();
+    }
+    out.extend(units.iter().map(|u| crate::charcode::code_to_char(*u as i64)));
+    out
 }
 
 fn type_name(v: &Value) -> &'static str {
@@ -2291,6 +2364,66 @@ mod tests {
         let mut it = Interp::new(&ch);
         it.run().unwrap_or_else(|e| panic!("{}", e.0));
         String::from_utf8_lossy(&it.out).into_owned()
+    }
+
+    /// Run a chapter that must fail, and answer why.
+    fn failure(src: &str) -> String {
+        let src = src.as_bytes().to_vec();
+        let parsed = crate::parser::parse(&src);
+        let mut dg = crate::desugar::Desugar::new(&src);
+        let ch = dg.chapter(&parsed.tree);
+        let mut it = Interp::new(&ch);
+        match it.run() {
+            Ok(()) => panic!("ran to the end: {}", String::from_utf8_lossy(&it.out)),
+            Err(e) => e.0,
+        }
+    }
+
+    const WRAP: &str = "Chapter: T\n\nSection: S\n\n  Hold = record {\n    h : Integer wrapping\n  }\n\n  big : Integer\n  big = 4000000000\n\n  by-param : Integer wrapping, Integer -> Integer\n  by-param (a) (b) = a * b\n\n  keeps : Integer wrapping, Integer, Integer -> Integer\n  keeps (h) (k) (v) = h * k + v\n\n  w64-mul : Integer wrapping, Integer -> Integer wrapping\n  w64-mul (a) (b) = a * b\n\n  through-let : Integer -> Integer\n  through-let (b) = let c = w64-mul b big in c * big\n\n  from-field : Hold -> Integer\n  from-field (s) = s.h * big\n\n  by-plain : Integer, Integer -> Integer\n  by-plain (a) (b) = a * b\n\n  literal-left : Integer wrapping -> Integer\n  literal-left (a) = 4000000000 * a\n\n  builtin-left : Integer wrapping -> Integer\n  builtin-left (a) = bit-xor a 0 * a\n\n";
+
+    /// An operation wraps when its type is a `wrapping` band: a declared
+    /// parameter, a declared result through a `let`, a declared record field,
+    /// and the left operand's mode kept across a second operation.
+    #[test]
+    fn an_operation_on_a_wrapping_integer_wraps() {
+        let src = format!("{WRAP}Section: E\n\n  opening : [Console] Nothing = act\n    print-line-uni (show (by-param big big))\n    print-line-uni (show (keeps 9223372036854775807 1 1))\n    print-line-uni (show (through-let big))\n    print-line-uni (show (from-field (Hold {{ h = big }})))\n  end\n");
+        let big: i64 = 4_000_000_000;
+        let want = [
+            big.wrapping_mul(big),
+            i64::MAX.wrapping_add(1),
+            big.wrapping_mul(big).wrapping_mul(big),
+            big.wrapping_mul(big),
+        ];
+        let got = out(&src);
+        assert_eq!(got.lines().collect::<Vec<_>>(), want.iter().map(|v| v.to_string()).collect::<Vec<_>>());
+    }
+
+    /// A plain Integer traps on overflow, and so does an operation whose left
+    /// operand is a literal or a builtin's result, whatever the right is.
+    #[test]
+    fn an_overflow_on_a_plain_integer_traps() {
+        for call in ["by-plain big big", "literal-left big", "builtin-left big"] {
+            let src = format!("{WRAP}Section: E\n\n  opening : [Console] Nothing = act\n    print-line-uni (show ({call}))\n  end\n");
+            let why = failure(&src);
+            assert!(why.contains("overflows a plain Integer, which traps"), "{call}: {why}");
+        }
+    }
+
+    /// `bit-shr` keeps a negative number's sign and `bit-shru` does not, as
+    /// x86's `sar` and `shr` do. Ed25519's carry out of a negative limb is
+    /// `bit-shr v 16`.
+    #[test]
+    fn bit_shr_carries_the_sign_and_bit_shru_does_not() {
+        let src = "Chapter: T\n\nSection: E\n\n  opening : [Console] Nothing = act\n    print-line-uni (show (bit-shr (0 - 65536) 16))\n    print-line-uni (show (bit-shru (0 - 65536) 16))\n  end\n";
+        assert_eq!(out(src), format!("{}\n{}\n", -65536i64 >> 16, ((-65536i64) as u64 >> 16) as i64));
+    }
+
+    /// `show` of a Real is x86's `__real_to_text`. The two wide rows are
+    /// `codex/test/real-show-wide.expected`'s.
+    #[test]
+    fn a_real_shows_as_x86_prints_it() {
+        let src = "Chapter: T\n\nSection: E\n\n  opening : [Console] Nothing = act\n    print-line-uni (show 4000.0)\n    print-line-uni (show 12345678901234567.0)\n    print-line-uni (show 123456789012345678.0)\n    print-line-uni (show 1.5)\n    print-line-uni (show 0.5)\n    print-line-uni (show 0.0)\n    print-line-uni (show (0.0 - 2.5))\n  end\n";
+        assert_eq!(out(src), "4000.0\n12345678901234568.0\n123456789012345680.0\n1.5\n0.5\n0.0\n-2.5\n");
     }
 
     /// The two writes codexir's own harness makes, in program order.

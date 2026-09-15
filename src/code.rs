@@ -110,7 +110,10 @@ pub enum Code {
     /// A whole application spine, flat: the head and every argument, each with
     /// the span of the application that CONSUMES it.
     Apply(Box<Code>, Vec<(Code, Span)>),
-    Binary(Box<Code>, BinaryOp, Box<Code>),
+    /// The flag says `+`, `-` and `*` WRAP: the operation's type, worked out
+    /// at compile time (`Static::arith`), is a `wrapping` band. Where it is
+    /// false they trap on overflow.
+    Binary(Box<Code>, BinaryOp, Box<Code>, bool),
     Unary(Box<Code>),
     If(Box<Code>, Box<Code>, Box<Code>),
     /// Each binding gets its own frame, pushed in order, so a binding is in
@@ -159,6 +162,78 @@ pub struct Names {
     pub builtin_nullary: HashMap<Sym, &'static str>,
     pub builtin_undeclared: HashMap<Sym, &'static str>,
     pub bounds: HashMap<(Sym, Sym), FieldBound>,
+    /// The record types, so a declared type can say it names one.
+    pub records: HashSet<Sym>,
+    /// A function's arity and declared result, by its global index.
+    pub results: HashMap<u32, (usize, Static)>,
+    /// A nullary definition's declared type, by its index.
+    pub const_types: HashMap<u32, Static>,
+}
+
+/// What compilation knows of a value's type: as much as it takes to say
+/// whether `+`, `-` and `*` on it wrap.
+///
+/// Upstream reads that off the checker's types, and this arm has none. So it
+/// follows the checker's rules where an Integer's band and mode come from: a
+/// declared parameter, result or record field, a `let` of one, and arithmetic
+/// over them. Everything else is `Other`, which on the left of an operation
+/// traps, as a literal or a builtin's plain `Integer` does upstream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Static {
+    Int { lo: i64, hi: i64, wraps: bool },
+    Record(Sym),
+    Other,
+}
+
+impl Static {
+    /// `int-ty-default`: a plain `Integer`, and an integer literal's type.
+    pub const INTEGER: Static = Static::Int { lo: i64::MIN, hi: i64::MAX, wraps: false };
+
+    /// A declared type, through its effects and linearity.
+    pub fn of(t: &TypeExpr, names: &Names, syms: &SymTab) -> Static {
+        match t {
+            TypeExpr::BoundedInt(_, lo, hi, mode, _) => {
+                Static::Int { lo: *lo, hi: *hi, wraps: *mode == OverflowMode::Wrapping }
+            }
+            TypeExpr::Named(n, _) if names.records.contains(n) => Static::Record(*n),
+            TypeExpr::Named(n, _) if syms.text(*n) == "Integer" => Static::INTEGER,
+            TypeExpr::Effect(.., inner, _) | TypeExpr::Linear(inner, _) => Static::of(inner, names, syms),
+            _ => Static::Other,
+        }
+    }
+
+    /// `arith-result-ty`: an operation has its left operand's type, unless
+    /// the right operand's band is narrower and inside it. So a `wrapping`
+    /// left operand keeps `h * k + v` wrapping across the `+`.
+    fn arith(l: Static, r: Static) -> Static {
+        match (l, r) {
+            (Static::Int { lo: ll, hi: lh, .. }, Static::Int { lo: rl, hi: rh, .. })
+                if (rl, rh) != (ll, lh) && rl >= ll && rh <= lh =>
+            {
+                r
+            }
+            _ => l,
+        }
+    }
+
+    fn wraps(self) -> bool {
+        matches!(self, Static::Int { wraps: true, .. })
+    }
+}
+
+/// A definition's declared parameter types, one for each parameter it names,
+/// and its declared result. Without a declaration, or where the declaration
+/// has fewer arrows than parameters, nothing is known.
+pub fn signature(d: &Def, names: &Names, syms: &SymTab) -> (Vec<Static>, Static) {
+    let unknown = || (vec![Static::Other; d.params.len()], Static::Other);
+    let Some(mut t) = d.declared_type.first() else { return unknown() };
+    let mut params = Vec::with_capacity(d.params.len());
+    for _ in &d.params {
+        let TypeExpr::Fun(a, b, _) = t else { return unknown() };
+        params.push(Static::of(a, names, syms));
+        t = b;
+    }
+    (params, Static::of(t, names, syms))
 }
 
 /// Compiles one definition's body.
@@ -167,14 +242,15 @@ pub struct Names {
 /// name resolves against. `frames` mirrors, exactly, the frames the run will
 /// push: one for a call's parameters, one for a lambda's, one per `let`
 /// binding, one per `act` bind, and one per match arm -- including an arm
-/// whose pattern binds nothing, because the run pushes that one too.
+/// whose pattern binds nothing, because the run pushes that one too. Each name
+/// in a frame carries what is known of its type.
 pub struct Compiler<'a> {
     names: &'a Names,
-    /// Only for the two questions a symbol cannot answer itself: is this name
-    /// capitalised, and what does a builtin call itself.
+    /// For the questions a symbol cannot answer itself: is this name
+    /// capitalised, what does a builtin call itself, and is a type `Integer`.
     syms: &'a SymTab,
     slug: &'a str,
-    frames: Vec<Vec<Sym>>,
+    frames: Vec<Vec<(Sym, Static)>>,
 }
 
 impl<'a> Compiler<'a> {
@@ -185,7 +261,8 @@ impl<'a> Compiler<'a> {
     /// A definition's body, under a frame holding its parameters.
     pub fn def(names: &'a Names, syms: &'a SymTab, d: &'a Def) -> Code {
         let mut c = Compiler::new(names, syms, d.chapter_slug.as_str());
-        c.frames.push(d.params.iter().map(|p| p.name).collect());
+        let (params, _) = signature(d, names, syms);
+        c.frames.push(d.params.iter().map(|p| p.name).zip(params).collect());
         c.expr(&d.body)
     }
 
@@ -196,12 +273,30 @@ impl<'a> Compiler<'a> {
     }
 
     pub fn expr(&mut self, e: &'a Expr) -> Code {
+        self.typed(e).0
+    }
+
+    /// An expression's code, and what is known of its type.
+    fn typed(&mut self, e: &'a Expr) -> (Code, Static) {
         match e {
-            Expr::Lit(text, kind, _) => match literal(text, *kind) {
-                Ok(v) => Code::Const(v),
-                Err(e) => Code::Fail(e.0),
+            Expr::Lit(text, kind, _) => {
+                let code = match literal(text, *kind) {
+                    Ok(v) => Code::Const(v),
+                    Err(e) => Code::Fail(e.0),
+                };
+                (code, if *kind == LiteralKind::IntLit { Static::INTEGER } else { Static::Other })
+            }
+            Expr::NameRef(n, _) => match self.local(*n) {
+                Some(local) => local,
+                None => {
+                    let code = self.name(*n);
+                    let t = match code {
+                        Code::ConstDef(i) => self.names.const_types.get(&i).copied().unwrap_or(Static::Other),
+                        _ => Static::Other,
+                    };
+                    (code, t)
+                }
             },
-            Expr::NameRef(n, _) => self.name(*n),
             Expr::Apply(..) => {
                 // Down the left spine to the head, once and for all. Each
                 // argument keeps the span of the application that consumes it,
@@ -217,59 +312,86 @@ impl<'a> Compiler<'a> {
                 if args.len() == 1 {
                     if let Expr::NameRef(n, _) = head {
                         if self.syms.text(*n) == "deck-record" {
-                            return Code::DeckRecord(Box::new(self.expr(args[0].0)));
+                            let (x, t) = self.typed(args[0].0);
+                            return (Code::DeckRecord(Box::new(x)), t);
                         }
                     }
                 }
                 let h = self.expr(head);
+                // A function given all its arguments has its declared result.
+                let t = match &h {
+                    Code::Global(g) => match self.names.results.get(g) {
+                        Some(&(arity, t)) if arity == args.len() => t,
+                        _ => Static::Other,
+                    },
+                    _ => Static::Other,
+                };
                 let mut out = Vec::with_capacity(args.len());
                 for (a, sp) in args {
                     out.push((self.expr(a), sp));
                 }
-                Code::Apply(Box::new(h), out)
+                (Code::Apply(Box::new(h), out), t)
             }
             Expr::Binary(l, op, r, _) => {
-                let a = self.expr(l);
-                let b = self.expr(r);
-                Code::Binary(Box::new(a), *op, Box::new(b))
+                let (a, lt) = self.typed(l);
+                let (b, rt) = self.typed(r);
+                let t = match op {
+                    BinaryOp::OpAdd | BinaryOp::OpSub | BinaryOp::OpMul | BinaryOp::OpDiv | BinaryOp::OpPow => {
+                        Static::arith(lt, rt)
+                    }
+                    _ => Static::Other,
+                };
+                (Code::Binary(Box::new(a), *op, Box::new(b), t.wraps()), t)
             }
-            Expr::Unary(x, _) => Code::Unary(Box::new(self.expr(x))),
+            Expr::Unary(x, _) => {
+                let (x, t) = self.typed(x);
+                (Code::Unary(Box::new(x)), t)
+            }
+            // The checker gives an `if` its `then` branch's type.
             Expr::If(c, t, f, _) => {
                 let c = self.expr(c);
-                let t = self.expr(t);
+                let (t, ty) = self.typed(t);
                 let f = self.expr(f);
-                Code::If(Box::new(c), Box::new(t), Box::new(f))
+                (Code::If(Box::new(c), Box::new(t), Box::new(f)), ty)
             }
             Expr::Let(binds, body, _) => {
                 let mut vals = Vec::with_capacity(binds.len());
                 for b in binds {
-                    vals.push(self.expr(&b.value));
-                    self.frames.push(vec![b.name]);
+                    let (v, t) = self.typed(&b.value);
+                    vals.push(v);
+                    self.frames.push(vec![(b.name, t)]);
                 }
-                let body = self.expr(body);
+                let (body, t) = self.typed(body);
                 self.frames.truncate(self.frames.len() - binds.len());
-                Code::Let(vals, Box::new(body))
+                (Code::Let(vals, Box::new(body)), t)
             }
             Expr::Lambda(params, body, _) => {
-                self.frames.push(params.iter().copied().collect());
+                self.frames.push(params.iter().map(|p| (*p, Static::Other)).collect());
                 let b = self.expr(body);
                 self.frames.pop();
-                Code::Lambda(Rc::new(Lam { arity: params.len(), body: Rc::new(b) }))
+                (Code::Lambda(Rc::new(Lam { arity: params.len(), body: Rc::new(b) })), Static::Other)
             }
+            // The checker unifies every arm with a fresh result, which the
+            // first arm's body binds.
             Expr::Match(s, arms, _) | Expr::Induction(s, arms, _) => {
                 let scrut = self.expr(s);
                 let mut out = Vec::with_capacity(arms.len());
-                for a in arms {
-                    out.push(self.arm(a));
+                let mut t = Static::Other;
+                for (i, a) in arms.iter().enumerate() {
+                    let (arm, at) = self.arm(a);
+                    if i == 0 {
+                        t = at;
+                    }
+                    out.push(arm);
                 }
-                Code::Match(Box::new(scrut), Rc::new(out))
+                (Code::Match(Box::new(scrut), Rc::new(out)), t)
             }
             Expr::List(xs, _) => {
                 let mut out = Vec::with_capacity(xs.len());
                 for x in xs {
                     out.push(self.expr(x));
                 }
-                Code::List(out)
+                (Code::List(out), Static::Other)
             }
             Expr::Record(name, fields, _) => {
                 let mut out = Vec::with_capacity(fields.len());
@@ -277,9 +399,19 @@ impl<'a> Compiler<'a> {
                     let bound = self.names.bounds.get(&(*name, f.name)).copied();
                     out.push(RecField { name: f.name, value: self.expr(&f.value), bound });
                 }
-                Code::Record(*name, out)
+                (Code::Record(*name, out), Static::Record(*name))
             }
-            Expr::FieldAccess(o, f, sp) => Code::FieldAccess(Box::new(self.expr(o)), *f, *sp),
+            Expr::FieldAccess(o, f, sp) => {
+                let (o, ot) = self.typed(o);
+                let t = match ot {
+                    Static::Record(r) => match self.names.bounds.get(&(r, *f)) {
+                        Some(b) => Static::Int { lo: b.lo, hi: b.hi, wraps: b.mode == OverflowMode::Wrapping },
+                        None => Static::Other,
+                    },
+                    _ => Static::Other,
+                };
+                (Code::FieldAccess(Box::new(o), *f, *sp), t)
+            }
             Expr::Act(stmts, _) => {
                 let mut out = Vec::with_capacity(stmts.len());
                 let mut pushed = 0;
@@ -287,48 +419,50 @@ impl<'a> Compiler<'a> {
                     match s {
                         ActStmt::Exec(e, _) => out.push(Stmt::Exec(self.expr(e))),
                         ActStmt::Bind(n, e, _) => {
-                            out.push(Stmt::Bind(self.expr(e)));
-                            self.frames.push(vec![*n]);
+                            let (c, t) = self.typed(e);
+                            out.push(Stmt::Bind(c));
+                            self.frames.push(vec![(*n, t)]);
                             pushed += 1;
                         }
                     }
                 }
                 self.frames.truncate(self.frames.len() - pushed);
-                Code::Act(out)
+                (Code::Act(out), Static::Other)
             }
-            Expr::Lazy(i, _) => Code::Lazy(Box::new(self.expr(i))),
+            Expr::Lazy(i, _) => (Code::Lazy(Box::new(self.expr(i))), Static::Other),
             Expr::FieldAssign(r, f, v, _) => {
                 let name = *f;
                 let base = self.expr(r);
                 let val = self.expr(v);
-                Code::FieldAssign(Box::new(base), name, Box::new(val))
+                (Code::FieldAssign(Box::new(base), name, Box::new(val)), Static::Other)
             }
             Expr::Error(why, _) => {
-                Code::Fail(format!("the desugarer could not translate {why}"))
+                (Code::Fail(format!("the desugarer could not translate {why}")), Static::Other)
             }
-            Expr::Handle(..) => Code::Unsupported("effect handlers are not interpreted yet"),
-            Expr::WithTimeout(..) => Code::Unsupported("with-timeout is not interpreted yet"),
-            Expr::Try(..) => Code::Unsupported("trying blocks are not interpreted yet"),
+            Expr::Handle(..) => (Code::Unsupported("effect handlers are not interpreted yet"), Static::Other),
+            Expr::WithTimeout(..) => (Code::Unsupported("with-timeout is not interpreted yet"), Static::Other),
+            Expr::Try(..) => (Code::Unsupported("trying blocks are not interpreted yet"), Static::Other),
         }
     }
 
-    fn arm(&mut self, a: &'a MatchArm) -> Arm {
+    /// An arm, and its body's type.
+    fn arm(&mut self, a: &'a MatchArm) -> (Arm, Static) {
         let mut vars: Vec<Sym> = Vec::new();
         let pat = pat_code(&a.pattern, &mut vars);
         let nvars = vars.len();
-        self.frames.push(vars);
+        self.frames.push(vars.into_iter().map(|v| (v, Static::Other)).collect());
         let guard = self.expr(&a.guard);
-        let body = self.expr(&a.body);
+        let (body, t) = self.typed(&a.body);
         self.frames.pop();
-        Arm { pat, nvars, guard, body }
+        (Arm { pat, nvars, guard, body }, t)
     }
 
     /// A local, innermost frame first. Later bindings shadow earlier ones in
     /// the same frame, which is why this takes the LAST match in a frame.
-    fn local(&self, n: Sym) -> Option<Code> {
+    fn local(&self, n: Sym) -> Option<(Code, Static)> {
         for (hops, f) in self.frames.iter().rev().enumerate() {
-            if let Some(slot) = f.iter().rposition(|k| *k == n) {
-                return Some(Code::Local(hops as u32, slot as u32));
+            if let Some(slot) = f.iter().rposition(|k| k.0 == n) {
+                return Some((Code::Local(hops as u32, slot as u32), f[slot].1));
             }
         }
         None
@@ -337,7 +471,7 @@ impl<'a> Compiler<'a> {
     /// The resolution order is the walker's, case for case. Changing it here
     /// changes which definition a colliding name means.
     fn name(&self, n: Sym) -> Code {
-        if let Some(c) = self.local(n) {
+        if let Some((c, _)) = self.local(n) {
             return c;
         }
         let colliding = self.names.colliding.contains(&n);
