@@ -3036,14 +3036,19 @@ impl<'a> Cx<'a> {
                 want(2)?;
                 format!("I32.shr_zf_wrap({}, I32.to_u8_wrap({}))", xs[0], xs[1])
             }
-            // The interpreter shifts the word's bits by the count's low six
-            // bits, and both right shifts fill with zeros. Roc's shifts take
-            // the count modulo the width, so a count's low byte is enough.
+            // x86 shifts the word by the count's low six bits: `bit-shr` is
+            // `sar`, carrying the sign down, and `bit-shru` is `shr`, filling
+            // with zeros (`Builtins.codex`). Roc's shifts take the count
+            // modulo the width, so a count's low byte is enough.
             "bit-shl" => {
                 want(2)?;
                 format!("I64.shl_wrap({}, I64.to_u8_wrap({}))", xs[0], xs[1])
             }
-            "bit-shr" | "bit-shru" => {
+            "bit-shr" => {
+                want(2)?;
+                format!("I64.shr_wrap({}, I64.to_u8_wrap({}))", xs[0], xs[1])
+            }
+            "bit-shru" => {
                 want(2)?;
                 format!("I64.shr_zf_wrap({}, I64.to_u8_wrap({}))", xs[0], xs[1])
             }
