@@ -39,6 +39,7 @@ pub mod punctual;
 pub mod resolve_types;
 pub mod roc_emit;
 pub mod roc_forwarders;
+pub mod roc_text;
 pub mod scope;
 pub mod scoper;
 pub mod seams;

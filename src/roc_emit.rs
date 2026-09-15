@@ -430,10 +430,6 @@ Prelude :: [].{
 
 	# `a ^ b` with a negative exponent is 0, where Roc's pow crashes
 	# (codex/test's ops/int-pow: `ipow 5 (0 - 2)` is 0).
-	# An empty separator splits into one piece, the whole text (interp.rs).
-	text_split : Str, Str -> List(Str)
-	text_split = |t, sep| if sep == "" { [t] } else { Str.split_on(t, sep) }
-
 	int_pow : I64, I64 -> I64
 	int_pow = |a, b| if b < 0 { 0 } else { I64.pow(a, b) }
 
@@ -533,6 +529,9 @@ pub fn emit_modules(
         if taken {
             return Err(format!("chapter module `{slug}` is a name the threaded {} holds", cx.state));
         }
+        if slug == "Text" {
+            return Err("chapter module `Text` is the name rocemit's text module holds".into());
+        }
         cx.current = slug.clone();
         cx.imports.clear();
         // The helper is per MODULE now: a chapter with a [Console] act
@@ -584,9 +583,9 @@ pub fn emit_modules(
         needs.insert(module_ident(slug), cx.imports.iter().cloned().collect());
         files.push((format!("{}.roc", module_ident(slug)), text));
     }
-    if cx.uses_cce {
-        needs.insert("Cce".into(), Vec::new());
-        files.push(("Cce.roc".into(), cce_module()));
+    if cx.uses_text {
+        needs.insert("Text".into(), Vec::new());
+        files.push(("Text.roc".into(), crate::roc_text::text_module()));
     }
     if prelude {
         needs.insert("Prelude".into(), Vec::new());
@@ -693,9 +692,9 @@ struct Cx<'a> {
     /// Type-variable letters, per definition signature.
     tvars: BTreeMap<u32, String>,
     uses_line: bool,
-    /// Set when the unit reaches for the alphabet, which is then emitted
-    /// beside the chapters as `Cce.roc`.
-    uses_cce: bool,
+    /// Set when the unit reaches for a text helper, which is then emitted
+    /// beside the chapters as `Text.roc` (`roc_text`).
+    uses_text: bool,
     /// Set while a right fold's body is emitted: its leaves become
     /// accumulator steps (see `def`).
     fold: Option<Fold>,
@@ -813,7 +812,7 @@ impl<'a> Cx<'a> {
             locals: Vec::new(),
             tvars: BTreeMap::new(),
             uses_line: false,
-            uses_cce: false,
+            uses_text: false,
             fold: None,
             device_ops: Default::default(),
             device_defs: Default::default(),
@@ -1108,10 +1107,10 @@ impl<'a> Cx<'a> {
     fn ty(&mut self, t: &Ty) -> Result<String, String> {
         Ok(match t {
             Ty::Integer(..) => self.int().into(),
-            // A Codex Char is its code in the alphabet (see `cce_module`).
+            // A Codex Char is its code (see `roc_text`).
             Ty::Char => "I64".into(),
             Ty::Real(RealWidth::F64, _) => self.real().into(),
-            Ty::Text => "Str".into(),
+            Ty::Text => "List(U8)".into(),
             Ty::Boolean => "Bool".into(),
             Ty::Nothing => "{}".into(),
             Ty::Unit(n, _) => self.type_ref(*n),
@@ -1336,7 +1335,7 @@ impl<'a> Cx<'a> {
                 "Real" => self.real().into(),
                 "Integer" => self.int().into(),
                 "Char" => "I64".into(),
-                "Text" => "Str".into(),
+                "Text" => "List(U8)".into(),
                 "Boolean" => "Bool".into(),
                 "Nothing" => "{}".into(),
                 s if s.starts_with(|c: char| c.is_ascii_lowercase()) => s.to_string(),
@@ -1738,7 +1737,11 @@ impl<'a> Cx<'a> {
                 out.push_str(&format!("\t{l}\n"));
             }
             let text = match strip_unit(&body.ty()).clone() {
-                Ty::Text => x,
+                Ty::Text => {
+                    self.uses_text = true;
+                    self.imports.insert("Text".into());
+                    format!("Text.printed({x})")
+                }
                 Ty::Integer(..) => format!("I64.to_str({x})"),
                 other => {
                     return Err(format!(
@@ -1775,7 +1778,9 @@ impl<'a> Cx<'a> {
                         }
                         Ty::Text if last => {
                             self.uses_line = true;
-                            out.push_str(&format!("\tline!({e})\n"));
+                            self.uses_text = true;
+                            self.imports.insert("Text".into());
+                            out.push_str(&format!("\tline!(Text.printed({e}))\n"));
                         }
                         Ty::Boolean | Ty::Real(..) if last => {
                             return Err(format!("an opening of type {}", crate::ir_text::render_ty(self.syms, &ty)));
@@ -2195,7 +2200,22 @@ impl<'a> Cx<'a> {
                 } else {
                     ""
                 };
-                return Ok(format!("{s}.{}{bang}({})", name.replace('-', "_"), xs.join(", ")));
+                // A scope is text, and the machine keeps one as a Str: units
+                // leave through `printed` and come back through `of_str`.
+                let mut xs = xs.to_vec();
+                if name == "process-set-scope" {
+                    self.uses_text = true;
+                    self.imports.insert("Text".into());
+                    let last = xs.len() - 1;
+                    xs[last] = format!("Text.printed({})", xs[last]);
+                }
+                let call = format!("{s}.{}{bang}({})", name.replace('-', "_"), xs.join(", "));
+                if name == "process-get-scope" || name == "process-get-network-scope" {
+                    self.uses_text = true;
+                    self.imports.insert("Text".into());
+                    return Ok(format!("Text.answer_units({call})"));
+                }
+                return Ok(call);
             }
             // base, offset [, value]; a load answers the value and a store
             // answers 0, as the interpreter does.
@@ -2321,7 +2341,7 @@ impl<'a> Cx<'a> {
         Ok(match e {
             E::IntLit(v, _) => int_lit(*v),
             E::NumLit(bits, _) => num_lit(*bits, self.wgsl),
-            E::TextLit(s, _) => roc_quote(s),
+            E::TextLit(s, _) => crate::roc_text::literal(s),
             E::BoolLit(b, _) => if *b { "True".into() } else { "False".into() },
             // The IR carries a char literal as its CODE already.
             E::CharLit(c, _) => int_lit(*c),
@@ -2672,7 +2692,7 @@ impl<'a> Cx<'a> {
             B::GtEq => format!("({l} >= {r})"),
             B::And => format!("({l} and {r})"),
             B::Or => format!("({l} or {r})"),
-            B::AppendText => format!("Str.concat({l}, {r})"),
+            B::AppendText => format!("List.concat({l}, {r})"),
             B::AppendList => format!("List.concat({l}, {r})"),
             // `=~=` is ordinal equality on doubles; two doubles with the same
             // bits have the same ordinal, and -0.0 differs from 0.0 in both.
@@ -2866,20 +2886,19 @@ impl<'a> Cx<'a> {
                 want(2)?;
                 format!("{int}.rem_by({}, {})", xs[0], xs[1])
             }
-            // `List Integer -> Text`, the bytes as written: raw UTF-8,
-            // not the CCE alphabet, and a byte that is not valid UTF-8
-            // becomes the replacement character (interp.rs).
-            // Each byte is a CCE unit, as the interpreter's rule says.
+            // `List Integer -> Text`: each integer's low byte is a unit, as
+            // the interpreter's rule says.
             "raw-bytes-to-text" if !self.wgsl => {
                 want(1)?;
-                self.uses_cce = true;
-                self.imports.insert("Cce".into());
-                format!("Cce.str_of(List.map({}, |b| I64.bitwise_and(b, 255)))", xs[0])
+                self.uses_text = true;
+                self.imports.insert("Text".into());
+                format!("Text.of_bytes({})", xs[0])
             }
             "text-split" => {
                 want(2)?;
-                self.imports.insert("Prelude".into());
-                format!("Prelude.text_split({}, {})", xs[0], xs[1])
+                self.uses_text = true;
+                self.imports.insert("Text".into());
+                format!("Text.split({}, {})", xs[0], xs[1])
             }
             "list-insert-at" => {
                 want(3)?;
@@ -2890,9 +2909,9 @@ impl<'a> Cx<'a> {
             }
             "text-compare" => {
                 want(2)?;
-                self.uses_cce = true;
-                self.imports.insert("Cce".into());
-                format!("Cce.compare({}, {})", xs[0], xs[1])
+                self.uses_text = true;
+                self.imports.insert("Text".into());
+                format!("Text.compare({}, {})", xs[0], xs[1])
             }
             "char-code" | "code-to-char" => {
                 want(1)?;
@@ -2901,21 +2920,24 @@ impl<'a> Cx<'a> {
             }
             "char-code-at" => {
                 want(2)?;
-                self.uses_cce = true;
-                self.imports.insert("Cce".into());
-                format!("Cce.at({}, {})", xs[0], xs[1])
+                self.uses_text = true;
+                self.imports.insert("Text".into());
+                format!("Text.char_code_at({}, {})", xs[0], xs[1])
             }
             "char-at" => {
                 want(2)?;
-                self.uses_cce = true;
-                self.imports.insert("Cce".into());
-                format!("Cce.at_or_crash({}, {})", xs[0], xs[1])
+                self.uses_text = true;
+                self.imports.insert("Text".into());
+                format!("Text.char_at({}, {})", xs[0], xs[1])
             }
+            // `char-to-text` keeps the code's low byte and `char-encode` frames
+            // it, as the interpreter has them.
             "char-to-text" | "char-encode" => {
                 want(1)?;
-                self.uses_cce = true;
-                self.imports.insert("Cce".into());
-                format!("Cce.text({})", xs[0])
+                self.uses_text = true;
+                self.imports.insert("Text".into());
+                let f = if name == "char-to-text" { "char_to_text" } else { "char_encode" };
+                format!("Text.{f}({})", xs[0])
             }
             // The classifiers are code RANGES, not the host's idea of a
             // letter: the alphabet is frequency-ordered (interp.rs).
@@ -2933,9 +2955,9 @@ impl<'a> Cx<'a> {
             }
             "substring" => {
                 want(3)?;
-                self.uses_cce = true;
-                self.imports.insert("Cce".into());
-                format!("Cce.substring({}, {}, {})", xs[0], xs[1], xs[2])
+                self.uses_text = true;
+                self.imports.insert("Text".into());
+                format!("Text.substring({}, {}, {})", xs[0], xs[1], xs[2])
             }
             // `__narrow` is the checker's marker for a value proved to fit a
             // bound; at runtime it is the value (interp.rs).
@@ -2947,39 +2969,47 @@ impl<'a> Cx<'a> {
                 want(2)?;
                 format!("List.append({}, {})", xs[0], xs[1])
             }
-            // `show` is Codex's own spelling of a value, not Roc's: a
-            // boolean is `True` or `False` (interp::show).
+            // `show` is Codex's own spelling of a value, as units: an integer's
+            // digits, `True` or `False`, and a Char's code (interp::show).
             "show" | "integer-to-text" => {
                 want(1)?;
-                match strip_unit(&args[0].ty()).clone() {
-                    Ty::Integer(..) => format!("{int}.to_str({})", xs[0]),
-                    Ty::Boolean => format!("(if {} {{ \"True\" }} else {{ \"False\" }})", xs[0]),
+                let ty = strip_unit(&args[0].ty()).clone();
+                if !matches!(ty, Ty::Text) {
+                    self.uses_text = true;
+                    self.imports.insert("Text".into());
+                }
+                match ty {
+                    Ty::Integer(..) if int == "I64" => format!("Text.show_int({})", xs[0]),
+                    Ty::Integer(..) => format!("Text.show_int({int}.to_i64({}))", xs[0]),
+                    Ty::Char => format!("Text.show_int({})", xs[0]),
+                    Ty::Boolean => format!(
+                        "(if {} {{ {} }} else {{ {} }})",
+                        xs[0],
+                        crate::roc_text::literal("True"),
+                        crate::roc_text::literal("False")
+                    ),
                     Ty::Text => xs[0].clone(),
                     Ty::Real(..) if !self.wgsl => {
                         self.imports.insert("Prelude".into());
-                        format!("Prelude.real_to_str({})", xs[0])
-                    }
-                    Ty::Char => {
-                        self.uses_cce = true;
-                self.imports.insert("Cce".into());
-                        format!("Cce.text({})", xs[0])
+                        format!("Text.of_str(Prelude.real_to_str({}))", xs[0])
                     }
                     other => return Err(format!("show on a {}", crate::ir_text::render_ty(self.syms, &other))),
                 }
             }
-            // A Codex Text is CCE units over an alphabet of 1..127, so its
-            // length is its byte count.
+            // A Codex Text is its units, so its length is their count.
             "text-length" => {
                 want(1)?;
-                self.uses_cce = true;
-                self.imports.insert("Cce".into());
-                format!("Cce.length({})", xs[0])
+                self.uses_text = true;
+                self.imports.insert("Text".into());
+                format!("Text.len({})", xs[0])
             }
-            // `text-to-integer` trims and answers 0 for anything it cannot
-            // read, as the interpreter does.
+            // `text-to-integer` reads the printed text, trimmed, and answers 0
+            // for anything it cannot read, as the interpreter does.
             "text-to-integer" => {
                 want(1)?;
-                format!("({int}.from_str(Str.trim({})) ?? 0)", xs[0])
+                self.uses_text = true;
+                self.imports.insert("Text".into());
+                format!("Text.to_integer({})", xs[0])
             }
             "real-from-int" | "__int-to-real" => {
                 want(1)?;
@@ -3080,24 +3110,39 @@ impl<'a> Cx<'a> {
                     format!("(-{})", xs[0])
                 }
             }
-            // Containment and prefix are the same question over UTF-8 as over
-            // characters: a UTF-8 sequence cannot start inside another.
-            "text-contains" => {
+            // Containment, prefix, suffix and replacement go unit by unit,
+            // blind to frames, as the zig parts and the interpreter do.
+            "text-contains" | "text-starts-with" | "text-ends-with" => {
                 want(2)?;
-                format!("Str.contains({}, {})", xs[0], xs[1])
+                self.uses_text = true;
+                self.imports.insert("Text".into());
+                let f = match name {
+                    "text-contains" => "contains",
+                    "text-starts-with" => "starts_with",
+                    _ => "ends_with",
+                };
+                format!("Text.{f}({}, {})", xs[0], xs[1])
+            }
+            "text-replace" => {
+                want(3)?;
+                self.uses_text = true;
+                self.imports.insert("Text".into());
+                format!("Text.replace({}, {}, {})", xs[0], xs[1], xs[2])
             }
             "text-concat-list" => {
                 want(1)?;
-                format!("Str.join_with({}, \"\")", xs[0])
+                self.uses_text = true;
+                self.imports.insert("Text".into());
+                format!("Text.concat_list({})", xs[0])
             }
-            "text-starts-with" => {
-                want(2)?;
-                format!("Str.starts_with({}, {})", xs[0], xs[1])
-            }
+            // **PRINTING IS WHERE UNITS BECOME UTF-8**, decoded as x86's print
+            // loop decodes them (`Text.printed`).
             "print-line-uni" | "print-line" => {
                 want(1)?;
                 self.uses_line = true;
-                format!("line!({})", xs[0])
+                self.uses_text = true;
+                self.imports.insert("Text".into());
+                format!("line!(Text.printed({}))", xs[0])
             }
             _ => return Err(format!("builtin `{name}`")),
         })
@@ -3112,7 +3157,7 @@ impl<'a> Cx<'a> {
             }
             IrPat::Lit(v, ty, _) => match strip_unit(ty) {
                 Ty::Integer(..) | Ty::Char => v.clone(),
-                Ty::Text => roc_quote(v),
+                Ty::Text => crate::roc_text::literal(v),
                 // The IR spells it `True` / `False`; a lowercase test made
                 // every boolean pattern `False`, which Roc then called a
                 // non-exhaustive match (codex/test/when-bool-cross).
@@ -3514,23 +3559,6 @@ fn num_lit(bits: i64, f32: bool) -> String {
     }
 }
 
-fn roc_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            '$' => out.push_str("\\$"),
-            other => out.push(other),
-        }
-    }
-    out.push('"');
-    out
-}
-
 #[cfg(test)]
 mod literals_round_trip {
     use super::num_lit;
@@ -3581,159 +3609,4 @@ mod module_names {
         assert!(e.contains("`Core--Maybe`") && e.contains("`Emit--Maybe`"), "{e}");
         assert_eq!(slugs, vec!["Maybe"]);
     }
-}
-
-/// **THE CODEX ALPHABET, WRITTEN OUT FOR ROC.** A Codex `Char` is not a
-/// byte and not a Unicode scalar: it is a code in a private,
-/// frequency-ordered alphabet of 1..127, where `char-code 'A'` is 41 and
-/// the codes above 96 are accented Latin and Cyrillic. A Codex `Text` is a
-/// sequence of those units, one per CHARACTER, so its length and its
-/// indexing are by character and not by byte.
-///
-/// So a Char emits as its code, an `I64`, and this module is what turns a
-/// Roc `Str` into codes and back. It is GENERATED from `charcode.rs`'s own
-/// tables rather than transcribed, because that file says in as many words
-/// that the tables cannot be transcribed by hand: ten corpus programs once
-/// differed from the oracle by exactly 61 bytes, a run of NULs where the
-/// Cyrillic should have been.
-fn cce_module() -> String {
-    let mut points = [0u32; 128];
-    for (b, code) in crate::charcode::CHAR_CODE.iter().enumerate() {
-        if *code != 0 {
-            points[*code as usize] = b as u32;
-        }
-    }
-    for (i, c) in crate::charcode::CHAR_CODE_HIGH.iter().enumerate() {
-        points[crate::charcode::HIGH_BASE as usize + i] = *c as u32;
-    }
-    let codes: Vec<String> = crate::charcode::CHAR_CODE.iter().map(|c| c.to_string()).collect();
-    let pts: Vec<String> = points.iter().map(|p| p.to_string()).collect();
-    let wrap = |xs: &[String]| -> String {
-        xs.chunks(16).map(|c| format!("\t\t{}", c.join(", "))).collect::<Vec<_>>().join(",\n")
-    };
-    format!(
-        r#"# Cce -- the Codex character alphabet, written from the compiler's own
-# tables by rocemit (rust-codex-compiler). Do not edit.
-#
-# A Codex Char is its CODE in a private frequency-ordered alphabet of
-# 1..127: `char-code 'A'` is 41, not 65. Codes 97..127 are accented Latin
-# and Cyrillic, which no byte reaches. A Codex Text is a sequence of those
-# units, ONE PER CHARACTER, so `text-length` counts characters and
-# `char-code-at` indexes them.
-
-Cce :: [].{{
-	# The code of each of the first 128 Unicode code points; 0 for a point
-	# the alphabet does not name.
-	codes : List(I64)
-	codes = [
-{codes}
-	]
-
-	# The code point each code names, indexed by code; 0 for none.
-	points : List(U64)
-	points = [
-{points}
-	]
-
-	# The code of one Unicode code point, or 0.
-	of_point : U64 -> I64
-	of_point = |p|
-		if p < 128 {{ List.get(Cce.codes, p) ?? 0 }} else {{ Cce.high_of(p, 97) }}
-
-	high_of : U64, I64 -> I64
-	high_of = |p, c|
-		if c > 127 {{ 0 }}
-		else if (List.get(Cce.points, I64.to_u64_wrap(c)) ?? 0) == p {{ c }}
-		else {{ Cce.high_of(p, c + 1) }}
-
-	# A text as its codes, one per character.
-	codes_of : Str -> List(I64)
-	codes_of = |s| Cce.decode(Str.to_utf8(s), 0, [])
-
-	decode : List(U8), U64, List(I64) -> List(I64)
-	decode = |bytes, i, acc|
-		if i >= List.len(bytes) {{ acc }} else {{
-			b = U8.to_u64(List.get(bytes, i) ?? 0)
-			# The alphabet reaches no further than two UTF-8 bytes, but a
-			# text may hold anything; a character the alphabet does not
-			# name is code 0, as `char-code` answers.
-			width = if b < 128 {{ 1 }} else if b < 224 {{ 2 }} else if b < 240 {{ 3 }} else {{ 4 }}
-			point = if width == 1 {{ b }} else {{
-				Cce.tail(bytes, i + 1, i + width, Cce.lead(b, width))
-			}}
-			Cce.decode(bytes, i + width, List.append(acc, Cce.of_point(point)))
-		}}
-
-	lead : U64, U64 -> U64
-	lead = |b, width|
-		if width == 2 {{ U64.bitwise_and(b, 31) }}
-		else if width == 3 {{ U64.bitwise_and(b, 15) }}
-		else {{ U64.bitwise_and(b, 7) }}
-
-	tail : List(U8), U64, U64, U64 -> U64
-	tail = |bytes, i, stop, acc|
-		if i >= stop {{ acc }} else {{
-			b = U8.to_u64(List.get(bytes, i) ?? 0)
-			Cce.tail(bytes, i + 1, stop, acc * 64 + U64.bitwise_and(b, 63))
-		}}
-
-	# `text-length`: the count of characters.
-	length : Str -> I64
-	length = |s| U64.to_i64_wrap(List.len(Cce.codes_of(s)))
-
-	# `char-code-at`: the code of the i-th character, 0 past the end.
-	at : Str, I64 -> I64
-	at = |s, i| if i < 0 {{ 0 }} else {{ List.get(Cce.codes_of(s), I64.to_u64_wrap(i)) ?? 0 }}
-
-	# `char-at` answers a character and refuses to run past the end.
-	at_or_crash : Str, I64 -> I64
-	at_or_crash = |s, i|
-		if i < 0 {{ crash("char-at past the end") }}
-		else {{ List.get(Cce.codes_of(s), I64.to_u64_wrap(i)) ?? crash("char-at past the end") }}
-
-	# `char-to-text`, and what `show` of a Char prints.
-	text : I64 -> Str
-	text = |c| Str.from_utf8(Cce.utf8(Cce.to_point(c))) ?? ""
-
-	to_point : I64 -> U64
-	to_point = |c| if c < 0 or c > 127 {{ 0 }} else {{ List.get(Cce.points, I64.to_u64_wrap(c)) ?? 0 }}
-
-	utf8 : U64 -> List(U8)
-	utf8 = |p|
-		if p < 128 {{ [U64.to_u8_wrap(p)] }}
-		else if p < 2048 {{ [U64.to_u8_wrap(192 + U64.div_by(p, 64)), U64.to_u8_wrap(128 + U64.bitwise_and(p, 63))] }}
-		else {{ [
-			U64.to_u8_wrap(224 + U64.div_by(p, 4096)),
-			U64.to_u8_wrap(128 + U64.bitwise_and(U64.div_by(p, 64), 63)),
-			U64.to_u8_wrap(128 + U64.bitwise_and(p, 63)),
-		] }}
-
-	# `text-compare` is over CCE units, which is this alphabet's order and
-	# not ASCII's: -1, 0 or 1.
-	compare : Str, Str -> I64
-	compare = |a, b| Cce.compare_codes(Cce.codes_of(a), Cce.codes_of(b), 0)
-
-	compare_codes : List(I64), List(I64), U64 -> I64
-	compare_codes = |xs, ys, i| {{
-		x = List.get(xs, i)
-		y = List.get(ys, i)
-		match (x, y) {{
-			(Err(_), Err(_)) => 0
-			(Err(_), Ok(_)) => -1
-			(Ok(_), Err(_)) => 1
-			(Ok(a), Ok(b)) => if a < b {{ -1 }} else if a > b {{ 1 }} else {{ Cce.compare_codes(xs, ys, i + 1) }}
-		}}
-	}}
-
-	# `substring`, over characters.
-	substring : Str, I64, I64 -> Str
-	substring = |s, start, len| Cce.str_of(List.sublist(Cce.codes_of(s), {{ start: I64.to_u64_wrap(I64.max(start, 0)), len: I64.to_u64_wrap(I64.max(len, 0)) }}))
-
-	str_of : List(I64) -> Str
-	str_of = |cs| List.fold(cs, "", |acc, c| Str.concat(acc, Cce.text(c)))
-}}
-"#,
-        codes = wrap(&codes),
-        points = wrap(&pts)
-    )
 }

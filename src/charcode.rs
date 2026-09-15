@@ -248,12 +248,12 @@ pub fn tier0_point(code: u8) -> u32 {
 }
 
 /// Tier 1, codes 128..=2175: `cce_t1_code`, `cce_t1_size`, `cce_t1_uni`.
-const T1_CODE: [u32; 11] = [128, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1792, 2048];
-const T1_SIZE: [u32; 11] = [256, 128, 128, 128, 128, 128, 128, 128, 512, 256, 128];
-const T1_UNI: [u32; 11] = [128, 1024, 880, 1536, 1424, 2304, 3584, 4352, 19968, 12352, 8704];
+pub(crate) const T1_CODE: [u32; 11] = [128, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1792, 2048];
+pub(crate) const T1_SIZE: [u32; 11] = [256, 128, 128, 128, 128, 128, 128, 128, 512, 256, 128];
+pub(crate) const T1_UNI: [u32; 11] = [128, 1024, 880, 1536, 1424, 2304, 3584, 4352, 19968, 12352, 8704];
 /// Tier 2, codes from 2176, cumulative: `cce_t2_uni`, `cce_t2_size`.
-const T2_UNI: [u32; 10] = [12288, 12352, 12448, 19968, 13312, 44032, 3584, 8192, 127744, 9728];
-const T2_SIZE: [u32; 10] = [64, 96, 96, 20992, 6592, 11172, 256, 512, 1024, 256];
+pub(crate) const T2_UNI: [u32; 10] = [12288, 12352, 12448, 19968, 13312, 44032, 3584, 8192, 127744, 9728];
+pub(crate) const T2_SIZE: [u32; 10] = [64, 96, 96, 20992, 6592, 11172, 256, 512, 1024, 256];
 
 /// `cx_cp_to_cce`: the code for a code point, tier 0 first. A code point no
 /// tier covers is `?`, code 68, as bare metal substitutes it.
@@ -311,13 +311,13 @@ pub fn units_of(s: &str) -> Vec<u8> {
 /// tier 1, indexed by `(code - 128) >> 7`. **Slice 0 starts at U+00C0 where
 /// the encoding's tier 1 starts at U+0080**, so codes 128..=383 print 64 code
 /// points above the character that framed them. That is x86's table, emulated.
-const X86_T1_BASES: [u64; 16] =
+pub(crate) const X86_T1_BASES: [u64; 16] =
     [192, 320, 1024, 880, 1536, 1424, 2304, 3584, 4352, 19968, 20096, 20224, 20352, 12352, 12480, 8704];
 
 /// x86's `tier2-rodata`: per slice, the code it ends before (two bytes) and
 /// the delta to its code point (four bytes, added unsigned in a 64-bit
 /// register).
-const X86_T2: [[u8; 6]; 10] = [
+pub(crate) const X86_T2: [[u8; 6]; 10] = [
     [192, 8, 128, 39, 0, 0],
     [32, 9, 128, 39, 0, 0],
     [128, 9, 128, 39, 0, 0],
