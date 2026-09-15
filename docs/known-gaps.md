@@ -50,40 +50,35 @@ Nine, six of them in `test/errors/`, and none at all in the compiler, foreword,
 plugs or os. Each error node carries the NAME of the CST kind it could not
 translate, so the list is actionable rather than a count.
 
-## The CCE round trip: fixed in codexrun, still open in rocemit
+## The CCE round trip: closed in both arms
 
-**codexrun now holds a Text as CCE units** (`interp::Str`, `charcode.rs`):
-framing, the unit builtins, `show` of a Char as its code, x86's print loop byte
-for byte, `print-text` raw, `read-file-uni` as x86 reads. The five programs
-below match their verdicts under it, and a before/after run over codex/test
-moved six programs to match and none away. **rocemit still models a Text as a
-`Str` of characters**, so the Roc ladder still fails four of them; the plan
-(`List(U8)`, one helper per zig `cx_*` text part) is the essay
-`notes/codex-text-in-roc.md`.
+**Both arms hold a Text as CCE units**: codexrun as `interp::Str`
+(`charcode.rs`), rocemit as a Roc `List(U8)` with the `Text.roc` it writes
+(`roc_text.rs`), one helper per zig `cx_*` text part. Framing, the unit
+builtins, `show` of a Char as its code, and x86's print loop byte for byte are
+the same on both sides. The design is the essay `notes/codex-text-in-roc.md`.
 
-What was measured at Update 60, before the fix. These programs printed
-differently from their `.expected`, and `codexrun` printed the same wrong lines
-the Roc arm did, so the defect was on the side the two arms share:
+The Roc ladder passes `ops/unicode-bytes-roundtrip`, `ops/char-encode-bands`,
+`forewords/encode-json-escapes`, `validation-rules`, `lib/utf8-cce-test`,
+`fat16-source-cr`, `factlog-layout` and `text-helper-native`: 787 of 1,032 at
+u61-candidate, from 779, with none lost.
 
-    ops/unicode-bytes-roundtrip    65 -> units [75], back 41   (expected [41], back 65)
-                                   192 -> units [0]            (expected [193 128])
-    ops/char-encode-bands          128 len=1 decoded=0         (expected a round trip)
-    forewords/encode-json-escapes  u00C0 len=3 units 15 0 32   (expected len=4, 15 193 128 32)
-    validation-rules               greek=ERR                   (expected greek=ok)
-    lib/utf8-cce-test              utf8-3byte-one-char=fail    (expected ok)
+**`text-helper-native`'s verdict corrected both arms.** `text-to-integer`
+reads a minus only as the first unit, then CCE digits up to the first unit that
+is not one (`+7` and ` 42` are 0, `12abc` is 12), as `cx_text_to_integer`
+does; `text-replace` with an empty pattern answers the text unchanged.
 
-The round trip is Codex, in `codex/foreword/core/CCE.codex`: it maps each code
-point into the alphabet, frames one outside it into units 128..255, and hands
-the list to the builtin `raw-bytes-to-text`.
+**No verdict pins how a framed unit prints.** Both arms emulate x86's printer,
+including the two places it prints a character other than the one framed
+(tier 1's first slice starts at U+00C0; a negative tier-2 delta gives an
+overlong code point). A Roc `Str` cannot hold an overlong sequence, so
+`Text.printed` hands the platform U+FFFD there.
 
-**Half of it was that builtin, and is fixed.** Both arms decoded its bytes as
-UTF-8, where upstream copies them in as units, so ASCII broke too (65 came back
-as unit 75). With that fixed, every row inside the alphabet matches, and
-`arm64-http-test` passes.
+## codexrun prints no value opening
 
-**The other half is the representation.** A Text here is a string of real
-characters, and a lone framing unit 128..255 has none: it reads back as 0. The
-rows that remain are exactly those units (192 is `[0 0]` against `[193 128]`).
+`opening : Integer = text-to-integer "-5"` (`neg-int-parse`) prints nothing
+under codexrun; its verdict and the Roc arm print `-5`. How many units have a
+value opening is not counted.
 
 ## `literal_main` must differ
 
