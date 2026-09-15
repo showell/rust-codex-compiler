@@ -228,16 +228,13 @@ fn find_units(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     hay.get(from..)?.windows(needle.len()).position(|w| w == needle).map(|p| p + from)
 }
 
-/// Every occurrence of `from`, left to right, replaced by `to`, as
-/// `str::replace` does.
+/// Every occurrence of `from`, left to right, replaced by `to`; an empty
+/// `from` answers the text as it was.
 fn replace_units(s: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    // An empty pattern answers the text as it was, as x86 does
+    // (text-helper-native: `text-replace "hello" "" "x"` is `hello`).
     if from.is_empty() {
-        let mut out = to.to_vec();
-        for u in s {
-            out.push(*u);
-            out.extend_from_slice(to);
-        }
-        return out;
+        return s.to_vec();
     }
     let mut out = Vec::with_capacity(s.len());
     let mut i = 0;
@@ -1564,7 +1561,20 @@ impl Interp {
                 let r = replace_units(a.units(), b.units(), c.units());
                 self.text(r)
             }
-            ("text-to-integer", [Text(t)]) => Ok(Int(t.printed().trim().parse().unwrap_or(0))),
+            // `cx_text_to_integer`, as x86 reads one: a minus only as the first
+            // unit, then decimal digits (units 3..12) until the first unit that
+            // is not one, wrapping. So `+7`, ` 42` and `abc` are 0, and `12abc`
+            // is 12 (text-helper-native).
+            ("text-to-integer", [Text(t)]) => {
+                let u = t.units();
+                let neg = u.first() == Some(&73);
+                let n = u
+                    .iter()
+                    .skip(neg as usize)
+                    .take_while(|b| (3..=12).contains(*b))
+                    .fold(0i64, |acc, b| acc.wrapping_mul(10).wrapping_add((*b - 3) as i64));
+                Ok(Int(if neg { n.wrapping_neg() } else { n }))
+            }
             // `text-compare` is unsigned unit order, as `cx_text_compare`.
             ("text-compare", [Text(a), Text(b)]) => {
                 let (x, y) = (a.units(), b.units());

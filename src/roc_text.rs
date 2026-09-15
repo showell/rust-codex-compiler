@@ -187,13 +187,10 @@ Text :: [].{
 		else if List.sublist(h, { start: i, len: List.len(n) }) == n { U64.to_i64_wrap(i) }
 		else { Text.find(h, n, i + 1) }
 
-	# `text-replace` (`cx_text_replace`), as the interpreter replaces: every
-	# occurrence left to right, and an empty pattern puts the replacement
-	# before every unit and after the last.
+	# `text-replace` (`cx_text_replace`): every occurrence left to right, and
+	# an empty pattern answers the text as it was.
 	replace : List(U8), List(U8), List(U8) -> List(U8)
-	replace = |s, a, b|
-		if List.len(a) == 0 { List.fold(s, b, |acc, u| List.concat(List.append(acc, u), b)) }
-		else { Text.replace_from(s, a, b, 0, []) }
+	replace = |s, a, b| if List.len(a) == 0 { s } else { Text.replace_from(s, a, b, 0, []) }
 
 	replace_from : List(U8), List(U8), List(U8), U64, List(U8) -> List(U8)
 	replace_from = |s, a, b, i, acc| {
@@ -226,10 +223,21 @@ Text :: [].{
 	concat_list : List(List(U8)) -> List(U8)
 	concat_list = |l| List.fold(l, [], |acc, p| List.concat(acc, p))
 
-	# `text-to-integer`, as the interpreter reads one: the printed text,
-	# trimmed, or 0.
+	# `text-to-integer` (`cx_text_to_integer`): a minus only as the first unit,
+	# then decimal digits, units 3..12, until the first unit that is not one,
+	# wrapping. So `+7` and ` 42` are 0, and `12abc` is 12.
 	to_integer : List(U8) -> I64
-	to_integer = |s| I64.from_str(Str.trim(Text.printed(s))) ?? 0
+	to_integer = |s| {
+		neg = (List.get(s, 0) ?? 0) == 73
+		n = Text.digits_from(s, if neg { 1 } else { 0 }, 0)
+		if neg { I64.minus_wrap(0, n) } else { n }
+	}
+
+	digits_from : List(U8), U64, I64 -> I64
+	digits_from = |s, i, acc| {
+		u = Text.at(s, i)
+		if u >= 3 and u <= 12 { Text.digits_from(s, i + 1, I64.plus_wrap(I64.times_wrap(acc, 10), U64.to_i64_wrap(u - 3))) } else { acc }
+	}
 
 	# `show` of an integer (`cx_show_int`): its decimal digits as units, 3 + d
 	# each, and 73 for a minus.
