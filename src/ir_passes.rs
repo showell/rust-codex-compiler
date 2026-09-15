@@ -185,18 +185,19 @@ fn fold_apply(
 
 /// A definition a call site may be replaced by: its parameters, their declared
 /// types, and its body. `InlineLeaf` upstream, and both passes use it.
-struct Candidate {
-    name: Sym,
-    params: Vec<Sym>,
-    ptys: Vec<Ty>,
+#[derive(Clone)]
+pub(crate) struct Candidate {
+    pub(crate) name: Sym,
+    pub(crate) params: Vec<Sym>,
+    pub(crate) ptys: Vec<Ty>,
     /// The declared type AFTER the parameters: what the call site receives.
-    rty: Ty,
-    body: IrExpr,
+    pub(crate) rty: Ty,
+    pub(crate) body: IrExpr,
 }
 
 /// A candidate's declared return type. Lowering has already refused any
 /// definition with more parameters than its type has arrows.
-fn declared_return(d: &IrDef) -> Ty {
+pub(crate) fn declared_return(d: &IrDef) -> Ty {
     lt::peel_returns_n(&d.ty, d.params.len())
         .cloned()
         .expect("lowering refuses a definition with more params than arrows")
@@ -205,7 +206,7 @@ fn declared_return(d: &IrDef) -> Ty {
 /// **A BOUNDED SIGNATURE IS NEVER INLINED.** A function with a bounded
 /// parameter or return is enforced by runtime guards at its entry and
 /// epilogue; splicing its body into the caller would bypass them.
-fn has_bounded_boundary(d: &IrDef) -> bool {
+pub(crate) fn has_bounded_boundary(d: &IrDef) -> bool {
     let bounded = |t: &Ty| {
         matches!(t, Ty::Integer(lo, hi, Overflow::Error)
             if *lo != i64::MIN || *hi != i64::MAX)
@@ -224,7 +225,7 @@ fn has_bounded_boundary(d: &IrDef) -> bool {
 }
 
 /// The name at the head of an application spine, and the arguments under it.
-fn apply_root(e: &IrExpr) -> Option<Sym> {
+pub(crate) fn apply_root(e: &IrExpr) -> Option<Sym> {
     match e {
         IrExpr::Apply(f, _, _, _) => apply_root(f),
         IrExpr::Name(n, _, _) => Some(*n),
@@ -232,7 +233,7 @@ fn apply_root(e: &IrExpr) -> Option<Sym> {
     }
 }
 
-fn apply_args(e: &IrExpr) -> Vec<&IrExpr> {
+pub(crate) fn apply_args(e: &IrExpr) -> Vec<&IrExpr> {
     match e {
         IrExpr::Apply(f, a, _, _) => {
             let mut v = apply_args(f);
@@ -429,7 +430,7 @@ fn operand_same(a: &IrExpr, b: &IrExpr) -> bool {
 /// **THIS LIST AND `subst_once` BELOW ARE WRITTEN TO BE READ SIDE BY SIDE.**
 /// Widening one without the other is how this pass would silently leave a
 /// parameter name loose in the caller.
-fn once_binder_free(e: &IrExpr) -> bool {
+pub(crate) fn once_binder_free(e: &IrExpr) -> bool {
     use IrExpr as E;
     match e {
         E::IntLit(..)
@@ -455,7 +456,7 @@ fn once_binder_free(e: &IrExpr) -> bool {
 /// `once-free-escapes`: a name in the body that is neither a parameter nor a
 /// global, but happens to be bound AT THE CALL SITE. Substituting there would
 /// capture it, so the site is declined.
-fn once_free_escapes(e: &IrExpr, params: &[Sym], bound: &[Sym]) -> bool {
+pub(crate) fn once_free_escapes(e: &IrExpr, params: &[Sym], bound: &[Sym]) -> bool {
     match e {
         IrExpr::Name(n, _, _) => !params.contains(n) && bound.contains(n),
         other => other.children().iter().any(|c| once_free_escapes(c, params, bound)),
@@ -492,7 +493,7 @@ fn once_retype(ty: &Ty, ptys: &[Ty], atys: &[Ty]) -> Ty {
 }
 
 /// Substitution over exactly the vocabulary `once_binder_free` admits.
-fn subst_once(
+pub(crate) fn subst_once(
     e: &IrExpr,
     params: &[Sym],
     args: &[&IrExpr],
@@ -614,7 +615,7 @@ fn once_site(e: &IrExpr, cands: &[Candidate], bound: &[Sym]) -> IrExpr {
 /// **THE SITE RULE FIRES ON THE WAY OUT.** An application is rewritten after
 /// its own function and argument have been, so a call whose argument is itself
 /// an inlinable call is handled inner-first.
-fn rewrite(
+pub(crate) fn rewrite(
     e: &IrExpr,
     cands: &[Candidate],
     bound: &mut Vec<Sym>,

@@ -492,6 +492,8 @@ pub fn emit_modules(
     vm_flags: bool,
     by_reach: bool,
 ) -> Result<Vec<(String, String)>, String> {
+    let called_back = crate::roc_forwarders::call_back_directly(defs);
+    let defs = &called_back[..];
     let mut cx = Cx::new(ch, tds, syms, defs, vm_flags, by_reach);
     // **A UNIT WITH NO OPENING IS A LIBRARY**: every chapter a module, no
     // app. That is what a GPU kernel chapter is.
