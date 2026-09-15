@@ -1584,6 +1584,10 @@ impl<'a> Cx<'a> {
             all.extend(ps);
             return Ok(format!("{tabs}{name} : {sig}\n{tabs}{name} = |{}| {body}\n", all.join(", ")));
         }
+        if let Some(body) = in_roc(&module_slug(&d.origin), self.syms.text(d.name), &ps, self.real()) {
+            self.locals.truncate(mark);
+            return Ok(format!("{tabs}{name} : {sig}\n{tabs}{name} = {body}\n"));
+        }
         // **A RIGHT FOLD IS EMITTED AS AN ACCUMULATOR LOOP.** Codex builds a
         // list by `x & f rest`: the recursive call is the right operand of
         // an append, and each level copies everything below it, so a
@@ -3245,6 +3249,77 @@ impl<'a> Cx<'a> {
             return Ok(out);
         }
         Ok(format!("List.concat({acc}, {})", self.expr(l, ind)?))
+    }
+}
+
+/// **A DEFINITION WRITTEN IN ROC, NOT EMITTED FROM ITS CODEX.** Geometry's
+/// `geo-sqrt` and Quaternion's `quat-real-sqrt` are Newton's method written out:
+/// a guess refined until two guesses are within `~`, four ULPs. Roc's `sqrt` is
+/// the machine's instruction; the loop's answer is within those few ULPs of it
+/// (`in_roc_tests`). Each keeps its definition's guard, zero for an argument that
+/// is not positive, where `sqrt` answers NaN. The chapter is part of the key, so
+/// a program's own definition of the same name is emitted as written.
+fn in_roc(chapter: &str, name: &str, params: &[String], real: &str) -> Option<String> {
+    match (chapter, name, params) {
+        ("Geometry", "geo-sqrt", [n]) | ("Quaternion", "quat-real-sqrt", [n]) => {
+            Some(format!("|{n}| if {n} <= 0.0 {{ 0.0 }} else {{ {real}.sqrt({n}) }}"))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod in_roc_tests {
+    use super::in_roc;
+
+    /// Codex's `~`: the bit patterns as monotone ordinals, within four.
+    fn ordinal(f: f64) -> i64 {
+        let b = f.to_bits() as i64;
+        if b < 0 { (b ^ i64::MAX).wrapping_add(1) } else { b }
+    }
+
+    /// `geo-sqrt` as Geometry writes it.
+    fn newton(n: f64) -> f64 {
+        if n <= 0.0 {
+            return 0.0;
+        }
+        let mut guess = n / 2.0 + 1.0;
+        loop {
+            let next = (guess + n / guess) / 2.0;
+            if (ordinal(next) - ordinal(guess)).abs() <= 4 {
+                return next;
+            }
+            guess = next;
+        }
+    }
+
+    #[test]
+    fn both_newton_roots_are_written_as_roc_sqrt_behind_their_guard() {
+        let n = vec!["n".to_string()];
+        let want = "|n| if n <= 0.0 { 0.0 } else { F64.sqrt(n) }";
+        assert_eq!(in_roc("Geometry", "geo-sqrt", &n, "F64").as_deref(), Some(want));
+        assert_eq!(in_roc("Quaternion", "quat-real-sqrt", &n, "F64").as_deref(), Some(want));
+        assert_eq!(in_roc("Raytracer", "geo-sqrt", &n, "F64"), None);
+        assert_eq!(in_roc("Geometry", "geo-sqrt-loop", &n, "F64"), None);
+    }
+
+    /// The loop and the instruction agree to within four ULPs, from a
+    /// millionth to a trillion and on every perfect square the scenes use.
+    #[test]
+    fn the_newton_loop_is_within_four_ulps_of_sqrt() {
+        let mut worst = 0;
+        let mut x = 1e-6_f64;
+        while x < 1e12 {
+            for n in [x, x * 1.37, x * 7.91] {
+                worst = worst.max((ordinal(newton(n)) - ordinal(n.sqrt())).abs());
+            }
+            x *= 3.3;
+        }
+        for k in 1..2000 {
+            let n = (k * k) as f64;
+            worst = worst.max((ordinal(newton(n)) - ordinal(n.sqrt())).abs());
+        }
+        assert!(worst <= 4, "the loop is {worst} ULPs from sqrt somewhere");
     }
 }
 
