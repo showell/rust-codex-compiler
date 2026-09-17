@@ -5,6 +5,10 @@ the way Cobblestone is -- lexer, parser, desugarer, scope, check, lower -- and
 stopping at the IR. **The primary goal is compile speed.** Linting and
 bug-hunting come later, on the same front end.
 
+**It also transpiles Codex to Roc** (`rocemit`), down the same road as far as
+the lowering and then writing Roc instead of IR text. That is what puts Codex
+programs on Roc platforms; see "Emitting Roc" below.
+
 There is also an interpreter (`codexrun`), which is not on that path. It
 compiles the desugared AST to a run form -- names already resolved to frame
 slots, literals already values -- and walks that. It exists to be an oracle
@@ -89,6 +93,7 @@ writes; safari's `build/*-unit.codex` already are.
 | `desugardump` | desugarer | ditto |
 | `irdump` | IR preamble | a RESOLVED unit |
 | `codexrun` | interpreter (not on the path above) | a resolved unit |
+| `rocemit` | Roc, from the lowering | a resolved unit, and a directory to write |
 
     ./safari/run.sh     safari's own checks through our interpreter
     ./safari/bench.sh   time the interpreter on a fixed set of safari units
@@ -122,6 +127,34 @@ What a program pays before its first step is the FRONT END -- read, lex, parse,
 desugar, compile -- and a resolved unit carries its whole prelude, so that is
 not free. `bench` times the RUN only; the gap between its total and the wall
 clock is what the front end cost.
+
+## Emitting Roc
+
+    rocemit <unit.codex> <dir>             one type module per chapter, whole,
+                                           and the spec's app, into <dir>
+    rocemit --by-reach <unit.codex> <dir>
+
+Two lines on stdout: the app's file name, or `library` for a unit with no
+opening, and a digest of everything written. A refusal exits 2.
+
+**The same road as `irdump whole`** -- resolve, parse, desugar, check, lower --
+and then `roc_emit` where the IR text would be. So a program that transpiles is
+a program this front end already understood, and the emitter is judged by
+whether the Roc it writes MEANS what the Codex meant, not by shape.
+
+`--by-reach` picks the threaded state from what the opening can actually reach
+rather than from every definition in the unit's chapters. It is for a platform
+whose host stops a read or write at an address it does not back -- roc-apps'
+framebuffer -- where a program can reach a device through a memory address no
+builtin names, and only the host can see it.
+
+What the emitter has had to decide, and where those decisions are written down:
+a Codex `Text` is a `List(U8)` of CCE units, with the `Text.roc` it writes
+beside it (`docs/known-gaps.md`); a list built by pushing onto a recursive call
+becomes an accumulator loop; a memory or port door that reads or writes is an
+effect, as are the UEFI key reads; `bit-shr` is Roc's arithmetic shift and
+`bit-shru` the zero-filling one; and a call to a forwarder that calls back is
+written as the call it makes.
 
 ## The gates
 
