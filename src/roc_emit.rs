@@ -1533,6 +1533,7 @@ impl<'a> Cx<'a> {
     /// as the literal it is, since the nightly's checker is linear in them.
     fn def(&mut self, d: &IrDef, base: usize) -> Result<String, String> {
         self.heap_live = self.by_closure() && self.device_defs.contains(&d.name);
+        self.tmp_n = 0;
         // Roc spells an effectful function's name with `!` (`def_ref` agrees).
         let bang = if self.bang_defs.contains(&d.name) { "!" } else { "" };
         let name = format!("{}{bang}", self.ident(d.name)?);
@@ -1679,6 +1680,7 @@ impl<'a> Cx<'a> {
         if !d.params.is_empty() {
             return Err("opening takes parameters".into());
         }
+        self.tmp_n = 0;
         // **THE MACHINE RUNS ONE UNSCOPED PROCESS.** x86 stores the opening's
         // FileSystem and Network scopes as the boot process's before it runs,
         // and `process-get-scope` answers them; the machine answers the empty
@@ -1883,7 +1885,9 @@ impl<'a> Cx<'a> {
     }
 
     /// A hoisted call's answer. The double underscore is not a spelling any
-    /// Codex identifier reaches.
+    /// Codex identifier reaches, and the number is the DEFINITION's: a
+    /// chapter's text must not depend on how many temporaries the chapters
+    /// ahead of it took (`carried_value` has the rest of that story).
     fn fresh_tmp(&mut self) -> String {
         self.tmp_n += 1;
         format!("{}__{}", self.dev_base(), self.tmp_n)
@@ -2455,7 +2459,10 @@ impl<'a> Cx<'a> {
                 self.dev = Some(d);
                 tmp
             }
-            E::Let(..) => self.let_block(e, ind)?,
+            E::Let(..) => match carried_value(e) {
+                IrExpr::Let(..) => self.let_block(e, ind)?,
+                inner => self.expr(inner, ind)?,
+            },
             E::Apply(..) => self.apply(e, ind)?,
             E::Lambda(..) => return Err("lambda".into()),
             E::List(xs, _, _) => {
@@ -2626,7 +2633,7 @@ impl<'a> Cx<'a> {
         let tabs = "\t".repeat(ind + 1);
         let mut out = String::from("({\n");
         let mark = self.locals.len();
-        let mut cur = e;
+        let mut cur = carried_value(e);
         while let IrExpr::Let(n, _, v, body, _) = cur {
             let (lines, v) = self.hoisting(v, ind + 1)?;
             for l in lines {
@@ -2635,7 +2642,7 @@ impl<'a> Cx<'a> {
             self.locals.push(*n);
             let b = self.binder(*n, &[body])?;
             out.push_str(&format!("{tabs}{b} = {v}\n"));
-            cur = body;
+            cur = carried_value(body);
         }
         let (lines, tail) = self.hoisting(cur, ind + 1)?;
         for l in lines {
@@ -3502,6 +3509,25 @@ fn reads(e: &IrExpr, n: Sym, restore: Option<Sym>) -> bool {
 /// A Codex name as a Roc identifier: kebab to snake, keywords suffixed. A
 /// lifted `__lam_0` loses its underscores, which in Roc would mark it unused,
 /// and a derived `__eq_Tup2` loses its capitals, which Roc reads as a type.
+/// Past a `let x = e in x`, which is `e`.
+///
+/// **A NAME THAT ONLY CARRIES A TYPE IS NOT A BINDING.** An IR literal has
+/// no type slot, so lowering binds a unit-typed value to a name and answers
+/// the name, the name being where the unit type can live
+/// (`Lowering.codex:615`, `lower_unit_ctor_value`). Roc spells a unit as its
+/// own integer and needs no such name; emitting one wrote a binding nothing
+/// reads, spelled `__unit-<offset>` from the value's offset in the BUNDLED
+/// source -- so the same chapter emitted different text behind different
+/// chapters, and roc-apps, which shares one copy of each chapter across the
+/// tests, could not share those.
+fn carried_value(e: &IrExpr) -> &IrExpr {
+    let IrExpr::Let(n, _, v, body, _) = e else { return e };
+    match &**body {
+        IrExpr::Name(m, _, _) if m == n => carried_value(v),
+        _ => e,
+    }
+}
+
 fn ident_text(t: &str) -> Result<String, String> {
     let t = t.trim_start_matches('_');
     if t.is_empty() {
