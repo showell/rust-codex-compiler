@@ -2965,6 +2965,12 @@ impl<'a> Cx<'a> {
                 want(1)?;
                 xs[0].clone()
             }
+            // An empty list; the capacity is a reservation, not a length
+            // (interp.rs).
+            "__list-with-capacity" => {
+                want(1)?;
+                format!("List.with_capacity({int}.to_u64_wrap({}))", xs[0])
+            }
             "list-push" | "list-snoc" => {
                 want(2)?;
                 format!("List.append({}, {})", xs[0], xs[1])
