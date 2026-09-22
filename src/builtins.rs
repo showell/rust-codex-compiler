@@ -10,7 +10,7 @@
 // VALUE and not a function of one argument. `None` is one of the eight
 // that declare no type at all. Re-run the probe after a pin change; do
 // not edit by hand.
-pub const BUILTINS: [(&str, Option<usize>); 266] = [
+pub const BUILTINS: [(&str, Option<usize>); 272] = [
     ("negate", Some(1)),
     ("text-length", Some(1)),
     ("integer-to-text", Some(1)),
@@ -66,7 +66,6 @@ pub const BUILTINS: [(&str, Option<usize>); 266] = [
     ("run-process", Some(2)),
     ("run-process-full", Some(2)),
     ("process-exit", Some(1)),
-    ("host-socket", Some(4)),
     ("fork", Some(1)),
     ("await", Some(1)),
     ("par", Some(2)),
@@ -98,6 +97,7 @@ pub const BUILTINS: [(&str, Option<usize>); 266] = [
     ("cpu-read-cr0", Some(0)),
     ("cpu-read-cr3", Some(0)),
     ("hosted-kind", Some(0)),
+    ("host-socket", Some(4)),
     ("cpu-cpuid-eax", Some(1)),
     ("cpu-cpuid-ebx", Some(1)),
     ("cpu-cpuid-ecx", Some(1)),
@@ -252,6 +252,12 @@ pub const BUILTINS: [(&str, Option<usize>); 266] = [
     ("bits-to-real-approx", Some(1)),
     ("vec4-splat", Some(1)),
     ("vec4-extract", Some(2)),
+    ("mask4-any", Some(1)),
+    ("mask4-all", Some(1)),
+    ("mask4-none", Some(1)),
+    ("mask4-count", Some(1)),
+    ("vec4-select", Some(3)),
+    ("vec4-reduce-add", Some(1)),
     ("suggested-vector-width", Some(1)),
     ("atomic-load", Some(1)),
     ("atomic-store", Some(2)),
@@ -297,7 +303,7 @@ pub const BUILTIN_EFFECT_NAMES: [&str; 5] = ["Console.Read", "Process", "Device.
 /// whose type names `Task` is otherwise untyped in a program that never does.
 pub const BUILTIN_TYPE_NAMES: [&str; 4] = ["Maybe", "SChan", "Task", "TypeBinding"];
 
-pub const BUILTIN_TYPES: [(&str, &str); 254] = [
+pub const BUILTIN_TYPES: [(&str, &str); 260] = [
     ("negate", "(forall 0 (fn (tvar 0) empty (tvar 0)))"),
     ("text-length", "(fn text empty int)"),
     ("integer-to-text", "(fn int empty text)"),
@@ -538,6 +544,12 @@ pub const BUILTIN_TYPES: [(&str, &str); 254] = [
     ("bits-to-real-approx", "(fn int empty real-approx)"),
     ("vec4-splat", "(fn real-approx empty (vec 4 real-approx))"),
     ("vec4-extract", "(fn (vec 4 real-approx) empty (fn int empty real-approx))"),
+    ("mask4-any", "(fn (vec-mask 4) empty bool)"),
+    ("mask4-all", "(fn (vec-mask 4) empty bool)"),
+    ("mask4-none", "(fn (vec-mask 4) empty bool)"),
+    ("mask4-count", "(fn (vec-mask 4) empty int)"),
+    ("vec4-select", "(fn (vec-mask 4) empty (fn (vec 4 real-approx) empty (fn (vec 4 real-approx) empty (vec 4 real-approx))))"),
+    ("vec4-reduce-add", "(fn (vec 4 real-approx) empty real-approx)"),
     ("suggested-vector-width", "(forall 0 (fn (tvar 0) empty int))"),
     ("atomic-load", "(fn int empty int)"),
     ("atomic-store", "(fn int empty (fn int empty int))"),
@@ -545,11 +557,11 @@ pub const BUILTIN_TYPES: [(&str, &str); 254] = [
     ("atomic-add", "(fn int empty (fn int empty int))"),
     ("atomic-exchange", "(fn int empty (fn int empty int))"),
     ("memory-fence", "(fn int empty int)"),
-    ("vec-empty", "(forall 0 (vec 0 (tvar 0)))"),
-    ("vec-singleton", "(forall 0 (fn (tvar 0) empty (vec 1 (tvar 0))))"),
-    ("vec-head", "(forall 0 (fn (vec -1 (tvar 0)) empty (tvar 0)))"),
-    ("vec-cons", "(forall 0 (fn (tvar 0) empty (fn (vec -1 (tvar 0)) empty (vec -1 (tvar 0)))))"),
-    ("vec-length", "(forall 0 (fn (vec -1 (tvar 0)) empty int))"),
+    ("vec-empty", "(forall 0 (svec 0 (tvar 0)))"),
+    ("vec-singleton", "(forall 0 (fn (tvar 0) empty (svec 1 (tvar 0))))"),
+    ("vec-head", "(forall 0 (fn (svec -1 (tvar 0)) empty (tvar 0)))"),
+    ("vec-cons", "(forall 0 (fn (tvar 0) empty (fn (svec -1 (tvar 0)) empty (svec -1 (tvar 0)))))"),
+    ("vec-length", "(forall 0 (fn (svec -1 (tvar 0)) empty int))"),
     ("s-new", "(forall 0 (ctd SChan (tvar 0)))"),
     ("s-recv-value", "(forall 0 (fn (ctd SChan (tvar 0)) empty int))"),
 ];

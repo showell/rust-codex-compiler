@@ -228,7 +228,7 @@ fn type_names(ch: &Chapter, tds: &TypeDefs, st: &mut UnifyState) {
 fn builtin_type_name(name: &str) -> bool {
     matches!(
         name,
-        "Integer" | "Real" | "Text" | "Boolean" | "Char" | "Nothing" | "Proof" | "List" | "LinkedList" | "Vector"
+        "Integer" | "Real" | "Text" | "Boolean" | "Char" | "Nothing" | "Proof" | "List" | "LinkedList" | "Vector" | "SizedVec"
     )
 }
 

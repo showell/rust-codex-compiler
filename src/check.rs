@@ -70,6 +70,9 @@ pub enum Ty {
     PropEq(Box<Ty>, Box<Ty>),
     Unit(Name, Box<Ty>),
     Vector(i64, Box<Ty>),
+    /// `SizedVec n T`: the list-shaped family (`vec-empty`, `vec-cons`, ...),
+    /// not packed SIMD lanes. A length of -1 is any length.
+    SizedVec(i64, Box<Ty>),
     VectorMask(i64),
     TypeCon(Name),
     TypeApply(Box<Ty>, Box<Ty>),
@@ -651,6 +654,7 @@ impl UnifyState {
                 Ty::Constructed(n, a.iter().map(|x| self.deep_resolve(x)).collect())
             }
             Ty::Vector(n, e) => Ty::Vector(n, Box::new(self.deep_resolve(&e))),
+            Ty::SizedVec(n, e) => Ty::SizedVec(n, Box::new(self.deep_resolve(&e))),
             Ty::Unit(n, e) => Ty::Unit(n, Box::new(self.deep_resolve(&e))),
             Ty::PropEq(a, b) => Ty::PropEq(Box::new(self.deep_resolve(&a)), Box::new(self.deep_resolve(&b))),
             Ty::TypeApply(f, a) => {
@@ -737,13 +741,40 @@ impl UnifyState {
             let mut vs = std::collections::BTreeSet::new();
             collect_type_vars(&ra, &mut vs);
             collect_type_vars(&rb, &mut vs);
-            if vs.is_empty() && head_name(&ra) != head_name(&rb) {
-                eprintln!("CONFLICT-PAIR {} vs {}", head_name(&ra), head_name(&rb));
+            // A packed vector's width is part of its identity for this
+            // question: `Vector 2` against `Vector 4` shares a head and is
+            // still a conflict upstream reports.
+            let named = |t: &Ty| match t {
+                Ty::Vector(w, _) if *w >= 0 => format!("Vector{w}"),
+                Ty::VectorMask(w) if *w >= 0 => format!("VectorMask{w}"),
+                _ => head_name(t).to_string(),
+            };
+            if vs.is_empty() && named(&ra) != named(&rb) {
+                eprintln!("CONFLICT-PAIR {} vs {}", named(&ra), named(&rb));
+            }
+            // The vector families conflict by head and width alone, whatever
+            // their elements hold, so these are recorded with variables too.
+            let family = |t: &Ty| matches!(t, Ty::Vector(..) | Ty::SizedVec(..) | Ty::VectorMask(..));
+            if (family(&ra) || family(&rb)) && named(&ra) != named(&rb) {
+                eprintln!("VEC-PAIR {} vs {}", named(&ra), named(&rb));
             }
         }
         // Two sides of an equality are terms, and `Con:Off` against `Con:On`
         // is the whole finding.
         if self.propeq_depth > 0 {
+            self.error(Cdx::TYPE_MISMATCH, format!("Type mismatch: {} vs {}", type_desc(&ra), type_desc(&rb)));
+            return;
+        }
+        // The vector families, as `unify-at` refuses them
+        // (Types/Unifier.codex:650 and :662): packed lanes of two known
+        // widths, and packed lanes against the list-shaped SizedVec. The
+        // element types play no part, so a pair holding variables counts.
+        let vector_conflict = match (&ra, &rb) {
+            (Ty::Vector(w1, _), Ty::Vector(w2, _)) => *w1 >= 0 && *w2 >= 0 && w1 != w2,
+            (Ty::Vector(..), Ty::SizedVec(..)) | (Ty::SizedVec(..), Ty::Vector(..)) => true,
+            _ => false,
+        };
+        if vector_conflict {
             self.error(Cdx::TYPE_MISMATCH, format!("Type mismatch: {} vs {}", type_desc(&ra), type_desc(&rb)));
             return;
         }
@@ -896,6 +927,11 @@ impl UnifyState {
                 let (x, y) = (x.clone(), y.clone());
                 self.unify(&x, &y)
             }
+            // `unify-at`'s SizedVecTy arm (Types/Unifier.codex:662).
+            (Ty::SizedVec(n1, x), Ty::SizedVec(n2, y)) if n1 == n2 || *n1 < 0 || *n2 < 0 => {
+                let (x, y) = (x.clone(), y.clone());
+                self.unify(&x, &y)
+            }
             (Ty::TypeApply(f1, x1), Ty::TypeApply(f2, x2)) => {
                 let (f1, x1, f2, x2) = (f1.clone(), x1.clone(), f2.clone(), x2.clone());
                 self.unify(&f1, &f2) && self.unify(&x1, &x2)
@@ -992,6 +1028,7 @@ fn subst_type_var(t: &Ty, id: u32, with: &Ty) -> Ty {
             a.iter().map(|x| subst_type_var(x, id, with)).collect(),
         ),
         Ty::Vector(n, e) => Ty::Vector(*n, Box::new(subst_type_var(e, id, with))),
+        Ty::SizedVec(n, e) => Ty::SizedVec(*n, Box::new(subst_type_var(e, id, with))),
         Ty::Unit(n, e) => Ty::Unit(n.clone(), Box::new(subst_type_var(e, id, with))),
         // `cong`'s `tyapply` and every proof builtin's `propeq` are bound
         // under the same `forall`; a variable left inside either is the
@@ -1285,6 +1322,17 @@ fn resolve_applied(syms: &SymTab, n: Name, args: &[&crate::ast::TypeExpr], rende
             Ty::Vector(len, Box::new(elem.clone()))
         }
         ("Vector", _) => Ty::Vector(2, Box::new(Ty::Error)),
+        // `resolve-type-expr`'s SizedVec arm (Types/TypeChecker.codex:75).
+        ("SizedVec", [_, elem]) => {
+            let len = match args.first() {
+                Some(crate::ast::TypeExpr::Named(w, _)) => {
+                    crate::token::lit_text_to_integer(syms.text(*w))
+                }
+                _ => 0,
+            };
+            Ty::SizedVec(len, Box::new(elem.clone()))
+        }
+        ("SizedVec", _) => Ty::SizedVec(0, Box::new(Ty::Error)),
         _ => Ty::Constructed(n, rendered),
     }
 }
@@ -1717,6 +1765,8 @@ fn type_desc(t: &Ty) -> String {
         Ty::Var(i) => format!("T{i}"),
         Ty::PropEq(a, b) => format!("PropEq[{},{}]", type_desc(a), type_desc(b)),
         Ty::TypeApply(f, x) => format!("App[{} {}]", type_desc(f), type_desc(x)),
+        Ty::Vector(n, e) => format!("Vector {n} {}", type_desc(e)),
+        Ty::SizedVec(n, e) => format!("SizedVec {n} {}", type_desc(e)),
         _ => head_name(t).to_string(),
     }
 }
@@ -1726,7 +1776,7 @@ fn head_name(t: &Ty) -> &'static str {
         Ty::Integer(..) => "Integer", Ty::Real(..) => "Real", Ty::Text => "Text", Ty::Boolean => "Boolean",
         Ty::Char => "Char", Ty::Nothing => "Nothing", Ty::Fun(..) => "Fun", Ty::List(..) => "List",
         Ty::Record(..) => "Record", Ty::Sum(..) => "Sum", Ty::Constructed(..) => "Constructed",
-        Ty::Unit(..) => "Unit", Ty::Vector(..) => "Vector", Ty::VectorMask(..) => "VectorMask",
+        Ty::Unit(..) => "Unit", Ty::Vector(..) => "Vector", Ty::SizedVec(..) => "SizedVec", Ty::VectorMask(..) => "VectorMask",
         Ty::LinkedList(..) => "LinkedList", Ty::Linear(..) => "Linear", Ty::TypeApply(..) => "TypeApply",
         Ty::Var(..) => "Var", Ty::Error => "Error", Ty::NoExpect => "NoExpect", _ => "Other",
     }
@@ -2042,6 +2092,7 @@ fn param_walk(t: &Ty, syms: &SymTab, st: &mut UnifyState, entries: &mut Vec<Para
         Ty::LinkedList(e) => Ty::LinkedList(Box::new(param_walk(e, syms, st, entries))),
         Ty::Linear(e) => Ty::Linear(Box::new(param_walk(e, syms, st, entries))),
         Ty::Vector(n, e) => Ty::Vector(*n, Box::new(param_walk(e, syms, st, entries))),
+        Ty::SizedVec(n, e) => Ty::SizedVec(*n, Box::new(param_walk(e, syms, st, entries))),
         Ty::Effectful(effs, sc, r) => Ty::Effectful(
             effs.clone(),
             sc.clone(),
@@ -2113,7 +2164,7 @@ fn default_ambiguous_vars(st: &mut UnifyState, def_var_start: u32, own_type: Opt
 fn collect_type_vars(t: &Ty, out: &mut std::collections::BTreeSet<u32>) {
     match t {
         Ty::Var(id) => { out.insert(*id); }
-        Ty::List(a) | Ty::LinkedList(a) | Ty::Vector(_, a) | Ty::Unit(_, a)
+        Ty::List(a) | Ty::LinkedList(a) | Ty::Vector(_, a) | Ty::SizedVec(_, a) | Ty::Unit(_, a)
         | Ty::Linear(a) | Ty::ForAll(_, a) | Ty::ForAllEff(_, a) => collect_type_vars(a, out),
         Ty::Fun(a, _, b) | Ty::PropEq(a, b) | Ty::TypeApply(a, b) => {
             collect_type_vars(a, out);
@@ -3931,6 +3982,7 @@ fn build(syms: &SymTab, head: &str, args: &[Ty], words: &[String], rows: &[Effec
         "list" => Ty::List(Box::new(args.first()?.clone())),
         "llist" => Ty::LinkedList(Box::new(args.first()?.clone())),
         "vec" => Ty::Vector(words.first()?.parse().ok()?, Box::new(args.first()?.clone())),
+        "svec" => Ty::SizedVec(words.first()?.parse().ok()?, Box::new(args.first()?.clone())),
         "vec-mask" => Ty::VectorMask(words.first()?.parse().ok()?),
         "propeq" => Ty::PropEq(
             Box::new(args.first()?.clone()),

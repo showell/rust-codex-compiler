@@ -103,7 +103,7 @@ def _sexp(text, i):
 # and the interpreter built a one-argument function for a value. Nothing about
 # an arity of 0 says whether it was read or defaulted.
 TRANSPARENT = {'ForAllTy', 'ForAllEff', 'EffectfulTy'}
-ENDS_THE_SPINE = {'TypeVar', 'ListTy', 'VectorTy', 'ConstructedTy', 'PropEqTy',
+ENDS_THE_SPINE = {'TypeVar', 'ListTy', 'VectorTy', 'SizedVecTy', 'ConstructedTy', 'PropEqTy',
                   'VectorMaskTy', 'LinkedListTy', 'TypeApply', 'RecordTy',
                   # `deck-record T` is a record ON THE DECK -- a wrapper, but
                   # around a type and never around an arrow. `s-new :: ForAllTy 0
@@ -317,6 +317,12 @@ def _check_type(form):
         e = _check_type(form[2])
         n = _vec_len(form[1])
         return f'(vec {n} {e})' if e and n is not None else None
+    # `SizedVecTy n T` is the list-shaped family (vec-empty, vec-cons ...), not
+    # the packed SIMD `VectorTy`; its own spelling keeps the two apart.
+    if head == 'SizedVecTy' and len(form) >= 3:
+        e = _check_type(form[2])
+        n = _vec_len(form[1])
+        return f'(svec {n} {e})' if e and n is not None else None
     if head == 'VectorMaskTy' and len(form) >= 2:
         return f'(vec-mask {form[1]})'
     if head == 'LinkedListTy' and len(form) >= 2:

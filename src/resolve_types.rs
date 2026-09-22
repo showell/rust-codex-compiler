@@ -63,6 +63,7 @@ pub fn resolve_ty_deep(syms: &SymTab, m: &TypeMap, t: &Ty) -> Ty {
         Ty::Effectful(e, sc, r) => Ty::Effectful(e.clone(), sc.clone(), Box::new(go(r))),
         Ty::Unit(n, inner) => Ty::Unit(*n, Box::new(go(inner))),
         Ty::Vector(n, e) => Ty::Vector(*n, Box::new(go(e))),
+        Ty::SizedVec(n, e) => Ty::SizedVec(*n, Box::new(go(e))),
         Ty::TypeApply(f, a) => {
             let (rf, ra) = (go(f), go(a));
             match rf {
