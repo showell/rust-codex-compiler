@@ -272,12 +272,12 @@ impl<'a> Compiler<'a> {
         Compiler::new(names, syms, slug).expr(e)
     }
 
-    pub fn expr(&mut self, e: &'a Expr) -> Code {
+    pub fn expr(&mut self, e: &Expr) -> Code {
         self.typed(e).0
     }
 
     /// An expression's code, and what is known of its type.
-    fn typed(&mut self, e: &'a Expr) -> (Code, Static) {
+    fn typed(&mut self, e: &Expr) -> (Code, Static) {
         match e {
             Expr::Lit(text, kind, _) => {
                 let code = match literal(text, *kind) {
@@ -301,7 +301,7 @@ impl<'a> Compiler<'a> {
                 // Down the left spine to the head, once and for all. Each
                 // argument keeps the span of the application that consumes it,
                 // so an error still names the innermost one.
-                let mut args: Vec<(&'a Expr, Span)> = Vec::new();
+                let mut args: Vec<(&Expr, Span)> = Vec::new();
                 let mut head = e;
                 while let Expr::Apply(f, a, sp) = head {
                     args.push((a, *sp));
@@ -412,11 +412,23 @@ impl<'a> Compiler<'a> {
                 };
                 (Code::FieldAccess(Box::new(o), *f, *sp), t)
             }
-            Expr::Act(stmts, _) => {
+            // A `let` statement swallows the rest of the block, as it does in
+            // lowering (`act_stmts`): the binding is in scope for what
+            // follows, so the remaining statements become an `act` inside the
+            // let's body. Compiled as siblings, they name a binding that has
+            // already gone out of scope.
+            Expr::Act(stmts, asp) => {
                 let mut out = Vec::with_capacity(stmts.len());
                 let mut pushed = 0;
-                for s in stmts {
+                for (k, s) in stmts.iter().enumerate() {
                     match s {
+                        ActStmt::Exec(Expr::Let(bs, body, ls), sp) if k + 1 < stmts.len() => {
+                            let mut inner = vec![ActStmt::Exec((**body).clone(), *sp)];
+                            inner.extend(stmts[k + 1..].iter().cloned());
+                            let whole = Expr::Let(bs.clone(), Rc::new(Expr::Act(inner, *asp)), *ls);
+                            out.push(Stmt::Exec(self.expr(&whole)));
+                            break;
+                        }
                         ActStmt::Exec(e, _) => out.push(Stmt::Exec(self.expr(e))),
                         ActStmt::Bind(n, e, _) => {
                             let (c, t) = self.typed(e);
@@ -446,7 +458,7 @@ impl<'a> Compiler<'a> {
     }
 
     /// An arm, and its body's type.
-    fn arm(&mut self, a: &'a MatchArm) -> (Arm, Static) {
+    fn arm(&mut self, a: &MatchArm) -> (Arm, Static) {
         let mut vars: Vec<Sym> = Vec::new();
         let pat = pat_code(&a.pattern, &mut vars);
         let nvars = vars.len();
