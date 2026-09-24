@@ -529,8 +529,8 @@ pub fn emit_modules(
         if taken {
             return Err(format!("chapter module `{slug}` is a name the threaded {} holds", cx.state));
         }
-        if slug == "Text" {
-            return Err("chapter module `Text` is the name rocemit's text module holds".into());
+        if slug == "CceText" || slug == "CceChar" {
+            return Err(format!("chapter module `{slug}` is the name one of rocemit's text modules holds"));
         }
         cx.current = slug.clone();
         cx.imports.clear();
@@ -565,8 +565,10 @@ pub fn emit_modules(
         }
         prelude |= cx.imports.contains("Prelude");
         memory |= cx.imports.contains("Mem");
-        // A literal, an `&` or a type is enough to need `Text.roc`.
-        cx.uses_text |= cx.imports.contains("Text");
+        // A literal, an `&` or a type is enough to need `CceText.roc`, and `CceText.roc`
+        // needs `CceChar.roc`.
+        cx.uses_text |= cx.imports.contains("CceText");
+        cx.uses_char |= cx.imports.contains("CceChar");
         let mut text = format!("# {} -- emitted from Codex by rocemit (rust-codex-compiler). Do not edit.\n", module_ident(slug));
         for m in &cx.imports {
             text.push_str(&format!("import {m}\n"));
@@ -586,8 +588,12 @@ pub fn emit_modules(
         files.push((format!("{}.roc", module_ident(slug)), text));
     }
     if cx.uses_text {
-        needs.insert("Text".into(), Vec::new());
-        files.push(("Text.roc".into(), crate::roc_text::text_module()));
+        needs.insert("CceText".into(), vec!["CceChar".into()]);
+        files.push(("CceText.roc".into(), crate::roc_text::text_module()));
+    }
+    if cx.uses_text || cx.uses_char {
+        needs.insert("CceChar".into(), Vec::new());
+        files.push(("CceChar.roc".into(), crate::roc_text::char_module()));
     }
     if prelude {
         needs.insert("Prelude".into(), Vec::new());
@@ -695,8 +701,10 @@ struct Cx<'a> {
     tvars: BTreeMap<u32, String>,
     uses_line: bool,
     /// Set when the unit reaches for a text helper, which is then emitted
-    /// beside the chapters as `Text.roc` (`roc_text`).
+    /// beside the chapters as `CceText.roc` (`roc_text`).
     uses_text: bool,
+    /// A Codex `Char` appeared: `CceChar.roc` is written (and `CceText.roc` always needs it).
+    uses_char: bool,
     /// Set while a right fold's body is emitted: its leaves become
     /// accumulator steps (see `def`).
     fold: Option<Fold>,
@@ -815,6 +823,7 @@ impl<'a> Cx<'a> {
             tvars: BTreeMap::new(),
             uses_line: false,
             uses_text: false,
+            uses_char: false,
             fold: None,
             device_ops: Default::default(),
             device_defs: Default::default(),
@@ -1109,12 +1118,15 @@ impl<'a> Cx<'a> {
     fn ty(&mut self, t: &Ty) -> Result<String, String> {
         Ok(match t {
             Ty::Integer(..) => self.int().into(),
-            // A Codex Char is its code (see `roc_text`).
-            Ty::Char => "I64".into(),
+            // A Codex Char is its code, as its own type (see `roc_text`).
+            Ty::Char => {
+                self.imports.insert("CceChar".into());
+                "CceChar".into()
+            }
             Ty::Real(RealWidth::F64, _) => self.real().into(),
             Ty::Text => {
-                self.imports.insert("Text".into());
-                "Text".into()
+                self.imports.insert("CceText".into());
+                "CceText".into()
             }
             Ty::Boolean => "Bool".into(),
             Ty::Nothing => "{}".into(),
@@ -1339,10 +1351,13 @@ impl<'a> Cx<'a> {
             TypeExpr::Named(n, _) => match self.syms.text(*n) {
                 "Real" => self.real().into(),
                 "Integer" => self.int().into(),
-                "Char" => "I64".into(),
+                "Char" => {
+                    self.imports.insert("CceChar".into());
+                    "CceChar".into()
+                }
                 "Text" => {
-                    self.imports.insert("Text".into());
-                    "Text".into()
+                    self.imports.insert("CceText".into());
+                    "CceText".into()
                 }
                 "Boolean" => "Bool".into(),
                 "Nothing" => "{}".into(),
@@ -1749,8 +1764,8 @@ impl<'a> Cx<'a> {
             let text = match strip_unit(&body.ty()).clone() {
                 Ty::Text => {
                     self.uses_text = true;
-                    self.imports.insert("Text".into());
-                    format!("Text.printed({x})")
+                    self.imports.insert("CceText".into());
+                    format!("CceText.printed({x})")
                 }
                 Ty::Integer(..) => format!("I64.to_str({x})"),
                 other => {
@@ -1789,8 +1804,8 @@ impl<'a> Cx<'a> {
                         Ty::Text if last => {
                             self.uses_line = true;
                             self.uses_text = true;
-                            self.imports.insert("Text".into());
-                            out.push_str(&format!("\tline!(Text.printed({e}))\n"));
+                            self.imports.insert("CceText".into());
+                            out.push_str(&format!("\tline!(CceText.printed({e}))\n"));
                         }
                         Ty::Boolean | Ty::Real(..) if last => {
                             return Err(format!("an opening of type {}", crate::ir_text::render_ty(self.syms, &ty)));
@@ -2217,15 +2232,15 @@ impl<'a> Cx<'a> {
                 let mut xs = xs.to_vec();
                 if name == "process-set-scope" {
                     self.uses_text = true;
-                    self.imports.insert("Text".into());
+                    self.imports.insert("CceText".into());
                     let last = xs.len() - 1;
-                    xs[last] = format!("Text.printed({})", xs[last]);
+                    xs[last] = format!("CceText.printed({})", xs[last]);
                 }
                 let call = format!("{s}.{}{bang}({})", name.replace('-', "_"), xs.join(", "));
                 if name == "process-get-scope" || name == "process-get-network-scope" {
                     self.uses_text = true;
-                    self.imports.insert("Text".into());
-                    return Ok(format!("Text.answer_units({call})"));
+                    self.imports.insert("CceText".into());
+                    return Ok(format!("CceText.answer_units({call})"));
                 }
                 return Ok(call);
             }
@@ -2354,12 +2369,15 @@ impl<'a> Cx<'a> {
             E::IntLit(v, _) => int_lit(*v),
             E::NumLit(bits, _) => num_lit(*bits, self.wgsl),
             E::TextLit(s, _) => {
-                self.imports.insert("Text".into());
+                self.imports.insert("CceText".into());
                 crate::roc_text::literal(s)
             }
             E::BoolLit(b, _) => if *b { "True".into() } else { "False".into() },
             // The IR carries a char literal as its CODE already.
-            E::CharLit(c, _) => int_lit(*c),
+            E::CharLit(c, _) => {
+                self.imports.insert("CceChar".into());
+                format!("CceChar.of_code({})", int_lit(*c))
+            }
             E::Name(n, _, _) => self.name_value(*n)?,
             // **A SHORT-CIRCUIT OPERAND IS NOT ALWAYS EVALUATED**, so a
             // poke in one cannot be hoisted ahead of the operator. Write
@@ -2711,8 +2729,8 @@ impl<'a> Cx<'a> {
             B::And => format!("({l} and {r})"),
             B::Or => format!("({l} or {r})"),
             B::AppendText => {
-                self.imports.insert("Text".into());
-                format!("Text.concat({l}, {r})")
+                self.imports.insert("CceText".into());
+                format!("CceText.concat({l}, {r})")
             }
             B::AppendList => format!("List.concat({l}, {r})"),
             // `=~=` is ordinal equality on doubles; two doubles with the same
@@ -2912,14 +2930,14 @@ impl<'a> Cx<'a> {
             "raw-bytes-to-text" if !self.wgsl => {
                 want(1)?;
                 self.uses_text = true;
-                self.imports.insert("Text".into());
-                format!("Text.of_bytes({})", xs[0])
+                self.imports.insert("CceText".into());
+                format!("CceText.of_bytes({})", xs[0])
             }
             "text-split" => {
                 want(2)?;
                 self.uses_text = true;
-                self.imports.insert("Text".into());
-                format!("Text.split({}, {})", xs[0], xs[1])
+                self.imports.insert("CceText".into());
+                format!("CceText.split({}, {})", xs[0], xs[1])
             }
             "list-insert-at" => {
                 want(3)?;
@@ -2931,54 +2949,47 @@ impl<'a> Cx<'a> {
             "text-compare" => {
                 want(2)?;
                 self.uses_text = true;
-                self.imports.insert("Text".into());
-                format!("Text.compare({}, {})", xs[0], xs[1])
+                self.imports.insert("CceText".into());
+                format!("CceText.compare({}, {})", xs[0], xs[1])
             }
             "char-code" | "code-to-char" => {
                 want(1)?;
-                // A Char IS its code here, so both are the value.
-                xs[0].clone()
+                self.imports.insert("CceChar".into());
+                format!("CceChar.{}({})", if name == "char-code" { "code" } else { "of_code" }, xs[0])
             }
             "char-code-at" => {
                 want(2)?;
                 self.uses_text = true;
-                self.imports.insert("Text".into());
-                format!("Text.char_code_at({}, {})", xs[0], xs[1])
+                self.imports.insert("CceText".into());
+                format!("CceText.char_code_at({}, {})", xs[0], xs[1])
             }
             "char-at" => {
                 want(2)?;
                 self.uses_text = true;
-                self.imports.insert("Text".into());
-                format!("Text.char_at({}, {})", xs[0], xs[1])
+                self.imports.insert("CceText".into());
+                format!("CceText.char_at({}, {})", xs[0], xs[1])
             }
             // `char-to-text` keeps the code's low byte and `char-encode` frames
             // it, as the interpreter has them.
             "char-to-text" | "char-encode" => {
                 want(1)?;
                 self.uses_text = true;
-                self.imports.insert("Text".into());
+                self.imports.insert("CceText".into());
                 let f = if name == "char-to-text" { "char_to_text" } else { "char_encode" };
-                format!("Text.{f}({})", xs[0])
+                format!("CceText.{f}({})", xs[0])
             }
             // The classifiers are code RANGES, not the host's idea of a
             // letter: the alphabet is frequency-ordered (interp.rs).
-            "is-letter" => {
+            "is-letter" | "is-digit" | "is-whitespace" => {
                 want(1)?;
-                format!("(({x} >= 13 and {x} <= 64) or ({x} >= 97 and {x} <= 127))", x = xs[0])
-            }
-            "is-digit" => {
-                want(1)?;
-                format!("({x} >= 3 and {x} <= 12)", x = xs[0])
-            }
-            "is-whitespace" => {
-                want(1)?;
-                format!("({x} >= 1 and {x} <= 2)", x = xs[0])
+                self.imports.insert("CceChar".into());
+                format!("CceChar.{}({})", name.replace('-', "_"), xs[0])
             }
             "substring" => {
                 want(3)?;
                 self.uses_text = true;
-                self.imports.insert("Text".into());
-                format!("Text.substring({}, {}, {})", xs[0], xs[1], xs[2])
+                self.imports.insert("CceText".into());
+                format!("CceText.substring({}, {}, {})", xs[0], xs[1], xs[2])
             }
             // `__narrow` is the checker's marker for a value proved to fit a
             // bound; at runtime it is the value (interp.rs).
@@ -3003,12 +3014,12 @@ impl<'a> Cx<'a> {
                 let ty = strip_unit(&args[0].ty()).clone();
                 if !matches!(ty, Ty::Text) {
                     self.uses_text = true;
-                    self.imports.insert("Text".into());
+                    self.imports.insert("CceText".into());
                 }
                 match ty {
-                    Ty::Integer(..) if int == "I64" => format!("Text.show_int({})", xs[0]),
-                    Ty::Integer(..) => format!("Text.show_int({int}.to_i64({}))", xs[0]),
-                    Ty::Char => format!("Text.show_int({})", xs[0]),
+                    Ty::Integer(..) if int == "I64" => format!("CceText.show_int({})", xs[0]),
+                    Ty::Integer(..) => format!("CceText.show_int({int}.to_i64({}))", xs[0]),
+                    Ty::Char => format!("CceText.show_int(CceChar.code({}))", xs[0]),
                     Ty::Boolean => format!(
                         "(if {} {{ {} }} else {{ {} }})",
                         xs[0],
@@ -3018,7 +3029,7 @@ impl<'a> Cx<'a> {
                     Ty::Text => xs[0].clone(),
                     Ty::Real(..) if !self.wgsl => {
                         self.imports.insert("Prelude".into());
-                        format!("Text.of_str(Prelude.real_to_str({}))", xs[0])
+                        format!("CceText.of_str(Prelude.real_to_str({}))", xs[0])
                     }
                     other => return Err(format!("show on a {}", crate::ir_text::render_ty(self.syms, &other))),
                 }
@@ -3027,16 +3038,16 @@ impl<'a> Cx<'a> {
             "text-length" => {
                 want(1)?;
                 self.uses_text = true;
-                self.imports.insert("Text".into());
-                format!("Text.len({})", xs[0])
+                self.imports.insert("CceText".into());
+                format!("CceText.len({})", xs[0])
             }
             // `text-to-integer` reads the printed text, trimmed, and answers 0
             // for anything it cannot read, as the interpreter does.
             "text-to-integer" => {
                 want(1)?;
                 self.uses_text = true;
-                self.imports.insert("Text".into());
-                format!("Text.to_integer({})", xs[0])
+                self.imports.insert("CceText".into());
+                format!("CceText.to_integer({})", xs[0])
             }
             "real-from-int" | "__int-to-real" => {
                 want(1)?;
@@ -3142,25 +3153,25 @@ impl<'a> Cx<'a> {
             "text-contains" | "text-starts-with" | "text-ends-with" => {
                 want(2)?;
                 self.uses_text = true;
-                self.imports.insert("Text".into());
+                self.imports.insert("CceText".into());
                 let f = match name {
                     "text-contains" => "contains",
                     "text-starts-with" => "starts_with",
                     _ => "ends_with",
                 };
-                format!("Text.{f}({}, {})", xs[0], xs[1])
+                format!("CceText.{f}({}, {})", xs[0], xs[1])
             }
             "text-replace" => {
                 want(3)?;
                 self.uses_text = true;
-                self.imports.insert("Text".into());
-                format!("Text.replace({}, {}, {})", xs[0], xs[1], xs[2])
+                self.imports.insert("CceText".into());
+                format!("CceText.replace({}, {}, {})", xs[0], xs[1], xs[2])
             }
             "text-concat-list" => {
                 want(1)?;
                 self.uses_text = true;
-                self.imports.insert("Text".into());
-                format!("Text.concat_list({})", xs[0])
+                self.imports.insert("CceText".into());
+                format!("CceText.concat_list({})", xs[0])
             }
             // **PRINTING IS WHERE UNITS BECOME UTF-8**, decoded as x86's print
             // loop decodes them (`Text.printed`).
@@ -3168,8 +3179,8 @@ impl<'a> Cx<'a> {
                 want(1)?;
                 self.uses_line = true;
                 self.uses_text = true;
-                self.imports.insert("Text".into());
-                format!("line!(Text.printed({}))", xs[0])
+                self.imports.insert("CceText".into());
+                format!("line!(CceText.printed({}))", xs[0])
             }
             _ => return Err(format!("builtin `{name}`")),
         })
@@ -3185,7 +3196,7 @@ impl<'a> Cx<'a> {
             IrPat::Lit(v, ty, _) => match strip_unit(ty) {
                 Ty::Integer(..) | Ty::Char => v.clone(),
                 Ty::Text => {
-                    self.imports.insert("Text".into());
+                    self.imports.insert("CceText".into());
                     crate::roc_text::literal(v)
                 }
                 // The IR spells it `True` / `False`; a lowercase test made
