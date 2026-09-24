@@ -565,6 +565,8 @@ pub fn emit_modules(
         }
         prelude |= cx.imports.contains("Prelude");
         memory |= cx.imports.contains("Mem");
+        // A literal, an `&` or a type is enough to need `Text.roc`.
+        cx.uses_text |= cx.imports.contains("Text");
         let mut text = format!("# {} -- emitted from Codex by rocemit (rust-codex-compiler). Do not edit.\n", module_ident(slug));
         for m in &cx.imports {
             text.push_str(&format!("import {m}\n"));
@@ -1110,7 +1112,10 @@ impl<'a> Cx<'a> {
             // A Codex Char is its code (see `roc_text`).
             Ty::Char => "I64".into(),
             Ty::Real(RealWidth::F64, _) => self.real().into(),
-            Ty::Text => "List(U8)".into(),
+            Ty::Text => {
+                self.imports.insert("Text".into());
+                "Text".into()
+            }
             Ty::Boolean => "Bool".into(),
             Ty::Nothing => "{}".into(),
             Ty::Unit(n, _) => self.type_ref(*n),
@@ -1335,7 +1340,10 @@ impl<'a> Cx<'a> {
                 "Real" => self.real().into(),
                 "Integer" => self.int().into(),
                 "Char" => "I64".into(),
-                "Text" => "List(U8)".into(),
+                "Text" => {
+                    self.imports.insert("Text".into());
+                    "Text".into()
+                }
                 "Boolean" => "Bool".into(),
                 "Nothing" => "{}".into(),
                 s if s.starts_with(|c: char| c.is_ascii_lowercase()) => s.to_string(),
@@ -2345,7 +2353,10 @@ impl<'a> Cx<'a> {
         Ok(match e {
             E::IntLit(v, _) => int_lit(*v),
             E::NumLit(bits, _) => num_lit(*bits, self.wgsl),
-            E::TextLit(s, _) => crate::roc_text::literal(s),
+            E::TextLit(s, _) => {
+                self.imports.insert("Text".into());
+                crate::roc_text::literal(s)
+            }
             E::BoolLit(b, _) => if *b { "True".into() } else { "False".into() },
             // The IR carries a char literal as its CODE already.
             E::CharLit(c, _) => int_lit(*c),
@@ -2699,7 +2710,10 @@ impl<'a> Cx<'a> {
             B::GtEq => format!("({l} >= {r})"),
             B::And => format!("({l} and {r})"),
             B::Or => format!("({l} or {r})"),
-            B::AppendText => format!("List.concat({l}, {r})"),
+            B::AppendText => {
+                self.imports.insert("Text".into());
+                format!("Text.concat({l}, {r})")
+            }
             B::AppendList => format!("List.concat({l}, {r})"),
             // `=~=` is ordinal equality on doubles; two doubles with the same
             // bits have the same ordinal, and -0.0 differs from 0.0 in both.
@@ -3170,7 +3184,10 @@ impl<'a> Cx<'a> {
             }
             IrPat::Lit(v, ty, _) => match strip_unit(ty) {
                 Ty::Integer(..) | Ty::Char => v.clone(),
-                Ty::Text => crate::roc_text::literal(v),
+                Ty::Text => {
+                    self.imports.insert("Text".into());
+                    crate::roc_text::literal(v)
+                }
                 // The IR spells it `True` / `False`; a lowercase test made
                 // every boolean pattern `False`, which Roc then called a
                 // non-exhaustive match (codex/test/when-bool-cross).

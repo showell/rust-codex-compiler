@@ -1,9 +1,14 @@
-//! **A CODEX TEXT IN ROC IS ITS UNITS**: a `List(U8)`, one CCE unit per
-//! element, as every upstream backend holds a Text (x86 a length and bytes,
-//! the zig plug a `[]const u8`). Codes 1..127 are one unit per character; a
-//! code outside them is FRAMED as 2, 3 or 4 units, with bands at 128, 2176 and
-//! 67712. A Roc `Str` cannot carry that: it must be valid UTF-8, and a lone
-//! framing unit is not.
+//! **A CODEX TEXT IN ROC IS ITS UNITS**: `Text :: List(U8)`, one CCE unit
+//! per element, as every upstream backend holds a Text (x86 a length and
+//! bytes, the zig plug a `[]const u8`). Codes 1..127 are one unit per
+//! character; a code outside them is FRAMED as 2, 3 or 4 units, with bands at
+//! 128, 2176 and 67712. A Roc `Str` cannot carry that: it must be valid UTF-8,
+//! and a lone framing unit is not.
+//!
+//! **Text IS ITS OWN TYPE**, opaque, so the Roc says where a Codex Text was:
+//! a `List(U8)` is bytes, a `Text` is text, and a translation back to Codex
+//! reads which is which off the types. A text literal is a Roc string literal,
+//! made a `Text` by `from_quote`.
 //!
 //! `text_module` writes `Text.roc`: one function per zig text part
 //! (`cx_text_len`, `cx_substring`, ... in ZigEmitter.codex), behaving as the
@@ -15,11 +20,26 @@
 
 use crate::charcode;
 
-/// A text literal as the units it holds: every character through the tiers,
-/// framed, as the interpreter reads a literal (`charcode::units_of`).
+/// A text literal as a Roc string literal. `Text.from_quote` reads it as
+/// `of_str` reads a platform's text, each character's code framed, which is
+/// `charcode::units_of`: the units a Codex literal holds. A character Roc
+/// cannot write plainly is escaped.
 pub fn literal(s: &str) -> String {
-    let units: Vec<String> = charcode::units_of(s).iter().map(u8::to_string).collect();
-    format!("[{}]", units.join(", "))
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '$' => out.push_str("\\$"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 32 || c as u32 == 127 => out.push_str(&format!("\\u({:x})", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// `Text.roc`, with its tables filled in.
@@ -54,12 +74,13 @@ const TEXT: &str = r#"# Text -- a Codex Text as its CCE units, written by rocemi
 #
 # A Codex Text is a sequence of units 0..255, as every upstream backend holds
 # one: codes 1..127 are one unit per character, and a code outside them is
-# framed as 2, 3 or 4 units. Each function is the zig plug's text part of the
+# framed as 2, 3 or 4 units. Text is its own type over those units, and a
+# string literal where a Text is wanted is one (`from_quote`). Each function is the zig plug's text part of the
 # same name (`cx_*`), behaving as rust-codex-compiler's interpreter does where
 # the two differ. A Str appears only at the edges: `printed` for the console,
 # `of_str` for text from the platform.
 
-Text :: [].{
+Text :: List(U8).{
 	# The code point each code 0..127 names (`cce_table`); 0 for none.
 	points : List(U64)
 	points = [
@@ -103,28 +124,53 @@ Text :: [].{
 	x86_t2_delta : List(U64)
 	x86_t2_delta = [@X86_T2_DELTA@]
 
+	# **A LITERAL IS A Text** (`from_quote`): a Roc string literal where a Text
+	# is wanted is its characters' codes, framed, as `of_str` reads a platform's
+	# text, which is what the compiler does with a Codex literal
+	# (`charcode::units_of`).
+	from_quote : Str -> Try(Text, [BadQuotedBytes(Str)])
+	from_quote = |str| Ok(Text.of_str(str))
+
+	# The units themselves, in and out.
+	from_units : List(U8) -> Text
+	from_units = |us| Text.(us)
+
+	units : Text -> List(U8)
+	units = |Text.(us)| us
+
+	# `==` and hashing compare the units.
+	is_eq : Text, Text -> Bool
+	is_eq = |Text.(a), Text.(b)| a == b
+
+	to_hash : Text, Hasher -> Hasher
+	to_hash = |Text.(s), hasher| Hasher.write_bytes(hasher, s)
+
+	# `&` on two texts.
+	concat : Text, Text -> Text
+	concat = |Text.(a), Text.(b)| Text.(List.concat(a, b))
+
 	# `text-length` (`cx_text_len`): the count of units.
-	len : List(U8) -> I64
-	len = |s| U64.to_i64_wrap(List.len(s))
+	len : Text -> I64
+	len = |Text.(s)| U64.to_i64_wrap(List.len(s))
 
 	# `char-at` (`cx_char_at`): one unit, and no running past the end.
-	char_at : List(U8), I64 -> I64
-	char_at = |s, i|
+	char_at : Text, I64 -> I64
+	char_at = |Text.(s), i|
 		if i < 0 { crash("char-at past the end") }
 		else { U64.to_i64_wrap(U8.to_u64(List.get(s, I64.to_u64_wrap(i)) ?? crash("char-at past the end"))) }
 
 	# `char-code-at`: one unit, 0 past the end.
-	char_code_at : List(U8), I64 -> I64
-	char_code_at = |s, i| if i < 0 { 0 } else { U64.to_i64_wrap(U8.to_u64(List.get(s, I64.to_u64_wrap(i)) ?? 0)) }
+	char_code_at : Text, I64 -> I64
+	char_code_at = |Text.(s), i| if i < 0 { 0 } else { U64.to_i64_wrap(U8.to_u64(List.get(s, I64.to_u64_wrap(i)) ?? 0)) }
 
 	# `substring` (`cx_substring`), clamped to the text as the interpreter
 	# clamps it.
-	substring : List(U8), I64, I64 -> List(U8)
-	substring = |s, start, n| List.sublist(s, { start: I64.to_u64_wrap(I64.max(start, 0)), len: I64.to_u64_wrap(I64.max(n, 0)) })
+	substring : Text, I64, I64 -> Text
+	substring = |Text.(s), start, n| Text.(List.sublist(s, { start: I64.to_u64_wrap(I64.max(start, 0)), len: I64.to_u64_wrap(I64.max(n, 0)) }))
 
 	# `text-compare` (`cx_text_compare`): unsigned unit order, -1, 0 or 1.
-	compare : List(U8), List(U8) -> I64
-	compare = |a, b| Text.compare_from(a, b, 0)
+	compare : Text, Text -> I64
+	compare = |Text.(a), Text.(b)| Text.compare_from(a, b, 0)
 
 	compare_from : List(U8), List(U8), U64 -> I64
 	compare_from = |a, b, i| {
@@ -139,12 +185,12 @@ Text :: [].{
 	}
 
 	# `char-to-text` (`cx_char_to_text`): one unit, the code's low byte.
-	char_to_text : I64 -> List(U8)
-	char_to_text = |c| [I64.to_u8_wrap(c)]
+	char_to_text : I64 -> Text
+	char_to_text = |c| Text.([I64.to_u8_wrap(c)])
 
 	# `char-encode` (`cx_char_encode`): the code framed as 1 to 4 units.
-	char_encode : I64 -> List(U8)
-	char_encode = |c| Text.frame(U64.bitwise_and(I64.to_u64_wrap(c), 4294967295))
+	char_encode : I64 -> Text
+	char_encode = |c| Text.(Text.frame(U64.bitwise_and(I64.to_u64_wrap(c), 4294967295)))
 
 	frame : U64 -> List(U8)
 	frame = |u|
@@ -171,14 +217,14 @@ Text :: [].{
 
 	# `text-contains`, `text-starts-with`, `text-ends-with`
 	# (`cx_text_contains` ...): unit by unit, blind to frames.
-	contains : List(U8), List(U8) -> Bool
-	contains = |h, n| Text.find(h, n, 0) >= 0
+	contains : Text, Text -> Bool
+	contains = |Text.(h), Text.(n)| Text.find(h, n, 0) >= 0
 
-	starts_with : List(U8), List(U8) -> Bool
-	starts_with = |s, p| List.starts_with(s, p)
+	starts_with : Text, Text -> Bool
+	starts_with = |Text.(s), Text.(p)| List.starts_with(s, p)
 
-	ends_with : List(U8), List(U8) -> Bool
-	ends_with = |s, p| List.ends_with(s, p)
+	ends_with : Text, Text -> Bool
+	ends_with = |Text.(s), Text.(p)| List.ends_with(s, p)
 
 	# The first index from `i` where `n` occurs in `h`, or -1.
 	find : List(U8), List(U8), U64 -> I64
@@ -189,8 +235,8 @@ Text :: [].{
 
 	# `text-replace` (`cx_text_replace`): every occurrence left to right, and
 	# an empty pattern answers the text as it was.
-	replace : List(U8), List(U8), List(U8) -> List(U8)
-	replace = |s, a, b| if List.len(a) == 0 { s } else { Text.replace_from(s, a, b, 0, []) }
+	replace : Text, Text, Text -> Text
+	replace = |Text.(s), Text.(a), Text.(b)| if List.len(a) == 0 { Text.(s) } else { Text.(Text.replace_from(s, a, b, 0, [])) }
 
 	replace_from : List(U8), List(U8), List(U8), U64, List(U8) -> List(U8)
 	replace_from = |s, a, b, i, acc| {
@@ -205,29 +251,29 @@ Text :: [].{
 
 	# `text-split` (`cx_text_split`): the pieces between separators; an empty
 	# separator answers the text whole.
-	split : List(U8), List(U8) -> List(List(U8))
-	split = |s, sep| if List.len(sep) == 0 { [s] } else { Text.split_from(s, sep, 0, []) }
+	split : Text, Text -> List(Text)
+	split = |Text.(s), Text.(sep)| if List.len(sep) == 0 { [Text.(s)] } else { Text.split_from(s, sep, 0, []) }
 
-	split_from : List(U8), List(U8), U64, List(List(U8)) -> List(List(U8))
+	split_from : List(U8), List(U8), U64, List(Text) -> List(Text)
 	split_from = |s, sep, start, acc| {
 		p = Text.find(s, sep, start)
 		if p < 0 {
-			List.append(acc, List.drop_first(s, start))
+			List.append(acc, Text.(List.drop_first(s, start)))
 		} else {
 			at = I64.to_u64_wrap(p)
-			Text.split_from(s, sep, at + List.len(sep), List.append(acc, List.sublist(s, { start: start, len: at - start })))
+			Text.split_from(s, sep, at + List.len(sep), List.append(acc, Text.(List.sublist(s, { start: start, len: at - start }))))
 		}
 	}
 
 	# `text-concat-list` (`cx_text_concat_list`).
-	concat_list : List(List(U8)) -> List(U8)
-	concat_list = |l| List.fold(l, [], |acc, p| List.concat(acc, p))
+	concat_list : List(Text) -> Text
+	concat_list = |l| Text.(List.fold(l, [], |acc, Text.(p)| List.concat(acc, p)))
 
 	# `text-to-integer` (`cx_text_to_integer`): a minus only as the first unit,
 	# then decimal digits, units 3..12, until the first unit that is not one,
 	# wrapping. So `+7` and ` 42` are 0, and `12abc` is 12.
-	to_integer : List(U8) -> I64
-	to_integer = |s| {
+	to_integer : Text -> I64
+	to_integer = |Text.(s)| {
 		neg = (List.get(s, 0) ?? 0) == 73
 		n = Text.digits_from(s, if neg { 1 } else { 0 }, 0)
 		if neg { I64.minus_wrap(0, n) } else { n }
@@ -241,17 +287,17 @@ Text :: [].{
 
 	# `show` of an integer (`cx_show_int`): its decimal digits as units, 3 + d
 	# each, and 73 for a minus.
-	show_int : I64 -> List(U8)
-	show_int = |n| List.map(Str.to_utf8(I64.to_str(n)), |b| if b == 45 { 73 } else { b - 45 })
+	show_int : I64 -> Text
+	show_int = |n| Text.(List.map(Str.to_utf8(I64.to_str(n)), |b| if b == 45 { 73 } else { b - 45 }))
 
 	# `raw-bytes-to-text`: each integer's low byte, a unit as given.
-	of_bytes : List(I64) -> List(U8)
-	of_bytes = |xs| List.map(xs, |b| I64.to_u8_wrap(b))
+	of_bytes : List(I64) -> Text
+	of_bytes = |xs| Text.(List.map(xs, |b| I64.to_u8_wrap(b)))
 
 	# A platform's Str as units (`cx_utf8_to_cce`): each code point's code,
 	# framed.
-	of_str : Str -> List(U8)
-	of_str = |str| Text.of_utf8(Str.to_utf8(str), 0, [])
+	of_str : Str -> Text
+	of_str = |str| Text.(Text.of_utf8(Str.to_utf8(str), 0, []))
 
 	of_utf8 : List(U8), U64, List(U8) -> List(U8)
 	of_utf8 = |bytes, i, acc|
@@ -311,8 +357,8 @@ Text :: [].{
 	# frame. Each byte is the low byte of the shifted value, and a unit past the
 	# end reads as 0. A sequence x86 writes that is not UTF-8 (an overlong code
 	# point from a negative tier-2 delta) arrives as U+FFFD.
-	printed : List(U8) -> Str
-	printed = |s| Str.from_utf8_lossy(Text.print_from(s, 0, []))
+	printed : Text -> Str
+	printed = |Text.(s)| Str.from_utf8_lossy(Text.print_from(s, 0, []))
 
 	print_from : List(U8), U64, List(U8) -> List(U8)
 	print_from = |s, i, out|
@@ -355,7 +401,7 @@ Text :: [].{
 	cont = |v| Text.low(U64.bitwise_or(U64.bitwise_and(v, 63), 128))
 
 	# A door's answer whose text comes from the machine, as units.
-	answer_units : (a, Str) -> (a, List(U8))
+	answer_units : (a, Str) -> (a, Text)
 	answer_units = |pair| (pair.0, Text.of_str(pair.1))
 }
 "#;
@@ -364,12 +410,12 @@ Text :: [].{
 mod tests {
     use super::*;
 
-    /// `encode-json-escapes` on bare metal: `u00C0  len=4 units= 15 193 128 32`.
     #[test]
-    fn a_literal_is_its_units_framed() {
-        assert_eq!(literal("aÀb"), "[15, 193, 128, 32]");
-        assert_eq!(literal(""), "[]");
-        assert_eq!(literal("€"), "[233, 168, 144]");
+    fn a_literal_is_a_roc_string() {
+        assert_eq!(literal("aÀb"), "\"aÀb\"");
+        assert_eq!(literal(""), "\"\"");
+        assert_eq!(literal("say \"${x}\"\n"), r#""say \"\${x}\"\n""#);
+        assert_eq!(literal("a\u{1}b\\"), r#""a\u(1)b\\""#);
     }
 
     #[test]
