@@ -705,6 +705,8 @@ struct Cx<'a> {
     uses_text: bool,
     /// A Codex `Char` appeared: `CceChar.roc` is written (and `CceText.roc` always needs it).
     uses_char: bool,
+    /// The match being written is on a Char, as its code; see `scrutinee`.
+    char_match: bool,
     /// Set while a right fold's body is emitted: its leaves become
     /// accumulator steps (see `def`).
     fold: Option<Fold>,
@@ -824,6 +826,7 @@ impl<'a> Cx<'a> {
             uses_line: false,
             uses_text: false,
             uses_char: false,
+            char_match: false,
             fold: None,
             device_ops: Default::default(),
             device_defs: Default::default(),
@@ -2061,6 +2064,22 @@ impl<'a> Cx<'a> {
     // match; the whole match is pair-valued instead, exactly as a
     // conditional is. The scrutinee is emitted before any arm, so
     // whatever it hoists is already owed to the enclosing block.
+    /// **A MATCH ON A CHAR MATCHES ITS CODE**: `match CceChar.code(c) { 15 => ...}`.
+    /// A code as a pattern would need `CceChar.from_numeral`, and a nominal over a
+    /// number with a literal conversion cannot tell its own values from literals
+    /// to convert. So a char pattern is a code, on the scrutinee's code, and only
+    /// there: `char_match` says the match being written is one.
+    fn scrutinee(&mut self, sc: &IrExpr, ind: usize) -> Result<String, String> {
+        let x = self.expr(sc, ind)?;
+        self.char_match = matches!(strip_unit(&sc.ty()), Ty::Char);
+        Ok(if self.char_match {
+            self.imports.insert("CceChar".into());
+            format!("CceChar.code({x})")
+        } else {
+            x
+        })
+    }
+
     fn eff_match(&mut self, e: &IrExpr, ind: usize) -> Result<String, String> {
         use IrExpr as E;
         let E::Match(sc, bs, _, _) = e else {
@@ -2068,10 +2087,12 @@ impl<'a> Cx<'a> {
         };
 
             let tabs = "\t".repeat(ind + 1);
-            let mut out = format!("(match {} {{\n", self.expr(sc, ind)?);
+            let mut out = format!("(match {} {{\n", self.scrutinee(sc, ind)?);
+            let char_match = self.char_match;
             let entry = self.cur_dev()?;
             for b in bs {
                 let mark = self.locals.len();
+                self.char_match = char_match;
                 let pat = self.pattern(&b.pattern, &[&b.body, &b.guard])?;
                 let guard = match &b.guard {
                     E::BoolLit(true, _) => String::new(),
@@ -2503,9 +2524,11 @@ impl<'a> Cx<'a> {
             }
             E::Match(sc, bs, _, _) => {
                 let tabs = "\t".repeat(ind + 1);
-                let mut out = format!("(match {} {{\n", self.expr(sc, ind)?);
+                let mut out = format!("(match {} {{\n", self.scrutinee(sc, ind)?);
+                let char_match = self.char_match;
                 for b in bs {
                     let mark = self.locals.len();
+                    self.char_match = char_match;
                     let pat = self.pattern(&b.pattern, &[&b.body, &b.guard])?;
                     let guard = match &b.guard {
                         E::BoolLit(true, _) => String::new(),
@@ -3194,7 +3217,9 @@ impl<'a> Cx<'a> {
                 self.binder(*n, scope)?
             }
             IrPat::Lit(v, ty, _) => match strip_unit(ty) {
-                Ty::Integer(..) | Ty::Char => v.clone(),
+                Ty::Integer(..) => v.clone(),
+                Ty::Char if self.char_match => v.clone(),
+                Ty::Char => return Err("a Char pattern inside another pattern".into()),
                 Ty::Text => {
                     self.imports.insert("CceText".into());
                     crate::roc_text::literal(v)

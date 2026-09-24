@@ -62,13 +62,6 @@ CceChar :: I64.{
 	code : CceChar -> I64
 	code = |CceChar.(c)| c
 
-	# A number where a CceChar is wanted, as a pattern `15 =>`, is that code.
-	from_numeral : Numeral -> Try(CceChar, [InvalidNumeral(Str)])
-	from_numeral = |n| match I64.from_numeral(n) {
-		Ok(c) => Ok(CceChar.(c))
-		Err(e) => Err(e)
-	}
-
 	is_eq : CceChar, CceChar -> Bool
 	is_eq = |CceChar.(a), CceChar.(b)| a == b
 
