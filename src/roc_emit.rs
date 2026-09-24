@@ -687,6 +687,12 @@ struct Cx<'a> {
     /// bare, here and in every other module, so only the definition's
     /// spelling changes (verified on the nightly).
     recursive: std::collections::BTreeSet<Sym>,
+    /// The types written `:=`: the recursive ones, and **EVERY RECORD TYPE** without
+    /// type parameters. A
+    /// `:` record is structural, so two Codex records of one shape (`Byte` and
+    /// `Wide`, both `{ val }`) would be one Roc type, and which one a value was
+    /// would be lost; a nominal keeps the name, and is built `Name.{ .. }`.
+    nominal: std::collections::BTreeSet<Sym>,
     /// The chapter's derived `__eq_<T>`, by the type it compares. A nominal
     /// type has no structural `==`, so the one Codex derived is attached to
     /// it as the `is_eq` method Roc's `==` dispatches to.
@@ -818,6 +824,7 @@ impl<'a> Cx<'a> {
             current: String::new(),
             app: String::new(),
             recursive: Default::default(),
+            nominal: Default::default(),
             derived_eq: BTreeMap::new(),
             fun_holding: Default::default(),
             imports: Default::default(),
@@ -1007,6 +1014,17 @@ impl<'a> Cx<'a> {
             }
         }
         cx.recursive = mentions.iter().filter(|(n, ms)| ms.contains(n)).map(|(n, _)| *n).collect();
+        cx.nominal = cx.recursive.clone();
+        for td in &ch.type_defs {
+            // Not a record with type parameters: its equality would need a
+            // `where` clause per parameter, which `methods` does not write, and a
+            // generic record is not what two same-shaped Codex types collide on.
+            if let TypeDef::Record(n, ps, fields, _, _) = td {
+                if !fields.is_empty() && ps.is_empty() {
+                    cx.nominal.insert(*n);
+                }
+            }
+        }
         let direct = cx.fun_holding.clone();
         cx.fun_holding.extend(mentions.iter().filter(|(_, ms)| ms.iter().any(|m| direct.contains(m))).map(|(n, _)| *n));
         for d in defs {
@@ -1413,7 +1431,7 @@ impl<'a> Cx<'a> {
         let n = match td {
             TypeDef::Record(n, ..) | TypeDef::Variant(n, ..) | TypeDef::Unit(n, ..) => *n,
         };
-        if !self.recursive.contains(&n) || self.fun_holding.contains(&n) {
+        if !self.nominal.contains(&n) || self.fun_holding.contains(&n) {
             return Ok(String::new());
         }
         let t = "\t".repeat(base + 1);
@@ -1493,7 +1511,7 @@ impl<'a> Cx<'a> {
 
     /// `:` for a plain alias, `:=` for one that stands on a cycle.
     fn colon(&self, n: Sym) -> &'static str {
-        if self.recursive.contains(&n) { ":=" } else { ":" }
+        if self.nominal.contains(&n) { ":=" } else { ":" }
     }
 
     fn type_def(&mut self, td: &TypeDef, base: usize) -> Result<String, String> {
@@ -2577,7 +2595,11 @@ impl<'a> Cx<'a> {
                     };
                     items.push(format!("{}: {}", self.ident(f.name)?, v));
                 }
-                format!("{{ {} }}", items.join(", "))
+                if self.nominal.contains(n) {
+                    format!("{}.{{ {} }}", self.type_ref(*n), items.join(", "))
+                } else {
+                    format!("{{ {} }}", items.join(", "))
+                }
             }
             E::FieldAccess(r, slot, _, _) => {
                 let field = slot.split('/').next().unwrap_or(slot);
