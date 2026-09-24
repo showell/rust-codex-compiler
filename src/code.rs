@@ -86,6 +86,11 @@ pub enum PatCode {
     /// matched; so does this.
     BadLit,
     Ctor(Sym, Vec<PatCode>),
+    /// `Nil` and `Cons (h) (t)`: a user's constructor of that name, or a LIST,
+    /// which Codex matches with the same two (codex/test/list-pattern). `Nil` is
+    /// the empty list; `Cons` a non-empty one, its head and the rest.
+    ListNil(Sym),
+    ListCons(Sym, Box<PatCode>, Box<PatCode>),
     Vec_(Vec<PatCode>),
 }
 
@@ -460,7 +465,7 @@ impl<'a> Compiler<'a> {
     /// An arm, and its body's type.
     fn arm(&mut self, a: &MatchArm) -> (Arm, Static) {
         let mut vars: Vec<Sym> = Vec::new();
-        let pat = pat_code(&a.pattern, &mut vars);
+        let pat = pat_code(&a.pattern, &mut vars, self.syms);
         let nvars = vars.len();
         self.frames.push(vars.into_iter().map(|v| (v, Static::Other)).collect());
         let guard = self.expr(&a.guard);
@@ -537,7 +542,7 @@ impl<'a> Compiler<'a> {
 
 /// The slots a pattern binds are its `Var`s in walk order, and the matcher
 /// pushes in exactly this order -- which is what makes the slot implicit.
-fn pat_code(p: &Pat, vars: &mut Vec<Sym>) -> PatCode {
+fn pat_code(p: &Pat, vars: &mut Vec<Sym>, syms: &SymTab) -> PatCode {
     match p {
         Pat::Wild(_) => PatCode::Wild,
         Pat::Var(n, _) => {
@@ -548,9 +553,15 @@ fn pat_code(p: &Pat, vars: &mut Vec<Sym>) -> PatCode {
             Ok(v) => PatCode::Lit(v),
             Err(_) => PatCode::BadLit,
         },
-        Pat::Ctor(name, subs, _) => {
-            PatCode::Ctor(*name, subs.iter().map(|s| pat_code(s, vars)).collect())
+        Pat::Ctor(name, subs, _) if syms.text(*name) == "Nil" && subs.is_empty() => PatCode::ListNil(*name),
+        Pat::Ctor(name, subs, _) if syms.text(*name) == "Cons" && subs.len() == 2 => {
+            let head = pat_code(&subs[0], vars, syms);
+            let tail = pat_code(&subs[1], vars, syms);
+            PatCode::ListCons(*name, Box::new(head), Box::new(tail))
         }
-        Pat::Vec_(subs, _) => PatCode::Vec_(subs.iter().map(|s| pat_code(s, vars)).collect()),
+        Pat::Ctor(name, subs, _) => {
+            PatCode::Ctor(*name, subs.iter().map(|s| pat_code(s, vars, syms)).collect())
+        }
+        Pat::Vec_(subs, _) => PatCode::Vec_(subs.iter().map(|s| pat_code(s, vars, syms)).collect()),
     }
 }

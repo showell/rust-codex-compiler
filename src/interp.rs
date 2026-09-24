@@ -2112,7 +2112,9 @@ fn binary(syms: &SymTab, bump: &mut crate::bump::Bump, op: BinaryOp, wraps: bool
         (OpMul, Int(x), Int(y)) => Int(int_op(*x, *y, wraps, "*", i64::overflowing_mul)?),
         (OpDiv, Int(x), Int(y)) if *y != 0 => Int(x / y),
         (OpDiv, Int(_), Int(_)) => return err("division by zero"),
-        (OpPow, Int(x), Int(y)) => Int(x.pow(*y as u32)),
+        // A negative exponent is 0 (codex/test/ops/int-pow: `ipow 5 (0 - 2)`), not
+        // the exponent read as a huge unsigned count.
+        (OpPow, Int(x), Int(y)) => Int(if *y < 0 { 0 } else { x.pow(*y as u32) }),
         (OpAdd, Real(x), Real(y)) => Real(x + y),
         (OpSub, Real(x), Real(y)) => Real(x - y),
         (OpMul, Real(x), Real(y)) => Real(x * y),
@@ -2230,6 +2232,29 @@ fn matches_pat(v: &Value, p: &PatCode, vals: &mut Vec<Value>) -> bool {
                 let fields = fields.borrow();
                 subs.len() == fields.len()
                     && subs.iter().zip(fields.iter()).all(|(s, f)| matches_pat(&f.1, s, vals))
+            }
+            _ => false,
+        },
+        PatCode::ListNil(name) => match v {
+            Value::List(xs) => xs.v.borrow().is_empty(),
+            Value::Ctor(n, fields) => *n == *name && fields.is_empty(),
+            _ => false,
+        },
+        PatCode::ListCons(name, head, tail) => match v {
+            Value::List(xs) => {
+                let cells = xs.v.borrow();
+                let Some(first) = cells.first() else { return false };
+                // The rest is a list of its own: nothing writes through it here,
+                // and it shares the parent's address, as a view of it would.
+                let rest = Value::List(Rc::new(Cell {
+                    addr: xs.addr,
+                    cached: std::cell::Cell::new(false),
+                    v: RefCell::new(cells[1..].to_vec()),
+                }));
+                matches_pat(first, head, vals) && matches_pat(&rest, tail, vals)
+            }
+            Value::Ctor(n, fields) if *n == *name && fields.len() == 2 => {
+                matches_pat(&fields[0], head, vals) && matches_pat(&fields[1], tail, vals)
             }
             _ => false,
         },
