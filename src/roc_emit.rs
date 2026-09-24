@@ -2014,7 +2014,7 @@ impl<'a> Cx<'a> {
                                 out.push_str(&format!("{tabs}_ = {x}\n"));
                             }
                         }
-                        IrActStmt::Bind(n, _, x, _) => {
+                        IrActStmt::Bind(n, bty, x, _) => {
                             self.no_dev_name(*n)?;
                             if self.is_effectful(x) {
                                 let v = self.eff_expr(x, ind + 1)?;
@@ -2030,6 +2030,7 @@ impl<'a> Cx<'a> {
                                 }
                                 self.locals.push(*n);
                                 let b = if i == last { self.local(*n)? } else { self.binder(*n, &rest)? };
+                                out.push_str(&self.local_annotation(&b, bty, &tabs)?);
                                 out.push_str(&format!("{tabs}{b} = {v}\n"));
                             }
                             if i == last {
@@ -2082,6 +2083,26 @@ impl<'a> Cx<'a> {
     // match; the whole match is pair-valued instead, exactly as a
     // conditional is. The scrutinee is emitted before any arm, so
     // whatever it hoists is already owed to the enclosing block.
+    /// **A LOCAL OF A PLAIN TYPE IS ANNOTATED**: `s : CceText` above `s = "abc"`.
+    /// Unannotated, Roc generalises the binding, and a string or number literal in
+    /// it stays a `Str` or a fraction where its uses want a `CceText` or an `I64`;
+    /// Roc converts at each use, and a translation to a language without that
+    /// polymorphism (Rust) cannot. Text, numbers, booleans, chars and lists of
+    /// them; nothing with a type variable.
+    fn local_annotation(&mut self, b: &str, ty: &Ty, tabs: &str) -> Result<String, String> {
+        fn plain(t: &Ty) -> bool {
+            match t {
+                Ty::Text | Ty::Integer(..) | Ty::Real(..) | Ty::Boolean | Ty::Char => true,
+                Ty::List(e) => plain(e),
+                _ => false,
+            }
+        }
+        if b == "_" || b.starts_with('_') || !plain(strip_unit(ty)) {
+            return Ok(String::new());
+        }
+        Ok(format!("{tabs}{b} : {}\n", self.ty(ty)?))
+    }
+
     /// **A MATCH ON A CHAR MATCHES ITS CODE**: `match CceChar.code(c) { 15 => ...}`.
     /// A code as a pattern would need `CceChar.from_numeral`, and a nominal over a
     /// number with a literal conversion cannot tell its own values from literals
@@ -2138,7 +2159,7 @@ impl<'a> Cx<'a> {
             let mut out = String::from("({\n");
             let mark = self.locals.len();
             let mut cur = e;
-            while let E::Let(n, _, v, body, _) = cur {
+            while let E::Let(n, lty, v, body, _) = cur {
                 self.no_dev_name(*n)?;
                 // **A WRITE IS OFTEN A LET NOBODY READS.** `let w =
                 // poke-byte addr 0 v in peek-byte addr 0` is how every
@@ -2160,6 +2181,7 @@ impl<'a> Cx<'a> {
                 }
                 self.locals.push(*n);
                 let b = self.binder(*n, &[body])?;
+                out.push_str(&self.local_annotation(&b, lty, &tabs)?);
                 out.push_str(&format!("{tabs}{b} = {v}\n"));
                 cur = body;
             }
@@ -2708,13 +2730,14 @@ impl<'a> Cx<'a> {
         let mut out = String::from("({\n");
         let mark = self.locals.len();
         let mut cur = carried_value(e);
-        while let IrExpr::Let(n, _, v, body, _) = cur {
+        while let IrExpr::Let(n, lty, v, body, _) = cur {
             let (lines, v) = self.hoisting(v, ind + 1)?;
             for l in lines {
                 out.push_str(&format!("{tabs}{l}\n"));
             }
             self.locals.push(*n);
             let b = self.binder(*n, &[body])?;
+            out.push_str(&self.local_annotation(&b, lty, &tabs)?);
             out.push_str(&format!("{tabs}{b} = {v}\n"));
             cur = carried_value(body);
         }
@@ -3312,10 +3335,11 @@ impl<'a> Cx<'a> {
                 let mut out = String::from("({\n");
                 let mark = self.locals.len();
                 let mut cur = e;
-                while let E::Let(n, _, v, body, _) = cur {
+                while let E::Let(n, lty, v, body, _) = cur {
                     let v = self.expr(v, ind + 1)?;
                     self.locals.push(*n);
                     let b = self.binder(*n, &[body])?;
+                    out.push_str(&self.local_annotation(&b, lty, &tabs)?);
                     out.push_str(&format!("{tabs}{b} = {v}\n"));
                     cur = body;
                 }
