@@ -270,8 +270,12 @@ impl Static {
 fn real_conversion(name: &str) -> Option<RealKind> {
     let k = |f32, trapping, saturating| Some(RealKind { f32, trapping, saturating });
     match name {
-        "real-from-int" | "bits-to-real" | "from-real-approx" | "from-real-trapping" | "from-real-saturating"
-        | "from-real-approx-trapping" | "from-real-approx-saturating" => k(false, false, false),
+        "real-from-int" | "bits-to-real" | "from-real-approx" | "from-real-trapping" | "from-real-saturating" => {
+            k(false, false, false)
+        }
+        // These drop the mode and keep the width (`real-approx-saturating ->
+        // real-approx`).
+        "from-real-approx-trapping" | "from-real-approx-saturating" => k(true, false, false),
         "to-real-trapping" => k(false, true, false),
         "to-real-saturating" => k(false, false, true),
         "to-real-approx" | "real-approx-from-int" | "bits-to-real-approx" => k(true, false, false),

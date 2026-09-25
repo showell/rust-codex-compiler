@@ -398,6 +398,32 @@ Prelude :: [].{
 	approx_eq : F64, F64 -> Bool
 	approx_eq = |x, y| I64.abs(I64.minus_wrap(Prelude.ordinal(x), Prelude.ordinal(y))) <= 4
 
+	# `ordinal` and `approx_eq` over an f32's bits: `~` on a `Real
+	# approximate` counts f32 units.
+	ordinal32 : F32 -> I64
+	ordinal32 = |f| {
+		b = I32.to_i64(U32.to_i32_wrap(F32.to_bits(f)))
+		if b < 0 { I64.plus_wrap(I64.bitwise_xor(b, 2147483647), 1) } else { b }
+	}
+
+	approx_eq32 : F32, F32 -> Bool
+	approx_eq32 = |x, y| I64.abs(I64.minus_wrap(Prelude.ordinal32(x), Prelude.ordinal32(y))) <= 4
+
+	# A `saturating` Real answers the largest finite value for an infinity and
+	# 0 for NaN; a `trapping` one traps on either (codex/test's
+	# ops/real-saturating, real-approx-modes).
+	sat_f64 : F64 -> F64
+	sat_f64 = |x| if F64.is_nan(x) { 0.0 } else if F64.is_infinite(x) { if x > 0.0 { F64.from_bits(9218868437227405311) } else { F64.from_bits(18442240474082181119) } } else { x }
+
+	sat_f32 : F32 -> F32
+	sat_f32 = |x| if F32.is_nan(x) { F32.from_bits(0) } else if F32.is_infinite(x) { if x > F32.from_bits(0) { F32.from_bits(2139095039) } else { F32.from_bits(4286578687) } } else { x }
+
+	trap_f64 : F64 -> F64
+	trap_f64 = |x| if F64.is_finite(x) { x } else { crash("a trapping Real left the finite range") }
+
+	trap_f32 : F32 -> F32
+	trap_f32 = |x| if F32.is_finite(x) { x } else { crash("a trapping Real left the finite range") }
+
 	# `a ^ b` with a negative exponent is 0, where Roc's pow crashes
 	# (codex/test's ops/int-pow: `ipow 5 (0 - 2)` is 0).
 	int_pow : I64, I64 -> I64
@@ -1318,6 +1344,9 @@ impl<'a> Cx<'a> {
                 "CceChar".into()
             }
             Ty::Real(RealWidth::F64, _) => self.real().into(),
+            // `Real approximate`, whatever its overflow mode: the mode is on
+            // the operations (`binary`), not the type.
+            Ty::Real(RealWidth::F32, _) => "F32".into(),
             Ty::Text => {
                 self.imports.insert("CceText".into());
                 "CceText".into()
@@ -1563,6 +1592,17 @@ impl<'a> Cx<'a> {
                 s if s.starts_with(|c: char| c.is_ascii_lowercase()) => s.to_string(),
                 _ => self.type_ref(*n),
             },
+            // `Real approximate saturating`: qualifiers, not arguments
+            // (`resolve-real-quals`); only the width shows in Roc.
+            TypeExpr::App(f, args, _)
+                if matches!(&**f, TypeExpr::Named(n, _) if self.syms.text(*n) == "Real")
+                    && args.iter().all(|a| {
+                        matches!(a, TypeExpr::Named(w, _) if matches!(self.syms.text(*w), "approximate" | "trapping" | "saturating"))
+                    }) =>
+            {
+                let f32 = args.iter().any(|a| matches!(a, TypeExpr::Named(w, _) if self.syms.text(*w) == "approximate"));
+                if f32 { "F32".into() } else { self.real().into() }
+            }
             TypeExpr::App(f, args, _) => {
                 let TypeExpr::Named(n, _) = &**f else {
                     return Err("a type applied to a non-name".into());
@@ -1683,7 +1723,17 @@ impl<'a> Cx<'a> {
             TypeDef::Record(n, ps, fields, _, _) => {
                 let mut fs = Vec::new();
                 for f in fields {
-                    fs.push(format!("{} : {}", self.ident(f.name)?, self.texpr(&f.type_expr)?));
+                    let mut ty = self.texpr(&f.type_expr)?;
+                    // A class dictionary's `__super-<S> : <S>Dict` is the
+                    // superclass's dictionary AT THE SAME TYPE. Upstream writes
+                    // it bare (desugar.rs `synth_class_type_defs`); Roc reads a
+                    // bare parameterised alias as free, for each use to fix
+                    // apart, so the parameter is written.
+                    if syms.text(f.name).starts_with("__super-") && matches!(f.type_expr, TypeExpr::Named(..)) && !ps.is_empty() {
+                        let ps: Vec<&str> = ps.iter().map(|p| syms.text(*p)).collect();
+                        ty = format!("{ty}({})", ps.join(", "));
+                    }
+                    fs.push(format!("{} : {}", self.ident(f.name)?, ty));
                 }
                 let col = self.colon(*n);
                 let body = if fs.is_empty() { "{}".to_string() } else { format!("{{ {} }}", fs.join(", ")) };
@@ -2662,6 +2712,9 @@ impl<'a> Cx<'a> {
                 tmp
             }
             E::Binary(op, l, r, t, _) => {
+                // `~` counts units of its OPERANDS' width; the mode
+                // operations take the width from the result.
+                let f32 = matches!(l.ty(), Ty::Real(RealWidth::F32, _)) || matches!(t, Ty::Real(RealWidth::F32, _));
                 let (l, r) = (self.expr(l, ind)?, self.expr(r, ind)?);
                 // **THE OVERFLOW MODE IS ON THE TYPE.** A field declared
                 // `Integer between lo and hi wrapping` (Rng's LCG state) wraps
@@ -2671,7 +2724,7 @@ impl<'a> Cx<'a> {
                 if matches!(t, Ty::Integer(_, _, crate::check::Overflow::Clamping)) {
                     return Err("a clamping integer".into());
                 }
-                self.binary(*op, l, r, wrap)?
+                self.binary(*op, l, r, wrap, f32)?
             }
             // **A NEGATED LITERAL IS ONE LITERAL.** The lowest integer is
             // written `-9223372036854775808`, which is a negate over a
@@ -2956,7 +3009,7 @@ impl<'a> Cx<'a> {
         Ok(out)
     }
 
-    fn binary(&mut self, op: IrBinOp, l: String, r: String, wrap: bool) -> Result<String, String> {
+    fn binary(&mut self, op: IrBinOp, l: String, r: String, wrap: bool, f32: bool) -> Result<String, String> {
         use IrBinOp as B;
         let int = self.int();
         if wrap && !self.wgsl {
@@ -2983,11 +3036,30 @@ impl<'a> Cx<'a> {
                 _ => {}
             }
         }
+        // A trapping or saturating Real checks each result: the helpers
+        // (Prelude `trap_f64`, `sat_f32`, ...) trap on, or clamp, an infinity
+        // or a NaN, as upstream's emitters test the exponent.
+        let w = if f32 { "f32" } else { "f64" };
+        let mut checked = |helper: &str, e: String| {
+            self.imports.insert("Prelude".into());
+            format!("Prelude.{helper}_{w}({e})")
+        };
+        match op {
+            B::AddRealTrapping => return Ok(checked("trap", format!("({l} + {r})"))),
+            B::SubRealTrapping => return Ok(checked("trap", format!("({l} - {r})"))),
+            B::MulRealTrapping => return Ok(checked("trap", format!("({l} * {r})"))),
+            B::DivRealTrapping => return Ok(checked("trap", format!("({l} / {r})"))),
+            B::AddRealSaturating => return Ok(checked("sat", format!("({l} + {r})"))),
+            B::SubRealSaturating => return Ok(checked("sat", format!("({l} - {r})"))),
+            B::MulRealSaturating => return Ok(checked("sat", format!("({l} * {r})"))),
+            B::DivRealSaturating => return Ok(checked("sat", format!("({l} / {r})"))),
+            _ => {}
+        }
         Ok(match op {
-            B::AddInt | B::AddNum => format!("({l} + {r})"),
-            B::SubInt | B::SubNum => format!("({l} - {r})"),
-            B::MulInt | B::MulNum => format!("({l} * {r})"),
-            B::DivNum => format!("({l} / {r})"),
+            B::AddInt | B::AddNum | B::AddRealApprox => format!("({l} + {r})"),
+            B::SubInt | B::SubNum | B::SubRealApprox => format!("({l} - {r})"),
+            B::MulInt | B::MulNum | B::MulRealApprox => format!("({l} * {r})"),
+            B::DivNum | B::DivRealApprox => format!("({l} / {r})"),
             B::DivInt => format!("{int}.div_trunc_by({l}, {r})"),
             B::RemInt => format!("{int}.rem_by({l}, {r})"),
             B::PowInt => {
@@ -3009,7 +3081,21 @@ impl<'a> Cx<'a> {
             B::AppendList => format!("List.concat({l}, {r})"),
             // `=~=` is ordinal equality on doubles; two doubles with the same
             // bits have the same ordinal, and -0.0 differs from 0.0 in both.
+            // `~0` is ORDINAL equality, and -0.0 and +0.0 share ordinal 0
+            // (codex/test's ops/real-approx-equality: `-0 ~0 +0` is True).
+            B::ApproxEqExact if f32 && !self.wgsl => {
+                self.imports.insert("Prelude".into());
+                format!("(Prelude.ordinal32({l}) == Prelude.ordinal32({r}))")
+            }
+            B::ApproxEqExact if !self.wgsl => {
+                self.imports.insert("Prelude".into());
+                format!("(Prelude.ordinal({l}) == Prelude.ordinal({r}))")
+            }
             B::ApproxEqExact => format!("({real}.to_bits({l}) == {real}.to_bits({r}))", real = self.real()),
+            B::ApproxEq if f32 && !self.wgsl => {
+                self.imports.insert("Prelude".into());
+                format!("Prelude.approx_eq32({l}, {r})")
+            }
             B::ApproxEq if !self.wgsl => {
                 self.imports.insert("Prelude".into());
                 format!("Prelude.approx_eq({l}, {r})")
@@ -3308,6 +3394,12 @@ impl<'a> Cx<'a> {
                         crate::roc_text::literal("False")
                     ),
                     Ty::Text => xs[0].clone(),
+                    // An f32 shows as the double it widens to (real-approx:
+                    // `show sum` is `7.0`).
+                    Ty::Real(RealWidth::F32, _) if !self.wgsl => {
+                        self.imports.insert("Prelude".into());
+                        format!("CceText.of_str(Prelude.real_to_str(F32.to_f64({})))", xs[0])
+                    }
                     Ty::Real(..) if !self.wgsl => {
                         self.imports.insert("Prelude".into());
                         format!("CceText.of_str(Prelude.real_to_str({}))", xs[0])
@@ -3353,6 +3445,39 @@ impl<'a> Cx<'a> {
             "real-min" => {
                 want(2)?;
                 format!("{real}.min({}, {})", xs[0], xs[1])
+            }
+            // `Real approximate` and the overflow modes. A mode is on the
+            // operations, so entering or leaving one is the identity; only a
+            // change of width converts.
+            "to-real-approx" => {
+                want(1)?;
+                format!("F64.to_f32_wrap({})", xs[0])
+            }
+            "from-real-approx" => {
+                want(1)?;
+                format!("F32.to_f64({})", xs[0])
+            }
+            "to-real-trapping" | "to-real-saturating" | "from-real-trapping" | "from-real-saturating"
+            | "to-real-approx-trapping" | "to-real-approx-saturating" | "from-real-approx-trapping"
+            | "from-real-approx-saturating" => {
+                want(1)?;
+                xs[0].clone()
+            }
+            "real-approx-from-int" => {
+                want(1)?;
+                format!("I64.to_f32({})", xs[0])
+            }
+            "real-approx-to-int" => {
+                want(1)?;
+                format!("F32.to_i64_wrap({})", xs[0])
+            }
+            "real-approx-to-bits" => {
+                want(1)?;
+                format!("U32.to_i64(F32.to_bits({}))", xs[0])
+            }
+            "bits-to-real-approx" => {
+                want(1)?;
+                format!("F32.from_bits(I64.to_u32_wrap({}))", xs[0])
             }
             "real-to-bits" => {
                 want(1)?;
