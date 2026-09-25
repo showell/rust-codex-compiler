@@ -50,6 +50,10 @@ pub enum Value {
     /// guess. `list-set-at` is the ONLY writer; `list-push`, `&` and `::` all
     /// allocate.
     List(Rc<Cell<RefCell<Vec<Value>>>>),
+    /// **A PACKED VECTOR, `Vector n T`, AND A MASK, `VectorMask n`** (lanes
+    /// of Booleans). A value, not a list: `+` and `*` work lane by lane and a
+    /// comparison answers a mask, where on a list `==` is one Boolean.
+    Vector(Rc<Vec<Value>>),
     /// A record literal: its type name and its fields. A name is a four-byte
     /// `Sym`, so building a record copies nothing and this variant is the
     /// smallest thing that can carry two.
@@ -1964,6 +1968,69 @@ impl Interp {
             // then the bump); the bytes are read and written with the peeks
             // and pokes below.
             ("alloc-bytes", [Int(n)]) => Ok(Int(self.bump.alloc(*n))),
+            // -- vectors (Builtins.codex's declared types) ----------------
+            // `Vector 2 T` and the four-lane `Vector 4 (Real approximate)`
+            // are packed values (`Value::Vector`); `SizedVec n T` is list
+            // shaped. A mask is lanes of Booleans.
+            ("vec-splat", [x]) => Ok(Vector(Rc::new(vec![x.clone(), x.clone()]))),
+            ("vec4-splat", [Real(f)]) => Ok(Vector(Rc::new(vec![Real(*f as f32 as f64); 4]))),
+            ("vec-extract" | "vec4-extract", [Vector(xs), Int(i)]) => match xs.get(*i as usize) {
+                Some(v) if *i >= 0 => Ok(v.clone()),
+                _ => err(format!("vec-extract lane {i} of a {}-lane vector", xs.len())),
+            },
+            ("vec-add" | "vec-sub" | "vec-mul" | "vec-div", [a @ Vector(_), b @ Vector(_)]) => {
+                let op = match name {
+                    "vec-add" => BinaryOp::OpAdd,
+                    "vec-sub" => BinaryOp::OpSub,
+                    "vec-mul" => BinaryOp::OpMul,
+                    _ => BinaryOp::OpDiv,
+                };
+                let Interp { syms, bump, .. } = self;
+                binary(syms, bump, op, crate::code::Arith::default(), a.clone(), b.clone())
+            }
+            ("vec-reduce-add", [Vector(xs)]) => {
+                let mut t = 0.0;
+                for x in xs.iter() {
+                    if let Real(f) = x {
+                        t += f;
+                    }
+                }
+                Ok(Real(t))
+            }
+            // Four f32 lanes add as f32, each partial sum rounded.
+            ("vec4-reduce-add", [Vector(xs)]) => {
+                let mut t: f32 = 0.0;
+                for x in xs.iter() {
+                    if let Real(f) = x {
+                        t += *f as f32;
+                    }
+                }
+                Ok(Real(t as f64))
+            }
+            ("vec-select" | "vec4-select", [Vector(m), Vector(a), Vector(b)]) => Ok(Vector(Rc::new(
+                m.iter()
+                    .zip(a.iter().zip(b.iter()))
+                    .map(|(k, (x, y))| if matches!(k, Bool(true)) { x.clone() } else { y.clone() })
+                    .collect(),
+            ))),
+            ("mask-any" | "mask4-any", [Vector(m)]) => Ok(Bool(m.iter().any(|k| matches!(k, Bool(true))))),
+            ("mask-all" | "mask4-all", [Vector(m)]) => Ok(Bool(m.iter().all(|k| matches!(k, Bool(true))))),
+            ("mask-none" | "mask4-none", [Vector(m)]) => Ok(Bool(!m.iter().any(|k| matches!(k, Bool(true))))),
+            ("mask-count" | "mask4-count", [Vector(m)]) => Ok(Int(m.iter().filter(|k| matches!(k, Bool(true))).count() as i64)),
+            // `SizedVec`: `vec-cons x v` appends and the head stays
+            // (codex/test's vec-sized: "vec-cons appends, head stays").
+            ("vec-empty", []) => Ok(self.list(Vec::new())),
+            ("vec-singleton", [x]) => Ok(self.list(vec![x.clone()])),
+            ("vec-cons", [x, List(xs)]) => {
+                let mut v = xs.borrow().clone();
+                v.push(x.clone());
+                Ok(self.list(v))
+            }
+            ("vec-head", [List(xs)]) => match xs.borrow().first() {
+                Some(v) => Ok(v.clone()),
+                None => err("vec-head of an empty SizedVec"),
+            },
+            ("vec-length", [List(xs)]) => Ok(Int(xs.borrow().len() as i64)),
             ("peek-byte", [Int(b), Int(o)]) => Ok(Int(self.mem.load(b + o, 1))),
             ("peek-16", [Int(b), Int(o)]) => Ok(Int(self.mem.load(b + o, 2))),
             ("peek-32", [Int(b), Int(o)]) => Ok(Int(self.mem.load(b + o, 4))),
@@ -2198,6 +2265,20 @@ fn binary(syms: &SymTab, bump: &mut crate::bump::Bump, op: BinaryOp, mode: crate
     }
     use BinaryOp::*;
     use Value::*;
+    // **TWO VECTORS ARE COMBINED LANE BY LANE**, arithmetic and comparison
+    // alike; a comparison answers a mask (`infer-comparison`), so `==` here
+    // is lanes of Booleans, not the one Boolean it is on a list.
+    if let (Vector(x), Vector(y)) = (&a, &b) {
+        if x.len() == y.len()
+            && matches!(op, OpAdd | OpSub | OpMul | OpDiv | OpEq | OpNotEq | OpLt | OpGt | OpLtEq | OpGtEq | OpApproxEq | OpApproxEqExact)
+        {
+            let mut lanes = Vec::with_capacity(x.len());
+            for (p, q) in x.iter().zip(y.iter()) {
+                lanes.push(binary(syms, bump, op, mode, p.clone(), q.clone())?);
+            }
+            return Ok(Vector(Rc::new(lanes)));
+        }
+    }
     Ok(match (op, &a, &b) {
         (OpAdd, Int(x), Int(y)) => Int(int_op(*x, *y, wraps, "+", i64::overflowing_add)?),
         (OpSub, Int(x), Int(y)) => Int(int_op(*x, *y, wraps, "-", i64::overflowing_sub)?),
@@ -2295,6 +2376,7 @@ fn equal(a: &Value, b: &Value) -> bool {
         (Ctor(n, x), Ctor(m, y)) => {
             n == m && x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| equal(p, q))
         }
+        (Vector(x), Vector(y)) => x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| equal(p, q)),
         (Record(n, x), Record(m, y)) => {
             let (x, y) = (x.borrow(), y.borrow());
             n == m
@@ -2361,6 +2443,10 @@ fn matches_pat(v: &Value, p: &PatCode, vals: &mut Vec<Value>) -> bool {
                 subs.len() == xs.len()
                     && subs.iter().zip(xs.iter()).all(|(s, x)| matches_pat(x, s, vals))
             }
+            // `is Vector [0, 0]` (codex/test's vec-pattern).
+            Value::Vector(xs) => {
+                subs.len() == xs.len() && subs.iter().zip(xs.iter()).all(|(s, x)| matches_pat(x, s, vals))
+            }
             _ => false,
         },
     }
@@ -2387,6 +2473,10 @@ pub fn show(syms: &SymTab, v: &Value) -> String {
         Value::Unit => String::new(),
         Value::List(xs) => {
             let inner: Vec<String> = xs.borrow().iter().map(|x| show(syms, x)).collect();
+            format!("[{}]", inner.join(", "))
+        }
+        Value::Vector(xs) => {
+            let inner: Vec<String> = xs.iter().map(|x| show(syms, x)).collect();
             format!("[{}]", inner.join(", "))
         }
         Value::Ctor(n, fs) if fs.is_empty() => syms.text(*n).to_string(),
@@ -2476,6 +2566,7 @@ fn type_name(v: &Value) -> &'static str {
         Value::Char(_) => "a char",
         Value::Bool(_) => "a boolean",
         Value::List(_) => "a list",
+        Value::Vector(_) => "a vector",
         Value::Record(..) => "a record",
         Value::Ctor(..) => "a constructor",
         Value::Fun(_) => "a function",
@@ -3623,6 +3714,7 @@ fn frozen(v: &Value) -> bool {
         | Value::Unit => true,
         Value::Ctor(_, fs) => fs.iter().all(frozen),
         Value::List(_) | Value::Record(..) | Value::Fun(_) => false,
+        Value::Vector(xs) => xs.iter().all(frozen),
     }
 }
 
