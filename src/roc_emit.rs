@@ -119,37 +119,6 @@ fn type_name(t: &str) -> String {
 }
 
 
-/// **CODEX WRITES A LIST IN PLACE; ROC ANSWERS A NEW ONE.** The two agree
-/// wherever the program uses the answer, and diverge wherever it uses the
-/// list it wrote through another name. Two shapes say the write was for
-/// its effect, and both are refused rather than emitted wrongly:
-///
-/// - a definition that writes one of its own list parameters and answers
-///   something that is not a list (the foreword's `cb-shl1-step` doubles a
-///   bignum in place and answers the carry, and its caller reads the
-///   doubled list);
-/// - a `let` whose value is such a write and whose name nothing reads.
-///
-/// The verdicts that pin the behaviour are `codex/test/edalias` and
-/// `cryptobig`, and both were answering quietly wrong numbers before this.
-/// A definition's result: `k` parameters peel `k` arrows.
-fn result_ty(t: &Ty, k: usize) -> Ty {
-    let mut cur = t.clone();
-    for _ in 0..k {
-        loop {
-            match cur {
-                Ty::ForAll(_, b) | Ty::ForAllEff(_, b) => cur = *b,
-                _ => break,
-            }
-        }
-        match cur {
-            Ty::Fun(_, _, r) => cur = *r,
-            other => return other,
-        }
-    }
-    cur
-}
-
 /// Whether a type expression holds a function (or an effect) anywhere in it.
 fn holds_fun(t: &TypeExpr) -> bool {
     match t {
@@ -489,13 +458,12 @@ pub fn emit_modules(
     vm_flags: bool,
     by_reach: bool,
     whole: bool,
-    list_versions: bool,
     seed: &[(Sym, String)],
 ) -> Result<(Vec<(String, String)>, Vec<String>), String> {
     let called_back = crate::roc_forwarders::call_back_directly(defs);
     let defs = &called_back[..];
     if !whole {
-        return emit_round(ch, tds, syms, defs, vm_flags, by_reach, list_versions, None).map(|(files, _)| (files, Vec::new()));
+        return emit_round(ch, tds, syms, defs, vm_flags, by_reach, None).map(|(files, _)| (files, Vec::new()));
     }
     // A round writes what it can and names what it could not; their
     // dependents are then decided too (`settle_fates`), and the next round
@@ -511,7 +479,7 @@ pub fn emit_modules(
         settle_fates(defs, syms, &mut fates);
     }
     loop {
-        let (files, failed) = emit_round(ch, tds, syms, defs, vm_flags, by_reach, list_versions, Some(&fates))?;
+        let (files, failed) = emit_round(ch, tds, syms, defs, vm_flags, by_reach, Some(&fates))?;
         if failed.is_empty() {
             // What was not written as written, for whoever runs this.
             let notes = fates
@@ -632,11 +600,9 @@ fn emit_round(
     defs: &[IrDef],
     vm_flags: bool,
     by_reach: bool,
-    list_versions: bool,
     fates: Option<&BTreeMap<Sym, Fate>>,
 ) -> Result<(Vec<(String, String)>, Vec<(Sym, String)>), String> {
     let mut cx = Cx::new(ch, tds, syms, defs, vm_flags, by_reach);
-    cx.list_versions = list_versions;
     if let Some(f) = fates {
         cx.whole = true;
         cx.fates = f.clone();
@@ -929,8 +895,6 @@ struct Cx<'a> {
     /// nightly). `fates` is what an earlier round decided; `failed` is what
     /// this round could not write.
     whole: bool,
-    /// `list_versions` ran on the definitions (`rocemit --list-versions`).
-    list_versions: bool,
     /// Class dictionaries with no Roc type (`has_free_field_binder`): whole
     /// mode stubs a definition whose text names one.
     undeclared: Vec<String>,
@@ -1045,7 +1009,6 @@ impl<'a> Cx<'a> {
             bang_defs: Default::default(),
             stubbed: Default::default(),
             whole: false,
-            list_versions: false,
             undeclared: Vec::new(),
             fates: Default::default(),
             failed: Vec::new(),
@@ -1700,30 +1663,6 @@ impl<'a> Cx<'a> {
         ))
     }
 
-    /// The name of a list parameter this body writes with `list-set-at`.
-    fn written_param(&self, body: &IrExpr, params: &[Sym]) -> Option<String> {
-        let mut found = None;
-        body.walk(&mut |x| {
-            let mut head = x;
-            let mut args: Vec<&IrExpr> = Vec::new();
-            while let IrExpr::Apply(f, a, _, _) = head {
-                args.push(a);
-                head = f;
-            }
-            args.reverse();
-            if let IrExpr::Name(n, _, _) = head {
-                if args.len() == 3 && self.syms.text(*n) == "list-set-at" {
-                    if let IrExpr::Name(t, _, _) = args[0] {
-                        if params.contains(t) && found.is_none() {
-                            found = Some(self.syms.text(*t).to_string());
-                        }
-                    }
-                }
-            }
-        });
-        found
-    }
-
     /// `:` for a plain alias, `:=` for one that stands on a cycle.
     fn colon(&self, n: Sym) -> &'static str {
         if self.nominal.contains(&n) { ":=" } else { ":" }
@@ -1850,17 +1789,6 @@ impl<'a> Cx<'a> {
         // Roc spells an effectful function's name with `!` (`def_ref` agrees).
         let bang = if self.bang_defs.contains(&d.name) { "!" } else { "" };
         let name = format!("{}{bang}", self.ident(d.name)?);
-        // A write to a list parameter, in a definition that answers
-        // something else, is a mutation the caller reads back (see
-        // `writes_a_param`). With `list_versions` run (rocemit
-        // --list-versions) the callers read it back; without, it is refused.
-        let ps: Vec<Sym> = d.params.iter().map(|p| p.name).collect();
-        self.arrows(d)?;
-        if !self.list_versions && !matches!(result_ty(&d.ty, d.params.len()), Ty::List(_)) {
-            if let Some(t) = self.written_param(&d.body, &ps) {
-                return Err(format!("`{}` writes its list parameter `{t}` and answers something else", self.syms.text(d.name)));
-            }
-        }
         let sig = self.signature(d)?;
         let mark = self.locals.len();
         let mut ps = Vec::new();
@@ -3240,12 +3168,10 @@ impl<'a> Cx<'a> {
                 want(2)?;
                 format!("(List.get({}, {int}.to_u64_wrap({})) ?? crash(\"list-at out of range\"))", xs[0], xs[1])
             }
-            // **CODEX MUTATES IN PLACE; ROC ANSWERS A NEW LIST.** The two
-            // agree when the program uses the answer; a program that relies
-            // on the aliasing (sets and then reads the old name) diverges
-            // silently, unless `list_versions` ran (rocemit --list-versions),
-            // which makes every later read, here and in the callers, read
-            // this answer. Past the end is a crash in both.
+            // **CODEX MUTATES IN PLACE; ROC ANSWERS A NEW LIST.**
+            // `list_versions` has already made every later read of the list,
+            // here and in the callers, read this answer. Past the end is a
+            // crash in both.
             "list-set-at" => {
                 want(3)?;
                 format!("(List.set({}, {int}.to_u64_wrap({}), {}) ?? crash(\"list-set-at past the end\"))", xs[0], xs[1], xs[2])

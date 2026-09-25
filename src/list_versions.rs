@@ -25,7 +25,8 @@
 //! a list in the same call that writes it.
 //!
 //! Refused, by definition, with the reason: a write to a list held in a
-//! record field (the record is shared; its holders would see it), a lambda
+//! record field whose answer is dropped (`dropped_field_write`), a write to
+//! a list after it was stored by name in a record, a list or a constructor, a lambda
 //! that writes a list it captured, a writer used as a value, a write in one statement of an `act`
 //! that a later statement reads, and a write under `handle`, `with-timeout`
 //! or `try`.
@@ -119,6 +120,11 @@ pub fn apply(defs: Vec<IrDef>, syms: &mut SymTab) -> (Vec<IrDef>, Vec<(Sym, Stri
             eprintln!("list_versions: `{}` writes {:?}{}", syms.text(*n), w.written, if w.returns_list { ", answers the list" } else { "" });
         }
     }
+    // Each chapter's own top-level names, which a version must not shadow.
+    let mut chapter_names: BTreeMap<String, BTreeSet<Sym>> = BTreeMap::new();
+    for d in &defs {
+        chapter_names.entry(d.origin.clone()).or_default().insert(d.name);
+    }
     let mut out = Vec::new();
     let mut failed = Vec::new();
     for d in defs {
@@ -127,7 +133,25 @@ pub fn apply(defs: Vec<IrDef>, syms: &mut SymTab) -> (Vec<IrDef>, Vec<(Sym, Stri
             continue;
         }
         let mut rw = Rw::new(syms, set_at, tuple, &writers);
-        match rw.rewrite(&d) {
+        rw.taken = chapter_names[&d.origin].clone();
+        rw.taken.extend(d.params.iter().map(|p| p.name));
+        d.body.walk(&mut |x| match x {
+            IrExpr::Name(n, _, _) | IrExpr::Let(n, ..) => {
+                rw.taken.insert(*n);
+            }
+            IrExpr::Match(_, bs, _, _) => {
+                for b in bs {
+                    rw.taken.extend(pat_names(&b.pattern));
+                }
+            }
+            IrExpr::Lambda(ps, ..) => rw.taken.extend(ps.iter().map(|p| p.name)),
+            _ => {}
+        });
+        let result = rw.rewrite(&d).and_then(|nd| match rw.violation.take() {
+            Some(why) => Err(why),
+            None => Ok(nd),
+        });
+        match result {
             Ok(nd) => out.push(nd),
             Err(why) => {
                 failed.push((d.name, why));
@@ -137,6 +161,31 @@ pub fn apply(defs: Vec<IrDef>, syms: &mut SymTab) -> (Vec<IrDef>, Vec<(Sym, Stri
     }
     (out, failed)
 }
+
+/// **A WRITE THROUGH A RECORD FIELD WHOSE ANSWER IS DROPPED.** Writing
+/// `(node.forward)` changes the list every holder of that record sees; a Roc
+/// record keeps the old one, and no renaming reaches it. A program that uses
+/// the answer (rebuilding the record with it, as `fb-set` does) means the
+/// same thing in both; one that binds it to a name it never reads, or runs it
+/// as a statement, relies on the record changing under it
+/// (`rts-extend-path-loop`'s `dummy`), and is refused.
+fn dropped_field_write(v: &IrExpr, set_at: Sym) -> bool {
+    let (head, args) = flatten(v);
+    matches!(head, IrExpr::Name(f, _, _) if *f == set_at) && args.len() == 3 && matches!(args[0], IrExpr::FieldAccess(..))
+}
+
+fn mentions(e: &IrExpr, n: Sym) -> bool {
+    let mut hit = false;
+    e.walk(&mut |x| {
+        if matches!(x, IrExpr::Name(m, _, _) if *m == n) {
+            hit = true;
+        }
+    });
+    hit
+}
+
+const DROPPED_FIELD_WRITE: &str =
+    "it writes a list held in a record field and drops the answer, relying on the record changing under it";
 
 /// Whether a definition writes a list or calls a writer at all; one that
 /// does neither is passed through as it is.
@@ -162,6 +211,10 @@ struct Env {
     /// The names in scope here: a list bound inside one arm is not joined
     /// after it.
     bound: BTreeSet<Sym>,
+    /// Roots stored, by name, in a record, a list or a constructor: they
+    /// hold the list itself, so a later write would have to reach them too,
+    /// and no renaming does.
+    stored: BTreeSet<Sym>,
 }
 
 impl Env {
@@ -182,6 +235,14 @@ struct Rw<'a> {
     fresh: usize,
     /// The roots the last `join` answered, for `finish_join`.
     pending: Vec<Sym>,
+    /// Set when a list is written after it was stored (`Env::stored`).
+    violation: Option<String>,
+    /// **THE NAMES A VERSION MAY NOT TAKE**: the definition's own and its
+    /// chapter's top-level names. Checking the unit's whole symbol table
+    /// instead numbered versions by which OTHER chapters the unit cited, and
+    /// a chapter's emitted text then depended on the program, which the
+    /// shared chapters of roc-apps tests/ported cannot allow.
+    taken: BTreeSet<Sym>,
 }
 
 fn wrap(mut pre: Pre, mut x: IrExpr) -> IrExpr {
@@ -258,7 +319,7 @@ fn is_list(t: &Ty) -> bool {
 
 impl<'a> Rw<'a> {
     fn new(syms: &'a mut SymTab, set_at: Sym, tuple: Sym, writers: &'a BTreeMap<Sym, Writer>) -> Rw<'a> {
-        Rw { syms, set_at, tuple, writers, types: BTreeMap::new(), fresh: 0, pending: Vec::new() }
+        Rw { syms, set_at, tuple, writers, types: BTreeMap::new(), fresh: 0, pending: Vec::new(), violation: None, taken: BTreeSet::new() }
     }
 
     fn mint(&mut self, base: Sym) -> Sym {
@@ -266,9 +327,10 @@ impl<'a> Rw<'a> {
         let b = self.syms.text(base).trim_start_matches('_').to_string();
         let mut k = self.fresh;
         loop {
-            let cand = format!("{b}-v{k}");
-            if self.syms.find(&cand).is_none() {
-                return self.syms.intern(&cand);
+            let cand = self.syms.intern(&format!("{b}-v{k}"));
+            if self.taken.insert(cand) {
+                self.fresh = k;
+                return cand;
             }
             k += 1;
         }
@@ -310,6 +372,12 @@ impl<'a> Rw<'a> {
 
     /// Record `v` as the new version of `root`.
     fn advance(&mut self, env: &mut Env, root: Sym, v: Sym) {
+        if env.stored.contains(&root) && self.violation.is_none() {
+            self.violation = Some(format!(
+                "it writes `{}` after storing it in a record or a list, which hold the list itself",
+                self.syms.text(root)
+            ));
+        }
         env.current.insert(root, v);
         env.root_of.insert(v, root);
         if let Some(t) = self.types.get(&root).cloned() {
@@ -328,7 +396,14 @@ impl<'a> Rw<'a> {
     /// every arm is the same list. Anything else is a list of its own.
     fn alias_root(&self, a: &IrExpr, env: &Env) -> Option<Sym> {
         match a {
-            IrExpr::Name(n, t, _) if is_list(t) || self.types.contains_key(&env.root(*n)) => Some(env.root(*n)),
+            // **ONLY A LOCAL LIST IS WRITTEN IN PLACE.** A top-level constant
+            // is shared by every reader, and Codex copies it on a write:
+            // `list-set-at w-direct 0 99` leaves `w-direct` as it was
+            // (codex/test's const-share pins it). So a name that is not a
+            // parameter or bound here names no root.
+            IrExpr::Name(n, t, _) if env.bound.contains(&env.root(*n)) && (is_list(t) || self.types.contains_key(&env.root(*n))) => {
+                Some(env.root(*n))
+            }
             IrExpr::Let(_, _, _, body, _) => self.alias_root(body, env),
             IrExpr::If(_, x, y, _, _) => {
                 let r = self.alias_root(x, env)?;
@@ -453,6 +528,9 @@ impl<'a> Rw<'a> {
         loop {
             match cur {
                 IrExpr::Let(n, t, v, body, _) => {
+                    if dropped_field_write(v, self.set_at) && !mentions(body, *n) {
+                        return Err(DROPPED_FIELD_WRITE.into());
+                    }
                     let v2 = self.expr(v, env, &mut pre)?;
                     self.bind(*n, t, &v2, env);
                     pre.push((*n, t.clone(), v2));
@@ -563,6 +641,20 @@ impl<'a> Rw<'a> {
         xs.into_iter().map(|x| if matches!(x, IrExpr::Name(..)) { self.rename(&x, env) } else { x }).collect()
     }
 
+    /// `references_last`, and each list stored by name is marked stored.
+    fn store(&self, xs: Vec<IrExpr>, env: &mut Env) -> Vec<IrExpr> {
+        let xs = self.references_last(xs, env);
+        for x in &xs {
+            if let IrExpr::Name(n, _, _) = x {
+                let r = env.root(*n);
+                if self.types.contains_key(&r) {
+                    env.stored.insert(r);
+                }
+            }
+        }
+        xs
+    }
+
     fn rename(&self, e: &IrExpr, env: &Env) -> IrExpr {
         match e {
             IrExpr::Name(n, t, s) => {
@@ -596,21 +688,35 @@ impl<'a> Rw<'a> {
                 let v = self.expr(v, env, pre)?;
                 E::FieldStore(Box::new(x), f.clone(), Box::new(v), t.clone(), *s)
             }
+            // **A LIST STORED BY NAME IS THE LIST ITSELF**, as an argument
+            // is: the version after every element or field is evaluated
+            // (`brdix-build` stores four tables and fills them in its last
+            // field). A later write to it could not reach the copy stored.
             E::List(xs, t, s) => {
                 let mut out = Vec::new();
                 for x in xs {
                     out.push(self.expr(x, env, pre)?);
                 }
+                let out = self.store(out, env);
                 E::List(out, t.clone(), *s)
             }
             E::Record(n, fs, t, s) => {
-                let mut out = Vec::new();
+                let mut vals = Vec::new();
                 for f in fs {
-                    out.push(crate::ir_chapter::IrFieldVal { name: f.name, value: self.expr(&f.value, env, pre)? });
+                    vals.push(self.expr(&f.value, env, pre)?);
                 }
+                let vals = self.store(vals, env);
+                let out = fs
+                    .iter()
+                    .zip(vals)
+                    .map(|(f, value)| crate::ir_chapter::IrFieldVal { name: f.name, value })
+                    .collect();
                 E::Record(*n, out, t.clone(), *s)
             }
             E::Let(n, t, v, body, _) => {
+                if dropped_field_write(v, self.set_at) && !mentions(body, *n) {
+                    return Err(DROPPED_FIELD_WRITE.into());
+                }
                 let v2 = self.expr(v, env, pre)?;
                 self.bind(*n, t, &v2, env);
                 pre.push((*n, t.clone(), v2));
@@ -668,6 +774,9 @@ impl<'a> Rw<'a> {
                             (IrActStmt::Bind(*n, bt.clone(), v2, *sp), inner.current != before)
                         }
                         IrActStmt::Exec(v, sp) => {
+                            if dropped_field_write(v, self.set_at) {
+                                return Err(DROPPED_FIELD_WRITE.into());
+                            }
                             let v2 = self.block(v, &mut inner)?;
                             (IrActStmt::Exec(v2, *sp), inner.current != before)
                         }
@@ -734,12 +843,6 @@ impl<'a> Rw<'a> {
         let mut xs = self.references_last(xs, env);
         if f == self.set_at && xs.len() == 3 {
             let c = call(head.clone(), xs, e.ty());
-            // **A LIST HELD IN A RECORD IS SHARED.** Writing `(node.forward)`
-            // changes the list every holder of that record sees; a Roc
-            // record keeps the old one, and no rewrite of names reaches it.
-            if matches!(args[0], IrExpr::FieldAccess(..)) {
-                return Err("it writes a list held in a record field, which every holder of the record sees".into());
-            }
             if let Some(r) = roots[0] {
                 self.note_list(r, &e.ty());
                 let v = self.mint(r);
@@ -748,6 +851,10 @@ impl<'a> Rw<'a> {
                 return Ok(IrExpr::Name(v, e.ty(), e.span()));
             }
             return Ok(c);
+        }
+        if self.syms.text(f).starts_with(|c: char| c.is_ascii_uppercase()) {
+            let xs = self.store(xs, env);
+            return Ok(call(head.clone(), xs, e.ty()));
         }
         if let Some(w) = self.writers.get(&f).cloned() {
             if xs.len() < w.arity {

@@ -1,11 +1,9 @@
-# List versions: Codex's in-place list writes in Roc (WORK IN PROGRESS)
+# List versions: Codex's in-place list writes in Roc
 
-**Status, 2026-09-25 (U62):** `src/list_versions.rs` exists and works for
-most of what it targets, but is **off by default**. It runs only under
-`rocemit --list-versions`. Without the flag rocemit behaves exactly as it
-did: a definition that writes a list parameter and answers something else
-is refused, "`f` writes its list parameter `p` and answers something else".
-That refusal was the ladder's largest, 35 units at U62.
+**Status, 2026-09-25 (U62): the default in rocemit.** `src/list_versions.rs`
+runs on every emission, pruned and `--whole`. It replaced the refusal "`f`
+writes its list parameter `p` and answers something else", which was the
+ladder's largest at U62 (35 units).
 
 ## The problem
 
@@ -60,41 +58,37 @@ constructor) and `__copyout-at-K` (element K). `roc_emit` spells them as
 `(a, b)` and `t.K`. Set `LV_TRACE=1` to print which definitions are writers,
 and of which kind.
 
-## Where it stands (the 35 units refused at U62)
+## Where it stands
 
-    rocemit --list-versions, via ROCEMIT=<a build that passes it>:
-      24 PASS
-       8 REFUSED  write to a list held in a record field (ranked-text-set x2,
-                  network-effect, web-mux-* x5): correct refusals
-       2 FAIL     lib@brotli-test (brotli-fit-exact, brotli-xform-smaller: the
-                  output round-trips but is larger than it should be),
-                  e1000-rx-reuse ("list heap grew": a heap measurement; probably
-                  belongs on the DIVERGES list with the other __heap-save ones)
-       1 CRASH    lib@brotli-dict-test, "list-at out of range"
+    roc-apps ladder: 846 -> 872 PASS (863 PASS + 9 new SLOW, all compile-time
+    evaluation, added to tests/slow.txt); no PASS lost.
+    e1000-rx-reuse is DIVERGES (a __heap-save measurement).
 
-The ladder script has no flag for it. To try it, point `ROCEMIT` at a small
-wrapper that adds `--list-versions`, or temporarily make it the default.
+Three things the first full run taught, all now in the pass:
 
-## To finish it, in order
+- **A list stored by name is the list.** `brdix-build` stores four empty
+  tables in a record and fills them in its last field. The fields must be
+  the filled versions (`store`, like `references_last` for arguments). A
+  write after the store is refused, since no renaming can reach the copy
+  stored. This was both Brotli failures.
+- **A write through a record field is refused only when its answer is
+  dropped.** Refusing every field write lost 31 passing units (`fb-set` and
+  others rebuild the record with the answer, which means the same in Roc).
+  Only `let dummy = list-set-at (node.f) ...` with `dummy` unused, or the
+  write run as a statement, relies on the record changing under it.
+- **Only a LOCAL list is written in place.** A top-level constant is copied
+  on write (codex/test's const-share pins `list-set-at w-direct 0 99`
+  leaving `w-direct` as it was), so it is never a root.
 
-1. **Brotli.** Both Brotli failures are almost certainly one remaining
-   aliasing shape the pass doesn't see. Use `LV_TRACE=1` on
-   `codex/test/lib/brotli-test.codex` and read the emitted Roc for the
-   length-limiting code (`brotli-fit`, `-clamp`, `-repair*`) and the transform
-   search. Suspects:
-   - a list that reaches a writer through something `alias_root` doesn't
-     cover (a tuple writer's answer that IS a list, a list inside a list);
-   - a top-level constant list passed to a writer. Codex would mutate the
-     shared constant; the pass versions it only inside the one caller.
-2. **e1000-rx-reuse.** Decide whether it is DIVERGES (a heap measurement) and
-   say so in roc-apps `tests/ladder.sh`.
-3. **Speed.** Some newly passing units are slow in Roc: ecdsa-sha384 ~49 s,
-   tls-cv-schemes ~37 s, ecdsa-p384 ~35 s. The likely cause is copy-out
-   keeping an old reference alive, so `List.set` copies instead of writing in
-   place (O(n) per write). Check with a smaller case first; the fix is
-   probably making sure the old version is dead at the write.
-4. **Make it the default.** Remove the flag and the old `written_param`
-   refusal in `roc_emit.rs`. Then run the full roc-apps ladder, diff the
-   ledger against the committed one (no PASS may be lost; the new
-   record-field refusal is the thing to watch), and regenerate
-   `tests/ported` with `tests/package.py`.
+And one for `--whole`: version names are numbered per definition against
+its own and its chapter's names (`taken`), not the unit's symbol table.
+Otherwise a chapter's text depended on which other chapters the unit cited.
+
+## What is still refused
+
+The eight remaining "record field" units at U62 (ranked-text-set x2,
+network-effect, web-mux-* x5) are refused for dropping a field write's
+answer (`rts-extend-path-loop`, `arp-cache-add` in their shapes) or for a
+write in one `act` statement that a later one reads. Both mean shared heap
+in Codex. Doing better needs a model of which records share a list, which
+is a different piece of work.
