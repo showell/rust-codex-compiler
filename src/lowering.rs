@@ -73,6 +73,10 @@ pub struct Lower<'a> {
     /// wrote while the shadow test must be answered about the name we would
     /// EMIT.
     binders: std::cell::RefCell<Vec<(Sym, Sym)>>,
+    /// `__classmethods` (`collect-multi-method-names`): the methods of every
+    /// class with more than one instance. A use of one is dispatched here, by
+    /// the type at that use, to the instance's own definition `m-T`.
+    class_methods: std::collections::BTreeSet<Sym>,
 }
 
 impl<'a> Lower<'a> {
@@ -95,7 +99,42 @@ impl<'a> Lower<'a> {
             base,
             overlay: std::cell::RefCell::new(Vec::new()),
             binders: std::cell::RefCell::new(Vec::new()),
+            class_methods: std::collections::BTreeSet::new(),
         }
+    }
+
+    /// `register-class-methods`' `__classmethods`: the methods of each class
+    /// that has more than one instance. With one, the desugarer already
+    /// wrote the bare definitions and there is nothing to dispatch.
+    pub fn set_class_methods(&mut self, ch: &crate::ast::Chapter) {
+        self.class_methods = ch
+            .class_defs
+            .iter()
+            .filter(|c| ch.instance_defs.iter().filter(|i| i.class_name == c.name).count() > 1)
+            .flat_map(|c| c.methods.iter().map(|m| m.name))
+            .collect();
+    }
+
+    /// Whether a use of `n` is a class method's: `n` is one and no local
+    /// binding shadows it. (Upstream probes `__classmethods` without the
+    /// shadow test; a local of the same name is the local.)
+    fn is_class_method(&self, n: Sym) -> bool {
+        self.class_methods.contains(&n) && self.bound_name(n) == n && self.overlay_ty(n).is_none()
+    }
+
+    /// `lookup-type-split overlay base`: the type a top-level or local name
+    /// is bound at, if any.
+    fn name_ty(&self, n: Sym) -> Option<Ty> {
+        self.overlay_ty(n).or_else(|| self.bindings.get(&n).cloned())
+    }
+
+    /// `method-spec-rn`: `m-T` when the key is known and that name is bound.
+    fn method_spec(&self, m: Sym, key: &str) -> Option<(Sym, Ty)> {
+        if key.is_empty() {
+            return None;
+        }
+        let n = self.syms.borrow().find(&format!("{}-{key}", self.text(m)))?;
+        self.name_ty(n).map(|t| (n, t))
     }
 
     /// Narrow `base` to the builtins and `keep`. The driver's base is every
@@ -313,6 +352,17 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
             //
             // The NAME is `bound-name`'s: a reference to a binder that was
             // re-spelled has to be re-spelled with it.
+            if cx.text(*n).starts_with("__dict-of-") {
+                return Ok(lower_dict_placeholder(*n, want, cx, *s));
+            }
+            if cx.is_class_method(*n) {
+                // `lower-class-method-ref`: a method used as a value is keyed
+                // by its whole type -- `zero-val : Integer` is `zero-val-Integer`.
+                let cand = cx.at(*s).unwrap_or_else(|| cx.st.deep_resolve(want));
+                if let Some((spec, raw)) = cx.method_spec(*n, &type_key_of(&cand, cx)) {
+                    return Ok(IrExpr::Name(spec, crate::check::strip_forall(&cx.st.deep_resolve(&raw)), *s));
+                }
+            }
             let rn = cx.bound_name(*n);
             let t = match cx.at(*s) {
                 Some(t) => crate::check::strip_forall(&t),
@@ -371,12 +421,95 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
                 None => lower_compare_prim(&lt, l, r, cx, *s),
             });
         }
+        // `lower-apply-aa`: a constrained definition applied to the
+        // dictionary placeholder the desugarer inserted and then to its
+        // argument. The dictionary is chosen by the ARGUMENT's type:
+        // `lower-constrained-apply` for a class (`C-dict-T`, else the
+        // enclosing definition's own `__C-dict`), `lower-derived-apply` for
+        // `deriving Show` and `Ord` (`__show_T`, `__compare_T`).
+        Expr::Apply(f, a, s) if dict_placeholder_arg(f, cx).is_some() => {
+            let (inner_f, pn) = dict_placeholder_arg(f, cx).expect("guarded");
+            let func = expr(&inner_f, &Ty::NoExpect, cx)?;
+            let func_ty = cx.st.deep_resolve(&func.ty());
+            let a = expr(a, &Ty::NoExpect, cx)?;
+            let arg_ty = cx.st.deep_resolve(&a.ty());
+            let pname = cx.text(pn);
+            let dict = if let Some(cls) = pname.strip_prefix("__dict-of-") {
+                let key = type_key_of(&arg_ty, cx);
+                let concrete = if key.is_empty() { None } else { cx.syms.borrow().find(&format!("{cls}-dict-{key}")) };
+                let param = cx.syms.borrow().find(&format!("__{cls}-dict"));
+                match concrete.and_then(|c| cx.name_ty(c).map(|b| (c, b))).or_else(|| param.and_then(|p| cx.name_ty(p).map(|b| (p, b)))) {
+                    Some(found) => Some(found),
+                    None => {
+                        let t = expected_or_recorded(want, cx, *s);
+                        let none = cx.syms.borrow_mut().intern(&format!("__no-instance-{cls}-{key}"));
+                        return Ok(IrExpr::Apply(Box::new(IrExpr::Name(none, t.clone(), *s)), Box::new(a), t, *s));
+                    }
+                }
+            } else {
+                let prefix = if pname == "__dderiv-Show" { "__show_" } else { "__compare_" };
+                let h = cx.syms.borrow().find(&format!("{prefix}{}", type_name_of(&arg_ty, cx)));
+                h.and_then(|h| cx.name_ty(h).map(|b| (h, b)))
+            };
+            let Some((dn, db)) = dict else {
+                // No such helper: the placeholder stays, as upstream's
+                // `lookup-type-split` answering nothing would leave it.
+                let t = expected_or_recorded(want, cx, *s);
+                let inner = IrExpr::Apply(Box::new(func), Box::new(IrExpr::Name(pn, Ty::Error, *s)), peel_fun_return(&func_ty), *s);
+                return Ok(IrExpr::Apply(Box::new(inner), Box::new(a), t, *s));
+            };
+            let dict_ir = IrExpr::Name(dn, cx.st.deep_resolve(&db), *s);
+            let inner_ret = peel_fun_return(&func_ty);
+            let ret = peel_fun_return(&inner_ret);
+            let res = if lt::has_typevars(&ret) || matches!(ret, Ty::Error) { expected_or_recorded(want, cx, *s) } else { ret };
+            let inner = IrExpr::Apply(Box::new(func), Box::new(dict_ir), inner_ret, *s);
+            Ok(IrExpr::Apply(Box::new(inner), Box::new(a), res, *s))
+        }
+        // `lower-method-apply`: a class method applied to its argument is
+        // the instance for the ARGUMENT's type, `m-T`; with none, a name no
+        // definition binds, `__no-instance-m-T`, which a backend refuses.
+        Expr::Apply(f, a, s) if matches!(&**f, Expr::NameRef(m, _) if cx.is_class_method(*m)) => {
+            let Expr::NameRef(m, _) = &**f else { unreachable!() };
+            let a = expr(a, &Ty::NoExpect, cx)?;
+            let key = type_key_of(&cx.st.deep_resolve(&a.ty()), cx);
+            let Some((spec, raw)) = cx.method_spec(*m, &key) else {
+                let t = expected_or_recorded(want, cx, *s);
+                let none = cx.syms.borrow_mut().intern(&format!("__no-instance-{}-{key}", cx.text(*m)));
+                return Ok(IrExpr::Apply(Box::new(IrExpr::Name(none, t.clone(), *s)), Box::new(a), t, *s));
+            };
+            let fty = crate::check::strip_forall(&cx.st.deep_resolve(&raw));
+            let ret = peel_fun_return(&fty);
+            let res = if lt::has_typevars(&ret) || matches!(ret, Ty::Error) {
+                match lt::subst_from_arg(&peel_fun_param(&fty), &a.ty(), &ret) {
+                    Ty::Error | Ty::NoExpect => expected_or_recorded(want, cx, *s),
+                    other => other,
+                }
+            } else {
+                ret
+            };
+            Ok(IrExpr::Apply(Box::new(IrExpr::Name(spec, fty, *s)), Box::new(a), res, *s))
+        }
         Expr::Apply(f, a, s) => {
+            let is_show = matches!(&**f, Expr::NameRef(m, _)
+                if cx.text(*m) == "show" && cx.bound_name(*m) == *m && cx.overlay_ty(*m).is_none());
             let f = expr(f, &Ty::NoExpect, cx)?;
             let fty = f.ty();
             let arg_ty = peel_fun_param(&fty);
             let ret_ty = peel_fun_return(&fty);
             let a = try_unit_convert(expr(a, &arg_ty, cx)?, &arg_ty, *s, cx);
+            // `lower-show-apply`: `show` on a value of a type that derives
+            // Show is that type's own `__show_T`.
+            if is_show {
+                let tn = type_name_of(&cx.st.deep_resolve(&a.ty()), cx);
+                if !tn.is_empty() && !is_primitive_type_name(&tn) {
+                    let h = cx.syms.borrow().find(&format!("__show_{tn}"));
+                    if let Some((h, raw)) = h.and_then(|h| cx.name_ty(h).map(|t| (h, t))) {
+                        let hty = crate::check::strip_forall(&cx.st.deep_resolve(&raw));
+                        let ret = peel_fun_return(&hty);
+                        return Ok(IrExpr::Apply(Box::new(IrExpr::Name(h, hty, *s)), Box::new(a), ret, *s));
+                    }
+                }
+            }
             let resolved = lt::subst_from_arg(&arg_ty, &a.ty(), &ret_ty);
             let res = match resolved {
                 Ty::Error | Ty::NoExpect => expected_or_recorded(want, cx, *s),
@@ -993,6 +1126,15 @@ fn special_apply_name(f: &Expr, cx: &Lower) -> Option<(&'static str, Expr)> {
     Some((which, (**a1).clone()))
 }
 
+/// `f` is a callee applied to a dictionary placeholder, `__dict-of-C` or
+/// `__dderiv-Show`/`Ord`: the callee and the placeholder.
+fn dict_placeholder_arg(f: &Expr, cx: &Lower) -> Option<(Expr, Sym)> {
+    let Expr::Apply(inner, pa, _) = f else { return None };
+    let Expr::NameRef(pn, _) = &**pa else { return None };
+    let t = cx.text(*pn);
+    (t.starts_with("__dict-of-") || t.starts_with("__dderiv-")).then(|| ((**inner).clone(), *pn))
+}
+
 /// `is-primitive-type-name`.
 fn is_primitive_type_name(n: &str) -> bool {
     matches!(n, "Integer" | "Real" | "Text" | "Boolean" | "Char" | "Nothing" | "List")
@@ -1041,6 +1183,48 @@ fn type_name_of(t: &Ty, cx: &Lower) -> String {
         Ty::List(_) | Ty::LinkedList(_) => "List".into(),
         Ty::Constructed(n, _) | Ty::Record(n, _) | Ty::Sum(n, _) => cx.text(*n),
         _ => String::new(),
+    }
+}
+
+/// `type-key-of` (Lowering.codex:779): the instance key, `type-name-of`
+/// with the type's arguments bracketed -- `List[Integer]`. It renders as the
+/// desugarer's `instance-head-key` does from the syntax head.
+fn type_key_of(t: &Ty, cx: &Lower) -> String {
+    let base = type_name_of(t, cx);
+    let args: Vec<Ty> = match t {
+        Ty::Constructed(_, a) | Ty::Sum(_, a) | Ty::Record(_, a) => a.clone(),
+        Ty::List(e) | Ty::LinkedList(e) => vec![(**e).clone()],
+        _ => Vec::new(),
+    };
+    if base.is_empty() || args.is_empty() {
+        return base;
+    }
+    let keys: Vec<String> = args.iter().map(|x| type_key_of(x, cx)).collect();
+    format!("{base}[{}]", keys.join(","))
+}
+
+/// `lower-dict-placeholder` (Lowering.codex:232). `__dict-of-C` at type
+/// `CDict T` is the instance's dictionary `C-dict-T`; where `T` is not known
+/// -- inside a constrained definition -- it is that definition's own
+/// dictionary parameter `__C-dict` (`dict-placeholder-fallback`).
+fn lower_dict_placeholder(n: Sym, want: &Ty, cx: &Lower, sp: crate::ast::Span) -> IrExpr {
+    let cand = cx.at(sp).unwrap_or_else(|| cx.st.deep_resolve(want));
+    let cls_dict = type_name_of(&cand, cx);
+    let arg_key = match &cand {
+        Ty::Constructed(_, a) | Ty::Record(_, a) if !a.is_empty() => type_key_of(&cx.st.deep_resolve(&a[0]), cx),
+        _ => String::new(),
+    };
+    if !arg_key.is_empty() && cls_dict.len() > 4 {
+        let concrete = format!("{}-dict-{arg_key}", &cls_dict[..cls_dict.len() - 4]);
+        let found = cx.syms.borrow().find(&concrete);
+        if let Some((c, b)) = found.and_then(|c| cx.name_ty(c).map(|b| (c, b))) {
+            return IrExpr::Name(c, cx.st.deep_resolve(&b), sp);
+        }
+    }
+    let param = cx.syms.borrow().find(&format!("__{}-dict", &cx.text(n)["__dict-of-".len()..]));
+    match param.and_then(|p| cx.name_ty(p).map(|b| (p, b))) {
+        Some((p, b)) => IrExpr::Name(p, cx.st.deep_resolve(&b), sp),
+        None => IrExpr::Name(n, want.clone(), sp),
     }
 }
 

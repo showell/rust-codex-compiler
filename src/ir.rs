@@ -188,7 +188,8 @@ fn lower_pipeline(
     let ll_empty = syms.borrow_mut().intern("__linked-list-empty");
     let mut defs = Vec::new();
     if driver_passes {
-        let cx = crate::lowering::Lower::new(&syms, bindings, st, tds, ll_empty);
+        let mut cx = crate::lowering::Lower::new(&syms, bindings, st, tds, ll_empty);
+        cx.set_class_methods(ch);
         for d in ch.defs.iter() {
             defs.push(crate::lowering::lower_def(d, &cx)?);
         }
@@ -204,6 +205,7 @@ fn lower_pipeline(
             let cx = cxs.entry(d.origin.as_str()).or_insert_with(|| {
                 let mut cx = crate::lowering::Lower::new(&syms, bindings, st, tds, ll_empty);
                 cx.restrict_base(&names[d.origin.as_str()]);
+                cx.set_class_methods(ch);
                 cx
             });
             defs.push(crate::lowering::lower_def(d, cx)?);

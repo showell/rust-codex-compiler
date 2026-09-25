@@ -191,6 +191,9 @@ pub fn apply(ch: &mut Chapter) {
     // (definition, the dictionary its callers pass)
     let mut info: Vec<(Name, Name)> = Vec::new();
     let (mut has_show, mut has_ord) = (false, false);
+    // The module the wrappers are written into: that of the first definition
+    // taking a derived dictionary. The IR's chapter stays empty, as upstream's.
+    let mut wrapper_origin = String::new();
     for d in defs.iter_mut() {
         let Some(TypeExpr::Constrained(cls, tv, body, _)) = d.declared_type.first().cloned() else { continue };
         let cls_text = syms.text(cls).to_string();
@@ -222,6 +225,9 @@ pub fn apply(ch: &mut Chapter) {
             d.params.insert(0, Param { name: dict_param, span: synthetic() });
             d.declared_type = vec![TypeExpr::Fun(Rc::new(dict_ty), body.clone(), synthetic())];
             info.push((d.name, syms.intern(&format!("__dderiv-{cls_text}"))));
+            if wrapper_origin.is_empty() {
+                wrapper_origin = d.origin.clone();
+            }
             if cls_text == "Show" {
                 has_show = true;
             } else {
@@ -298,6 +304,9 @@ pub fn apply(ch: &mut Chapter) {
         front.extend(PRIM_WRAPPER_TYPES.iter().map(|tn| prim_show_wrapper(syms, tn)));
     }
     if !front.is_empty() {
+        for w in front.iter_mut() {
+            w.origin = wrapper_origin.clone();
+        }
         front.append(defs);
         *defs = front;
     }

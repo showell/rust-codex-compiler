@@ -3669,9 +3669,12 @@ fn ident_text(t: &str) -> Result<String, String> {
     if t.is_empty() {
         return Err("a name of only underscores cannot be a Roc identifier".into());
     }
-    if !t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !t.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '[' | ']' | ',')) {
         return Err(format!("name `{t}` cannot be a Roc identifier"));
     }
+    // An instance for an applied head is named by its KEY, `to-text-List[Integer]`
+    // (`type-key-of`), and Roc has no brackets in a name: spelled out.
+    let t = t.replace('[', "-of-").replace(',', "-and-").replace(']', "-end");
     // **ONLY THE FIRST LETTER IS LOWERCASED.** Roc wants a value name to
     // start lowercase and allows capitals after that, and Codex tells two
     // names apart by case: `test-glyph-e` and `test-glyph-E` are both in
