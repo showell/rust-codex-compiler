@@ -408,7 +408,12 @@ fn parse_paren(p: &mut Parser<'_>, cp: usize) -> NodeKind {
     if p.kind(0) == Some(Kind::RightParen) {
         p.bump();
     } else {
-        p.err("expected ')'");
+        // `expect RightParen`: CDX1000 wherever the ')' is missing, at the
+        // end of the file too since U62 (COMPILER-35, codex/test's
+        // errors/paren-open-at-eof), where upstream's `expect` used to
+        // answer its state untouched.
+        let got = p.got_text();
+        p.err(format!("Expected token kind mismatch, got {got}"));
     }
     let kind = if commas > 0 { NodeKind::Tuple } else { NodeKind::Paren };
     p.b.wrap_from(cp, kind);

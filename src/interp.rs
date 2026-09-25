@@ -687,6 +687,7 @@ impl Interp {
         // Record field bounds, and a slot for every constructor.
         let mut ctors: Vec<(u32, Sym, usize)> = Vec::new();
         let mut tags: HashMap<Sym, i64> = HashMap::new();
+        let mut unit_types: Vec<Sym> = Vec::new();
         for t in &ch.type_defs {
             match t {
                 TypeDef::Record(name, _, fields, ..) => {
@@ -713,7 +714,7 @@ impl Interp {
                         ctors.push((i, c.name, c.fields.len()));
                     }
                 }
-                TypeDef::Unit(..) => {}
+                TypeDef::Unit(n, ..) => unit_types.push(*n),
             }
         }
 
@@ -755,6 +756,23 @@ impl Interp {
                     names.builtin_funs.insert(sym, i);
                 }
             }
+        }
+
+        // **A UNIT TYPE'S CONSTRUCTOR IS THE IDENTITY.** `Name "sin"` IS
+        // `"sin"`: upstream elides the call (`lower-unit-ctor-value`), so it
+        // matches the literal `"sin"` and shows as `sin` (codex/test's
+        // ops/unit-pattern-lit and unit-show). Built as a tagged value it
+        // matched nothing and showed as `Name sin`.
+        for n in unit_types {
+            let i = globals.len() as u32;
+            globals.push(Value::Fun(Rc::new(Closure {
+                name: n,
+                arity: 1,
+                body: Body::Builtin("__narrow"),
+                env: root.clone(),
+                applied: Vec::new(),
+            })));
+            names.builtin_funs.insert(n, i);
         }
 
         // Constructors are FIXED for the run, so their values are built here
@@ -874,7 +892,17 @@ impl Interp {
             return err("no `opening` definition to run");
         };
         let env = self.root.clone();
-        self.eval(&open, &env)?;
+        let v = self.eval(&open, &env)?;
+        // **A VALUE OPENING PRINTS ITS VALUE.** `opening : Integer = ...` is
+        // how a test with no Console reports (the protocol encoders, the
+        // capability probes): upstream's harness prints what it answers, as
+        // one line. `Nothing` answers nothing.
+        let nothing = matches!(&v, Value::Ctor(n, _) if self.syms.text(*n) == "Nothing");
+        if !matches!(v, Value::Unit) && !nothing {
+            let units = show_units(&self.syms, &v);
+            crate::charcode::print_bytes(&units, &mut self.out);
+            self.out.push(b'\n');
+        }
         Ok(())
     }
 
@@ -2011,6 +2039,16 @@ impl Interp {
 /// that subtracting two of them counts the representable values between --
 /// ULPs. Negative floats have their low 63 bits flipped and one added, which
 /// is what turns sign-magnitude into two's complement order.
+/// `ordinal` over an f32's bits.
+fn ordinal32(f: f32) -> i64 {
+    let bits = f.to_bits() as i32 as i64;
+    if bits < 0 {
+        (bits ^ 0x7FFF_FFFF).wrapping_add(1)
+    } else {
+        bits
+    }
+}
+
 fn ordinal(f: f64) -> i64 {
     let bits = f.to_bits() as i64;
     if bits < 0 {
@@ -2101,7 +2139,27 @@ pub(crate) fn literal(text: &str, kind: LiteralKind) -> R<Value> {
 /// The borrow is split rather than the table cloned: `syms` and `bump` are
 /// disjoint fields, and Rust will let both be borrowed at once when it can see
 /// that.
-fn binary(syms: &SymTab, bump: &mut crate::bump::Bump, op: BinaryOp, wraps: bool, a: Value, b: Value) -> R<Value> {
+fn binary(syms: &SymTab, bump: &mut crate::bump::Bump, op: BinaryOp, mode: crate::code::Arith, a: Value, b: Value) -> R<Value> {
+    let wraps = mode.wraps;
+    // A Real's arithmetic is its type's: an f32 rounds each result to f32, a
+    // `saturating` one answers the largest finite value in place of an
+    // infinity and 0 in place of NaN, and a `trapping` one traps on either
+    // (codex/test's real-saturating, real-approx-modes).
+    let real = |r: f64| -> R<Value> {
+        let Some(k) = mode.real else { return Ok(Value::Real(r)) };
+        let r = if k.f32 { r as f32 as f64 } else { r };
+        if r.is_finite() {
+            return Ok(Value::Real(r));
+        }
+        if k.saturating {
+            let max = if k.f32 { f32::MAX as f64 } else { f64::MAX };
+            return Ok(Value::Real(if r.is_nan() { 0.0 } else if r > 0.0 { max } else { -max }));
+        }
+        if k.trapping {
+            return err(format!("{r} from arithmetic on a trapping Real, which traps"));
+        }
+        Ok(Value::Real(r))
+    };
     // Nested fns rather than closures: two closures cannot both hold the bump.
     fn cat(bump: &mut crate::bump::Bump, units: Vec<u8>) -> Value {
         let addr = bump.alloc(units.len() as i64);
@@ -2122,10 +2180,10 @@ fn binary(syms: &SymTab, bump: &mut crate::bump::Bump, op: BinaryOp, wraps: bool
         // A negative exponent is 0 (codex/test/ops/int-pow: `ipow 5 (0 - 2)`), not
         // the exponent read as a huge unsigned count.
         (OpPow, Int(x), Int(y)) => Int(if *y < 0 { 0 } else { x.pow(*y as u32) }),
-        (OpAdd, Real(x), Real(y)) => Real(x + y),
-        (OpSub, Real(x), Real(y)) => Real(x - y),
-        (OpMul, Real(x), Real(y)) => Real(x * y),
-        (OpDiv, Real(x), Real(y)) => Real(x / y),
+        (OpAdd, Real(x), Real(y)) => real(x + y)?,
+        (OpSub, Real(x), Real(y)) => real(x - y)?,
+        (OpMul, Real(x), Real(y)) => real(x * y)?,
+        (OpDiv, Real(x), Real(y)) => real(x / y)?,
         (OpLt, Int(x), Int(y)) => Bool(x < y),
         (OpGt, Int(x), Int(y)) => Bool(x > y),
         (OpLtEq, Int(x), Int(y)) => Bool(x <= y),
@@ -2142,8 +2200,13 @@ fn binary(syms: &SymTab, bump: &mut crate::bump::Bump, op: BinaryOp, wraps: bool
         // and add one when negative -- and then `~` asks for a difference of
         // at most 4 and `~0` for exactly 0. Nothing about the operator says
         // "four"; it is a constant in the emitter.
-        (OpApproxEq, Real(x), Real(y)) => Bool((ordinal(*x) - ordinal(*y)).abs() <= 4),
-        (OpApproxEqExact, Real(x), Real(y)) => Bool(ordinal(*x) == ordinal(*y)),
+        // On an f32 the units are f32's (`-1ulp ~ +1ulp` is 2 apart there,
+        // and 2^63 apart read as f64 bits: real-approx-equality).
+        (OpApproxEq | OpApproxEqExact, Real(x), Real(y)) => {
+            let f32 = mode.real.is_some_and(|k| k.f32);
+            let d = if f32 { (ordinal32(*x as f32) - ordinal32(*y as f32)).abs() } else { (ordinal(*x) - ordinal(*y)).abs() };
+            Bool(if op == OpApproxEq { d <= 4 } else { d == 0 })
+        }
         (OpEq, _, _) => Bool(equal(&a, &b)),
         (OpNotEq, _, _) => Bool(!equal(&a, &b)),
         (OpDefEq, _, _) => Bool(equal(&a, &b)),

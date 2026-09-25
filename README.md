@@ -224,11 +224,13 @@ cloud container is set up.
 - **`src/list_versions.rs`**: Codex's in-place list writes, made explicit
   for Roc; the default since U62. `docs/list-versions.md` says what it does,
   what it still refuses, and why.
-- **`paren-open-at-eof`** (U62's COMPILER-35): the parser fix upstream made,
-  not yet ported here.
-- **The sweep's older differences:** `real-approx-modes`, `real-saturating`,
-  `real-approx-equality`, `unit-pattern-lit`, `unit-show`, `variant-address`,
-  and the value openings `codexrun` does not print. Not U62's; parity we owe.
+- **The sweep at U62 is 807 of 1081.** Of the older differences only
+  `variant-address` is left from that list: it expects a nullary constructor
+  (`Empty`) to be allocated at each construction, where the interpreter
+  builds it once. Changing that moves every heap measurement, so it waits.
+  The rest of the gap is mostly device builtins the interpreter has no rule
+  for (`alloc-bytes`, `port-out-32`, `block-read-sector`, ...) and programs
+  that exceed the sweep's step limit.
 - **roc-apps `tests/ported`** is emitted with `rocemit --whole` by
   `tests/package.py`; each unit's stubs and omissions are in
   `~/build/roc-apps/gen/whole/<unit>/notes.txt`.

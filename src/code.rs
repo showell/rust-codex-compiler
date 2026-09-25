@@ -118,7 +118,7 @@ pub enum Code {
     /// The flag says `+`, `-` and `*` WRAP: the operation's type, worked out
     /// at compile time (`Static::arith`), is a `wrapping` band. Where it is
     /// false they trap on overflow.
-    Binary(Box<Code>, BinaryOp, Box<Code>, bool),
+    Binary(Box<Code>, BinaryOp, Box<Code>, Arith),
     Unary(Box<Code>),
     If(Box<Code>, Box<Code>, Box<Code>),
     /// Each binding gets its own frame, pushed in order, so a binding is in
@@ -183,9 +183,27 @@ pub struct Names {
 /// declared parameter, result or record field, a `let` of one, and arithmetic
 /// over them. Everything else is `Other`, which on the left of an operation
 /// traps, as a literal or a builtin's plain `Integer` does upstream.
+/// How one arithmetic operation behaves, read off its operands' declared
+/// types: an Integer's overflow mode, and a Real's width and mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Arith {
+    pub wraps: bool,
+    pub real: Option<RealKind>,
+}
+
+/// `Real`, `Real approximate` (f32), and either with `trapping` or
+/// `saturating` (`resolve-real-quals`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct RealKind {
+    pub f32: bool,
+    pub trapping: bool,
+    pub saturating: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Static {
     Int { lo: i64, hi: i64, wraps: bool },
+    Real(RealKind),
     Record(Sym),
     Other,
 }
@@ -202,6 +220,24 @@ impl Static {
             }
             TypeExpr::Named(n, _) if names.records.contains(n) => Static::Record(*n),
             TypeExpr::Named(n, _) if syms.text(*n) == "Integer" => Static::INTEGER,
+            TypeExpr::Named(n, _) if syms.text(*n) == "Real" => Static::Real(RealKind::default()),
+            // `Real approximate saturating`: every argument a qualifier, as
+            // the checker's `resolve_real_quals` reads it.
+            TypeExpr::App(c, args, _) if matches!(&**c, TypeExpr::Named(n, _) if syms.text(*n) == "Real") => {
+                let mut k = RealKind::default();
+                for a in args {
+                    match a {
+                        TypeExpr::Named(w, _) => match syms.text(*w) {
+                            "approximate" => k.f32 = true,
+                            "trapping" => k.trapping = true,
+                            "saturating" => k.saturating = true,
+                            _ => return Static::Other,
+                        },
+                        _ => return Static::Other,
+                    }
+                }
+                Static::Real(k)
+            }
             TypeExpr::Effect(.., inner, _) | TypeExpr::Linear(inner, _) => Static::of(inner, names, syms),
             _ => Static::Other,
         }
@@ -221,8 +257,27 @@ impl Static {
         }
     }
 
-    fn wraps(self) -> bool {
-        matches!(self, Static::Int { wraps: true, .. })
+    fn arith_mode(self) -> Arith {
+        match self {
+            Static::Int { wraps, .. } => Arith { wraps, real: None },
+            Static::Real(k) => Arith { wraps: false, real: Some(k) },
+            _ => Arith::default(),
+        }
+    }
+}
+
+/// The Real a conversion builtin answers (Builtins.codex's declared types).
+fn real_conversion(name: &str) -> Option<RealKind> {
+    let k = |f32, trapping, saturating| Some(RealKind { f32, trapping, saturating });
+    match name {
+        "real-from-int" | "bits-to-real" | "from-real-approx" | "from-real-trapping" | "from-real-saturating"
+        | "from-real-approx-trapping" | "from-real-approx-saturating" => k(false, false, false),
+        "to-real-trapping" => k(false, true, false),
+        "to-real-saturating" => k(false, false, true),
+        "to-real-approx" | "real-approx-from-int" | "bits-to-real-approx" => k(true, false, false),
+        "to-real-approx-trapping" => k(true, true, false),
+        "to-real-approx-saturating" => k(true, false, true),
+        _ => None,
     }
 }
 
@@ -323,8 +378,14 @@ impl<'a> Compiler<'a> {
                     }
                 }
                 let h = self.expr(head);
+                // A builtin that makes a Real of a width or a mode has it.
+                let conv = match head {
+                    Expr::NameRef(n, _) if args.len() == 1 => real_conversion(self.syms.text(*n)),
+                    _ => None,
+                };
                 // A function given all its arguments has its declared result.
                 let t = match &h {
+                    _ if conv.is_some() => Static::Real(conv.expect("checked")),
                     Code::Global(g) => match self.names.results.get(g) {
                         Some(&(arity, t)) if arity == args.len() => t,
                         _ => Static::Other,
@@ -346,7 +407,13 @@ impl<'a> Compiler<'a> {
                     }
                     _ => Static::Other,
                 };
-                (Code::Binary(Box::new(a), *op, Box::new(b), t.wraps()), t)
+                // `~` and `~0` count units in the last place of the OPERANDS'
+                // width, so a comparison carries its operands' kind.
+                let mode = match op {
+                    BinaryOp::OpApproxEq | BinaryOp::OpApproxEqExact => Static::arith(lt, rt).arith_mode(),
+                    _ => t.arith_mode(),
+                };
+                (Code::Binary(Box::new(a), *op, Box::new(b), mode), t)
             }
             Expr::Unary(x, _) => {
                 let (x, t) = self.typed(x);

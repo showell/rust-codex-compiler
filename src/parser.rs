@@ -147,6 +147,16 @@ impl<'a> Parser<'a> {
         self.sig(n).map(|t| t.kind)
     }
 
+    /// `got-text` (ParserCore.codex): what `expect` says it found instead --
+    /// "end of file", or the token quoted.
+    pub(crate) fn got_text(&self) -> String {
+        match self.sig(0) {
+            None => "end of file".into(),
+            Some(t) if t.kind == Kind::EndOfFile => "end of file".into(),
+            Some(t) => format!("'{}'", String::from_utf8_lossy(t.text(self.src))),
+        }
+    }
+
     pub(crate) fn done(&self) -> bool {
         self.at() >= self.toks.len()
     }
