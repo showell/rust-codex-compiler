@@ -1,8 +1,22 @@
 //! Roc from a Codex unit.
 //!
-//!     rocemit <unit.codex> <dir>      one type module per chapter, whole, and
-//!                                     the spec's app, written into <dir>.
+//!     rocemit <unit.codex> <dir>      one module per chapter, and the spec's
+//!                                     app, written into <dir>: the
+//!                                     definitions the opening can reach
 //!     rocemit --by-reach <unit.codex> <dir>
+//!
+//! **PRUNED LIKE UPSTREAM, BY DEFAULT.** Every upstream backend emits what
+//! `ir-prune-unreachable-roots` keeps: the definitions reachable from
+//! `ir-emit-roots` (`opening` first). Emitting every cited chapter whole meant
+//! one definition a program never calls could refuse it: U62's GopXhci timer
+//! code refused `fat32-parse`, and U62's e1000/ne2k copy loops thirty-odd
+//! network tests, none of which call them. A unit with no `opening` is a
+//! library and has no root, so it stays whole.
+//!
+//! There used to be a reason to emit whole chapters: one chapter module shared
+//! by several emitted apps had to read the same in each. The one caller that
+//! did that (roc-apps canvas_apps/safari/emitted.sh) is retired; safari's Roc is
+//! source now.
 //!
 //! Two lines on stdout: the app's file name, or `library` for a unit with
 //! no opening, and a digest of everything written.
@@ -23,11 +37,9 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (by_reach, rest) = match args.split_first() {
-        Some((flag, rest)) if flag == "--by-reach" => (true, rest),
-        _ => (false, &args[..]),
-    };
-    let result = match rest {
+    let by_reach = args.iter().any(|a| a == "--by-reach");
+    let rest: Vec<&String> = args.iter().filter(|a| *a != "--by-reach").collect();
+    let result = match rest.as_slice() {
         [path, dir] => emit(Path::new(path), Path::new(dir), by_reach),
         _ => {
             eprintln!("usage: rocemit [--by-reach] <unit.codex> <dir>");
@@ -68,10 +80,27 @@ fn emit(path: &Path, dir: &Path, by_reach: bool) -> Result<String, String> {
     if let Some(halt) = codexc::ir::codegen_halted(&st) {
         return Err(halt);
     }
-    // **A MODULE IS THE WHOLE CHAPTER, AS WRITTEN.** The driver's prune and
-    // its inlining pipeline are the IR wire's rules; a chapter module that
-    // fifty apps import wants every definition and one text.
-    let low = codexc::ir::lower_whole(&ch, &bindings, &st, &tds)?;
+    // The driver's inlining pipeline is the IR wire's and is not run here;
+    // its PRUNE is every backend's, and is (see the top of this file).
+    let mut low = codexc::ir::lower_whole(&ch, &bindings, &st, &tds)?;
+    let has_opening = low.syms.find("opening").is_some_and(|o| low.defs.iter().any(|d| d.name == o));
+    if has_opening {
+        // **EVERY `__eq_<T>` IS A ROOT.** Upstream's lowering calls the
+        // instantiated helper by name (COMPILER-44), so its prune sees the
+        // reference; ours lowers `==` to a `Binary` node and roc_emit builds
+        // each type's equality from the `__eq_` definitions by name, so
+        // nothing here names them. Pruned, `==` on a record of such a type no
+        // longer compiled in Roc ("type does not support equality").
+        let eq: Vec<String> = low
+            .defs
+            .iter()
+            .map(|d| low.syms.text(d.name).to_string())
+            .filter(|n| n.starts_with("__eq_"))
+            .collect();
+        let roots: Vec<&str> = codexc::ir::IR_EMIT_ROOTS.iter().copied().chain(eq.iter().map(String::as_str)).collect();
+        let defs = std::mem::take(&mut low.defs);
+        low.defs = codexc::ir_passes::prune_unreachable_roots(defs, &roots, &low.syms);
+    }
     // A test's codex-vm flags sit beside it as `.vmargs`; a unit that brings
     // them asks for the machine's devices.
     let vm_flags = path.with_extension("vmargs").exists();

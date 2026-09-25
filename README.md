@@ -129,8 +129,9 @@ clock is what the front end cost.
 
 ## Emitting Roc
 
-    rocemit <unit.codex> <dir>             one type module per chapter, whole,
-                                           and the spec's app, into <dir>
+    rocemit <unit.codex> <dir>             one module per chapter, holding what
+                                           the opening reaches (upstream's
+                                           prune), and the app, into <dir>
     rocemit --by-reach <unit.codex> <dir>
 
 Two lines on stdout: the app's file name, or `library` for a unit with no
