@@ -184,6 +184,12 @@ pub struct UnifyState {
     /// already equated by an earlier unification look distinct and mint again.
     pub row_subst: Vec<EffectRow>,
     pub expr_types: Vec<(u64, Ty)>,
+    /// Every empty list literal's type, as `infer-list` answered it: a bare
+    /// variable. `settle_empty_lists` decides each one once its definition is
+    /// checked. Upstream's `empty-lists` (Unifier.codex, U62, main 26013).
+    pub empty_lists: Vec<Ty>,
+    /// How many of `empty_lists` are already settled.
+    pub empty_lists_settled: usize,
     /// The type each PATTERN node was checked against, by span.
     ///
     /// **DELIBERATELY NOT `expr_types`.** That table is a graded counter --
@@ -330,6 +336,8 @@ impl Default for UnifyState {
             next_row_id: 0,
             row_subst: Vec::new(),
             expr_types: Vec::new(),
+            empty_lists: Vec::new(),
+            empty_lists_settled: 0,
             pat_types: Vec::new(),
             diags: Vec::new(),
             unify_gaps: 0,
@@ -700,6 +708,37 @@ impl UnifyState {
                 self.occurs_in(var_id, &a, depth + 1) || self.occurs_in(var_id, &b, depth + 1)
             }
             _ => false,
+        }
+    }
+
+    /// `settle-empty-lists` (TypeChecker.codex, U62, main 26013): **AN EMPTY
+    /// LIST LITERAL IS A `List` OR A `LinkedList`, AND NOTHING ELSE.** Until
+    /// U62 `[]` was a bare variable that nothing ever constrained, so
+    /// `v : Integer = []` checked clean (our issue 153). Upstream now records
+    /// each empty literal's type as it is inferred and, once the definition is
+    /// checked, leaves a `LinkedList` alone and unifies anything else with
+    /// `List <fresh>` -- the whole definition gets to decide first, so a later
+    /// use can still make it a `LinkedList`.
+    ///
+    /// The mismatch is reported HERE rather than left to `unify`, because
+    /// `report_conflict` reports only primitive pairs and a list meeting an
+    /// Integer is not one.
+    pub fn settle_empty_lists(&mut self) {
+        while self.empty_lists_settled < self.empty_lists.len() {
+            let ty = self.empty_lists[self.empty_lists_settled].clone();
+            self.empty_lists_settled += 1;
+            match strip_linear(self.resolve(&ty)) {
+                Ty::LinkedList(_) | Ty::List(_) | Ty::Error => {}
+                other => {
+                    let elem = self.fresh();
+                    let list = Ty::List(Box::new(elem));
+                    if !self.unify(&list, &ty) {
+                        let got = self.deep_resolve(&other);
+                        self.error(Cdx::TYPE_MISMATCH,
+                                   format!("Type mismatch: {} vs {}", type_desc(&list), type_desc(&got)));
+                    }
+                }
+            }
         }
     }
 
@@ -2144,6 +2183,12 @@ fn param_walk(t: &Ty, syms: &SymTab, st: &mut UnifyState, entries: &mut Vec<Para
 /// the plug/monomorphisation phase; defaulting it here would wrongly make a
 /// polymorphic definition monomorphic.
 fn default_ambiguous_vars(st: &mut UnifyState, def_var_start: u32, own_type: Option<&Ty>) {
+    // **EMPTY LISTS ARE SETTLED FIRST.** An empty literal's variable is exactly
+    // the orphan this closes to int-default, and a closed one then settles as
+    // `List a` meeting `Integer`: `[] == []` (list-equality) and klondike's
+    // three reported mismatches the oracle does not. Upstream settles inside
+    // `check-def` and closes orphans only later, in RESOLVE.
+    st.settle_empty_lists();
     let mut generics = std::collections::BTreeSet::new();
     if let Some(t) = own_type {
         collect_type_vars(&st.deep_resolve(t), &mut generics);
@@ -2310,6 +2355,8 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
     let trace = std::env::var_os("CDX_TRACE_DIAGS").is_some();
     let rt_names: Vec<Sym> = ch.defs.iter().filter(|d| d.is_punctual).map(|d| d.name).collect();
     for (i, d) in ch.defs.iter().enumerate() {
+        // The previous definition is checked: decide its empty lists.
+        st.settle_empty_lists();
         if trace {
             eprintln!("DEF {} diags-so-far {}", ch.syms.text(d.name), st.diags.len());
         }
@@ -2578,6 +2625,8 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
         }
     }
     // `check-rt-cycles`, then `check-bounded-decls`, before the proof rules.
+    // The last definition's empty lists.
+    st.settle_empty_lists();
     crate::punctual::check_cycles(ch, &mut st);
     crate::cost::check_bounded_decls(ch, &mut st);
     // `check-proof-cycles` and `check-proof-grammar`, over the checked types.
@@ -3186,6 +3235,7 @@ pub fn infer_row(
             if xs.is_empty() {
                 let e = st.fresh();
                 st.record_expr_type(*sp, e.clone());
+                st.empty_lists.push(e.clone());
                 return (e, EffectRow::default());
             }
             let mut elem = Ty::Error;
