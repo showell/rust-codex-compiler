@@ -229,8 +229,18 @@ pub fn apply(ch: &mut Chapter) {
             }
             continue;
         }
+        // **ONE INSTANCE: THE FUNCTION IS SPECIALIZED TO IT** (U62, main
+        // 27104). Dropping the constraint left `tv` free, and a body that then
+        // fixed it through the class's method was refused with CDX2087
+        // (`section-title-keywords`). Its type variable becomes the one
+        // instance's head, so a call at a type with no instance is a type
+        // error, as it should be.
         if instance_count(cls) == 1 {
-            d.declared_type = vec![(*body).clone()];
+            let head = instance_defs.iter().find(|i| i.class_name == cls).map(|i| i.head.clone());
+            d.declared_type = vec![match head {
+                Some(h) => crate::desugar::specialize_class_var(&body, tv, &h),
+                None => (*body).clone(),
+            }];
             continue;
         }
         // A class with several instances: the dictionary parameter and the

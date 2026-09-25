@@ -798,9 +798,22 @@ impl<'a> Desugar<'a> {
             1 => head[0].clone(),
             _ => format!("{}[{}]", head[0], head[1..].join(",")),
         };
+        // Nested heads (`List (List Integer)`) flatten here: the tokens carry
+        // no brackets. None in the depot's tests has one.
+        let named: Vec<TypeExpr> = sig
+            .iter()
+            .skip(1)
+            .map(|t| TypeExpr::Named(self.sym(t), self.synth()))
+            .collect();
+        let head = match named.len() {
+            0 => TypeExpr::Named(self.sym_str(""), self.synth()),
+            1 => named[0].clone(),
+            _ => TypeExpr::App(Rc::new(named[0].clone()), named[1..].to_vec(), self.synth()),
+        };
         InstanceDef {
             class_name,
             type_name: self.sym_str(&key),
+            head,
             methods: n
                 .children_of(NodeKind::InstanceMethod)
                 .map(|m| InstanceMethodDef {
@@ -910,10 +923,29 @@ impl<'a> Desugar<'a> {
                     span: self.synth(),
                 });
             }
-            let mk = |name: Name, params: Vec<Name>, body: Expr| Def {
+            // **EACH SYNTHESISED DEFINITION IS DECLARED** (U62,
+            // `instance-method-types`): a method's type is its class
+            // signature with the class variable `a` replaced by the instance
+            // head, and the dictionary is `CDict <head>`. Undeclared, `m` was
+            // one monomorphic variable that its first caller shaped and the
+            // caller's orphan-defaulting then closed -- so `bound-value 1
+            // True` fixed the method's own `b` to Integer before the body was
+            // ever checked. Declared, each use instantiates the method's own
+            // variables afresh, which is what MethodLocalPolymorphism.md's
+            // stage 1 relies on.
+            let a = self.sym_str("a");
+            let class_sig = |m: Name| -> Vec<TypeExpr> {
+                ch.class_defs
+                    .iter()
+                    .find(|c| c.name == id.class_name)
+                    .and_then(|c| c.methods.iter().find(|op| op.name == m))
+                    .map(|op| vec![specialize_class_var(&op.type_expr, a, &id.head)])
+                    .unwrap_or_default()
+            };
+            let mk = |name: Name, params: Vec<Name>, body: Expr, declared: Vec<TypeExpr>| Def {
                 name,
                 params: params.into_iter().map(|n| Param { name: n, span: self.synth() }).collect(),
-                declared_type: Vec::new(),
+                declared_type: declared,
                 body,
                 chapter_slug: String::new(),
                 origin: self.slug.clone(),
@@ -923,10 +955,12 @@ impl<'a> Desugar<'a> {
                 wcet_budget: 0,
                 bounded_class: None,
             };
+            let dict_ty = self.sym_str(&format!("{class_text}Dict"));
             out.push(mk(
                 self.sym_str(&format!("{class_text}-dict-{key}")),
                 Vec::new(),
-                Expr::Record(self.sym_str(&format!("{class_text}Dict")), fields, self.synth()),
+                Expr::Record(dict_ty, fields, self.synth()),
+                vec![TypeExpr::App(Rc::new(TypeExpr::Named(dict_ty, self.synth())), vec![id.head.clone()], self.synth())],
             ));
             for m in &id.methods {
                 let mname = self.syms.borrow().text(m.name).to_string();
@@ -934,11 +968,12 @@ impl<'a> Desugar<'a> {
                     self.sym_str(&format!("{mname}-{key}")),
                     m.params.clone(),
                     m.body.clone(),
+                    class_sig(m.name),
                 ));
             }
             if instances == 1 {
                 for m in &id.methods {
-                    out.push(mk(m.name, m.params.clone(), m.body.clone()));
+                    out.push(mk(m.name, m.params.clone(), m.body.clone(), class_sig(m.name)));
                 }
             }
         }
@@ -2005,5 +2040,24 @@ mod a_unit_family_is_definitions_not_just_a_type {
         // The base member's factor is 1, and both sides drop the arithmetic.
         let base = ch.defs.iter().find(|d| ch.syms.text(d.name) == "Duration-to-Nanosecond").unwrap();
         assert!(matches!(base.body, crate::ast::Expr::NameRef(..)), "{:?}", base.body);
+    }
+}
+
+/// `specialize-type-var` (Desugarer.codex, U62): `var` replaced by `head`
+/// everywhere in `ty`, except under a `forall` that rebinds it.
+pub(crate) fn specialize_class_var(ty: &TypeExpr, var: Name, head: &TypeExpr) -> TypeExpr {
+    let go = |t: &TypeExpr| specialize_class_var(t, var, head);
+    match ty {
+        TypeExpr::Named(n, _) if *n == var => head.clone(),
+        TypeExpr::Named(..) => ty.clone(),
+        TypeExpr::Fun(p, r, s) => TypeExpr::Fun(Rc::new(go(p)), Rc::new(go(r)), *s),
+        TypeExpr::App(c, args, s) => TypeExpr::App(Rc::new(go(c)), args.iter().map(go).collect(), *s),
+        TypeExpr::Effect(e, sc, t, r, s) => TypeExpr::Effect(e.clone(), sc.clone(), t.clone(), Rc::new(go(r)), *s),
+        TypeExpr::BoundedInt(b, lo, hi, m, s) => TypeExpr::BoundedInt(Rc::new(go(b)), *lo, *hi, *m, *s),
+        TypeExpr::PropEq(l, r, s) => TypeExpr::PropEq(Rc::new(go(l)), Rc::new(go(r)), *s),
+        TypeExpr::Constrained(cn, cv, b, s) => TypeExpr::Constrained(*cn, *cv, Rc::new(go(b)), *s),
+        TypeExpr::Linear(i, s) => TypeExpr::Linear(Rc::new(go(i)), *s),
+        TypeExpr::Forall(v, _, _, _) if *v == var => ty.clone(),
+        TypeExpr::Forall(v, vt, p, s) => TypeExpr::Forall(*v, Rc::new(go(vt)), Rc::new(go(p)), *s),
     }
 }

@@ -295,6 +295,10 @@ pub struct InstanceMethodDef {
 pub struct InstanceDef {
     pub class_name: Name,
     pub type_name: Name,
+    /// The instance head as a TYPE, where `type_name` is only its key:
+    /// `Integer`, or `List Integer` for `instance C (List Integer)`. It is
+    /// what `a` becomes in the synthesised methods' declared types.
+    pub head: TypeExpr,
     pub methods: Vec<InstanceMethodDef>,
     pub span: Span,
 }

@@ -288,6 +288,7 @@ impl Cdx {
     pub const LIST_PATTERN_SHAPE: u16 = 2088;
     pub const UNREACHABLE_MATCH_ARM: u16 = 2096;
     pub const BODY_FIXES_DECLARED_VAR: u16 = 2087;
+    pub const CLASS_DICT_BY_HAND: u16 = 2098;
     pub const FIELD_ASSIGN_UNOBSERVABLE: u16 = 2068;
     pub const LIST_LITERAL_TOO_LARGE: u16 = 9004;
     pub const INVALID_TAB_ESCAPE: u16 = 5;
@@ -2285,6 +2286,7 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
     // defines `max` shadows the builtin, which the golds show for that name.
     let mut env = builtin_env(&ch.syms, &tds);
     env.derivings = &ch.derivings;
+    env.method_local_dicts = method_local_dicts(ch);
     // Collected during the walk and appended after it, so a lookup by name
     // finds the instantiated type rather than the generalised one.
     // The registry the linear walk asks one question of: is the callee's k-th
@@ -3429,6 +3431,18 @@ pub fn infer_row(
             let is_record = matches!(result, Ty::Record(..))
                 && env.type_defs.record_fields(rec_name).is_some()
                 && !is_synthetic(*sp);
+            // `ClassDictByHand` (U62, CDX2098): a dictionary of a class whose
+            // methods are generic in variables of their own is built only by
+            // an instance declaration, where each method is checked with those
+            // variables rigid (CDX2087). A record written here is not, and
+            // field access freshens them at every use, so it would be unsound.
+            // The desugarer's own construction has a synthetic span.
+            if !is_synthetic(*sp) && env.method_local_dicts.contains(&rec_name) {
+                st.error(
+                    Cdx::CLASS_DICT_BY_HAND,
+                    format!("'{}' is the dictionary of a class whose methods are generic in type variables of their own, and only an instance declaration builds one: a field written here is not checked to answer every choice of those variables. Declare an instance of the class instead", env.syms.text(rec_name)),
+                );
+            }
             for f in fields {
                 let (ft, frow) = infer_row(&f.value, env, st);
                 // `record-field-unknown`: a field the record does not declare.
@@ -3517,6 +3531,14 @@ pub fn infer_row(
                 // not the same, so the record has to be resolved first.
                 Ty::Constructed(n, cargs) => match env.type_defs.declared().get(&n) {
                     Some(Ty::Record(..)) => match constructed_field(env, n, &cargs, *f) {
+                        // `freshen-method-local` (U62, COMPILER-83 stage 1):
+                        // a class method's own variables are fresh at every
+                        // projection of its dictionary, or the first use of
+                        // `b` fixes it for every later one.
+                        Some(t) if env.method_local_dicts.contains(&n) => match env.get(n) {
+                            Some(ctor) => freshen_method_local(st, ctor, t),
+                            None => t,
+                        },
                         Some(t) => t,
                         None => {
                             st.error(Cdx::UNKNOWN_RECORD_FIELD, format!(
@@ -3834,6 +3856,10 @@ pub struct TyEnv<'a> {
     pub const_ranges: Vec<(Sym, crate::narrowing::Range)>,
     /// The chapter's `deriving` clauses, by type name.
     pub derivings: &'a [(Sym, Vec<String>)],
+    /// `__method-local` (U62): the dictionary record of every class with a
+    /// method generic in type variables of its own. Only an instance
+    /// declaration may build one; see `Cdx::CLASS_DICT_BY_HAND`.
+    pub method_local_dicts: Vec<Sym>,
 }
 
 impl<'a> TyEnv<'a> {
@@ -3846,6 +3872,7 @@ impl<'a> TyEnv<'a> {
             local_ranges: Vec::new(),
             const_ranges: Vec::new(),
             derivings: &[],
+            method_local_dicts: Vec::new(),
         }
     }
     pub fn get(&self, n: Sym) -> Option<&Ty> {
@@ -4760,4 +4787,68 @@ mod unification_stays_acyclic {
         assert!(!st.unify(&maybe, &either), "different names do not unify");
         assert_eq!(st.errors(), 0, "but a variable is present, so it is a gap");
     }
+}
+
+/// `method-local-dicts` (TypeChecker.codex, U62): the `CDict` record of each
+/// class with a method whose signature names a type variable other than the
+/// class's own `a`. A type variable is a lowercase name in type position.
+fn method_local_dicts(ch: &crate::ast::Chapter) -> Vec<Sym> {
+    fn free_vars(t: &crate::ast::TypeExpr, syms: &SymTab, out: &mut Vec<String>) {
+        use crate::ast::TypeExpr as T;
+        match t {
+            T::Named(n, _) => {
+                let text = syms.text(*n);
+                if text.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
+                    out.push(text.to_string());
+                }
+            }
+            T::Fun(p, r, _) => { free_vars(p, syms, out); free_vars(r, syms, out); }
+            T::App(c, args, _) => { free_vars(c, syms, out); for a in args { free_vars(a, syms, out); } }
+            T::Effect(_, _, _, r, _) | T::Linear(r, _) | T::BoundedInt(r, ..) | T::Constrained(_, _, r, _) => free_vars(r, syms, out),
+            T::PropEq(l, r, _) => { free_vars(l, syms, out); free_vars(r, syms, out); }
+            T::Forall(_, vt, p, _) => { free_vars(vt, syms, out); free_vars(p, syms, out); }
+        }
+    }
+    let mut out = Vec::new();
+    for c in &ch.class_defs {
+        let has_own = c.methods.iter().any(|m| {
+            let mut vs = Vec::new();
+            free_vars(&m.type_expr, &ch.syms, &mut vs);
+            vs.iter().any(|v| v != "a")
+        });
+        if has_own {
+            if let Some(d) = ch.syms.find(&format!("{}Dict", ch.syms.text(c.name))) {
+                out.push(d);
+            }
+        }
+    }
+    out
+}
+
+/// `freshen-method-local` (TypeCheckerInference.codex, U62): every variable
+/// the record constructor quantifies that is NOT one of the record's own
+/// arguments is a method-local binder, and is replaced by a fresh variable in
+/// this one projection's field type.
+fn freshen_method_local(st: &mut UnifyState, ctor: &Ty, mut field: Ty) -> Ty {
+    let mut bound = Vec::new();
+    let mut t = ctor;
+    while let Ty::ForAll(id, body) = t {
+        bound.push(*id);
+        t = body;
+    }
+    let mut spine = t;
+    while let Ty::Fun(_, _, r) = spine {
+        spine = r;
+    }
+    let own: Vec<u32> = match spine {
+        Ty::Record(_, rargs) => rargs.iter().filter_map(|a| if let Ty::Var(v) = a { Some(*v) } else { None }).collect(),
+        _ => Vec::new(),
+    };
+    for id in bound {
+        if !own.contains(&id) {
+            let fresh = st.fresh();
+            field = subst_type_var(&field, id, &fresh);
+        }
+    }
+    field
 }
