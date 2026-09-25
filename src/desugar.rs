@@ -746,6 +746,8 @@ impl<'a> Desugar<'a> {
             self.sym_str(e);
         }
         ch.syms = std::mem::take(&mut *self.syms.borrow_mut());
+        // Stage 2 of U62's method-local polymorphism, before the class rewrite.
+        crate::dict_projections::apply(&mut ch);
         crate::classes::apply(&mut ch);
         // The chapter scoper runs on the whole unit, before the proof plan
         // reads definitions by name.

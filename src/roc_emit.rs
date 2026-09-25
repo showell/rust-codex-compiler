@@ -511,6 +511,7 @@ pub fn emit_modules(
         claim_module(&mut slugs, &mut chapter_of, c)?;
     }
     let mut files = Vec::new();
+    let mut undeclared: Vec<String> = Vec::new();
     // Who each emitted module imports, for the prune below.
     let mut needs: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut prelude = false;
@@ -549,8 +550,14 @@ pub fn emit_modules(
             // So it is not declared. A dictionary used through a call is a
             // direct call by now; one that is still used as a value fails in
             // Roc as an undeclared type, which is that boundary, named.
-            if module_slug(c) == *slug && !has_free_field_binder(td, syms) {
-                items.push_str(&cx.type_def(td, base)?);
+            if module_slug(c) == *slug {
+                if has_free_field_binder(td, syms) {
+                    if let crate::ast::TypeDef::Record(n, ..) = td {
+                        undeclared.push(type_name(syms.text(*n)));
+                    }
+                } else {
+                    items.push_str(&cx.type_def(td, base)?);
+                }
             }
         }
         let mut main = None;
@@ -632,6 +639,17 @@ pub fn emit_modules(
             stack.extend(needs.get(&m).cloned().unwrap_or_default());
         }
         files.retain(|(name, _)| seen.contains(name.trim_end_matches(".roc")));
+    }
+    // **A DICTIONARY LEFT UNDECLARED BUT STILL USED IS REFUSED, BY NAME.**
+    // Stage 2 turns every projection of a generated dictionary into a direct
+    // call; one that is passed on, stored, or reached through a shadowed name
+    // is a runtime value whose field is generic in a variable of its own, and
+    // no Roc type holds it. Upstream's typed backends refuse the same thing
+    // (UNSUPPORTED_FREE_BINDER); saying so beats an undeclared-type error.
+    for (_, text) in &files {
+        if let Some(n) = undeclared.iter().find(|n| mentions(text, n)) {
+            return Err(format!("class dictionary `{n}` is used as a value, and its methods are generic in type variables of their own: no Roc type holds it (upstream's typed backends refuse it too: UNSUPPORTED_FREE_BINDER)"));
+        }
     }
     Ok(files)
 }
