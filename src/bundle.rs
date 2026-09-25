@@ -160,9 +160,7 @@ impl Quires {
     /// either.
     pub fn read(codex: &Path, local: Option<&Path>) -> Result<Self, String> {
         let mut entries = Vec::new();
-        let map = codex.join("build").join("quire-map.ps1");
-        let text = std::fs::read_to_string(&map)
-            .map_err(|e| format!("cannot read the quire registry at {}: {e}", map.display()))?;
+        let (map, text) = quire_registry(codex)?;
         for (quire, dir) in parse_quire_map(&text) {
             entries.push((quire, codex.join(dir)));
         }
@@ -227,6 +225,22 @@ impl Quires {
     }
 }
 
+/// The file holding the `$QuireDirs` table, and its text.
+///
+/// **THE GENERATED REGISTRY, read where it is generated.** Since Update 62 the
+/// quire map is written in Codex (`codex/build/quiremapScript.codex`) and
+/// generated to `build/host/windows/quire-map.ps1`. `build/quire-map.ps1` is
+/// kept upstream only as a shim for the many scripts that dot-source that
+/// path; nothing here dot-sources anything, so this reads the generated file
+/// and does not follow the shim. A checkout from before U62 has no such file
+/// and is refused by name.
+fn quire_registry(codex: &Path) -> Result<(PathBuf, String), String> {
+    let map = codex.join("build").join("host").join("windows").join("quire-map.ps1");
+    let text = std::fs::read_to_string(&map)
+        .map_err(|e| format!("cannot read the quire registry at {}: {e}", map.display()))?;
+    Ok((map, text))
+}
+
 /// Pull `'Name' = 'dir'` pairs out of the `$QuireDirs = @{ ... }` table.
 ///
 /// A hand parser rather than a regex: it has to stop at the table's closing
@@ -254,6 +268,21 @@ fn parse_quire_map(text: &str) -> Vec<(String, String)> {
             out.push((key.to_string(), vrest[..vclose].replace('\\', "/")));
             rest = &vrest[vclose + 1..];
         }
+    }
+    // A quire can also be added after the table, one indexed assignment per
+    // line: U62 registers `$QuireDirs['Accp'] = 'apps\\accp'` that way.
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let Some(rest) = line.strip_prefix("$QuireDirs['") else { continue };
+        let Some(close) = rest.find('\'') else { continue };
+        let key = &rest[..close];
+        let tail = &rest[close + 1..];
+        let Some(eq) = tail.find('=') else { continue };
+        let after_eq = &tail[eq + 1..];
+        let Some(vopen) = after_eq.find('\'') else { continue };
+        let vrest = &after_eq[vopen + 1..];
+        let Some(vclose) = vrest.find('\'') else { continue };
+        out.push((key.to_string(), vrest[..vclose].replace('\\', "/")));
     }
     out
 }
@@ -667,7 +696,7 @@ mod tests {
     fn checkout(root: &Path) {
         write(&root.join(MARKER), "Chapter: Opening\n");
         write(
-            &root.join("build/quire-map.ps1"),
+            &root.join("build/host/windows/quire-map.ps1"),
             "$QuireDirs = @{\n    'Foreword' = 'codex\\foreword\\core'; 'Parsmi' = 'codex\\parsmi'\n}\n",
         );
         for name in ["ListUtils", "Tuple", "Maybe"] {
@@ -680,6 +709,19 @@ mod tests {
 
     fn headers(text: &str) -> Vec<&str> {
         text.lines().filter_map(|l| l.strip_prefix("Chapter: ")).collect()
+    }
+
+    /// U62 registers `Accp` after the table, by indexed assignment.
+    #[test]
+    fn quire_map_reads_an_indexed_assignment_after_the_table() {
+        let t = "$QuireDirs = @{\n    'Foreword' = 'codex\\foreword\\core'\n}\n$QuireDirs['Accp'] = 'apps\\accp'\n";
+        assert_eq!(
+            parse_quire_map(t),
+            vec![
+                ("Foreword".into(), "codex/foreword/core".into()),
+                ("Accp".into(), "apps/accp".into()),
+            ]
+        );
     }
 
     #[test]
@@ -701,7 +743,7 @@ mod tests {
     fn the_projects_own_quire_file_beats_the_checkouts_and_says_so() {
         let dir = scratch("quires");
         write(
-            &dir.join("build/quire-map.ps1"),
+            &dir.join("build/host/windows/quire-map.ps1"),
             "$QuireDirs = @{\n    'Safari' = 'apps\\safari\\port'\n    'OS' = 'codex\\os'\n}",
         );
         let local = dir.join("quires.tsv");
