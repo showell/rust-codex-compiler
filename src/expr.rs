@@ -178,6 +178,16 @@ fn parse_binary(p: &mut Parser<'_>, min_prec: i32, min_col: u32) -> NodeKind {
         }
         p.bump(); // the operator
         p.skip_newlines();
+        // `refuse-plus-plus`: a `+` touching the next `+` is `++`, which is
+        // not Codex (CDX1075); the second `+` is taken with it.
+        if t.kind == Kind::Plus {
+            if let Some(n) = p.sig(0) {
+                if n.kind == Kind::Plus && n.offset == t.offset + 1 {
+                    p.err("`++` is not Codex; text concatenation is `&`");
+                    p.bump();
+                }
+            }
+        }
         let next_min = if right_assoc(t.kind) { prec } else { prec + 1 };
         parse_binary(p, next_min, min_col);
         p.b.wrap_from(cp, NodeKind::Bin);

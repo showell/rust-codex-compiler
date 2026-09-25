@@ -401,6 +401,10 @@ pub struct Chapter {
     /// `type_defs`. A `TypeDef` carries no slug of its own; an emitter that
     /// writes one module per chapter needs to know where a type lives.
     pub type_def_chapters: Vec<String>,
+    /// Every `Chapter:` header in the unit, in order, as written
+    /// (`Foreword--ListUtils`). `check-cites-resolve` asks it whether a cited
+    /// chapter is here at all.
+    pub chapter_names: Vec<String>,
     pub effect_defs: Vec<EffectDef>,
     pub class_defs: Vec<ClassDef>,
     pub instance_defs: Vec<InstanceDef>,

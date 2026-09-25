@@ -260,6 +260,9 @@ pub struct Diag {
     pub message: String,
 }
 
+/// `max-errors` (Core/BuildSettings.codex).
+const MAX_ERRORS: usize = 20;
+
 /// The `CdxCodes.codex` numbers we raise. **These are upstream's, not ours** --
 /// a diagnostic is part of the wire a user reads, and inventing a number would
 /// make two compilers disagree about what a program's problem IS while
@@ -280,6 +283,8 @@ impl Cdx {
     pub const TYPE_ARITY: u16 = 2032;
     pub const DUPLICATE_DEFINITION: u16 = 3001;
     pub const UNDEFINED_TYPE_NAME: u16 = 3008;
+    pub const CITE_NOT_IN_UNIT: u16 = 3007;
+    pub const TOO_MANY_ERRORS: u16 = 1;
     pub const UNKNOWN_PATTERN_CTOR: u16 = 2072;
     pub const NARROWING_RECORD_SET_LITERAL: u16 = 2050;
     pub const NARROWING_RECORD_SET: u16 = 2051;
@@ -811,6 +816,9 @@ impl UnifyState {
         // element types play no part, so a pair holding variables counts.
         let vector_conflict = match (&ra, &rb) {
             (Ty::Vector(w1, _), Ty::Vector(w2, _)) => *w1 >= 0 && *w2 >= 0 && w1 != w2,
+            // Masks of two widths too (Unifier.codex:676): a comparison of
+            // two `Vector 4` makes a `VectorMask 4`, and `mask-all` takes a 2.
+            (Ty::VectorMask(w1), Ty::VectorMask(w2)) => w1 != w2,
             (Ty::Vector(..), Ty::SizedVec(..)) | (Ty::SizedVec(..), Ty::Vector(..)) => true,
             _ => false,
         };
@@ -1807,6 +1815,7 @@ fn type_desc(t: &Ty) -> String {
         Ty::TypeApply(f, x) => format!("App[{} {}]", type_desc(f), type_desc(x)),
         Ty::Vector(n, e) => format!("Vector {n} {}", type_desc(e)),
         Ty::SizedVec(n, e) => format!("SizedVec {n} {}", type_desc(e)),
+        Ty::VectorMask(n) => format!("VectorMask {n}"),
         _ => head_name(t).to_string(),
     }
 }
@@ -2639,11 +2648,23 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
     // dropped here, as it was never found there.
     // A parse-phase code raised here (the type syntax rules) halts earlier
     // still, on its own.
-    let halts = |code: u16| code < 2000 || matches!(code, Cdx::DUPLICATE_DEFINITION | Cdx::UNDEFINED_NAME);
+    // A cite of a chapter the unit lacks (CDX3007) is the resolver's too:
+    // upstream merges it into the same bag, ahead of the undefined names.
+    let halts = |code: u16| {
+        code < 2000 || matches!(code, Cdx::DUPLICATE_DEFINITION | Cdx::UNDEFINED_NAME | Cdx::CITE_NOT_IN_UNIT)
+    };
     if st.diags.iter().any(|d| d.code < 2000) {
         st.diags.retain(|d| d.code < 2000);
     } else if st.diags.iter().any(|d| halts(d.code)) {
         st.diags.retain(|d| halts(d.code));
+    }
+    // **TWENTY ERRORS, THEN ONE THAT SAYS SO.** Upstream's `bag-add-error`
+    // (Core/DiagnosticBag.codex) keeps the first `max-errors` (20,
+    // BuildSettings) and appends CDX0001 "Too many errors. Further errors
+    // suppressed." once; a program with thirty undefined names reports 21.
+    if st.diags.len() > MAX_ERRORS {
+        st.diags.truncate(MAX_ERRORS);
+        st.error(Cdx::TOO_MANY_ERRORS, "Too many errors. Further errors suppressed.");
     }
     // The check/lower boundary, where upstream sorts too: everything below
     // this line looks entries up rather than appending them.
@@ -2874,8 +2895,7 @@ pub fn infer_row(
                 //
                 // Not modelled here, because upstream adds them AROUND these
                 // same functions and the subject exercises none on the wire:
-                // the real-equality and text-ordering bans, `infer-comparison`
-                // 's VectorMask result, and `infer-arithmetic`'s UnitTy arms.
+                // `infer-arithmetic`'s UnitTy arms.
 
                 // `infer-comparison`: the operands MEET, the answer is Boolean.
                 OpEq | OpNotEq | OpLt | OpGt | OpLtEq | OpGtEq | OpDefEq
@@ -2886,6 +2906,19 @@ pub fn infer_row(
                     let (rl, rr) = (st.resolve(&lt), st.resolve(&rt));
                     let real = |t: &Ty| matches!(t, Ty::Real(..));
                     let text_or_char = |t: &Ty| matches!(t, Ty::Text | Ty::Char);
+                    // `infer-comparison`: two `Vector n` compare lane by lane
+                    // into a `VectorMask n` (codex/test's vec-wide-refused:
+                    // `mask-all (wide 7 == wide 7)` is a mask of 4 where a
+                    // mask of 2 is taken). A ban below answers Boolean.
+                    let mask = match st.deep_resolve(&lt) {
+                        Ty::Vector(n, _) => Some(n),
+                        _ => None,
+                    };
+                    let banned = match op {
+                        OpEq | OpNotEq => real(&rl) || real(&rr),
+                        OpLt | OpGt | OpLtEq | OpGtEq => text_or_char(&rl) || text_or_char(&rr),
+                        _ => false,
+                    };
                     match op {
                         OpEq | OpNotEq if real(&rl) || real(&rr) => st.error(
                             Cdx::REAL_EQUALITY_BANNED,
@@ -2897,7 +2930,10 @@ pub fn infer_row(
                         ),
                         _ => {}
                     }
-                    Ty::Boolean
+                    match mask {
+                        Some(n) if !banned => Ty::VectorMask(n),
+                        _ => Ty::Boolean,
+                    }
                 }
                 // `infer-logical`: both operands MEET Boolean.
                 OpOr | OpBoolAnd => {

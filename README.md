@@ -229,8 +229,14 @@ cloud container is set up.
   (`Empty`) to be allocated at each construction, where the interpreter
   builds it once. Changing that moves every heap measurement, so it waits.
   The rest of the gap is mostly device builtins the interpreter has no rule
-  for (`alloc-bytes`, `port-out-32`, `block-read-sector`, ...) and programs
-  that exceed the sweep's step limit.
+  for (`port-out-32`, `block-read-sector`, ...) and programs that exceed the
+  sweep's step limit.
+- **Next, ready to gate: `alloc-bytes` in the interpreter.** One rule in
+  `src/interp.rs` beside `peek-byte`:
+  `("alloc-bytes", [Int(n)]) => Ok(Int(self.bump.alloc(*n)))` -- the heap
+  pointer, then the bump, as x86's `emit-alloc-bytes-helper` does. Tried
+  2026-09-25 on the 50 sweep programs that stopped there: 38 then match.
+  Not committed until the sweep and the curated interpreter arms have run.
 - **roc-apps `tests/ported`** is emitted with `rocemit --whole` by
   `tests/package.py`; each unit's stubs and omissions are in
   `~/build/roc-apps/gen/whole/<unit>/notes.txt`.

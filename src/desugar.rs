@@ -190,6 +190,22 @@ impl<'a> Desugar<'a> {
             .unwrap_or_default()
     }
 
+    /// `cites Quire chapter Resolve Types (a, b)`: the chapter's name is the
+    /// words after `chapter`, up to the selection or the line's end, one
+    /// space apart as upstream spells it. It was dropped here once -- every
+    /// citation carried an empty name -- so nothing could ask whether the
+    /// cited chapter was in the unit (CDX3007).
+    fn cited_chapter(&self, n: &Node) -> Name {
+        let toks: Vec<String> = n
+            .tokens()
+            .filter(|t| !t.kind.is_trivia() && !matches!(t.kind, Kind::Newline | Kind::Indent | Kind::Dedent))
+            .map(|t| self.text(t).to_string())
+            .collect();
+        let Some(at) = toks.iter().position(|t| t == "chapter") else { return Name::default() };
+        let words: Vec<&str> = toks[at + 1..].iter().take_while(|t| *t != "(").map(String::as_str).collect();
+        self.sym_str(&words.join(" "))
+    }
+
     /// The first token whatever its kind -- a record field or a constructor
     /// may be named with a keyword.
     fn leading(&self, n: &Node) -> Name {
@@ -661,6 +677,7 @@ impl<'a> Desugar<'a> {
             match child.kind {
                 NodeKind::ChapterHeader => {
                     slug = crate::preamble::header_text(child, self.src);
+                    ch.chapter_names.push(slug.clone());
                     ch.name = self.sym_str(&slug);
                     ch.chapter_title = slug.clone();
                 }
@@ -710,7 +727,7 @@ impl<'a> Desugar<'a> {
                 NodeKind::InstanceDef => ch.instance_defs.push(self.instance_def(child)),
                 NodeKind::Cites => ch.citations.push(CitesDecl {
                     quire: self.name_of(child),
-                    chapter_name: Name::default(),
+                    chapter_name: self.cited_chapter(child),
                     selected_names: Vec::new(),
                     citing_chapter: slug.clone(),
                     span: head_span(child),

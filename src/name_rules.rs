@@ -18,8 +18,43 @@ use crate::symbol::SymTab;
 
 pub fn check(ch: &Chapter, tds: &TypeDefs, st: &mut UnifyState) {
     type_syntax(ch, st);
+    cites_resolve(ch, st);
     duplicates(ch, st);
     type_names(ch, tds, st);
+}
+
+/// `check-cites-resolve` (Semantics/ChapterScoper.codex): a `cites Q chapter
+/// C` whose chapter is not in this unit is CDX3007, an error since
+/// 2026-07-20. A chapter is in the unit if a header or a definition names it;
+/// names compare by `cite-key` -- spaces dropped, capitals lowered -- on the
+/// part after `Quire--`. Upstream merges these ahead of name resolution's, so
+/// a unit missing a chapter reports the missing chapter first rather than
+/// every name it would have supplied.
+fn cites_resolve(ch: &Chapter, st: &mut UnifyState) {
+    fn key(s: &str) -> String {
+        s.chars().filter(|c| *c != ' ').map(|c| c.to_ascii_lowercase()).collect()
+    }
+    fn bare(s: &str) -> &str {
+        s.find("--").map_or(s, |p| &s[p + 2..])
+    }
+    let present: std::collections::HashSet<String> = ch
+        .chapter_names
+        .iter()
+        .map(|n| key(bare(n)))
+        .chain(ch.defs.iter().map(|d| key(bare(&d.origin))))
+        .collect();
+    for c in &ch.citations {
+        let name = ch.syms.text(c.chapter_name);
+        if !present.contains(&key(name)) {
+            st.error(
+                crate::check::Cdx::CITE_NOT_IN_UNIT,
+                format!(
+                    "Cited chapter '{name}' of quire '{}' is not present in this compilation unit",
+                    ch.syms.text(c.quire)
+                ),
+            );
+        }
+    }
 }
 
 /// Upstream's type PARSER refuses these; this parser reads them and the

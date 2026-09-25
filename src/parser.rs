@@ -58,6 +58,8 @@ pub fn code_for(msg: &str) -> u16 {
         1072
     } else if msg.starts_with("Expected token kind mismatch") || msg.starts_with("expected '=' after the parameters") {
         1000
+    } else if msg.starts_with("`++` is not Codex") {
+        1075
     } else if msg.starts_with("Application ended at newline") {
         1070
     } else if msg.starts_with("A line may not begin with '.'") || msg.starts_with("A '.' selector must be followed by a field name") {
