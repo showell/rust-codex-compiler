@@ -848,3 +848,17 @@ pub const BUILTIN_ALLOC: &[(&str, &str)] = &[
 pub fn builtin_alloc(name: &str) -> &'static str {
     BUILTIN_ALLOC.iter().find(|(n, _)| *n == name).map_or("unknown", |(_, c)| c)
 }
+// The builtins that are CONSTANTS, with their values, read from the x86
+// emitter (`emit-constant-helper` and the `Integer = N` it names) by
+// ladder/builtins_probe.py --rust-constants. Builtins.codex carries only
+// their names and types. The interpreter and rocemit answer them from
+// here. Re-run the probe after a pin change; do not edit by hand.
+pub const CONSTANT_BUILTINS: [(&str, i64); 2] = [
+    ("pit-input-hz", 1193182),
+    ("pit-count", 11932),
+];
+
+/// The value of a builtin that is a constant (`CONSTANT_BUILTINS`).
+pub fn constant_builtin(name: &str) -> Option<i64> {
+    CONSTANT_BUILTINS.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
+}

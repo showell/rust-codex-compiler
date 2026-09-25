@@ -487,10 +487,146 @@ pub fn emit_modules(
     defs: &[IrDef],
     vm_flags: bool,
     by_reach: bool,
-) -> Result<Vec<(String, String)>, String> {
+    whole: bool,
+) -> Result<(Vec<(String, String)>, Vec<String>), String> {
     let called_back = crate::roc_forwarders::call_back_directly(defs);
     let defs = &called_back[..];
+    if !whole {
+        return emit_round(ch, tds, syms, defs, vm_flags, by_reach, None).map(|(files, _)| (files, Vec::new()));
+    }
+    // A round writes what it can and names what it could not; their
+    // dependents are then decided too (`settle_fates`), and the next round
+    // writes with every fate known. It ends when a round finds nothing new.
+    let mut fates: BTreeMap<Sym, Fate> = BTreeMap::new();
+    loop {
+        let (files, failed) = emit_round(ch, tds, syms, defs, vm_flags, by_reach, Some(&fates))?;
+        if failed.is_empty() {
+            // What was not written as written, for whoever runs this.
+            let notes = fates
+                .iter()
+                .map(|(n, f)| match f {
+                    Fate::Stub(why) => format!("stubbed `{}`: {why}", syms.text(*n)),
+                    Fate::Omit(why) => format!("left out `{}`: {why}", syms.text(*n)),
+                })
+                .collect();
+            return Ok((files, notes));
+        }
+        for (n, why) in failed {
+            let d = defs.iter().find(|d| d.name == n);
+            let fate = if d.is_some_and(|d| d.params.is_empty()) { Fate::Omit(why) } else { Fate::Stub(why) };
+            fates.insert(n, fate);
+        }
+        settle_fates(defs, syms, &mut fates);
+    }
+}
+
+/// What whole mode does with a definition it will not write as written.
+#[derive(Clone, Debug)]
+pub enum Fate {
+    /// A function: its body is `crash` with the reason.
+    Stub(String),
+    /// A constant, or a lifted lambda whose users are all gone: not
+    /// written at all, and why.
+    Omit(String),
+}
+
+/// The dependents of what is stubbed or left out, to a fixed point. A
+/// definition that names one left out cannot compile: a function is stubbed,
+/// a constant left out. A constant whose evaluation could reach a stub is
+/// left out as well, since Roc evaluates it while compiling; any call it can
+/// reach counts, taken or not.
+fn settle_fates(defs: &[IrDef], syms: &SymTab, fates: &mut BTreeMap<Sym, Fate>) {
+    let refs: BTreeMap<Sym, Vec<Sym>> = defs
+        .iter()
+        .map(|d| {
+            let mut out = Vec::new();
+            d.body.walk(&mut |x| {
+                if let IrExpr::Name(m, _, _) = x {
+                    out.push(*m);
+                }
+            });
+            (d.name, out)
+        })
+        .collect();
+    loop {
+        let mut changed = false;
+        for d in defs {
+            if fates.contains_key(&d.name) || syms.text(d.name) == "opening" {
+                continue;
+            }
+            let omitted = refs[&d.name].iter().find(|m| matches!(fates.get(m), Some(Fate::Omit(_))));
+            let fate = if let Some(m) = omitted {
+                let why = format!("it uses `{}`, which rocemit could not write", syms.text(*m));
+                Some(if d.params.is_empty() { Fate::Omit(why) } else { Fate::Stub(why) })
+            } else if d.params.is_empty() {
+                // Everything this constant's evaluation can reach.
+                let mut seen: std::collections::BTreeSet<Sym> = Default::default();
+                let mut stack = refs[&d.name].clone();
+                let mut hits_stub = None;
+                while let Some(m) = stack.pop() {
+                    if !seen.insert(m) {
+                        continue;
+                    }
+                    if matches!(fates.get(&m), Some(Fate::Stub(_))) {
+                        hits_stub = Some(m);
+                        break;
+                    }
+                    if let Some(r) = refs.get(&m) {
+                        stack.extend(r.iter().copied());
+                    }
+                }
+                hits_stub.map(|m| {
+                    Fate::Omit(format!("Roc evaluates it while compiling, and it can reach `{}`, a stub", syms.text(m)))
+                })
+            } else {
+                None
+            };
+            if let Some(f) = fate {
+                fates.insert(d.name, f);
+                changed = true;
+            }
+        }
+        // A LIFTED LAMBDA BELONGS TO THE DEFINITION IT WAS LIFTED OUT OF.
+        // When every user of one is stubbed or left out it goes too: it is
+        // not part of the chapter, and it is typed at the use that is gone
+        // (a dictionary's `\x y -> y`, lowered at its instance, is `I64, a
+        // -> I64`, which Roc rightly rejects).
+        for d in defs {
+            if fates.contains_key(&d.name) || !syms.text(d.name).starts_with("__lam_") {
+                continue;
+            }
+            let users: Vec<Sym> =
+                defs.iter().filter(|u| u.name != d.name && refs[&u.name].contains(&d.name)).map(|u| u.name).collect();
+            if users.iter().all(|u| fates.contains_key(u)) {
+                let why = match users.first() {
+                    Some(u) => format!("it was lifted out of `{}`, which rocemit could not write", syms.text(*u)),
+                    None => "nothing uses it".to_string(),
+                };
+                fates.insert(d.name, Fate::Omit(why));
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_round(
+    ch: &Chapter,
+    tds: &TypeDefs,
+    syms: &SymTab,
+    defs: &[IrDef],
+    vm_flags: bool,
+    by_reach: bool,
+    fates: Option<&BTreeMap<Sym, Fate>>,
+) -> Result<(Vec<(String, String)>, Vec<(Sym, String)>), String> {
     let mut cx = Cx::new(ch, tds, syms, defs, vm_flags, by_reach);
+    if let Some(f) = fates {
+        cx.whole = true;
+        cx.fates = f.clone();
+    }
     // **A UNIT WITH NO OPENING IS A LIBRARY**: every chapter a module, no
     // app. That is what a GPU kernel chapter is.
     // A `[Device]` opening (GlobeKernels has one, for the wgsl plug's root)
@@ -511,7 +647,16 @@ pub fn emit_modules(
         claim_module(&mut slugs, &mut chapter_of, c)?;
     }
     let mut files = Vec::new();
-    let mut undeclared: Vec<String> = Vec::new();
+    let undeclared: Vec<String> = ch
+        .type_defs
+        .iter()
+        .filter(|td| has_free_field_binder(td, syms))
+        .filter_map(|td| match td {
+            crate::ast::TypeDef::Record(n, ..) => Some(type_name(syms.text(*n))),
+            _ => None,
+        })
+        .collect();
+    cx.undeclared = undeclared.clone();
     // Who each emitted module imports, for the prune below.
     let mut needs: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut prelude = false;
@@ -551,11 +696,7 @@ pub fn emit_modules(
             // direct call by now; one that is still used as a value fails in
             // Roc as an undeclared type, which is that boundary, named.
             if module_slug(c) == *slug {
-                if has_free_field_binder(td, syms) {
-                    if let crate::ast::TypeDef::Record(n, ..) = td {
-                        undeclared.push(type_name(syms.text(*n)));
-                    }
-                } else {
+                if !has_free_field_binder(td, syms) {
                     items.push_str(&cx.type_def(td, base)?);
                 }
             }
@@ -571,6 +712,13 @@ pub fn emit_modules(
             // checks a definition even when nothing calls it. A call that
             // does reach one is refused (`unwritable_eq`).
             if cx.unwritable_eq(d.name).is_some() {
+                continue;
+            }
+            if cx.whole {
+                if let Some(t) = cx.def_or_stub(d, base) {
+                    items.push('\n');
+                    items.push_str(&t);
+                }
                 continue;
             }
             items.push('\n');
@@ -651,7 +799,7 @@ pub fn emit_modules(
             return Err(format!("class dictionary `{n}` is used as a value, and its methods are generic in type variables of their own: no Roc type holds it (upstream's typed backends refuse it too: UNSUPPORTED_FREE_BINDER)"));
         }
     }
-    Ok(files)
+    Ok((files, std::mem::take(&mut cx.failed)))
 }
 
 /// The module a chapter becomes: its name without the quire, its words run
@@ -758,6 +906,20 @@ struct Cx<'a> {
     /// Definitions the opening cannot reach that reach a device builtin, in a
     /// unit that runs without the machine, each with the builtin it reaches.
     stubbed: BTreeMap<Sym, Sym>,
+    /// **WHOLE MODE** (`rocemit --whole`): every definition of every chapter is
+    /// written, and one rocemit cannot write is a `crash` stub if it is a
+    /// function and left out if it is a constant. Roc evaluates a top-level
+    /// constant while it compiles, so a stubbed constant is a compile error
+    /// even when nothing uses it; a stubbed function compiles cleanly and
+    /// crashes, with its reason, only if a program calls it (verified on the
+    /// nightly). `fates` is what an earlier round decided; `failed` is what
+    /// this round could not write.
+    whole: bool,
+    /// Class dictionaries with no Roc type (`has_free_field_binder`): whole
+    /// mode stubs a definition whose text names one.
+    undeclared: Vec<String>,
+    fates: BTreeMap<Sym, Fate>,
+    failed: Vec<(Sym, String)>,
     /// **THE STATE THIS UNIT THREADS.** `Device` for a GPU kernel, whose
     /// type says so; `Mem` for a program that reads and writes an address
     /// space, whose type does NOT: Codex gives `peek-byte` and friends an
@@ -866,6 +1028,10 @@ impl<'a> Cx<'a> {
             device_defs: Default::default(),
             bang_defs: Default::default(),
             stubbed: Default::default(),
+            whole: false,
+            undeclared: Vec::new(),
+            fates: Default::default(),
+            failed: Vec::new(),
             state: "Device",
             dev: None,
             dev_n: 0,
@@ -1602,6 +1768,60 @@ impl<'a> Cx<'a> {
     /// **A DATA TABLE IS NOT EMITTED, AND THE OMISSION IS WRITTEN DOWN.**
     /// A definition, whole; a data table of thousands of literals is emitted
     /// as the literal it is, since the nightly's checker is linear in them.
+    /// Whole mode's `def`: the definition as written, else its stub, else
+    /// nothing. A failure is recorded for the next round and the state the
+    /// attempt left behind is put back.
+    fn def_or_stub(&mut self, d: &IrDef, base: usize) -> Option<String> {
+        match self.fates.get(&d.name).cloned() {
+            Some(Fate::Omit(_)) => return None,
+            Some(Fate::Stub(why)) => return self.stub(d, base, &why),
+            None => {}
+        }
+        let (locals, imports) = (self.locals.len(), self.imports.clone());
+        let written = self.def(d, base).and_then(|t| match self.undeclared.iter().find(|n| mentions(&t, n)) {
+            Some(n) => Err(format!("it uses class dictionary `{n}` as a value, and no Roc type holds it (UNSUPPORTED_FREE_BINDER)")),
+            None => Ok(t),
+        });
+        match written {
+            Ok(t) => Some(t),
+            Err(why) => {
+                self.locals.truncate(locals);
+                self.imports = imports;
+                self.dev = None;
+                self.failed.push((d.name, why.clone()));
+                if d.params.is_empty() { None } else { self.stub(d, base, &why) }
+            }
+        }
+    }
+
+    /// `name = |_, ...| crash("...")`, under its signature when that can be
+    /// written and bare when it cannot.
+    fn stub(&mut self, d: &IrDef, base: usize, why: &str) -> Option<String> {
+        if d.params.is_empty() {
+            return None;
+        }
+        let bang = if self.bang_defs.contains(&d.name) { "!" } else { "" };
+        let name = format!("{}{bang}", self.ident(d.name).ok()?);
+        let dev = self.device_defs.contains(&d.name);
+        let imports = self.imports.clone();
+        let sig = if dev { self.device_signature(d) } else { self.signature(d) };
+        let blanks = vec!["_"; d.params.len() + usize::from(dev)].join(", ");
+        let msg = format!("rocemit could not write `{}`: {why}", self.syms.text(d.name)).replace(['"', '\\', '$'], "'");
+        let tabs = "\t".repeat(base);
+        let sig = sig.and_then(|t| if self.undeclared.iter().any(|n| mentions(&t, n)) { Err(String::new()) } else { Ok(t) });
+        let head = match sig {
+            Ok(sig) => format!("{tabs}{name} : {sig}\n"),
+            Err(_) => {
+                self.imports = imports;
+                String::new()
+            }
+        };
+        if dev {
+            self.imports.insert(self.state.into());
+        }
+        Some(format!("{head}{tabs}{name} = |{blanks}| crash(\"{msg}\")\n"))
+    }
+
     fn def(&mut self, d: &IrDef, base: usize) -> Result<String, String> {
         self.heap_live = self.by_closure() && self.device_defs.contains(&d.name);
         self.tmp_n = 0;
@@ -2701,15 +2921,14 @@ impl<'a> Cx<'a> {
         if t == "__heap-save" {
             return Ok("0".into());
         }
-        // U62's timer builtins (Builtins.codex: plain `Integer`, no effect).
-        // x86 emits the first two as constant helpers from X86_64Boot.codex's
-        // `pit-input-rate` and `pit-reload-count`; `cpu-park` is `sti; hlt`
-        // and answers 0, and a hosted program has no core to park.
-        match t {
-            "pit-input-hz" => return Ok("1193182".into()),
-            "pit-count" => return Ok("11932".into()),
-            "cpu-park" => return Ok("0".into()),
-            _ => {}
+        // A builtin x86 emits as a constant (`pit-input-hz`, `pit-count`) is
+        // that constant, read from upstream by the builtins probe. `cpu-park`
+        // is `sti; hlt` and answers 0: a hosted program has no core to park.
+        if let Some(v) = crate::builtins::constant_builtin(t) {
+            return Ok(int_lit(v));
+        }
+        if t == "cpu-park" {
+            return Ok("0".into());
         }
         Err(format!("builtin `{t}` used as a value"))
     }
@@ -3459,6 +3678,17 @@ fn in_roc(chapter: &str, name: &str, params: &[String], real: &str) -> Option<St
     match (chapter, name, params) {
         ("Geometry", "geo-sqrt", [n]) | ("Quaternion", "quat-real-sqrt", [n]) => {
             Some(format!("|{n}| if {n} <= 0.0 {{ 0.0 }} else {{ {real}.sqrt({n}) }}"))
+        }
+        // The derived-Ord wrappers over two primitives. Lowering compares
+        // through two Integer temporaries (`gen-int-compare`, upstream's
+        // too), which Roc rejects for a Bool or a Real; they are written
+        // only when nothing prunes them, as `rocemit --whole` does not.
+        // False orders before True, as 0 before 1.
+        (_, "__compare_Boolean", [x, y]) => {
+            Some(format!("|{x}, {y}| if {x} == {y} {{ 0 }} else if {x} {{ 1 }} else {{ -1 }}"))
+        }
+        (_, "__compare_Real", [x, y]) => {
+            Some(format!("|{x}, {y}| if {x} < {y} {{ -1 }} else if {x} > {y} {{ 1 }} else {{ 0 }}"))
         }
         _ => None,
     }

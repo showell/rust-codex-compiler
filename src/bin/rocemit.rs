@@ -38,11 +38,12 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let by_reach = args.iter().any(|a| a == "--by-reach");
-    let rest: Vec<&String> = args.iter().filter(|a| *a != "--by-reach").collect();
+    let whole = args.iter().any(|a| a == "--whole");
+    let rest: Vec<&String> = args.iter().filter(|a| *a != "--by-reach" && *a != "--whole").collect();
     let result = match rest.as_slice() {
-        [path, dir] => emit(Path::new(path), Path::new(dir), by_reach),
+        [path, dir] => emit(Path::new(path), Path::new(dir), by_reach, whole),
         _ => {
-            eprintln!("usage: rocemit [--by-reach] <unit.codex> <dir>");
+            eprintln!("usage: rocemit [--by-reach] [--whole] <unit.codex> <dir>");
             return ExitCode::from(2);
         }
     };
@@ -59,7 +60,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn emit(path: &Path, dir: &Path, by_reach: bool) -> Result<String, String> {
+fn emit(path: &Path, dir: &Path, by_reach: bool, whole: bool) -> Result<String, String> {
     let src = codexc::bundle::load(path)?;
     let parsed = parser::parse(&src);
     if !parsed.lex_errors.is_empty() || !parsed.diagnostics.is_empty() {
@@ -84,7 +85,7 @@ fn emit(path: &Path, dir: &Path, by_reach: bool) -> Result<String, String> {
     // its PRUNE is every backend's, and is (see the top of this file).
     let mut low = codexc::ir::lower_whole(&ch, &bindings, &st, &tds)?;
     let has_opening = low.syms.find("opening").is_some_and(|o| low.defs.iter().any(|d| d.name == o));
-    if has_opening {
+    if has_opening && !whole {
         // **EVERY `__eq_<T>` IS A ROOT.** Upstream's lowering calls the
         // instantiated helper by name (COMPILER-44), so its prune sees the
         // reference; ours lowers `==` to a `Binary` node and roc_emit builds
@@ -104,7 +105,10 @@ fn emit(path: &Path, dir: &Path, by_reach: bool) -> Result<String, String> {
     // A test's codex-vm flags sit beside it as `.vmargs`; a unit that brings
     // them asks for the machine's devices.
     let vm_flags = path.with_extension("vmargs").exists();
-    let files = codexc::roc_emit::emit_modules(&ch, &tds, &low.syms, &low.defs, vm_flags, by_reach)?;
+    let (files, notes) = codexc::roc_emit::emit_modules(&ch, &tds, &low.syms, &low.defs, vm_flags, by_reach, whole)?;
+    for n in &notes {
+        eprintln!("{n}");
+    }
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     // The directory holds ONLY this unit's modules: a file from an earlier
     // emission of a chapter that has since gone would still be imported.

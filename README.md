@@ -133,6 +133,8 @@ clock is what the front end cost.
                                            the opening reaches (upstream's
                                            prune), and the app, into <dir>
     rocemit --by-reach <unit.codex> <dir>
+    rocemit --whole <unit.codex> <dir>     every definition of every chapter,
+                                           unpruned (roc-apps tests/package.py)
 
 Two lines on stdout: the app's file name, or `library` for a unit with no
 opening, and a digest of everything written. A refusal exits 2.
@@ -141,6 +143,14 @@ opening, and a digest of everything written. A refusal exits 2.
 and then `roc_emit` where the IR text would be. So a program that transpiles is
 a program this front end already understood, and the emitter is judged by
 whether the Roc it writes MEANS what the Codex meant, not by shape.
+
+`--whole` is for sharing a chapter between programs, which needs its text to
+be the same whichever program emitted it. A function rocemit cannot write
+becomes `crash` with the reason, and crashes only if called; a constant it
+cannot write is left out, because Roc evaluates top-level constants while it
+compiles, so a `crash` there is a compile error even when nothing uses it.
+Whatever uses one left out follows it, to a fixed point. Each stub and each
+omission is printed on stderr.
 
 `--by-reach` picks the threaded state from what the opening can actually reach
 rather than from every definition in the unit's chapters. It is for a platform
@@ -166,7 +176,11 @@ The goal is that this compiler MEANS what Codex means. In order:
    `--rust-check-types` print the two tables in `src/builtins.rs`; splice them
    over the committed ones (the two hand-kept constants between them stay) and
    read the diff. U62: `+pit-input-hz +pit-count +cpu-park -uefi-read-file`.
-   An interpreter rule for a new builtin is separate work, in `src/interp.rs`.
+   `--rust-constants` prints the third table, `CONSTANT_BUILTINS`: the
+   builtins x86 emits as constants, with their VALUES, which live in the x86
+   emitter rather than in Builtins.codex. The interpreter and rocemit answer
+   them from it. Any other new builtin needs a rule in `src/interp.rs` and a
+   spelling in `src/roc_emit.rs`, by hand.
 2. **Cut the corpus.** `CODEX_ROOT=<checkout> tools/cut_units.py`, then
    `ln -sfn ~/units-<rev> ~/units-current`.
 3. **Meaning:** `codexrun sweep ~/units-current <checkout>/codex/test` --

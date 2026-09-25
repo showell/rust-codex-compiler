@@ -3,6 +3,9 @@
 
     ./builtins_probe.py            report the count and the first few
     ./builtins_probe.py --rust     emit the Rust table on stdout
+    ./builtins_probe.py --rust-constants
+                                   the constant builtins and their VALUES,
+                                   which live in the x86 emitter
 
 `builtin-names` is `bs-name` of every entry in `builtins`, and the name
 resolver needs the set: a call to `text-length` is not an undefined name, and
@@ -418,13 +421,55 @@ def as_rust(found, ar):
             + body + '\n];\n')
 
 
+# `emit-constant-helper st "pit-input-hz" pit-input-rate`: x86's helper for a
+# builtin that is a constant, with the constant's name; and `pit-input-rate :
+# Integer = 1193182`, the constant. Both live in the x86 emitter
+# (Emit/X86_64ProcessHelpers.codex and Emit/X86_64Boot.codex at U62), not in
+# Builtins.codex, which carries only the name and the type.
+EMIT = CODEX / 'codex' / 'compiler' / 'Emit'
+CONST_HELPER = re.compile(r'emit-constant-helper\s+\S+\s+"([^"]+)"\s+([a-z][a-z0-9-]*)')
+CONST_DEF = re.compile(r'^\s*([a-z][a-z0-9-]*)\s*:\s*Integer\s*=\s*(-?\d+)\s*$', re.M)
+
+
+def constants():
+    """[(builtin, value)] for every builtin x86 emits as a constant."""
+    text = '\n'.join(p.read_text(errors='replace') for p in sorted(EMIT.rglob('*.codex')))
+    values = {n: int(v) for n, v in CONST_DEF.findall(text)}
+    out = []
+    for name, ident in CONST_HELPER.findall(text):
+        if ident not in values:
+            raise SystemExit(f'`{name}` is emitted from `{ident}`, which is no `Integer = N` in {EMIT}')
+        if name not in [n for n, _ in out]:
+            out.append((name, values[ident]))
+    return out
+
+
+def as_rust_constants(cs):
+    lines = [
+        '// The builtins that are CONSTANTS, with their values, read from the x86',
+        "// emitter (`emit-constant-helper` and the `Integer = N` it names) by",
+        '// ladder/builtins_probe.py --rust-constants. Builtins.codex carries only',
+        '// their names and types. The interpreter and rocemit answer them from',
+        '// here. Re-run the probe after a pin change; do not edit by hand.',
+        f'pub const CONSTANT_BUILTINS: [(&str, i64); {len(cs)}] = [',
+    ]
+    lines += [f'    ("{n}", {v}),' for n, v in cs]
+    lines.append('];')
+    return '\n'.join(lines) + '\n'
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--rust', action='store_true', help='emit the Rust table on stdout')
     ap.add_argument('--rust-check-types', action='store_true',
                     help="emit the checker's declared-type table on stdout")
+    ap.add_argument('--rust-constants', action='store_true',
+                    help='emit the table of constant builtins and their values on stdout')
     a = ap.parse_args()
+    if a.rust_constants:
+        print(as_rust_constants(constants()), end='')
+        return 0
     found = names()
     ar = arities(SOURCE.read_text(errors='replace'))
     if a.rust:

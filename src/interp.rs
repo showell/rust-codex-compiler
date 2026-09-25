@@ -1946,11 +1946,12 @@ impl Interp {
             // anything: inside an extent it asks about the deck, outside it
             // asks about the bivy.
             ("__heap-save", []) => Ok(Int(self.cursor())),
-            // U62's timer builtins, as x86 emits them: two constants from
-            // X86_64Boot.codex (`pit-input-rate`, `pit-reload-count`), and
-            // `cpu-park`'s `sti; hlt` answering 0 -- no core here to park.
-            ("pit-input-hz", []) => Ok(Int(1193182)),
-            ("pit-count", []) => Ok(Int(11932)),
+            // A builtin x86 emits as a constant is that constant, read from
+            // upstream by the builtins probe (`CONSTANT_BUILTINS`); `cpu-park`'s
+            // `sti; hlt` answers 0 -- no core here to park.
+            (n, []) if crate::builtins::constant_builtin(n).is_some() => {
+                Ok(Int(crate::builtins::constant_builtin(n).expect("guarded")))
+            }
             ("cpu-park", []) => Ok(Int(0)),
             ("__heap-advance", [Int(n)]) => {
                 let c = self.cursor() + *n;
