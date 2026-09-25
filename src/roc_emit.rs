@@ -2674,6 +2674,16 @@ impl<'a> Cx<'a> {
         if t == "__heap-save" {
             return Ok("0".into());
         }
+        // U62's timer builtins (Builtins.codex: plain `Integer`, no effect).
+        // x86 emits the first two as constant helpers from X86_64Boot.codex's
+        // `pit-input-rate` and `pit-reload-count`; `cpu-park` is `sti; hlt`
+        // and answers 0, and a hosted program has no core to park.
+        match t {
+            "pit-input-hz" => return Ok("1193182".into()),
+            "pit-count" => return Ok("11932".into()),
+            "cpu-park" => return Ok("0".into()),
+            _ => {}
+        }
         Err(format!("builtin `{t}` used as a value"))
     }
 
