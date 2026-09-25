@@ -12,6 +12,7 @@ pub mod charcode;
 pub mod check;
 pub mod classes;
 pub mod dict_projections;
+pub mod list_versions;
 pub mod cohesion;
 pub mod cost;
 pub mod code;

@@ -135,6 +135,9 @@ clock is what the front end cost.
     rocemit --by-reach <unit.codex> <dir>
     rocemit --whole <unit.codex> <dir>     every definition of every chapter,
                                            unpruned (roc-apps tests/package.py)
+    rocemit --list-versions ...            Codex's in-place list writes made
+                                           explicit (docs/list-versions.md);
+                                           not yet the default
 
 Two lines on stdout: the app's file name, or `library` for a unit with no
 opening, and a digest of everything written. A refusal exits 2.
@@ -214,6 +217,24 @@ rather than here, because the limits are longer than the commands.
 
 The numbers these print are not copied into this file. A README that carries
 counts is a README that is wrong a week later; run the tool.
+
+## Work in progress (where U62 left off, 2026-09-25)
+
+Processed in a claude.ai cloud session; the session log is `U62.log` in
+codex-zig-ladder, whose README says how Updates are processed and how the
+cloud container is set up.
+
+- **`rocemit --list-versions`** (`src/list_versions.rs`): Codex's in-place
+  list writes, made explicit for Roc. Off by default; `docs/list-versions.md`
+  says where it stands and what is left, in order.
+- **`paren-open-at-eof`** (U62's COMPILER-35): the parser fix upstream made,
+  not yet ported here.
+- **The sweep's older differences:** `real-approx-modes`, `real-saturating`,
+  `real-approx-equality`, `unit-pattern-lit`, `unit-show`, `variant-address`,
+  and the value openings `codexrun` does not print. Not U62's; parity we owe.
+- **roc-apps `tests/ported`** is emitted with `rocemit --whole` by
+  `tests/package.py`; each unit's stubs and omissions are in
+  `~/build/roc-apps/gen/whole/<unit>/notes.txt`.
 
 ## Read before you are surprised
 

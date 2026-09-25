@@ -39,11 +39,13 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let by_reach = args.iter().any(|a| a == "--by-reach");
     let whole = args.iter().any(|a| a == "--whole");
-    let rest: Vec<&String> = args.iter().filter(|a| *a != "--by-reach" && *a != "--whole").collect();
+    let versions = args.iter().any(|a| a == "--list-versions");
+    let rest: Vec<&String> =
+        args.iter().filter(|a| *a != "--by-reach" && *a != "--whole" && *a != "--list-versions").collect();
     let result = match rest.as_slice() {
-        [path, dir] => emit(Path::new(path), Path::new(dir), by_reach, whole),
+        [path, dir] => emit(Path::new(path), Path::new(dir), by_reach, whole, versions),
         _ => {
-            eprintln!("usage: rocemit [--by-reach] [--whole] <unit.codex> <dir>");
+            eprintln!("usage: rocemit [--by-reach] [--whole] [--list-versions] <unit.codex> <dir>");
             return ExitCode::from(2);
         }
     };
@@ -60,7 +62,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn emit(path: &Path, dir: &Path, by_reach: bool, whole: bool) -> Result<String, String> {
+fn emit(path: &Path, dir: &Path, by_reach: bool, whole: bool, versions: bool) -> Result<String, String> {
     let src = codexc::bundle::load(path)?;
     let parsed = parser::parse(&src);
     if !parsed.lex_errors.is_empty() || !parsed.diagnostics.is_empty() {
@@ -105,7 +107,23 @@ fn emit(path: &Path, dir: &Path, by_reach: bool, whole: bool) -> Result<String, 
     // A test's codex-vm flags sit beside it as `.vmargs`; a unit that brings
     // them asks for the machine's devices.
     let vm_flags = path.with_extension("vmargs").exists();
-    let (files, notes) = codexc::roc_emit::emit_modules(&ch, &tds, &low.syms, &low.defs, vm_flags, by_reach, whole)?;
+    // Codex writes a list in place; make every later read of it, here and
+    // in the callers, read the version the write answered. NOT YET THE
+    // DEFAULT: docs/list-versions.md says what is left before it is.
+    let mut unversioned = Vec::new();
+    if versions {
+        let defs = std::mem::take(&mut low.defs);
+        let (defs, failed) = codexc::list_versions::apply(defs, &mut low.syms);
+        low.defs = defs;
+        unversioned = failed;
+    }
+    if !whole {
+        if let Some((n, why)) = unversioned.first() {
+            return Err(format!("`{}`: {why}", low.syms.text(*n)));
+        }
+    }
+    let (files, notes) =
+        codexc::roc_emit::emit_modules(&ch, &tds, &low.syms, &low.defs, vm_flags, by_reach, whole, versions, &unversioned)?;
     for n in &notes {
         eprintln!("{n}");
     }

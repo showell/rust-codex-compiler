@@ -118,6 +118,7 @@ fn type_name(t: &str) -> String {
     }
 }
 
+
 /// **CODEX WRITES A LIST IN PLACE; ROC ANSWERS A NEW ONE.** The two agree
 /// wherever the program uses the answer, and diverge wherever it uses the
 /// list it wrote through another name. Two shapes say the write was for
@@ -488,18 +489,29 @@ pub fn emit_modules(
     vm_flags: bool,
     by_reach: bool,
     whole: bool,
+    list_versions: bool,
+    seed: &[(Sym, String)],
 ) -> Result<(Vec<(String, String)>, Vec<String>), String> {
     let called_back = crate::roc_forwarders::call_back_directly(defs);
     let defs = &called_back[..];
     if !whole {
-        return emit_round(ch, tds, syms, defs, vm_flags, by_reach, None).map(|(files, _)| (files, Vec::new()));
+        return emit_round(ch, tds, syms, defs, vm_flags, by_reach, list_versions, None).map(|(files, _)| (files, Vec::new()));
     }
     // A round writes what it can and names what it could not; their
     // dependents are then decided too (`settle_fates`), and the next round
     // writes with every fate known. It ends when a round finds nothing new.
+    // `seed`: what an earlier pass could not rewrite (`list_versions`).
     let mut fates: BTreeMap<Sym, Fate> = BTreeMap::new();
+    for (n, why) in seed {
+        let d = defs.iter().find(|d| d.name == *n);
+        let fate = if d.is_some_and(|d| d.params.is_empty()) { Fate::Omit(why.clone()) } else { Fate::Stub(why.clone()) };
+        fates.insert(*n, fate);
+    }
+    if !fates.is_empty() {
+        settle_fates(defs, syms, &mut fates);
+    }
     loop {
-        let (files, failed) = emit_round(ch, tds, syms, defs, vm_flags, by_reach, Some(&fates))?;
+        let (files, failed) = emit_round(ch, tds, syms, defs, vm_flags, by_reach, list_versions, Some(&fates))?;
         if failed.is_empty() {
             // What was not written as written, for whoever runs this.
             let notes = fates
@@ -620,9 +632,11 @@ fn emit_round(
     defs: &[IrDef],
     vm_flags: bool,
     by_reach: bool,
+    list_versions: bool,
     fates: Option<&BTreeMap<Sym, Fate>>,
 ) -> Result<(Vec<(String, String)>, Vec<(Sym, String)>), String> {
     let mut cx = Cx::new(ch, tds, syms, defs, vm_flags, by_reach);
+    cx.list_versions = list_versions;
     if let Some(f) = fates {
         cx.whole = true;
         cx.fates = f.clone();
@@ -915,6 +929,8 @@ struct Cx<'a> {
     /// nightly). `fates` is what an earlier round decided; `failed` is what
     /// this round could not write.
     whole: bool,
+    /// `list_versions` ran on the definitions (`rocemit --list-versions`).
+    list_versions: bool,
     /// Class dictionaries with no Roc type (`has_free_field_binder`): whole
     /// mode stubs a definition whose text names one.
     undeclared: Vec<String>,
@@ -1029,6 +1045,7 @@ impl<'a> Cx<'a> {
             bang_defs: Default::default(),
             stubbed: Default::default(),
             whole: false,
+            list_versions: false,
             undeclared: Vec::new(),
             fates: Default::default(),
             failed: Vec::new(),
@@ -1358,6 +1375,11 @@ impl<'a> Cx<'a> {
                     .clone()
             }
             Ty::ForAll(_, b) | Ty::ForAllEff(_, b) | Ty::Linear(b) => self.ty(b)?,
+            // `list_versions`' copy-out tuple.
+            Ty::Constructed(n, a) if self.syms.text(*n) == crate::list_versions::TUPLE => {
+                let args: Result<Vec<_>, _> = a.iter().map(|x| self.ty(x)).collect();
+                format!("({})", args?.join(", "))
+            }
             Ty::Sum(n, a) | Ty::Record(n, a) | Ty::Constructed(n, a) => {
                 let name = self.type_ref(*n);
                 if a.is_empty() {
@@ -1830,11 +1852,11 @@ impl<'a> Cx<'a> {
         let name = format!("{}{bang}", self.ident(d.name)?);
         // A write to a list parameter, in a definition that answers
         // something else, is a mutation the caller reads back (see
-        // `writes_a_param`).
+        // `writes_a_param`). With `list_versions` run (rocemit
+        // --list-versions) the callers read it back; without, it is refused.
         let ps: Vec<Sym> = d.params.iter().map(|p| p.name).collect();
-        let (_, ret, _) = self.arrows(d)?;
-        if !matches!(result_ty(&d.ty, d.params.len()), Ty::List(_)) {
-            let _ = &ret;
+        self.arrows(d)?;
+        if !self.list_versions && !matches!(result_ty(&d.ty, d.params.len()), Ty::List(_)) {
             if let Some(t) = self.written_param(&d.body, &ps) {
                 return Err(format!("`{}` writes its list parameter `{t}` and answers something else", self.syms.text(d.name)));
             }
@@ -3199,6 +3221,14 @@ impl<'a> Cx<'a> {
                 Err(format!("`{name}` applied to {} arguments, takes {k}", xs.len()))
             }
         };
+        // `list_versions`' copy-out tuple and its elements.
+        if name == crate::list_versions::TUPLE {
+            return Ok(format!("({})", xs.join(", ")));
+        }
+        if let Some(k) = name.strip_prefix(crate::list_versions::AT) {
+            want(1)?;
+            return Ok(format!("{}.{k}", xs[0]));
+        }
         let (int, real, uint) = (self.int(), self.real(), self.uint());
         let int_lc = int.to_ascii_lowercase();
         Ok(match name {
@@ -3211,10 +3241,11 @@ impl<'a> Cx<'a> {
                 format!("(List.get({}, {int}.to_u64_wrap({})) ?? crash(\"list-at out of range\"))", xs[0], xs[1])
             }
             // **CODEX MUTATES IN PLACE; ROC ANSWERS A NEW LIST.** The two
-            // agree when the program uses the answer, which is what every
-            // typed use does; a program that relies on the aliasing (sets and
-            // then reads the old name) diverges silently, and only a verdict
-            // catches it. Past the end is a crash in both.
+            // agree when the program uses the answer; a program that relies
+            // on the aliasing (sets and then reads the old name) diverges
+            // silently, unless `list_versions` ran (rocemit --list-versions),
+            // which makes every later read, here and in the callers, read
+            // this answer. Past the end is a crash in both.
             "list-set-at" => {
                 want(3)?;
                 format!("(List.set({}, {int}.to_u64_wrap({}), {}) ?? crash(\"list-set-at past the end\"))", xs[0], xs[1], xs[2])
