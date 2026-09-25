@@ -224,7 +224,7 @@ cloud container is set up.
 - **`src/list_versions.rs`**: Codex's in-place list writes, made explicit
   for Roc; the default since U62. `docs/list-versions.md` says what it does,
   what it still refuses, and why.
-- **The sweep at U62 is 839 of 1081.** Of the older differences only
+- **The sweep at U62 is 843 of 1081.** Of the older differences only
   `variant-address` is left from that list: it expects a nullary constructor
   (`Empty`) to be allocated at each construction, where the interpreter
   builds it once. Changing that moves every heap measurement, so it waits.

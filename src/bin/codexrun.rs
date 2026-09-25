@@ -219,9 +219,9 @@ fn sweep(units: &Path, tests: &Path) -> ExitCode {
             continue;
         }
         ran += 1;
-        let want = expected_text(&std::fs::read_to_string(exp).unwrap_or_default());
+        let want = trimmed(&expected_text(&std::fs::read_to_string(exp).unwrap_or_default()));
         let verdict = match run_in_thread(&unit, Some(SWEEP_BUDGET)) {
-            Ok(got) if got == want.as_bytes() => {
+            Ok(got) if trimmed(&String::from_utf8_lossy(&got)) == want => {
                 matched += 1;
                 "ok".to_string()
             }
@@ -280,6 +280,15 @@ fn expected_text(raw: &str) -> String {
     t.strip_prefix('\u{1}').map(str::to_string).unwrap_or(t)
 }
 
+/// **TRAILING BLANK LINES ARE NOT COMPARED.** Upstream's captures lost a
+/// program's final blank line (sort-test and theme-ink-on print one; their
+/// `.expected` ends without it), so both sides end in exactly one newline
+/// here, as roc-apps' ladder and `tests/package.py` already compare.
+fn trimmed(t: &str) -> String {
+    let s = t.trim_end_matches('\n');
+    if s.is_empty() { String::new() } else { format!("{s}\n") }
+}
+
 fn collect_expected(root: &Path, out: &mut Vec<std::path::PathBuf>) {
     let Ok(rd) = std::fs::read_dir(root) else { return };
     for e in rd.flatten() {
@@ -303,8 +312,9 @@ fn check(path: &Path, expected: &Path) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let want = trimmed(&want);
     let got = match run(path) {
-        Ok(o) => String::from_utf8_lossy(&o).into_owned(),
+        Ok(o) => trimmed(&String::from_utf8_lossy(&o)),
         Err(e) => {
             println!("FAILED to run {}", path.display());
             println!("{e}");

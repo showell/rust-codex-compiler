@@ -169,6 +169,11 @@ pub struct Names {
     pub bounds: HashMap<(Sym, Sym), FieldBound>,
     /// The record types, so a declared type can say it names one.
     pub records: HashSet<Sym>,
+    /// The unit types (`Kelvin = unit Integer`), for the implicit conversion
+    /// at a call (`Static::Unit`).
+    pub units: HashSet<Sym>,
+    /// A function's declared parameter types, by its global index.
+    pub params: HashMap<u32, Vec<Static>>,
     /// A function's arity and declared result, by its global index.
     pub results: HashMap<u32, (usize, Static)>,
     /// A nullary definition's declared type, by its index.
@@ -204,6 +209,9 @@ pub struct RealKind {
 pub enum Static {
     Int { lo: i64, hi: i64, wraps: bool },
     Real(RealKind),
+    /// A value of a unit type, which a call converts to the unit its callee
+    /// declares (`try-unit-convert`).
+    Unit(Sym),
     Record(Sym),
     Other,
 }
@@ -219,6 +227,7 @@ impl Static {
                 Static::Int { lo: *lo, hi: *hi, wraps: *mode == OverflowMode::Wrapping }
             }
             TypeExpr::Named(n, _) if names.records.contains(n) => Static::Record(*n),
+            TypeExpr::Named(n, _) if names.units.contains(n) => Static::Unit(*n),
             TypeExpr::Named(n, _) if syms.text(*n) == "Integer" => Static::INTEGER,
             TypeExpr::Named(n, _) if syms.text(*n) == "Real" => Static::Real(RealKind::default()),
             // `Real approximate saturating`: every argument a qualifier, as
@@ -388,17 +397,43 @@ impl<'a> Compiler<'a> {
                     _ => None,
                 };
                 // A function given all its arguments has its declared result.
+                let unit_ctor = match head {
+                    Expr::NameRef(n, _) if args.len() == 1 && self.names.units.contains(n) => Some(*n),
+                    _ => None,
+                };
                 let t = match &h {
                     _ if conv.is_some() => Static::Real(conv.expect("checked")),
+                    _ if unit_ctor.is_some() => Static::Unit(unit_ctor.expect("checked")),
                     Code::Global(g) => match self.names.results.get(g) {
                         Some(&(arity, t)) if arity == args.len() => t,
                         _ => Static::Other,
                     },
                     _ => Static::Other,
                 };
+                // **A UNIT ARGUMENT IS CONVERTED TO THE UNIT THE CALLEE
+                // DECLARES** (`try-unit-convert`, IR/Lowering.codex): a
+                // `Celsius` handed to a `Kelvin` parameter goes through the
+                // program's own `Celsius-to-Kelvin` (codex/test's
+                // implicit-convert). With no such definition it is passed as
+                // it is, as upstream's lowering leaves the name to fail.
+                let declared: Vec<Static> = match &h {
+                    Code::Global(g) => self.names.params.get(g).cloned().unwrap_or_default(),
+                    _ => Vec::new(),
+                };
                 let mut out = Vec::with_capacity(args.len());
-                for (a, sp) in args {
-                    out.push((self.expr(a), sp));
+                for (i, (a, sp)) in args.into_iter().enumerate() {
+                    let (code, at) = self.typed(a);
+                    let code = match (at, declared.get(i)) {
+                        (Static::Unit(from), Some(Static::Unit(to))) if from != *to => {
+                            let name = format!("{}-to-{}", self.syms.text(from), self.syms.text(*to));
+                            match self.syms.find(&name).and_then(|c| self.names.funs.get(&c)) {
+                                Some(&g) => Code::Apply(Box::new(Code::Global(g)), vec![(code, sp)]),
+                                None => code,
+                            }
+                        }
+                        _ => code,
+                    };
+                    out.push((code, sp));
                 }
                 (Code::Apply(Box::new(h), out), t)
             }

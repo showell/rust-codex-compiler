@@ -356,8 +356,11 @@ Prelude :: [].{
 	# bug on that side and the reason this is written from the verdicts.
 	real_to_str : F64 -> Str
 	real_to_str = |f|
-		if F64.is_nan(f) { "NaN" }
+		if F64.is_nan(f) { "nan" }
 		else if F64.is_infinite(f) { if f < 0.0 { "-inf" } else { "inf" } }
+		else if F64.abs(f) >= 9223372036854775808.0 {
+			if f < 0.0 { Str.concat("-", Prelude.wide_to_str(F64.abs(f))) } else { Prelude.wide_to_str(f) }
+		}
 		else {
 			neg = f < 0.0
 			a = F64.abs(f)
@@ -367,6 +370,41 @@ Prelude :: [].{
 			body = Str.concat(Str.concat(I64.to_str(ip), "."), Prelude.digits_str(Prelude.trim_zeros(digits)))
 			if neg { Str.concat("-", body) } else { body }
 		}
+
+	# From 2^63 up Codex prints exponent form (U62, COMPILER-41): 15
+	# significant digits rounded half to even, trailing zeros dropped but one
+	# kept, then `e+NN`. Upstream rounds the EXACT integer (long division over
+	# 32-bit limbs); this scales by a power of ten, which agrees except where
+	# the digits past the fifteenth are an exact tie.
+	wide_to_str : F64 -> Str
+	wide_to_str = |a| {
+		e = Prelude.decimal_exponent(a, 0)
+		scaled = a / F64.pow(10.0, I64.to_f64(e - 14))
+		# Positive and under 10^16, so truncation is the floor.
+		base = F64.to_i64_wrap(scaled)
+		r = scaled - I64.to_f64(base)
+		up = r > 0.5 or (r == 0.5 and I64.rem_by(base, 2) == 1)
+		m0 = if up { base + 1 } else { base }
+		# Rounding up can carry into a sixteenth digit.
+		(m, ex) = if m0 >= 1000000000000000 { (I64.div_trunc_by(m0, 10), e + 1) } else { (m0, e) }
+		s = I64.to_str(m)
+		lead = Str.from_utf8_lossy(List.take_first(Str.to_utf8(s), 1))
+		rest = Str.from_utf8_lossy(List.drop_first(Str.to_utf8(s), 1))
+		trimmed = Prelude.trim_zero_text(rest)
+		Str.concat(Str.concat(Str.concat(lead, "."), if Str.is_empty(trimmed) { "0" } else { trimmed }), Str.concat("e+", I64.to_str(ex)))
+	}
+
+	decimal_exponent : F64, I64 -> I64
+	decimal_exponent = |a, e| if a >= 10.0 { Prelude.decimal_exponent(a / 10.0, e + 1) } else { e }
+
+	trim_zero_text : Str -> Str
+	trim_zero_text = |t| {
+		bs = Str.to_utf8(t)
+		Str.from_utf8_lossy(Prelude.drop_trailing_zeros(bs))
+	}
+
+	drop_trailing_zeros : List(U8) -> List(U8)
+	drop_trailing_zeros = |bs| if List.last(bs) == Ok(48) { Prelude.drop_trailing_zeros(List.drop_last(bs, 1)) } else { bs }
 
 	# The fraction's digits, most significant first, by taking one at a
 	# time; `n` bounds it at the width Codex's printer carries.

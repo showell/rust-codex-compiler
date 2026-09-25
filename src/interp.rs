@@ -371,6 +371,9 @@ pub struct Interp {
     writes: bool,
     /// `opening`, compiled in the empty environment.
     opening: Option<Rc<Code>>,
+    /// The opening is declared something other than `Nothing`: its value is
+    /// printed (`run`).
+    opening_prints: bool,
     /// `Type.field -> bound`, and the ONE thing resolution cannot do ahead of
     /// time. A record literal names its type, so its bounds are attached at
     /// compile time; a field ASSIGNMENT names only the field, and which record
@@ -805,6 +808,15 @@ impl Interp {
                 _ => None,
             })
             .collect();
+        names.units = ch
+            .type_defs
+            .iter()
+            .filter_map(|t| match t {
+                TypeDef::Unit(name, ..) => Some(*name),
+                _ => None,
+            })
+            .collect();
+        names.params = fun_defs.iter().map(|(i, d)| (*i, signature(d, &names, &ch.syms).0)).collect();
         let results: Vec<(u32, usize, Static)> =
             fun_defs.iter().map(|(i, d)| (*i, d.params.len(), signature(d, &names, &ch.syms).1)).collect();
         names.results = results.into_iter().map(|(i, arity, t)| (i, (arity, t))).collect();
@@ -837,12 +849,21 @@ impl Interp {
         // The entry point runs in the EMPTY environment, whatever it declares,
         // which is what the walker did. Last definition of the name wins, as
         // it does everywhere else.
-        let opening = ch
-            .defs
-            .iter()
-            .rev()
-            .find(|d| Some(d.name) == ch.syms.find("opening"))
-            .map(|d| Rc::new(Compiler::body(&names, &ch.syms, &d.chapter_slug, &d.body)));
+        let opening_def = ch.defs.iter().rev().find(|d| Some(d.name) == ch.syms.find("opening"));
+        let opening = opening_def.map(|d| Rc::new(Compiler::body(&names, &ch.syms, &d.chapter_slug, &d.body)));
+        // A value opening prints what it answers; one declared `Nothing`
+        // (through its effects) answers nothing, whatever its last statement
+        // left (sort-test's act ends on a value it discards).
+        let opening_prints = opening_def.is_some_and(|d| {
+            fn nothing(t: &TypeExpr, syms: &SymTab) -> bool {
+                match t {
+                    TypeExpr::Named(n, _) => syms.text(*n) == "Nothing",
+                    TypeExpr::Effect(.., inner, _) | TypeExpr::Linear(inner, _) => nothing(inner, syms),
+                    _ => false,
+                }
+            }
+            !d.declared_type.first().is_some_and(|t| nothing(t, &ch.syms))
+        });
 
         Interp {
             globals,
@@ -851,6 +872,7 @@ impl Interp {
             writes,
             const_defs,
             opening,
+            opening_prints,
             bounds: names.bounds,
             syms: ch.syms.clone(),
             root,
@@ -898,7 +920,7 @@ impl Interp {
         // capability probes): upstream's harness prints what it answers, as
         // one line. `Nothing` answers nothing.
         let nothing = matches!(&v, Value::Ctor(n, _) if self.syms.text(*n) == "Nothing");
-        if !matches!(v, Value::Unit) && !nothing {
+        if self.opening_prints && !matches!(v, Value::Unit) && !nothing {
             let units = show_units(&self.syms, &v);
             crate::charcode::print_bytes(&units, &mut self.out);
             self.out.push(b'\n');
@@ -2403,6 +2425,27 @@ fn real_text(f: f64) -> String {
         return out;
     }
     let x = f64::from_bits(mag);
+    // **FROM 2^63 UP, EXPONENT FORM** (U62, COMPILER-41; codex/test's
+    // real-show-wide): past what `cvttsd2si` answers, `__real_to_text`
+    // prints 15 significant digits, rounded half to even from the exact
+    // value, trailing zeros dropped but one kept, then `e+NN`. Infinity and
+    // NaN are spelled `inf` and `nan`.
+    if (mag >> 52) >= 1086 {
+        if x.is_nan() {
+            return "nan".into();
+        }
+        if x.is_infinite() {
+            out.push_str("inf");
+            return out;
+        }
+        let e = format!("{x:.14e}");
+        let (mant, exp) = e.split_once('e').expect("exponent form");
+        let (int, frac) = mant.split_once('.').expect("a point");
+        let frac = frac.trim_end_matches('0');
+        let frac = if frac.is_empty() { "0" } else { frac };
+        out.push_str(&format!("{int}.{frac}e+{exp}"));
+        return out;
+    }
     let ip = cvttsd2si(x);
     let mut frac = x - ip as f64;
     out.push_str(&(ip as u64).to_string());
