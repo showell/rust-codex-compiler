@@ -127,7 +127,7 @@ and the right parameter count and the wrong meaning.
 **Cannot see:** the same thing every truth here cannot -- it is the declaration
 layer with names resolved, not expressions.
 
-## The interpreter -- `codexrun`, `safari/run.sh`
+## The interpreter -- `codexrun`
 
 `codexrun` compiles the desugared AST to a run form -- names resolved to frame
 slots, literals already values -- and walks that. No types, no IR, no zig, no
@@ -137,9 +137,6 @@ that sees MEANING rather than shape -- five byte-comparison oracles are one
 oracle, and `and` failed to short-circuit under all of them.
 
 **Cannot see:** anything about the IR, or types. It is an interpreter.
-
-The fourth arm built on it -- what it proves, why it needs no gold, and the one
-unit that must DISAGREE -- is `safari/README.md`.
 
 ## Resolver agreement: ours against upstream's compile step
 
@@ -164,37 +161,3 @@ fetches a Foreword chapter again when the unit carries it under another prefix;
 the scoper's `find-slug-for-cite-name` takes the one chapter of that name. Ours
 follows the compiler, so a program carrying such a chapter disagrees here by
 design. Each disagreement is read, and named, before it is called a defect.
-
-## The self-host -- `./selfhost_gate.sh`
-
-The compiler compiling ITSELF: `codexcheck-subject.codex`, which is every
-chapter in one unit, checked and lowered by us and by the oracles, compared on
-five counters and then definition by definition on the wire.
-
-**The cheapest gate that touches everything.** About a minute against the
-corpus sweeps' twenty, because it is one unit rather than 1,246 -- and it moves
-for the same reasons they do, so it is the one to run first after a repin.
-
-**It compares, and it exits non-zero.** That is worth saying because it did not
-always: this lived as an inline step in a checkpoint script that printed both
-sides and never looked at them. The run where the counters first diverged still
-reported PASS, since `grep` had found its lines and nothing else was asked.
-
-**Three outcomes per definition, not two.** A definition the oracle emits and
-we do not is MISSING; one we both emit and disagree on DIFFERS. They want
-opposite responses -- port it, or fix it -- and folding them together reports
-the arrival of new upstream code as if it were a regression in ours. The split
-paid for itself on its first run: of 155, exactly one was MISSING, and it was
-`__eq_TokenKind`, the synthesised equality `gen-eq-def` mints.
-
-**WHAT IT CANNOT SEE, and this is the one to hold on to: the subject and the
-oracle move TOGETHER.** The corpus gates hold `units-u56` fixed and repin only
-the oracle, so a change in their numbers is the oracle's. Here the subject IS
-the compiler, so repinning changes what is being compiled and what is grading
-it in the same step. A number that moves cannot be attributed to either without
-a second measurement at the old pin, and there is no cheap one -- the old
-oracle is a build away.
-
-So read a move here as "the window between these two pins did something", never
-as "this Update did something". `generated/PROVENANCE.oracles` names the pin;
-the gate prints it.

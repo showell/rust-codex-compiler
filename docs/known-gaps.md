@@ -17,9 +17,8 @@ a defect on this side.
 
 **The gates that need no GOLD BANK are unaffected**, which is most of the
 reason they exist: `lexdump lossless` and `parsedump cover` need no oracle at
-all, and `codexrun sweep` and `safari/run.sh` have oracles of their own -- a
-`.expected` beside each unit, and the codexzig binary built from the same
-source. None of the four reads the bank.
+all, and `codexrun sweep` has an oracle of its own -- a `.expected` beside each
+unit. None of the three reads the bank.
 
 ## No byte oracle sees an expression
 
@@ -77,10 +76,6 @@ overlong code point). A Roc `Str` cannot hold an overlong sequence, so
 ## codexrun prints no value opening
 
 `opening : Integer = text-to-integer "-5"` (`neg-int-parse`) prints nothing
-under codexrun; its verdict and the Roc arm print `-5`. How many units have a
-value opening is not counted.
-
-## `literal_main` must differ
-
-Not a gap -- a required disagreement, and `safari/run.sh` fails if it ever
-goes away. See `safari/README.md`.
+under codexrun; its verdict and the Roc arm print `-5`. Counted at U62: 49 of
+the 1,081 programs `codexrun sweep` grades have a value opening, and each
+shows up as a wrong output (nothing printed) rather than as a gap.

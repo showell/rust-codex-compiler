@@ -95,7 +95,6 @@ writes; safari's `build/*-unit.codex` already are.
 | `codexrun` | interpreter (not on the path above) | a resolved unit |
 | `rocemit` | Roc, from the lowering | a resolved unit, and a directory to write |
 
-    ./safari/run.sh     safari's own checks through our interpreter
     ./safari/bench.sh   time the interpreter on a fixed set of safari units
 
 Everything that depends on the safari-codex checkout lives under `safari/` and
@@ -156,6 +155,28 @@ effect, as are the UEFI key reads; `bit-shr` is Roc's arithmetic shift and
 `bit-shru` the zero-filling one; and a call to a forwarder that calls back is
 written as the call it makes.
 
+## After a new Update
+
+The goal is that this compiler MEANS what Codex means. In order:
+
+1. **Port the builtins.** An Update often adds or removes builtins, and a
+   program calling one we do not know fails as an undefined name.
+   `CODEX_ROOT=<checkout> ladder/builtins_probe.py --rust` and
+   `--rust-check-types` print the two tables in `src/builtins.rs`; splice them
+   over the committed ones (the two hand-kept constants between them stay) and
+   read the diff. U62: `+pit-input-hz +pit-count +cpu-park -uefi-read-file`.
+   An interpreter rule for a new builtin is separate work, in `src/interp.rs`.
+2. **Cut the corpus.** `CODEX_ROOT=<checkout> tools/cut_units.py`, then
+   `ln -sfn ~/units-<rev> ~/units-current`.
+3. **Meaning:** `codexrun sweep ~/units-current <checkout>/codex/test` --
+   every upstream test with an `.expected`, run on our interpreter.
+4. **Accept and refuse:** `./corpus_check_gate.sh` (nothing we refuse that
+   the oracle compiles) and `./linear_gate.sh`, against `~/codexir/codexcheck`
+   built at the same checkout.
+
+The curated arms in `cobblestone-curated-tests` (`ir-zig`, `ir-rust`,
+`run-interp`, `ir-interp`) grade types and IR on a smaller, chosen corpus.
+
 ## The gates
 
     lexdump lossless <path>...              concat(tokens) == source
@@ -170,7 +191,6 @@ written as the call it makes.
     irdump defs <units-dir>                 every gold definition present, by name and arity
     codexrun --check <unit.codex> <expected>
     codexrun sweep <units-dir> <codex-test-dir>
-    ./selfhost_gate.sh                      the compiler on itself, counters and wire
     cargo test                              65 unit tests; needs no checkout at all
 
 **Every gate here has something it cannot see, and each one is worth knowing
@@ -184,6 +204,5 @@ counts is a README that is wrong a week later; run the tool.
 
 - **`docs/known-gaps.md`** -- what is not covered, and what is stale.
 - **`docs/gates.md`** -- what each gate proves, and what it does not.
-- **`safari/README.md`** -- the fourth arm, and why one unit must disagree.
 - **`docs/charcode.md`** -- `char-code` is not ASCII, and two pieces of
   Cobblestone read as bugs until you know that.

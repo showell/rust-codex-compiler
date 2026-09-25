@@ -219,7 +219,7 @@ fn sweep(units: &Path, tests: &Path) -> ExitCode {
             continue;
         }
         ran += 1;
-        let want = std::fs::read_to_string(exp).unwrap_or_default();
+        let want = expected_text(&std::fs::read_to_string(exp).unwrap_or_default());
         let verdict = match run_in_thread(&unit, Some(SWEEP_BUDGET)) {
             Ok(got) if got == want.as_bytes() => {
                 matched += 1;
@@ -270,6 +270,16 @@ fn sweep(units: &Path, tests: &Path) -> ExitCode {
     }
 }
 
+/// An `.expected` as the comparison sees it: no carriage returns, and no
+/// leading U+0001. Upstream writes some with CRLF and some open with the
+/// console's \x01 byte, and neither is program output; cobblestone-curated-
+/// tests' `common.expected` normalises the same two. Before this, 66 of the
+/// U62 sweep's 131 wrong outputs were these bytes and nothing else.
+fn expected_text(raw: &str) -> String {
+    let t = raw.replace('\r', "");
+    t.strip_prefix('\u{1}').map(str::to_string).unwrap_or(t)
+}
+
 fn collect_expected(root: &Path, out: &mut Vec<std::path::PathBuf>) {
     let Ok(rd) = std::fs::read_dir(root) else { return };
     for e in rd.flatten() {
@@ -287,7 +297,7 @@ fn collect_expected(root: &Path, out: &mut Vec<std::path::PathBuf>) {
 
 fn check(path: &Path, expected: &Path) -> ExitCode {
     let want = match std::fs::read_to_string(expected) {
-        Ok(t) => t,
+        Ok(t) => expected_text(&t),
         Err(e) => {
             eprintln!("{}: {e}", expected.display());
             return ExitCode::from(2);

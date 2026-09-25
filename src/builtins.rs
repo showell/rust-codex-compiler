@@ -10,7 +10,7 @@
 // VALUE and not a function of one argument. `None` is one of the eight
 // that declare no type at all. Re-run the probe after a pin change; do
 // not edit by hand.
-pub const BUILTINS: [(&str, Option<usize>); 272] = [
+pub const BUILTINS: [(&str, Option<usize>); 274] = [
     ("negate", Some(1)),
     ("text-length", Some(1)),
     ("integer-to-text", Some(1)),
@@ -124,6 +124,9 @@ pub const BUILTINS: [(&str, Option<usize>); 272] = [
     ("process-spawn-priority", Some(3)),
     ("process-wait", Some(1)),
     ("get-ticks", Some(0)),
+    ("pit-input-hz", Some(0)),
+    ("pit-count", Some(0)),
+    ("cpu-park", Some(0)),
     ("process-get-pid", Some(0)),
     ("process-restrict-cap", Some(2)),
     ("chan-kern-create", Some(1)),
@@ -173,7 +176,6 @@ pub const BUILTINS: [(&str, Option<usize>); 272] = [
     ("uefi-set-mode", Some(1)),
     ("uefi-read-key", Some(0)),
     ("uefi-read-key-ex", Some(0)),
-    ("uefi-read-file", Some(1)),
     ("text-concat-list", Some(1)),
     ("raw-bytes-to-text", Some(1)),
     ("__linked-list-empty", Some(1)),
@@ -303,7 +305,7 @@ pub const BUILTIN_EFFECT_NAMES: [&str; 5] = ["Console.Read", "Process", "Device.
 /// whose type names `Task` is otherwise untyped in a program that never does.
 pub const BUILTIN_TYPE_NAMES: [&str; 4] = ["Maybe", "SChan", "Task", "TypeBinding"];
 
-pub const BUILTIN_TYPES: [(&str, &str); 260] = [
+pub const BUILTIN_TYPES: [(&str, &str); 262] = [
     ("negate", "(forall 0 (fn (tvar 0) empty (tvar 0)))"),
     ("text-length", "(fn text empty int)"),
     ("integer-to-text", "(fn int empty text)"),
@@ -416,6 +418,9 @@ pub const BUILTIN_TYPES: [(&str, &str); 260] = [
     ("process-spawn-priority", "(foralleff 0 (fn (fn int (rowvar 0) int) empty (fn int empty (fn int (row Concurrent) int))))"),
     ("process-wait", "(fn int empty int)"),
     ("get-ticks", "int"),
+    ("pit-input-hz", "int"),
+    ("pit-count", "int"),
+    ("cpu-park", "int"),
     ("process-get-pid", "int"),
     ("process-restrict-cap", "(fn int empty (fn int (row Capability) int))"),
     ("chan-kern-create", "(fn int (row Concurrent) int)"),
@@ -465,7 +470,6 @@ pub const BUILTIN_TYPES: [(&str, &str); 260] = [
     ("uefi-set-mode", "(fn int empty int)"),
     ("uefi-read-key", "int"),
     ("uefi-read-key-ex", "int"),
-    ("uefi-read-file", "(fn text empty text)"),
     ("text-concat-list", "(fn (list text) empty text)"),
     ("raw-bytes-to-text", "(fn (list int) empty text)"),
     ("__linked-list-empty", "(forall 0 (fn int empty (llist (tvar 0))))"),

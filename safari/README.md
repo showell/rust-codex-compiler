@@ -1,60 +1,9 @@
 # Safari, driven from the Rust side
 
-Everything here depends on a **safari-codex checkout** and nothing here is
-vendored. `SAFARI_ROOT` points at it (default `~/showell_repos/safari-codex`).
-
-    ./run.sh      the fourth arm: safari's own checks, through our interpreter
-    ./bench.sh    time the interpreter on a fixed set of safari units
-
-## The fourth arm, and why it needs no gold
-
-safari-codex bundles each check into `build/<mod>-unit.codex` and compiles that
-same unit to `build/<mod>` with codexzig. After its `./harness/run.sh` both are
-already sitting there. So this needs no gold and no fixture:
-
-> **ONE SOURCE, TWO INDEPENDENT IMPLEMENTATIONS, run now and diffed.**
-
-Cobblestone's front end and emitter on one side; our lexer, parser, desugarer
-and interpreter on the other, sharing nothing below the text. That is what
-makes a disagreement attributable -- and it is the only oracle in this repo
-that sees MEANING rather than shape. Five byte-comparison oracles are one
-oracle, and `and` failed to short-circuit under all of them.
-
-## The filed divergences are safari's list, not a copy
-
-Three specs disagree for a reason that is filed and is not ours, all of them
-issue 125. **`spec/arm-gaps.tsv` over there is the list** -- spec name, issue
-number, what differs -- and `run.sh` reads it rather than keeping its own.
-
-That is not tidiness. The array that used to sit in `run.sh` named two while
-safari's file named three, so this gate reported `treesspec` as WRONG for three
-days after the answer had been written down one repo over. A gate that carries
-its own copy of somebody else's list is a gate that will eventually be wrong
-about it.
-
-`run.sh` REFUSES if the file is missing or parses to no rows, because a
-divergence list that silently reads as empty turns every filed defect back into
-a failure.
-
-## `literal_main` MUST differ
-
-`run.sh` **fails if the two arms ever agree** on it. It is FINDINGS 1B's repro:
-Cobblestone accumulates a 19-digit Real literal into a wrapping i64 and we read
-it as an f64. A second front end that does not reproduce the bug is the
-evidence, so agreement there would mean we had acquired the bug.
-
-## It is slow, and the number is not close
-
-Measured on this box against the Debug binaries safari's `run.sh` builds:
-
-    render   2.5s there, minutes here
-    ride     1.3s there
-
-The light checks are instant; the ones that simulate finish, but not quickly.
-So each side is bounded (`ZIG_SECS`, `RUST_SECS`) and the five units in
-`run.sh`'s `HEAVY` list are held back unless `SAFARI_ALL=1`. That list carries
-each one's step count, which is the honest measure of why. A tree-walking interpreter over persistent lists is
-what that costs today.
+safari-codex's committed units are a fixed benchmark for the interpreter.
+The fourth arm that used to live here (`safari/run.sh`) graded safari's
+retired judge checks; safari's specs and `cobblestone-curated-tests`' arms
+grade it now.
 
 ## Benchmarking
 
