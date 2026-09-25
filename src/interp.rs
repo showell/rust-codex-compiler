@@ -1937,6 +1937,11 @@ impl Interp {
             // Every one of these takes a BASE and an OFFSET and adds them, so
             // `peek-32 slot 0` is the shape a caller who already did the
             // arithmetic writes. A poke answers 0; `__memset` answers nothing.
+            // `alloc-bytes n` answers the heap pointer and moves it past `n`
+            // bytes, as x86's `emit-alloc-bytes-helper` does (`mov rax, r10`,
+            // then the bump); the bytes are read and written with the peeks
+            // and pokes below.
+            ("alloc-bytes", [Int(n)]) => Ok(Int(self.bump.alloc(*n))),
             ("peek-byte", [Int(b), Int(o)]) => Ok(Int(self.mem.load(b + o, 1))),
             ("peek-16", [Int(b), Int(o)]) => Ok(Int(self.mem.load(b + o, 2))),
             ("peek-32", [Int(b), Int(o)]) => Ok(Int(self.mem.load(b + o, 4))),
