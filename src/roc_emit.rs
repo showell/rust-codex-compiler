@@ -540,7 +540,16 @@ pub fn emit_modules(
         let mut items = String::new();
         let base = if *slug == app_slug { 0 } else { 1 };
         for (td, c) in ch.type_defs.iter().zip(&ch.type_def_chapters) {
-            if module_slug(c) == *slug {
+            // **A FIELD GENERIC IN A VARIABLE OF ITS OWN HAS NO ROC TYPE.** A
+            // class dictionary for `m : a, b -> b` is `CDict (a)` with a field
+            // over `b`, which Roc cannot declare ("type variable b is not
+            // declared"), and it checks every declaration whether or not
+            // anything uses it. It is upstream's typed-backend boundary too
+            // (MethodLocalPolymorphism.md, stage 3: UNSUPPORTED_FREE_BINDER).
+            // So it is not declared. A dictionary used through a call is a
+            // direct call by now; one that is still used as a value fails in
+            // Roc as an undeclared type, which is that boundary, named.
+            if module_slug(c) == *slug && !has_free_field_binder(td, syms) {
                 items.push_str(&cx.type_def(td, base)?);
             }
         }
@@ -3749,5 +3758,28 @@ mod module_names {
         let e = claim_module(&mut slugs, &mut of, "Emit--Maybe").unwrap_err();
         assert!(e.contains("`Core--Maybe`") && e.contains("`Emit--Maybe`"), "{e}");
         assert_eq!(slugs, vec!["Maybe"]);
+    }
+}
+
+/// A record declaration with a field type naming a type variable that is not
+/// one of the record's own parameters: a lowercase name in type position.
+fn has_free_field_binder(td: &crate::ast::TypeDef, syms: &SymTab) -> bool {
+    use crate::ast::{TypeDef, TypeExpr as T};
+    fn free(t: &T, params: &[Sym], syms: &SymTab) -> bool {
+        match t {
+            T::Named(n, _) => syms.text(*n).starts_with(|c: char| c.is_ascii_lowercase()) && !params.contains(n),
+            T::Fun(a, r, _) | T::PropEq(a, r, _) => free(a, params, syms) || free(r, params, syms),
+            T::App(c, args, _) => free(c, params, syms) || args.iter().any(|x| free(x, params, syms)),
+            T::Effect(_, _, _, r, _) | T::Linear(r, _) | T::BoundedInt(r, ..) | T::Constrained(_, _, r, _) => free(r, params, syms),
+            T::Forall(v, vt, p, _) => {
+                let mut inner = params.to_vec();
+                inner.push(*v);
+                free(vt, &inner, syms) || free(p, &inner, syms)
+            }
+        }
+    }
+    match td {
+        TypeDef::Record(_, params, fields, ..) => fields.iter().any(|f| free(&f.type_expr, params, syms)),
+        _ => false,
     }
 }

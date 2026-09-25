@@ -868,6 +868,12 @@ impl<'a> Desugar<'a> {
             }
             out.push(TypeDef::Record(dict, vec![self.sym_str("a")], fields, false, self.synth()));
         }
+        // **`type_def_chapters` IS PARALLEL TO `type_defs`**, and every reader
+        // pairs them with `zip`, which stops at the shorter one. Extending the
+        // types alone dropped every class dictionary's type from the Roc
+        // modules: `EquatableDict is not declared in this scope`. Each goes in
+        // the chapter its dictionary definitions are emitted from.
+        ch.type_def_chapters.extend(std::iter::repeat(self.slug.clone()).take(out.len()));
         ch.type_defs.extend(out);
     }
 

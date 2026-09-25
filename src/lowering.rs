@@ -663,9 +663,27 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
                 .at(*s)
                 .or_else(|| cx.bindings.get(n).map(strip_fun_args))
                 .unwrap_or_else(|| want.clone());
+            // `lower-record-fields-typed`: EACH FIELD IS LOWERED AGAINST ITS
+            // DECLARED TYPE, instantiated with the record's applied arguments
+            // (`subst-type-vars-from-arg`), and those come from what the
+            // context expects -- a class dictionary's declared `CDict Integer`
+            // among them. Lowering every field against nothing left a
+            // desugarer-built lambda, whose span is synthetic and records
+            // nothing, with `error` in every parameter.
+            let applied = crate::check::strip_forall(&cx.st.deep_resolve(&expected_or_recorded(want, cx, *s)));
+            let cargs = match &applied {
+                Ty::Constructed(m, a) | Ty::Record(m, a) if m == n => Some(a.clone()),
+                _ => None,
+            };
             let mut fs = Vec::new();
             for f in fields {
-                fs.push(IrFieldVal { name: f.name, value: expr(&f.value, &Ty::NoExpect, cx)? });
+                let field_want = match (&cargs, cx.bindings.get(n), cx.tds.field_index(*n, f.name)) {
+                    (Some(a), Some(ctor), Some(idx)) => {
+                        crate::check::instantiate_field(ctor, idx, a).unwrap_or(Ty::NoExpect)
+                    }
+                    _ => Ty::NoExpect,
+                };
+                fs.push(IrFieldVal { name: f.name, value: expr(&f.value, &field_want, cx)? });
             }
             Ok(IrExpr::Record(*n, fs, ty, *s))
         }
