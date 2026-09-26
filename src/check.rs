@@ -218,6 +218,10 @@ pub struct UnifyState {
     /// dictionary an `Eq a =>` call passes (`true`: the type it binds),
     /// judged per definition by `check-eq-on-declared-vars`.
     pub eq_sites: Vec<(Ty, bool)>,
+    /// `eq-type-withheld` answers, by (type, depth). Per checker state, not
+    /// global: a sweep checks many units in one process, and a type NAME
+    /// means a different declaration in each.
+    pub withheld_memo: std::collections::HashMap<(String, u32), bool>,
     /// Inside an induction proof's scrutinee. Stage 5 (`check-induction-def`)
     /// binds the forall's value binders there and this checker does not, so
     /// a name it cannot find is not CDX3002.
@@ -361,6 +365,7 @@ impl Default for UnifyState {
             diags: Vec::new(),
             unify_gaps: 0,
             eq_sites: Vec::new(),
+            withheld_memo: std::collections::HashMap::new(),
             in_proof: false,
             effect_exempt: false,
             list_name: None,
@@ -2015,33 +2020,63 @@ fn has_vec_cmp_builtin(op: crate::ast::BinaryOp, t: &Ty) -> bool {
 /// Real, a Vector or a SizedVec, looking through lists, constructed types and
 /// nested records and variants to a depth of 4. Field types are read from the
 /// constructors, instantiated at the type's arguments.
-fn eq_operand_withheld(env: &TyEnv<'_>, t: &Ty) -> bool {
-    matches!(strip_unit(t), Ty::Record(..) | Ty::Sum(..)) && eq_type_withheld(env, t, 4)
+fn eq_operand_withheld(env: &TyEnv<'_>, st: &mut UnifyState, t: &Ty) -> bool {
+    matches!(strip_unit(t), Ty::Record(..) | Ty::Sum(..)) && eq_type_withheld(env, st, t, 4)
 }
 
-fn eq_type_withheld(env: &TyEnv<'_>, t: &Ty, fuel: u32) -> bool {
+/// Every `==` on a record asks this, and the compiler's own records have
+/// dozens of fields that nest: walked afresh each time it was fields^4 work
+/// per comparison (`shell-build-keep`: over 90 s where codexcheck takes
+/// 0.83 s). So a record's field types come from ONE walk of its constructor,
+/// and each (type, depth) is answered once per checker state.
+fn eq_type_withheld(env: &TyEnv<'_>, st: &mut UnifyState, t: &Ty, fuel: u32) -> bool {
     if fuel == 0 {
         return false;
     }
-    match strip_unit(t) {
-        Ty::Real(..) | Ty::Vector(..) | Ty::SizedVec(..) => true,
-        Ty::List(e) | Ty::LinkedList(e) => eq_type_withheld(env, e, fuel - 1),
-        Ty::Constructed(_, args) => args.iter().any(|a| eq_type_withheld(env, a, fuel - 1)),
-        Ty::Record(n, args) => {
-            let count = env.type_defs.record_fields(*n).map_or(0, |f| f.len());
-            (0..count).any(|i| {
-                env.get(*n)
-                    .and_then(|c| instantiate_field(c, i, args))
-                    .is_some_and(|f| eq_type_withheld(env, &f, fuel - 1))
-            })
-        }
-        Ty::Sum(n, args) => env.type_defs.ctors(*n).is_some_and(|cs| {
-            cs.iter().any(|c| {
-                env.get(*c).is_some_and(|ct| ctor_field_types(ct, args).iter().any(|f| eq_type_withheld(env, f, fuel - 1)))
-            })
-        }),
-        _ => false,
+    let key = (format!("{t:?}"), fuel);
+    if let Some(&known) = st.withheld_memo.get(&key) {
+        return known;
     }
+    let answer = match strip_unit(t) {
+        Ty::Real(..) | Ty::Vector(..) | Ty::SizedVec(..) => true,
+        Ty::List(e) | Ty::LinkedList(e) => eq_type_withheld(env, st, e, fuel - 1),
+        Ty::Constructed(_, args) => args.iter().any(|a| eq_type_withheld(env, st, a, fuel - 1)),
+        Ty::Record(n, args) => {
+            let fields = env.get(*n).map(|c| record_field_types(c, args)).unwrap_or_default();
+            fields.iter().any(|f| eq_type_withheld(env, st, f, fuel - 1))
+        }
+        Ty::Sum(n, args) => {
+            let fields: Vec<Ty> = env
+                .type_defs
+                .ctors(*n)
+                .map(|cs| cs.iter().filter_map(|c| env.get(*c)).flat_map(|ct| ctor_field_types(ct, args)).collect())
+                .unwrap_or_default();
+            fields.iter().any(|f| eq_type_withheld(env, st, f, fuel - 1))
+        }
+        _ => false,
+    };
+    st.withheld_memo.insert(key, answer);
+    answer
+}
+
+/// A record constructor's field types, instantiated at the record's
+/// arguments, from one walk of its arrow (`instantiate-field` per field
+/// walked it once per field).
+fn record_field_types(ctor: &Ty, cargs: &[Ty]) -> Vec<Ty> {
+    let mut spine = strip_forall(ctor);
+    let mut fields = Vec::new();
+    while let Ty::Fun(a, _, r) = spine {
+        fields.push(*a);
+        spine = *r;
+    }
+    if let Ty::Record(_, rargs) = spine {
+        for (g, c) in rargs.iter().zip(cargs) {
+            if let Ty::Var(id) = g {
+                fields = fields.iter().map(|f| subst_type_var(f, *id, c)).collect();
+            }
+        }
+    }
+    fields
 }
 
 /// A variant constructor's field types, instantiated at the variant's
@@ -2791,7 +2826,7 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
                     st.error(code, "This packed Vector comparison has no lane-wise form: == and /= are lane-wise on Vector 2 Integer, and ~ and ~0 on Vector 2 Real and Vector 4 (Real approximate). Real lanes compare with ~ or ~0, never ==; a 256-bit vector has none of the four yet.");
                 }
                 Ty::Real(..) => st.error(Cdx::REAL_EQUALITY_BANNED, "This call binds an Eq a => variable to a Real, and floating-point equality is not safe. Compare with ~ or ~0 in a function of your own."),
-                _ if eq_operand_withheld(&env, &t) => st.error(Cdx::STRUCTURAL_EQ_WITHHELD, "This call binds an Eq a => variable to a type with no equality: a field holds a Real, a Vector or a SizedVec, which have no single structural equality."),
+                _ if eq_operand_withheld(&env, &mut st, &t) => st.error(Cdx::STRUCTURAL_EQ_WITHHELD, "This call binds an Eq a => variable to a type with no equality: a field holds a Real, a Vector or a SizedVec, which have no single structural equality."),
                 _ => {}
             }
         }
@@ -3168,7 +3203,7 @@ pub fn infer_row(
                                 );
                                 Ty::Boolean
                             }
-                            OpEq | OpNotEq if eq_operand_withheld(env, &dl) => {
+                            OpEq | OpNotEq if eq_operand_withheld(env, st, &dl) => {
                                 st.error(
                                     Cdx::STRUCTURAL_EQ_WITHHELD,
                                     "This type has no equality: a field holds a Real, a Vector or a SizedVec, which have no single structural equality, so == would compare the two values' addresses. Compare the fields you mean, using ~ or ~0 for a Real",

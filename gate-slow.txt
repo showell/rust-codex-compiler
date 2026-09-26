@@ -1,0 +1,10 @@
+# Units corpus_check_gate.sh leaves out by default, reported as SLOW; ALL=1
+# runs them. A unit belongs here only when our checkdump is slow on it for a
+# reason we have understood and chosen not to fix yet; one line each:
+# seconds (ours / codexcheck) at the Update measured, then the unit.
+#
+# Empty. The first candidate, shell-build-keep at U64 (over 90 s against
+# codexcheck's 0.83 s), was our own bug -- eq_type_withheld re-deriving every
+# record field per `==` -- fixed rather than listed: it now takes 0.01 s.
+# Every unit also runs under CHECK_TIMEOUT (default 30 s), so a unit that
+# turns slow is a TIMEOUT row, not a stalled gate.
