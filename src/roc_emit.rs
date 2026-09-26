@@ -4154,3 +4154,109 @@ fn has_free_field_binder(td: &crate::ast::TypeDef, syms: &SymTab) -> bool {
         _ => false,
     }
 }
+
+/// **A LIST HELPER CALL IS ROC'S `==`, AND SO IS A GENERIC RECORD'S.** Since
+/// U64 the desugarer derives `__eq_<R>` for a record too, and for one with
+/// type parameters Roc needs a `where` clause per parameter, which this
+/// emitter does not write (see the nominal-record note above): such a helper
+/// is dropped, and its calls, bare or instantiated (`__eq_R@...`), are Roc's
+/// structural `==`, which is what rocemit wrote before U64.
+///
+/// Since U64's step 1 lowering calls
+/// `__eq_List@<T>` for `==` on a list, as upstream does, and `eq_helpers`
+/// mints its definition only on the driver's path; rocemit reads the chapter
+/// whole and gets the call alone. In Roc a list compares structurally, each
+/// element by its own `is_eq`, so the call is put back as the `binary eq`
+/// rocemit always wrote for it -- and `/=` stays the `if` lowering made of
+/// it. Done before anything reads the IR, so the `where`-clause walk and the
+/// effect threading see exactly what they saw before.
+pub fn restore_list_eq(defs: Vec<IrDef>, syms: &SymTab, ch: &Chapter) -> Vec<IrDef> {
+    let generic: Vec<String> = ch
+        .type_defs
+        .iter()
+        .filter_map(|td| match td {
+            TypeDef::Record(n, ps, ..) if !ps.is_empty() => Some(format!("__eq_{}", syms.text(*n))),
+            _ => None,
+        })
+        .collect();
+    let plain_eq = |n: &str| n.starts_with("__eq_List@") || generic.iter().any(|g| n == g || n.starts_with(&format!("{g}@")));
+    defs.into_iter()
+        .filter(|d| !generic.iter().any(|g| syms.text(d.name) == g))
+        .map(|mut d| {
+            d.body = list_eq_expr(&d.body, syms, &plain_eq);
+            d
+        })
+        .collect()
+}
+
+fn list_eq_expr(e: &IrExpr, syms: &SymTab, plain_eq: &dyn Fn(&str) -> bool) -> IrExpr {
+    use IrExpr as E;
+    let list_eq_expr = |x: &IrExpr, syms: &SymTab| list_eq_expr(x, syms, plain_eq);
+    let go = |x: &IrExpr| Box::new(list_eq_expr(x, syms));
+    let stmts = |ss: &[IrActStmt]| -> Vec<IrActStmt> {
+        ss.iter()
+            .map(|s| match s {
+                IrActStmt::Bind(n, t, x, sp) => IrActStmt::Bind(*n, t.clone(), list_eq_expr(x, syms), *sp),
+                IrActStmt::Exec(x, sp) => IrActStmt::Exec(list_eq_expr(x, syms), *sp),
+            })
+            .collect()
+    };
+    match e {
+        E::Apply(f, b, t, sp) => {
+            if let E::Apply(h, a, _, _) = &**f {
+                if let E::Name(n, _, _) = &**h {
+                    if plain_eq(syms.text(*n)) {
+                        return E::Binary(IrBinOp::Eq, go(a), go(b), t.clone(), *sp);
+                    }
+                }
+            }
+            E::Apply(go(f), go(b), t.clone(), *sp)
+        }
+        E::Binary(op, l, r, t, sp) => E::Binary(*op, go(l), go(r), t.clone(), *sp),
+        E::Negate(x, t, sp) => E::Negate(go(x), t.clone(), *sp),
+        E::If(c, a, b, t, sp) => E::If(go(c), go(a), go(b), t.clone(), *sp),
+        E::Let(n, t, v, b, sp) => E::Let(*n, t.clone(), go(v), go(b), *sp),
+        E::Lambda(ps, b, t, sp) => E::Lambda(ps.clone(), go(b), t.clone(), *sp),
+        E::List(xs, t, sp) => E::List(xs.iter().map(|x| list_eq_expr(x, syms)).collect(), t.clone(), *sp),
+        E::Match(s, bs, t, sp) => E::Match(
+            go(s),
+            bs.iter()
+                .map(|b| crate::ir_chapter::IrBranch {
+                    pattern: b.pattern.clone(),
+                    body: list_eq_expr(&b.body, syms),
+                    guard: list_eq_expr(&b.guard, syms),
+                    span: b.span,
+                })
+                .collect(),
+            t.clone(),
+            *sp,
+        ),
+        E::Act(ss, t, sp) => E::Act(stmts(ss), t.clone(), *sp),
+        E::Record(n, fs, t, sp) => E::Record(
+            *n,
+            fs.iter().map(|f| crate::ir_chapter::IrFieldVal { name: f.name, value: list_eq_expr(&f.value, syms) }).collect(),
+            t.clone(),
+            *sp,
+        ),
+        E::FieldAccess(r, f, t, sp) => E::FieldAccess(go(r), f.clone(), t.clone(), *sp),
+        E::FieldStore(r, f, v, t, sp) => E::FieldStore(go(r), f.clone(), go(v), t.clone(), *sp),
+        E::Handle(eff, h, cs, t, sp) => E::Handle(
+            eff.clone(),
+            go(h),
+            cs.iter()
+                .map(|c| crate::ir_chapter::IrHandleClause {
+                    op_name: c.op_name.clone(),
+                    params: c.params.clone(),
+                    resume_name: c.resume_name,
+                    body: list_eq_expr(&c.body, syms),
+                    span: c.span,
+                })
+                .collect(),
+            t.clone(),
+            *sp,
+        ),
+        E::WithTimeout(s, es, sc, b, t, sp) => E::WithTimeout(*s, es.clone(), sc.clone(), go(b), t.clone(), *sp),
+        E::Try(m, b, f, x, t, sp) => E::Try(*m, stmts(b), stmts(f), stmts(x), t.clone(), *sp),
+        other => other.clone(),
+    }
+}

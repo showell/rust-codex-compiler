@@ -109,6 +109,7 @@ fn emit(path: &Path, dir: &Path, by_reach: bool, whole: bool) -> Result<String, 
     // in the callers, read the version the write answered
     // (docs/list-versions.md).
     let defs = std::mem::take(&mut low.defs);
+    let defs = codexc::roc_emit::restore_list_eq(defs, &low.syms, &ch);
     let (defs, unversioned) = codexc::list_versions::apply(defs, &mut low.syms);
     low.defs = defs;
     if !whole {
