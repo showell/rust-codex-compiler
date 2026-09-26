@@ -2971,6 +2971,14 @@ impl<'a> Cx<'a> {
         if t == "cpu-park" {
             return Ok("0".into());
         }
+        // `__heap-base` is where the target's heap begins (upstream answers it
+        // per backend: x86's `bare-metal-heap-base`, wasm's `$heap_start`).
+        // Both of rocemit's memories, `Mem` and `MachineMem`, open their bump
+        // pointer there, at 6291456; the `+ z` in `new` is only there to keep
+        // the heap out of the compiler's reach.
+        if t == "__heap-base" {
+            return Ok("6291456".into());
+        }
         Err(format!("builtin `{t}` used as a value"))
     }
 

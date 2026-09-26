@@ -2068,6 +2068,11 @@ impl Interp {
             // anything: inside an extent it asks about the deck, outside it
             // asks about the bivy.
             ("__heap-save", []) => Ok(Int(self.cursor())),
+            // `__heap-base` is where the target's heap begins, which upstream
+            // answers per backend (x86's `bare-metal-heap-base`, wasm's
+            // `$heap_start`). Here that is `HEAP_ORIGIN`, where every cursor
+            // starts.
+            ("__heap-base", []) => Ok(Int(crate::bump::HEAP_ORIGIN)),
             // A builtin x86 emits as a constant is that constant, read from
             // upstream by the builtins probe (`CONSTANT_BUILTINS`); `cpu-park`'s
             // `sti; hlt` answers 0 -- no core here to park.
