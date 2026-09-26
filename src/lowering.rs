@@ -1026,8 +1026,8 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
 /// A type WITH ARGUMENTS is called by an INSTANTIATED name, `__eq_Box@Integer`,
 /// spelled by `eq-helper-name-inst` from the site's actuals, and its type is
 /// built from the operand rather than read off the helper, whose own field
-/// stays at the declaration's type variable. `codexir` puts that name on the
-/// wire and attaches NO definition for it; matching the wire is the job here.
+/// stays at the declaration's type variable. The definition for that name is
+/// minted after lowering by `eq_helpers` (upstream's `eq-helper-defs`).
 ///
 /// `eq-site-actuals` reads actuals off a `ConstructedTy` ONLY: a `SumTy` with
 /// arguments still has them, so `has-args` is true and the type is the
@@ -1043,6 +1043,20 @@ fn eq_dispatch(
     s: crate::ast::Span,
 ) -> Result<IrExpr, (IrExpr, IrExpr)> {
     let resolved = cx.st.deep_resolve(lty);
+    // `eq-ty-is-list`: a list compares through its `__eq_List@<T>` helper,
+    // which `eq_helpers` mints.
+    if let Ty::List(_) = strip_unit(&resolved) {
+        let stripped = strip_unit(&resolved);
+        let hname = eq_helper_name_inst("List", &eq_site_actuals(&stripped), cx);
+        let fty = Ty::Fun(
+            Box::new(stripped.clone()),
+            crate::check::EffectRow::default(),
+            Box::new(Ty::Fun(Box::new(stripped.clone()), crate::check::EffectRow::default(), Box::new(Ty::Boolean))),
+        );
+        let hsym = cx.syms.borrow_mut().intern(&hname);
+        let inner = IrExpr::Apply(Box::new(IrExpr::Name(hsym, fty.clone(), s)), Box::new(l), peel_fun_return(&fty), s);
+        return Ok(IrExpr::Apply(Box::new(inner), Box::new(r), Ty::Boolean, s));
+    }
     let tn = type_name_of(&resolved, cx);
     if tn.is_empty() {
         return Err((l, r));
@@ -1255,6 +1269,7 @@ fn eq_type_has_args(t: &Ty) -> bool {
 fn eq_site_actuals(t: &Ty) -> Vec<Ty> {
     match t {
         Ty::Constructed(_, a) => a.clone(),
+        Ty::List(e) => vec![(**e).clone()],
         _ => Vec::new(),
     }
 }

@@ -1125,11 +1125,10 @@ impl<'a> Desugar<'a> {
             if derives("Show") {
                 out.push(self.show_def(name, td));
             }
-            // `td-eq-safe` since U63: not in the withheld set. Upstream also
-            // gives a RECORD a derived `__eq_` now; this still gives one only
-            // to a variant, the port of record equality pending.
+            // `td-eq-safe` since U63: a variant or a record not in the
+            // withheld set.
             let eq_safe = match td {
-                TypeDef::Variant(n, ..) => !withheld.contains(n),
+                TypeDef::Variant(n, ..) | TypeDef::Record(n, ..) => !withheld.contains(n),
                 _ => false,
             };
             if derives("Eq") || eq_safe {

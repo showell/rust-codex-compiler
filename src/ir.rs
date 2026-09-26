@@ -230,6 +230,9 @@ fn lower_pipeline(
     type_map.extend(tds.declared().iter().map(|(n, t)| (*n, t.clone())));
     let defs = crate::resolve_types::resolve_defs(defs, &syms, &type_map);
     let defs = crate::lambda_lifting::lift_lambdas(defs, &mut syms);
+    // `eq-attach-helpers`, between the lift and the prune (`prepare-method-ir`):
+    // the structural equality helpers the lowered IR names.
+    let defs = if driver_passes { crate::eq_helpers::attach(defs, &mut syms, tds, bindings) } else { defs };
     let defs = if driver_passes {
         crate::ir_passes::prune_unreachable_roots(defs, roots, &syms)
     } else {
@@ -933,8 +936,9 @@ mod tests {
 
     /// **`==` ON A TYPE WITH A GENERATED HELPER IS A CALL TO THE HELPER**,
     /// `lower-eq-dispatch`, and `/=` is `if call then False else True`. A
-    /// type with arguments is called by its INSTANTIATED name and a list,
-    /// which has no helper, stays a `binary eq`. The generated helper's own
+    /// type with arguments is called by its INSTANTIATED name, and so is a
+    /// list (`eq-ty-is-list`: `__eq_List@Integer`, minted by `eq_helpers`;
+    /// read off `codexir` at U64, `82cb77a5`). The generated helper's own
     /// body is on the wire too, and its sub-patterns carry the FIELD types:
     /// every pattern in it shares one synthetic span, so those cannot come
     /// from the checker's table. Read off `codexir` at `8570fba1`.
@@ -957,7 +961,8 @@ mod tests {
             all.contains(r#"(name "__eq_Box@Integer" (fn (ctd "Box" (args int-default)) (fn (ctd "Box" (args int-default)) boolean)))"#),
             "{all}"
         );
-        assert!(all.contains(r#"(binary eq (name "a" (list int-default)) (name "b" (list int-default)) boolean)"#), "{all}");
+        assert!(all.contains(r#"(apply (apply (name "__eq_List@Integer" (fn (list int-default) (fn (list int-default) boolean))) (name "a" (list int-default)) (fn (list int-default) boolean)) (name "b" (list int-default)) boolean)"#), "{all}");
+        assert!(all.contains(r#"(def "__eq_List@Integer__loop" "#), "{all}");
         // The helper's body: field 0 is an Integer, field 1 calls Box's
         // instantiated helper, and both `MkPair` patterns carry `Pair`.
         let pair = def_line(src, "__eq_Pair");
