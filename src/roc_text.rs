@@ -106,7 +106,7 @@ pub fn text_module() -> String {
     let codes = (0..128u32).map(|p| charcode::code_of_point(p) as u64).collect();
     let t2_end: Vec<String> = charcode::X86_T2.iter().map(|e| (e[0] as u32 | (e[1] as u32) << 8).to_string()).collect();
     let t2_delta: Vec<String> =
-        charcode::X86_T2.iter().map(|e| u32::from_le_bytes([e[2], e[3], e[4], e[5]]).to_string()).collect();
+        charcode::X86_T2.iter().map(|e| i32::from_le_bytes([e[2], e[3], e[4], e[5]]).to_string()).collect();
     let bases: Vec<String> = charcode::X86_T1_BASES.iter().map(u64::to_string).collect();
     TEXT.replace("@POINTS@", &rows(points))
         .replace("@CODES@", &rows(codes))
@@ -166,15 +166,15 @@ CceText :: List(U8).{
 
 	# x86's print tables: the code point starting each 128-code slice of tier 1
 	# (`tier1-slice-bases`), and per tier-2 slice the code it ends before and
-	# the delta to its code point, added unsigned in a 64-bit register
-	# (`tier2-rodata`).
+	# the delta to its code point, signed (`tier2-rodata`; since U63 x86 loads
+	# it with `movsxd`, so a negative delta subtracts).
 	x86_t1_bases : List(U64)
 	x86_t1_bases = [@X86_T1_BASES@]
 
 	x86_t2_end : List(U64)
 	x86_t2_end = [@X86_T2_END@]
 
-	x86_t2_delta : List(U64)
+	x86_t2_delta : List(I64)
 	x86_t2_delta = [@X86_T2_DELTA@]
 
 	# **A LITERAL IS A CceText** (`from_quote`): a Roc string literal where a CceText
@@ -408,8 +408,7 @@ CceText :: List(U8).{
 	# 128 is its tier-0 code point; a unit whose top nibble is 1110 starts a
 	# 3-unit tier-2 frame; every other unit from 128 is taken as a 2-unit tier-1
 	# frame. Each byte is the low byte of the shifted value, and a unit past the
-	# end reads as 0. A sequence x86 writes that is not UTF-8 (an overlong code
-	# point from a negative tier-2 delta) arrives as U+FFFD.
+	# end reads as 0. A sequence x86 writes that is not UTF-8 arrives as U+FFFD.
 	printed : CceText -> Str
 	printed = |CceText.(s)| Str.from_utf8_lossy(CceText.print_from(s, 0, []))
 
@@ -432,7 +431,7 @@ CceText :: List(U8).{
 	x86_t2_point : U64, U64 -> U64
 	x86_t2_point = |code, k|
 		if k >= List.len(CceText.x86_t2_end) { 65533 }
-		else if code < (List.get(CceText.x86_t2_end, k) ?? 0) { code + (List.get(CceText.x86_t2_delta, k) ?? 0) }
+		else if code < (List.get(CceText.x86_t2_end, k) ?? 0) { I64.to_u64_wrap(U64.to_i64_wrap(code) + (List.get(CceText.x86_t2_delta, k) ?? 0)) }
 		else { CceText.x86_t2_point(code, k + 1) }
 
 	# A code point in 1, 2 or 3 bytes.
@@ -480,6 +479,7 @@ mod tests {
         let first: Vec<&str> = codes.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()).take(128).collect();
         assert_eq!(first[65], "41");
         assert_eq!(first[9], "68", "no tier covers a tab");
-        assert!(m.contains("x86_t1_bases = [192, 320,"), "x86's slice 0 starts at U+00C0");
+        assert!(m.contains("x86_t1_bases = [128, 256,"), "since U63 x86's slice 0 starts at U+0080");
+        assert!(m.contains("x86_t2_delta = [") && m.contains(", -"), "a negative tier-2 delta stays negative");
     }
 }

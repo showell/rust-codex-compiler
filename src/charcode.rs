@@ -308,15 +308,19 @@ pub fn units_of(s: &str) -> Vec<u8> {
 }
 
 /// x86's `tier1-slice-bases`: the code point starting each 128-code slice of
-/// tier 1, indexed by `(code - 128) >> 7`. **Slice 0 starts at U+00C0 where
-/// the encoding's tier 1 starts at U+0080**, so codes 128..=383 print 64 code
-/// points above the character that framed them. That is x86's table, emulated.
+/// tier 1, indexed by `(code - 128) >> 7`. Through U62 slice 0 started at
+/// U+00C0 where the encoding's tier 1 starts at U+0080, so codes 128..=383
+/// printed 64 code points above the character that framed them, and this
+/// emulated that. U63 fixed x86's table to Foreword CCE's block bases (slices
+/// 0 and 1 are block 0, base 128), and codex/test/ops/tier1-latin-print pins it.
 pub(crate) const X86_T1_BASES: [u64; 16] =
-    [192, 320, 1024, 880, 1536, 1424, 2304, 3584, 4352, 19968, 20096, 20224, 20352, 12352, 12480, 8704];
+    [128, 256, 1024, 880, 1536, 1424, 2304, 3584, 4352, 19968, 20096, 20224, 20352, 12352, 12480, 8704];
 
 /// x86's `tier2-rodata`: per slice, the code it ends before (two bytes) and
-/// the delta to its code point (four bytes, added unsigned in a 64-bit
-/// register).
+/// the delta to its code point (four bytes, signed). Through U62 x86 built the
+/// delta from four zero-extended bytes and added it unsigned, so a negative
+/// delta printed an overlong 4-byte sequence; U63 loads it with `movsxd`, and
+/// codex/test/ops/tier2-print pins the negative slices.
 pub(crate) const X86_T2: [[u8; 6]; 10] = [
     [192, 8, 128, 39, 0, 0],
     [32, 9, 128, 39, 0, 0],
@@ -357,7 +361,7 @@ pub fn print_bytes(units: &[u8], out: &mut Vec<u8>) {
             let cp = X86_T2
                 .iter()
                 .find(|e| code < (e[0] as u64 | (e[1] as u64) << 8))
-                .map_or(65533, |e| code + u32::from_le_bytes([e[2], e[3], e[4], e[5]]) as u64);
+                .map_or(65533, |e| (code as i64 + i32::from_le_bytes([e[2], e[3], e[4], e[5]]) as i64) as u64);
             if cp < 65536 {
                 out.extend([((cp >> 12) | 224) as u8, (((cp >> 6) & 63) | 128) as u8, ((cp & 63) | 128) as u8]);
             } else {
@@ -421,14 +425,13 @@ mod unit_tests {
         assert_eq!(out, "hi é".as_bytes());
         let mut out = Vec::new();
         print_bytes(&[193, 128], &mut out);
-        assert_eq!(out, "Ā".as_bytes(), "x86's slice 0 starts at U+00C0");
-        // € is tier-2 slice 7, whose delta is negative. x86 adds it unsigned in
-        // a 64-bit register (`add-rr` carries REX.W), so the code point lands
-        // above 2^32 and goes out as a 4-byte sequence whose low bits are
-        // U+20AC: overlong.
+        assert_eq!(out, "À".as_bytes(), "since U63 x86's slice 0 starts at U+0080");
+        // € is tier-2 slice 7, whose delta is negative. Through U62 x86 added
+        // it unsigned and printed an overlong 4-byte sequence; since U63 the
+        // delta is sign-extended and € prints as itself.
         let mut out = Vec::new();
         print_bytes(&[233, 168, 144], &mut out);
-        assert_eq!(out, vec![0xF0, 0x82, 0x82, 0xAC]);
+        assert_eq!(out, "€".as_bytes());
     }
 
     #[test]
