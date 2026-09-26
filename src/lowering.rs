@@ -431,6 +431,28 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
             let (inner_f, pn) = dict_placeholder_arg(f, cx).expect("guarded");
             let func = expr(&inner_f, &Ty::NoExpect, cx)?;
             let func_ty = cx.st.deep_resolve(&func.ty());
+            // `lower-eq-derived-apply` (U64): the dictionary is for the type
+            // the call BINDS, read off the callee's instantiated type (its
+            // first parameter is `T -> T -> Boolean`), not off an argument.
+            if cx.text(pn) == "__dderiv-Eq" {
+                let a = expr(a, &Ty::NoExpect, cx)?;
+                let bound = strip_unit(&cx.st.deep_resolve(&peel_fun_param(&peel_fun_param(&func_ty))));
+                let dict_ir = eq_dict_expr(&bound, cx, *s)?;
+                let inner_ret = peel_fun_return(&func_ty);
+                let ret = peel_fun_return(&inner_ret);
+                // `prefer-applied-ty`: the APPLIED type, unless the
+                // expectation is a named type with arguments. Reading the
+                // recorded type instead finds the dictionary application,
+                // which shares the call's span (`insert-dict-refs`).
+                let res = match want {
+                    Ty::Constructed(_, eargs) if !eargs.is_empty() && (lt::has_typevars(&ret) || matches!(ret, Ty::Error)) => {
+                        expected_or_recorded(want, cx, *s)
+                    }
+                    _ => ret,
+                };
+                let inner = IrExpr::Apply(Box::new(func), Box::new(dict_ir), inner_ret, *s);
+                return Ok(IrExpr::Apply(Box::new(inner), Box::new(a), res, *s));
+            }
             let a = expr(a, &Ty::NoExpect, cx)?;
             let arg_ty = cx.st.deep_resolve(&a.ty());
             let pname = cx.text(pn);
@@ -1043,6 +1065,23 @@ fn eq_dispatch(
     s: crate::ast::Span,
 ) -> Result<IrExpr, (IrExpr, IrExpr)> {
     let resolved = cx.st.deep_resolve(lty);
+    // U64: `==` on the variable an `Eq a =>` dictionary binds calls that
+    // dictionary (`eq-dict-for-var`); on a type that HOLDS such variables,
+    // inside a constrained definition, a dictionary built for it
+    // (`eq-needs-dict-helper`, `lower-eq-dict-call`).
+    {
+        let stripped = strip_unit(&resolved);
+        if let Some(d) = eq_dict_for_var(&stripped, cx) {
+            let fty = eqd_dict_ty(&stripped);
+            let inner = IrExpr::Apply(Box::new(IrExpr::Name(d, fty.clone(), s)), Box::new(l), peel_fun_return(&fty), s);
+            return Ok(IrExpr::Apply(Box::new(inner), Box::new(r), Ty::Boolean, s));
+        }
+        if eq_needs_dict_helper(&stripped, cx) {
+            let Ok(dict) = eq_dict_expr(&stripped, cx, s) else { return Err((l, r)) };
+            let inner = IrExpr::Apply(Box::new(dict), Box::new(l), fun_ty(stripped.clone(), Ty::Boolean), s);
+            return Ok(IrExpr::Apply(Box::new(inner), Box::new(r), Ty::Boolean, s));
+        }
+    }
     // `eq-ty-is-list`: a list compares through its `__eq_List@<T>` helper,
     // which `eq_helpers` mints.
     if let Ty::List(_) = strip_unit(&resolved) {
@@ -1058,7 +1097,10 @@ fn eq_dispatch(
         return Ok(IrExpr::Apply(Box::new(inner), Box::new(r), Ty::Boolean, s));
     }
     let tn = type_name_of(&resolved, cx);
-    if tn.is_empty() {
+    // `is-primitive-type-name`: never a helper of its own, which since U64
+    // matters -- `__eq_Integer` exists, as a dictionary, and its own body's
+    // `==` must not call it.
+    if tn.is_empty() || is_primitive_type_name(&tn) {
         return Err((l, r));
     }
     let bare = format!("__eq_{tn}");
@@ -1254,6 +1296,116 @@ fn strip_unit(t: &Ty) -> Ty {
         Ty::Unit(_, inner) => strip_unit(inner),
         other => other.clone(),
     }
+}
+
+fn fun_ty(a: Ty, r: Ty) -> Ty {
+    Ty::Fun(Box::new(a), crate::check::EffectRow::default(), Box::new(r))
+}
+
+/// `eqd-dict-ty`: an Eq dictionary for `t`, `t -> t -> Boolean`.
+fn eqd_dict_ty(t: &Ty) -> Ty {
+    fun_ty(t.clone(), fun_ty(t.clone(), Ty::Boolean))
+}
+
+/// `eq-dict-for-var`: the `__d-Eq-*` parameter in scope whose dictionary
+/// binds this type variable, innermost first.
+fn eq_dict_for_var(t: &Ty, cx: &Lower) -> Option<Sym> {
+    let Ty::Var(id) = t else { return None };
+    let ov = cx.overlay.borrow();
+    ov.iter().rev().find_map(|(n, bt)| {
+        if !cx.syms.borrow().text(*n).starts_with("__d-Eq-") {
+            return None;
+        }
+        match cx.st.deep_resolve(&peel_fun_param(bt)) {
+            Ty::Var(pid) if pid == *id => Some(*n),
+            _ => None,
+        }
+    })
+}
+
+/// `eq-type-args-of`: a list's element, or a named type's arguments.
+fn eq_type_args_of(t: &Ty) -> Vec<Ty> {
+    match t {
+        Ty::List(e) => vec![(**e).clone()],
+        Ty::Constructed(_, a) | Ty::Sum(_, a) | Ty::Record(_, a) => a.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// `eq-needs-dict-helper`: a type holding type variables, with arguments to
+/// pass dictionaries for, inside a definition that has an Eq dictionary.
+fn eq_needs_dict_helper(t: &Ty, cx: &Lower) -> bool {
+    lt::has_typevars(t)
+        && !eq_type_args_of(t).is_empty()
+        && cx.overlay.borrow().iter().any(|(n, _)| cx.syms.borrow().text(*n).starts_with("__d-Eq-"))
+}
+
+/// `eqd-helper-ref`: `__eqd_<T>` applied to one dictionary per argument.
+fn eqd_helper_ref(tn: &str, dicts: Vec<IrExpr>, t: &Ty, cx: &Lower, sp: crate::ast::Span) -> IrExpr {
+    let mut full = eqd_dict_ty(t);
+    for d in dicts.iter().rev() {
+        full = fun_ty(d.ty(), full);
+    }
+    let name = cx.syms.borrow_mut().intern(&format!("__eqd_{tn}"));
+    let mut f = IrExpr::Name(name, full.clone(), sp);
+    let mut fty = full;
+    for d in dicts {
+        let rty = peel_fun_return(&fty);
+        f = IrExpr::Apply(Box::new(f), Box::new(d), rty.clone(), sp);
+        fty = rty;
+    }
+    f
+}
+
+/// `eq-dict-expr`: the dictionary for `t` -- the one in scope for its
+/// variable, the concrete one for a closed type, or `__eqd_<T>` over the
+/// dictionaries of its arguments.
+fn eq_dict_expr(t: &Ty, cx: &Lower, sp: crate::ast::Span) -> Result<IrExpr, String> {
+    if let Some(d) = eq_dict_for_var(t, cx) {
+        return Ok(IrExpr::Name(d, eqd_dict_ty(t), sp));
+    }
+    if !lt::has_typevars(t) {
+        return eq_dict_ir(t, cx, sp);
+    }
+    let tn = if matches!(t, Ty::List(_)) { "List".to_string() } else { type_name_of(t, cx) };
+    let args = eq_type_args_of(t);
+    if tn.is_empty() || args.is_empty() {
+        return Err("no Eq dictionary: a type variable here has no Eq a => in scope".into());
+    }
+    let dicts = args
+        .iter()
+        .map(|a| eq_dict_expr(&strip_unit(&cx.st.deep_resolve(a)), cx, sp))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(eqd_helper_ref(&tn, dicts, t, cx, sp))
+}
+
+/// `eq-dict-ir`: the dictionary for a closed type.
+fn eq_dict_ir(bound: &Ty, cx: &Lower, sp: crate::ast::Span) -> Result<IrExpr, String> {
+    let fty = eqd_dict_ty(bound);
+    if let Some(d) = eq_dict_for_var(bound, cx) {
+        return Ok(IrExpr::Name(d, fty, sp));
+    }
+    let named = |n: String| IrExpr::Name(cx.syms.borrow_mut().intern(&n), fty.clone(), sp);
+    if matches!(bound, Ty::List(_)) {
+        return Ok(named(eq_helper_name_inst("List", &eq_site_actuals(bound), cx)));
+    }
+    let tn = type_name_of(bound, cx);
+    if matches!(tn.as_str(), "Integer" | "Boolean" | "Text" | "Char") {
+        return Ok(named(format!("__eq_{tn}")));
+    }
+    let probe = if tn.is_empty() || is_primitive_type_name(&tn) {
+        None
+    } else {
+        cx.syms
+            .borrow()
+            .find(&format!("__eq_{tn}"))
+            .and_then(|n| cx.overlay_ty(n).or_else(|| cx.bindings.get(&n).cloned()))
+            .filter(|t| !matches!(t, Ty::Error | Ty::NoExpect))
+    };
+    if probe.is_none() {
+        return Err("no Eq dictionary: the type this call binds has no structural equality".into());
+    }
+    Ok(named(if eq_type_has_args(bound) { eq_helper_name_inst(&tn, &eq_site_actuals(bound), cx) } else { format!("__eq_{tn}") }))
 }
 
 /// `eq-type-has-args` (IR/Lowering.codex:684).

@@ -3562,10 +3562,18 @@ pub fn infer_row(
                 st.empty_lists.push(e.clone());
                 return (e, EffectRow::default());
             }
-            let mut elem = Ty::Error;
-            for x in xs {
+            // `infer-list`: the FIRST element's type is the list's, and every
+            // later element is unified with it (`unify-list-elems`). Taking
+            // the last element's type and unifying nothing left
+            // `[[glue "a"], []]` a list of the empty list's bare variable,
+            // which later defaulted to Integer.
+            let (elem, first_row) = infer_row(&xs[0], env, st);
+            row = st.row_union(&row, &first_row);
+            for x in &xs[1..] {
                 let (t, erow) = infer_row(x, env, st);
-                elem = t;
+                if !st.unify(&t, &elem) {
+                    st.unify_gaps += 1;
+                }
                 row = st.row_union(&row, &erow);
             }
             Ty::List(Box::new(elem))
