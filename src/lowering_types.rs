@@ -133,6 +133,7 @@ pub fn subst_from_arg(param: &Ty, arg: &Ty, target: &Ty) -> Ty {
         (Ty::LinkedList(pe), Ty::LinkedList(ae))
         | (Ty::Vector(_, pe), Ty::Vector(_, ae))
         | (Ty::SizedVec(_, pe), Ty::SizedVec(_, ae))
+        | (Ty::VectorMask(_, pe), Ty::VectorMask(_, ae))
         | (Ty::Linear(pe), Ty::Linear(ae)) => subst_from_arg(pe, ae, target),
         (Ty::Unit(pn, pe), Ty::Unit(an, ae)) if pn == an => subst_from_arg(pe, ae, target),
         _ => target.clone(),
@@ -178,6 +179,7 @@ fn children(t: &Ty) -> Vec<&Ty> {
         | Ty::Unit(_, e)
         | Ty::Vector(_, e)
         | Ty::SizedVec(_, e)
+        | Ty::VectorMask(_, e)
         | Ty::Linear(e) => vec![e],
         Ty::Sum(_, a) | Ty::Record(_, a) | Ty::Constructed(_, a) => a.iter().collect(),
         _ => vec![],
@@ -201,6 +203,7 @@ fn map_children(t: &Ty, f: &mut dyn FnMut(&Ty) -> Ty) -> Ty {
         Ty::Unit(n, e) => Ty::Unit(*n, Box::new(f(e))),
         Ty::Vector(w, e) => Ty::Vector(*w, Box::new(f(e))),
         Ty::SizedVec(w, e) => Ty::SizedVec(*w, Box::new(f(e))),
+        Ty::VectorMask(w, e) => Ty::VectorMask(*w, Box::new(f(e))),
         Ty::Linear(e) => Ty::Linear(Box::new(f(e))),
         Ty::Sum(n, a) => Ty::Sum(*n, each(a, f)),
         Ty::Record(n, a) => Ty::Record(*n, each(a, f)),

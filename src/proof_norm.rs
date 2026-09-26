@@ -968,7 +968,7 @@ fn type_mentions_proof(t: &Ty, fuel: i32, tds: &TypeDefs) -> bool {
     match t {
         Ty::Proof | Ty::PropEq(..) => true,
         Ty::Fun(p, _, r) => type_mentions_proof(p, fuel - 1, tds) || type_mentions_proof(r, fuel - 1, tds),
-        Ty::List(e) | Ty::LinkedList(e) | Ty::Linear(e) | Ty::Vector(_, e) | Ty::SizedVec(_, e) | Ty::Unit(_, e) => {
+        Ty::List(e) | Ty::LinkedList(e) | Ty::Linear(e) | Ty::Vector(_, e) | Ty::SizedVec(_, e) | Ty::VectorMask(_, e) | Ty::Unit(_, e) => {
             type_mentions_proof(e, fuel - 1, tds)
         }
         Ty::ForAll(_, b) | Ty::ForAllEff(_, b) | Ty::Effectful(_, _, b) => type_mentions_proof(b, fuel - 1, tds),

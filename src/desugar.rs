@@ -1108,7 +1108,7 @@ impl<'a> Desugar<'a> {
         // "Real", so asking the question must not add a symbol that the
         // chapter never mentioned. A chapter with no `Real` anywhere cannot
         // have a field naming one, so the absent symbol answers eq-safe.
-        let real = self.syms.borrow().find("Real");
+        let withheld = eq_withheld_set(&ch.type_defs, &self.syms.borrow());
         // A derived definition belongs to the chapter that declared its
         // type; the walk is over by now, so `self.slug` would say the last
         // chapter. Its wire slug stays "", as upstream spells it.
@@ -1125,11 +1125,11 @@ impl<'a> Desugar<'a> {
             if derives("Show") {
                 out.push(self.show_def(name, td));
             }
+            // `td-eq-safe` since U63: not in the withheld set. Upstream also
+            // gives a RECORD a derived `__eq_` now; this still gives one only
+            // to a variant, the port of record equality pending.
             let eq_safe = match td {
-                TypeDef::Variant(_, _, ctors, _) => match real {
-                    None => true,
-                    Some(r) => !ctors.iter().any(|c| c.fields.iter().any(|f| type_names(f, r))),
-                },
+                TypeDef::Variant(n, ..) => !withheld.contains(n),
                 _ => false,
             };
             if derives("Eq") || eq_safe {
@@ -1865,6 +1865,41 @@ const NO_ALT_GROUP: u32 = u32::MAX;
 
 /// Does this type expression NAME the given type? `td-self-recursive` asks it
 /// of every constructor field, and `List (N a)` counts as much as a bare `N`.
+/// `eq-withheld-set` (U63): the chapter's types that have no single
+/// structural equality -- a field names Real, Vector or SizedVec, or a type
+/// already in the set -- grown to a fixed point. A derived `__eq_` for such a
+/// type would compare a withheld field and be refused (CDX2099) inside code
+/// nobody wrote.
+fn eq_withheld_set(tds: &[TypeDef], syms: &crate::symbol::SymTab) -> Vec<Name> {
+    let seeds: Vec<Name> = ["Real", "Vector", "SizedVec"].iter().filter_map(|t| syms.find(t)).collect();
+    let fields_of = |td: &TypeDef| -> Vec<TypeExpr> {
+        match td {
+            TypeDef::Record(_, _, fs, ..) => fs.iter().map(|f| f.type_expr.clone()).collect(),
+            TypeDef::Variant(_, _, cs, _) => cs.iter().flat_map(|c| c.fields.iter().cloned()).collect(),
+            TypeDef::Unit(_, base, _) => vec![base.clone()],
+        }
+    };
+    let mut set: Vec<Name> = Vec::new();
+    loop {
+        let before = set.len();
+        for td in tds {
+            let n = match td {
+                TypeDef::Record(n, ..) | TypeDef::Variant(n, ..) | TypeDef::Unit(n, ..) => *n,
+            };
+            if set.contains(&n) {
+                continue;
+            }
+            let fs = fields_of(td);
+            if fs.iter().any(|f| seeds.iter().chain(set.iter()).any(|w| type_names(f, *w))) {
+                set.push(n);
+            }
+        }
+        if set.len() == before {
+            return set;
+        }
+    }
+}
+
 fn type_names(t: &TypeExpr, n: Name) -> bool {
     match t {
         TypeExpr::Named(m, _) => *m == n,

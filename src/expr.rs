@@ -71,7 +71,7 @@ fn starts_an_argument(k: Kind) -> bool {
     )
 }
 
-fn is_literal(k: Kind) -> bool {
+pub(crate) fn is_literal(k: Kind) -> bool {
     matches!(
         k,
         Kind::IntegerLiteral
@@ -470,8 +470,13 @@ fn record_braces(p: &mut Parser<'_>) {
         let fcp = p.b.checkpoint();
         // `cdx-bad-field-syntax`: a field is named by a word, and upstream
         // lets a reserved word (`effect`) name one.
+        // Upstream ends the record expression there, taking nothing more;
+        // what is left is then the body's (CDX1078 since U63).
         if !(t.kind == Kind::Identifier || t.kind.is_keyword()) {
             p.err("Expected field name in record literal");
+            p.b.wrap_from(fcp, NodeKind::RecordField);
+            p.paren_depth -= 1;
+            return;
         }
         p.bump(); // the field name
         if p.kind(0) == Some(Kind::Equals) {

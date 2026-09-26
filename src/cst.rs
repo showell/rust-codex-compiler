@@ -29,6 +29,9 @@ pub enum NodeKind {
     Grounds,
     /// `quotes ..`
     Quotes,
+    /// `trusting <key> <sig> <floor>` or `trusting above <n>`: the signers a
+    /// chapter's `quotes` accept, one header line each.
+    Trusting,
     /// `1 Minute = 60 Second` -- a unit conversion, which publishes an
     /// annotation and is not a definition however much it looks like one.
     Conversion,

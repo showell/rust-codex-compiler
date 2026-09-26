@@ -73,7 +73,10 @@ pub enum Ty {
     /// `SizedVec n T`: the list-shaped family (`vec-empty`, `vec-cons`, ...),
     /// not packed SIMD lanes. A length of -1 is any length.
     SizedVec(i64, Box<Ty>),
-    VectorMask(i64),
+    /// `VectorMask n T`: since U63 a mask carries the lane type of the
+    /// vectors compared to make it, so a mask of Real lanes does not meet one
+    /// of Real approximate lanes.
+    VectorMask(i64, Box<Ty>),
     TypeCon(Name),
     TypeApply(Box<Ty>, Box<Ty>),
     /// The quantified id is a ROW id, and row ids share `EffectRow`'s
@@ -289,6 +292,9 @@ impl Cdx {
     pub const NARROWING_RECORD_SET_LITERAL: u16 = 2050;
     pub const NARROWING_RECORD_SET: u16 = 2051;
     pub const REAL_EQUALITY_BANNED: u16 = 2085;
+    /// `cdx-structural-eq-withheld` (U63): `==` on a type with a Real, Vector
+    /// or SizedVec field, and a packed-vector comparison with no lane-wise form.
+    pub const STRUCTURAL_EQ_WITHHELD: u16 = 2099;
     pub const TEXT_ORDERING_BANNED: u16 = 2089;
     pub const LIST_PATTERN_SHAPE: u16 = 2088;
     pub const UNREACHABLE_MATCH_ARM: u16 = 2096;
@@ -669,6 +675,7 @@ impl UnifyState {
             }
             Ty::Vector(n, e) => Ty::Vector(n, Box::new(self.deep_resolve(&e))),
             Ty::SizedVec(n, e) => Ty::SizedVec(n, Box::new(self.deep_resolve(&e))),
+            Ty::VectorMask(n, e) => Ty::VectorMask(n, Box::new(self.deep_resolve(&e))),
             Ty::Unit(n, e) => Ty::Unit(n, Box::new(self.deep_resolve(&e))),
             Ty::PropEq(a, b) => Ty::PropEq(Box::new(self.deep_resolve(&a)), Box::new(self.deep_resolve(&b))),
             Ty::TypeApply(f, a) => {
@@ -791,7 +798,7 @@ impl UnifyState {
             // still a conflict upstream reports.
             let named = |t: &Ty| match t {
                 Ty::Vector(w, _) if *w >= 0 => format!("Vector{w}"),
-                Ty::VectorMask(w) if *w >= 0 => format!("VectorMask{w}"),
+                Ty::VectorMask(w, _) if *w >= 0 => format!("VectorMask{w}"),
                 _ => head_name(t).to_string(),
             };
             if vs.is_empty() && named(&ra) != named(&rb) {
@@ -818,8 +825,21 @@ impl UnifyState {
             (Ty::Vector(w1, _), Ty::Vector(w2, _)) => *w1 >= 0 && *w2 >= 0 && w1 != w2,
             // Masks of two widths too (Unifier.codex:676): a comparison of
             // two `Vector 4` makes a `VectorMask 4`, and `mask-all` takes a 2.
-            (Ty::VectorMask(w1), Ty::VectorMask(w2)) => w1 != w2,
+            // Since U63 a mask's lanes meet too (`unify-at`'s VectorMaskTy arm
+            // reports the lane mismatch and then the masks'): counted only
+            // when both lane types are concrete.
+            (Ty::VectorMask(w1, e1), Ty::VectorMask(w2, e2)) => {
+                let concrete = |t: &Ty| {
+                    let mut vs = std::collections::BTreeSet::new();
+                    collect_type_vars(t, &mut vs);
+                    vs.is_empty()
+                };
+                w1 != w2 || (concrete(e1) && concrete(e2) && e1 != e2)
+            }
             (Ty::Vector(..), Ty::SizedVec(..)) | (Ty::SizedVec(..), Ty::Vector(..)) => true,
+            // `unify-at`'s RealTy arm: width and mode must both match. `Real`
+            // against `Real approximate` is a mismatch, not one type.
+            (Ty::Real(w1, m1), Ty::Real(w2, m2)) => w1 != w2 || m1 != m2,
             _ => false,
         };
         if vector_conflict {
@@ -975,6 +995,17 @@ impl UnifyState {
                 let (x, y) = (x.clone(), y.clone());
                 self.unify(&x, &y)
             }
+            // `unify-at`'s VectorMaskTy arm: equal widths, and since U63 the
+            // lane types meet as well.
+            (Ty::VectorMask(w1, x), Ty::VectorMask(w2, y)) if w1 == w2 => {
+                let (x, y) = (x.clone(), y.clone());
+                if self.unify(&x, &y) {
+                    true
+                } else {
+                    self.report_conflict(&a, &b);
+                    false
+                }
+            }
             // `unify-at`'s SizedVecTy arm (Types/Unifier.codex:662).
             (Ty::SizedVec(n1, x), Ty::SizedVec(n2, y)) if n1 == n2 || *n1 < 0 || *n2 < 0 => {
                 let (x, y) = (x.clone(), y.clone());
@@ -1077,6 +1108,7 @@ fn subst_type_var(t: &Ty, id: u32, with: &Ty) -> Ty {
         ),
         Ty::Vector(n, e) => Ty::Vector(*n, Box::new(subst_type_var(e, id, with))),
         Ty::SizedVec(n, e) => Ty::SizedVec(*n, Box::new(subst_type_var(e, id, with))),
+        Ty::VectorMask(n, e) => Ty::VectorMask(*n, Box::new(subst_type_var(e, id, with))),
         Ty::Unit(n, e) => Ty::Unit(n.clone(), Box::new(subst_type_var(e, id, with))),
         // `cong`'s `tyapply` and every proof builtin's `propeq` are bound
         // under the same `forall`; a variable left inside either is the
@@ -1270,15 +1302,25 @@ pub fn resolve_declared(
         // `Integer between 0 and 255` -- a record field's usual shape. Without
         // this arm every such field failed to resolve and the record was left
         // with no fields at all.
-        T::BoundedInt(_, lo, hi, mode, _) => Ty::Integer(
-            *lo,
-            *hi,
-            match mode {
-                crate::ast::OverflowMode::Error => Overflow::Error,
-                crate::ast::OverflowMode::Wrapping => Overflow::Wrapping,
-                crate::ast::OverflowMode::Clamping => Overflow::Clamping,
-            },
-        ),
+        //
+        // `resolve-bounded-int-type`: a bound on a UNIT keeps the unit,
+        // `Meter between 0 and 10` is `UnitTy Meter (IntegerTy 0 10)`, which
+        // is what lets narrowing check it (U63).
+        T::BoundedInt(base, lo, hi, mode, _) => {
+            let bounded = Ty::Integer(
+                *lo,
+                *hi,
+                match mode {
+                    crate::ast::OverflowMode::Error => Overflow::Error,
+                    crate::ast::OverflowMode::Wrapping => Overflow::Wrapping,
+                    crate::ast::OverflowMode::Clamping => Overflow::Clamping,
+                },
+            );
+            match resolve_declared(syms, tds, base) {
+                Some(Ty::Unit(n, inner)) if matches!(*inner, Ty::Integer(..)) => Ty::Unit(n, Box::new(bounded)),
+                _ => bounded,
+            }
+        }
         // **AN EFFECT ANNOTATION ON AN ARROW'S RESULT IS THE ARROW'S ROW**,
         // and the result is what is left underneath. `resolve-type-expr`
         // (TypeChecker.codex:14) does exactly this, and the builtin table
@@ -1815,7 +1857,7 @@ fn type_desc(t: &Ty) -> String {
         Ty::TypeApply(f, x) => format!("App[{} {}]", type_desc(f), type_desc(x)),
         Ty::Vector(n, e) => format!("Vector {n} {}", type_desc(e)),
         Ty::SizedVec(n, e) => format!("SizedVec {n} {}", type_desc(e)),
-        Ty::VectorMask(n) => format!("VectorMask {n}"),
+        Ty::VectorMask(n, e) => format!("VectorMask {n} {}", type_desc(e)),
         _ => head_name(t).to_string(),
     }
 }
@@ -1905,6 +1947,84 @@ fn num_lit_out_of_range(val: &str) -> bool {
 
 /// `lint-vec-lane`: `vec-extract v N` and `vec4-extract v N` with a literal
 /// lane outside the builtin's own lane count.
+/// `strip-unit-ty`: a unit's base, anything else as it is.
+fn strip_unit(t: &Ty) -> &Ty {
+    match t {
+        Ty::Unit(_, b) => b,
+        other => other,
+    }
+}
+
+/// `vec-cmp-builtin` (IR/LoweringTypes, U63) answering a name: which packed
+/// comparisons have a lane-wise form. `==`/`/=` on `Vector 2` of Integer;
+/// `~`/`~0` on `Vector 2` of 64-bit Real and `Vector 4` of Real approximate.
+fn has_vec_cmp_builtin(op: crate::ast::BinaryOp, t: &Ty) -> bool {
+    use crate::ast::BinaryOp::*;
+    let Ty::Vector(n, e) = t else { return false };
+    let e = strip_unit(e);
+    let int = matches!(e, Ty::Integer(..));
+    let f64r = matches!(e, Ty::Real(RealWidth::F64, _));
+    let f32r = matches!(e, Ty::Real(RealWidth::F32, _));
+    match op {
+        OpEq | OpNotEq => *n == 2 && int,
+        OpApproxEq | OpApproxEqExact => (*n == 2 && f64r) || (*n == 4 && f32r),
+        _ => false,
+    }
+}
+
+/// `eq-operand-withheld` (U63): a record or variant with a field that holds a
+/// Real, a Vector or a SizedVec, looking through lists, constructed types and
+/// nested records and variants to a depth of 4. Field types are read from the
+/// constructors, instantiated at the type's arguments.
+fn eq_operand_withheld(env: &TyEnv<'_>, t: &Ty) -> bool {
+    matches!(strip_unit(t), Ty::Record(..) | Ty::Sum(..)) && eq_type_withheld(env, t, 4)
+}
+
+fn eq_type_withheld(env: &TyEnv<'_>, t: &Ty, fuel: u32) -> bool {
+    if fuel == 0 {
+        return false;
+    }
+    match strip_unit(t) {
+        Ty::Real(..) | Ty::Vector(..) | Ty::SizedVec(..) => true,
+        Ty::List(e) | Ty::LinkedList(e) => eq_type_withheld(env, e, fuel - 1),
+        Ty::Constructed(_, args) => args.iter().any(|a| eq_type_withheld(env, a, fuel - 1)),
+        Ty::Record(n, args) => {
+            let count = env.type_defs.record_fields(*n).map_or(0, |f| f.len());
+            (0..count).any(|i| {
+                env.get(*n)
+                    .and_then(|c| instantiate_field(c, i, args))
+                    .is_some_and(|f| eq_type_withheld(env, &f, fuel - 1))
+            })
+        }
+        Ty::Sum(n, args) => env.type_defs.ctors(*n).is_some_and(|cs| {
+            cs.iter().any(|c| {
+                env.get(*c).is_some_and(|ct| ctor_field_types(ct, args).iter().any(|f| eq_type_withheld(env, f, fuel - 1)))
+            })
+        }),
+        _ => false,
+    }
+}
+
+/// A variant constructor's field types, instantiated at the variant's
+/// arguments: the arrow's arguments, with each variable the result spells
+/// substituted by the matching actual.
+fn ctor_field_types(ctor: &Ty, cargs: &[Ty]) -> Vec<Ty> {
+    let mut spine = strip_forall(ctor);
+    let mut fields = Vec::new();
+    while let Ty::Fun(a, _, r) = spine {
+        fields.push(*a);
+        spine = *r;
+    }
+    if let Ty::Sum(_, rargs) = spine {
+        for (g, c) in rargs.iter().zip(cargs) {
+            if let Ty::Var(id) = g {
+                fields = fields.iter().map(|f| subst_type_var(f, *id, c)).collect();
+            }
+        }
+    }
+    fields
+}
+
 fn lint_vec_lane(f: &crate::ast::Expr, a: &crate::ast::Expr, env: &TyEnv, st: &mut UnifyState) {
     use crate::ast::{Expr as E, LiteralKind};
     let E::Apply(inner, _, _) = f else { return };
@@ -1912,6 +2032,9 @@ fn lint_vec_lane(f: &crate::ast::Expr, a: &crate::ast::Expr, env: &TyEnv, st: &m
     let lanes: i64 = match env.syms.text(*n) {
         "vec-extract" => 2,
         "vec4-extract" => 4,
+        // U63's 256-bit families.
+        "vec8-extract" => 8,
+        "vec4d-extract" => 4,
         _ => return,
     };
     let idx = match a {
@@ -2142,6 +2265,7 @@ fn param_walk(t: &Ty, syms: &SymTab, st: &mut UnifyState, entries: &mut Vec<Para
         Ty::Linear(e) => Ty::Linear(Box::new(param_walk(e, syms, st, entries))),
         Ty::Vector(n, e) => Ty::Vector(*n, Box::new(param_walk(e, syms, st, entries))),
         Ty::SizedVec(n, e) => Ty::SizedVec(*n, Box::new(param_walk(e, syms, st, entries))),
+        Ty::VectorMask(n, e) => Ty::VectorMask(*n, Box::new(param_walk(e, syms, st, entries))),
         Ty::Effectful(effs, sc, r) => Ty::Effectful(
             effs.clone(),
             sc.clone(),
@@ -2219,7 +2343,7 @@ fn default_ambiguous_vars(st: &mut UnifyState, def_var_start: u32, own_type: Opt
 fn collect_type_vars(t: &Ty, out: &mut std::collections::BTreeSet<u32>) {
     match t {
         Ty::Var(id) => { out.insert(*id); }
-        Ty::List(a) | Ty::LinkedList(a) | Ty::Vector(_, a) | Ty::SizedVec(_, a) | Ty::Unit(_, a)
+        Ty::List(a) | Ty::LinkedList(a) | Ty::Vector(_, a) | Ty::SizedVec(_, a) | Ty::VectorMask(_, a) | Ty::Unit(_, a)
         | Ty::Linear(a) | Ty::ForAll(_, a) | Ty::ForAllEff(_, a) => collect_type_vars(a, out),
         Ty::Fun(a, _, b) | Ty::PropEq(a, b) | Ty::TypeApply(a, b) => {
             collect_type_vars(a, out);
@@ -2544,11 +2668,22 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
             }
             // `lint-return-narrowing`: a bounded declared result takes the
             // body only when the body's range is proven inside it.
-            if let Ty::Integer(lo, hi, mode) = st.deep_resolve(&w) {
-                if lo > i64::MIN || hi < i64::MAX {
+            // Since U63 a bounded UNIT result is checked too, unit and all.
+            match st.deep_resolve(&w) {
+                Ty::Integer(lo, hi, mode) if lo > i64::MIN || hi < i64::MAX => {
                     let bound = Ty::Integer(lo, hi, mode);
                     crate::narrowing::lint_narrowing_check(&d.body, &body_ty, &bound, "bounded return", &env, &mut st);
                 }
+                resolved @ Ty::Unit(_, _) => {
+                    if let Ty::Unit(_, inner) = &resolved {
+                        if let Ty::Integer(lo, hi, _) = strip_unit(inner) {
+                            if *lo > i64::MIN || *hi < i64::MAX {
+                                crate::narrowing::lint_narrowing_check(&d.body, &body_ty, &resolved, "bounded return", &env, &mut st);
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         // **A QUANTIFIED DEFINITION IS TIED BACK TO ITS OWN SIGNATURE**, after
@@ -2901,38 +3036,60 @@ pub fn infer_row(
                 OpEq | OpNotEq | OpLt | OpGt | OpLtEq | OpGtEq | OpDefEq
                 | OpApproxEq | OpApproxEqExact => {
                     if !st.unify(&lt, &rt) { st.unify_gaps += 1; }
-                    // `infer-binary-op`: equality on a real and an ordering
-                    // on text or a character are refused after the meet.
+                    // `infer-comparison`: a `Vector n T` operand makes a
+                    // `VectorMask n T`, since U63 carrying its lane type;
+                    // anything else answers Boolean. `infer-binary-op` then
+                    // refuses, in this order (U63, TypeCheckerInference):
+                    // a vector comparison with no lane-wise builtin (CDX2085 on
+                    // Real lanes, else 2099; the mask stands); `==` on a Real
+                    // (2085); `==` on a record or variant with a Real, Vector
+                    // or SizedVec field (2099); an ordering on Text or a
+                    // character (2086). Each of the last three answers Boolean.
                     let (rl, rr) = (st.resolve(&lt), st.resolve(&rt));
-                    let real = |t: &Ty| matches!(t, Ty::Real(..));
+                    let real = |t: &Ty| matches!(strip_unit(t), Ty::Real(..));
                     let text_or_char = |t: &Ty| matches!(t, Ty::Text | Ty::Char);
-                    // `infer-comparison`: two `Vector n` compare lane by lane
-                    // into a `VectorMask n` (codex/test's vec-wide-refused:
-                    // `mask-all (wide 7 == wide 7)` is a mask of 4 where a
-                    // mask of 2 is taken). A ban below answers Boolean.
-                    let mask = match st.deep_resolve(&lt) {
-                        Ty::Vector(n, _) => Some(n),
-                        _ => None,
-                    };
-                    let banned = match op {
-                        OpEq | OpNotEq => real(&rl) || real(&rr),
-                        OpLt | OpGt | OpLtEq | OpGtEq => text_or_char(&rl) || text_or_char(&rr),
-                        _ => false,
-                    };
-                    match op {
-                        OpEq | OpNotEq if real(&rl) || real(&rr) => st.error(
-                            Cdx::REAL_EQUALITY_BANNED,
-                            "Floating-point equality is not safe. Use the ~ operator: x ~ y (approximately equal, 4 ULP tolerance), x ~0 y (bitwise exact, if you are certain)",
-                        ),
-                        OpLt | OpGt | OpLtEq | OpGtEq if text_or_char(&rl) || text_or_char(&rr) => st.error(
-                            Cdx::TEXT_ORDERING_BANNED,
-                            "Ordering on Text or a character has no single meaning. On Text this compared the operands as POINTERS, so the answer followed allocation order and not content. CCE numbers characters by frequency rather than alphabetically, so even a code-point order is not the alphabet. Use text-collate (Foreword chapter Collate) for alphabetical order, or text-compare for code-point order; for a character, compare char-code c as an Integer, which says what it is doing",
-                        ),
-                        _ => {}
-                    }
-                    match mask {
-                        Some(n) if !banned => Ty::VectorMask(n),
+                    let dl = st.deep_resolve(&lt);
+                    let compared = match strip_unit(&dl) {
+                        Ty::Vector(n, e) => Ty::VectorMask(*n, e.clone()),
                         _ => Ty::Boolean,
+                    };
+                    let vec_refused = matches!(op, OpEq | OpNotEq | OpApproxEq | OpApproxEqExact)
+                        && matches!(strip_unit(&dl), Ty::Vector(..))
+                        && !has_vec_cmp_builtin(*op, strip_unit(&dl));
+                    if vec_refused {
+                        let real_lanes = matches!(strip_unit(&dl), Ty::Vector(_, e) if real(e));
+                        let code = if matches!(op, OpEq | OpNotEq) && real_lanes {
+                            Cdx::REAL_EQUALITY_BANNED
+                        } else {
+                            Cdx::STRUCTURAL_EQ_WITHHELD
+                        };
+                        st.error(code, "This packed Vector comparison has no lane-wise form: == and /= are lane-wise on Vector 2 Integer, and ~ and ~0 on Vector 2 Real and Vector 4 (Real approximate). Real lanes compare with ~ or ~0, never ==; a 256-bit vector has none of the four yet.");
+                        compared
+                    } else {
+                        match op {
+                            OpEq | OpNotEq if real(&rl) || real(&rr) => {
+                                st.error(
+                                    Cdx::REAL_EQUALITY_BANNED,
+                                    "Floating-point equality is not safe. Use the ~ operator: x ~ y (approximately equal, 4 ULP tolerance), x ~0 y (bitwise exact, if you are certain)",
+                                );
+                                Ty::Boolean
+                            }
+                            OpEq | OpNotEq if eq_operand_withheld(env, &dl) => {
+                                st.error(
+                                    Cdx::STRUCTURAL_EQ_WITHHELD,
+                                    "This type has no equality: a field holds a Real, a Vector or a SizedVec, which have no single structural equality, so == would compare the two values' addresses. Compare the fields you mean, using ~ or ~0 for a Real",
+                                );
+                                Ty::Boolean
+                            }
+                            OpLt | OpGt | OpLtEq | OpGtEq if text_or_char(&rl) || text_or_char(&rr) => {
+                                st.error(
+                                    Cdx::TEXT_ORDERING_BANNED,
+                                    "Ordering on Text or a character has no single meaning. On Text this compared the operands as POINTERS, so the answer followed allocation order and not content. CCE numbers characters by frequency rather than alphabetically, so even a code-point order is not the alphabet. Use text-collate (Foreword chapter Collate) for alphabetical order, or text-compare for code-point order; for a character, compare char-code c as an Integer, which says what it is doing",
+                                );
+                                Ty::Boolean
+                            }
+                            _ => compared,
+                        }
                     }
                 }
                 // `infer-logical`: both operands MEET Boolean.
@@ -3408,6 +3565,30 @@ pub fn infer_row(
                     Ty::List(_) => (Some("List".to_string()), vec!["Nil".to_string(), "Cons".to_string()]),
                     _ => (None, Vec::new()),
                 };
+                // `check-literal-coverage` (U63): a match on a literal type
+                // needs a catch-all. A Boolean one may name True and False
+                // instead, and a bounded Integer of at most 256 values may name
+                // every value; each literal counts only unguarded.
+                let lit_has = |t: &str| {
+                    arms.iter().any(|a| matches!(&a.pattern, crate::ast::Pat::Lit(v, _, _) if v == t) && trivial(&a.guard))
+                };
+                let literal_type = match &resolved {
+                    Ty::Integer(lo, hi, _) => {
+                        let covered = *lo >= -256 && *hi <= 65536 && hi - lo <= 255 && (*lo..=*hi).all(|v| lit_has(&v.to_string()));
+                        Some(("Integer", covered))
+                    }
+                    Ty::Text => Some(("Text", false)),
+                    Ty::Char => Some(("Char", false)),
+                    Ty::Real(..) => Some(("Real", false)),
+                    Ty::Boolean => Some(("Boolean", lit_has("True") && lit_has("False"))),
+                    _ => None,
+                };
+                if let Some((lname, false)) = literal_type {
+                    st.error(
+                        Cdx::NON_EXHAUSTIVE_MATCH,
+                        format!("Non-exhaustive match on '{lname}': a literal match needs a catch-all arm"),
+                    );
+                }
                 if let Some(tname) = tname {
                     if !ctors.is_empty() {
                         let covered: Vec<String> = arms
@@ -4096,7 +4277,11 @@ fn build(syms: &SymTab, head: &str, args: &[Ty], words: &[String], rows: &[Effec
         "llist" => Ty::LinkedList(Box::new(args.first()?.clone())),
         "vec" => Ty::Vector(words.first()?.parse().ok()?, Box::new(args.first()?.clone())),
         "svec" => Ty::SizedVec(words.first()?.parse().ok()?, Box::new(args.first()?.clone())),
-        "vec-mask" => Ty::VectorMask(words.first()?.parse().ok()?),
+        // `(vec-mask N T)`; a table read before U63 spells no lane, `(vec-mask N)`.
+        "vec-mask" => Ty::VectorMask(
+            words.first()?.parse().ok()?,
+            Box::new(args.first().cloned().unwrap_or(Ty::Error)),
+        ),
         "propeq" => Ty::PropEq(
             Box::new(args.first()?.clone()),
             Box::new(args.get(1)?.clone()),

@@ -332,6 +332,10 @@ def _check_type(form):
         e = _check_type(form[2])
         n = _vec_len(form[1])
         return f'(svec {n} {e})' if e and n is not None else None
+    # Since U63 a mask carries its lane type: `VectorMaskTy 4 real-f32`.
+    if head == 'VectorMaskTy' and len(form) >= 3:
+        e = _check_type(form[2])
+        return None if e is None else f'(vec-mask {form[1]} {e})'
     if head == 'VectorMaskTy' and len(form) >= 2:
         return f'(vec-mask {form[1]})'
     if head == 'LinkedListTy' and len(form) >= 2:

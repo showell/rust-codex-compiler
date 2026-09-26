@@ -104,7 +104,7 @@ pub fn render_ty(syms: &SymTab, t: &Ty) -> String {
         Ty::Unit(n, inner) => format!("(unit {} {})", q(*n), render_ty(syms, inner)),
         Ty::Vector(n, e) => format!("(vector {n} {})", render_ty(syms, e)),
         Ty::SizedVec(n, e) => format!("(sized-vec {n} {})", render_ty(syms, e)),
-        Ty::VectorMask(n) => format!("(vector-mask {n})"),
+        Ty::VectorMask(n, e) => format!("(vector-mask {n} {})", render_ty(syms, e)),
         Ty::Linear(inner) => render_ty(syms, inner),
         Ty::Proof => "proof".into(),
         Ty::PropEq(a, b) => format!("(propeq {} {})", render_ty(syms, a), render_ty(syms, b)),

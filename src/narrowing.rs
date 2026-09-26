@@ -518,6 +518,21 @@ pub fn lint_narrowing_check(
     if is_narrow_call(value_arg, env) {
         return;
     }
+    // A bounded UNIT (U63): the check runs on the unit's base, against the
+    // value with its unit stripped -- and when the value is the unit's own
+    // constructor, `Meter n`, against `n` (`unit-ctor-arg`).
+    if let Ty::Unit(uname, inner) = field_ty {
+        let arg = match value_arg {
+            Expr::Apply(f, a, _) if matches!(&**f, Expr::NameRef(n, _) if n == uname) => &**a,
+            _ => value_arg,
+        };
+        let vty = match st.deep_resolve(value_ty) {
+            Ty::Unit(_, b) => *b,
+            other => other,
+        };
+        lint_narrowing_check(arg, &vty, inner, descriptor, env, st);
+        return;
+    }
     let Ty::Integer(f_lo, f_hi, Overflow::Error) = field_ty else { return };
     let (f_lo, f_hi) = (*f_lo, *f_hi);
     if let Expr::Lit(text, LiteralKind::IntLit, _) = value_arg {

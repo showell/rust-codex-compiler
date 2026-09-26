@@ -48,8 +48,18 @@ use crate::token::Kind;
 pub(crate) fn parse_act(p: &mut Parser<'_>, cp: usize) -> NodeKind {
     p.bump(); // act
     p.skip_newlines();
-    if stmts_to_end(p, &[]) == 0 {
+    let mut bare = Vec::new();
+    let n = stmts_to_end(p, &[], &mut bare);
+    if n == 0 {
         p.err("an 'act' block must contain at least one statement");
+    } else if p.prev_sig_kind() == Some(Kind::EndKeyword) {
+        // `check-discarded-literals`, since U63: a bare literal before the
+        // last statement is discarded, so it is refused (CDX1079). Upstream
+        // checks when the block meets its `end`, not at the end of a file.
+        for t in bare.iter().take(n - 1).flatten() {
+            let text = String::from_utf8_lossy(t.text(p.src)).to_string();
+            p.err_at(*t, format!("'{text}' is a bare literal before the last statement of an act block, so its value is discarded and the line does nothing. A literal line is valid only as the block's final value."));
+        }
     }
     p.b.wrap_from(cp, NodeKind::ActBlock);
     NodeKind::ActBlock
@@ -57,7 +67,7 @@ pub(crate) fn parse_act(p: &mut Parser<'_>, cp: usize) -> NodeKind {
 
 /// Statements until `end` or the end of the file, stopping early at any of
 /// `stops` -- the words that open `trying`'s later sections.
-fn stmts_to_end(p: &mut Parser<'_>, stops: &[&[u8]]) -> usize {
+fn stmts_to_end(p: &mut Parser<'_>, stops: &[&[u8]], bare: &mut Vec<Option<crate::token::Token>>) -> usize {
     let mut n = 0;
     loop {
         match p.kind(0) {
@@ -79,23 +89,32 @@ fn stmts_to_end(p: &mut Parser<'_>, stops: &[&[u8]]) -> usize {
                 return n;
             }
         }
-        act_stmt(p);
+        bare.push(act_stmt(p));
         n += 1;
         p.skip_newlines();
     }
 }
 
-/// `name <- expr`, or an expression on its own.
-fn act_stmt(p: &mut Parser<'_>) {
+/// `name <- expr`, or an expression on its own. Answers the literal token
+/// when the statement is an expression that is exactly one literal.
+fn act_stmt(p: &mut Parser<'_>) -> Option<crate::token::Token> {
     let cp = p.b.checkpoint();
     if p.kind(0) == Some(Kind::Identifier) && p.kind(1) == Some(Kind::LeftArrow) {
         p.bump(); // the bound name
         p.bump(); // <-
         parse_expr(p);
         p.b.wrap_from(cp, NodeKind::ActBind);
+        None
     } else {
+        let first = p.sig(0);
+        let start = p.at();
         parse_expr(p);
         p.b.wrap_from(cp, NodeKind::ActStmt);
+        let taken = p.toks[start..p.at()]
+            .iter()
+            .filter(|t| !t.kind.is_trivia() && !matches!(t.kind, Kind::Newline | Kind::Indent | Kind::Dedent))
+            .count();
+        first.filter(|t| taken == 1 && crate::expr::is_literal(t.kind))
     }
 }
 
@@ -160,7 +179,7 @@ pub(crate) fn parse_trying(p: &mut Parser<'_>, cp: usize) -> NodeKind {
 fn section(p: &mut Parser<'_>, kind: NodeKind, stops: &[&[u8]]) -> bool {
     let scp = p.b.checkpoint();
     let before = p.at();
-    stmts_to_end(p, stops);
+    stmts_to_end(p, stops, &mut Vec::new());
     let closed = p.toks[before..p.at()]
         .iter()
         .rev()

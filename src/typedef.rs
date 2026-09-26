@@ -224,7 +224,16 @@ fn ctor(p: &mut Parser<'_>) {
     p.bump(); // the constructor's name
     while p.kind(0) == Some(Kind::LeftParen) {
         let fcp = p.b.checkpoint();
+        let open = p.sig(0);
         p.bump();
+        // `classify-paren-type`, since U63: a comma at depth 0 with no arrow
+        // is `(A, B)`, which used to become a function type and fail later at
+        // a use. It is refused at the declaration (CDX1076).
+        if field_has_bare_comma(p) {
+            if let Some(t) = open {
+                p.err_at(t, "A constructor field written (A, B) has no arrow: write two fields as (A) (B), or one tuple field as ((A, B))");
+            }
+        }
         crate::types::parse_type(p);
         if p.kind(0) == Some(Kind::RightParen) {
             p.bump();
@@ -244,6 +253,24 @@ fn ctor(p: &mut Parser<'_>) {
         p.skip_newlines();
     }
     p.b.wrap_from(cp, NodeKind::VariantCtor);
+}
+
+/// From just inside a field's `(` to its `)`: a comma at depth 0 and no
+/// arrow at depth 0 (upstream's `classify-paren-type` answering 2).
+fn field_has_bare_comma(p: &Parser<'_>) -> bool {
+    let (mut depth, mut arrow, mut comma) = (0i32, false, false);
+    for t in &p.toks[p.at()..] {
+        match t.kind {
+            Kind::LeftParen | Kind::LeftBracket => depth += 1,
+            Kind::RightParen if depth == 0 => break,
+            Kind::RightParen | Kind::RightBracket => depth -= 1,
+            Kind::Arrow if depth == 0 => arrow = true,
+            Kind::Comma if depth == 0 => comma = true,
+            Kind::EndOfFile => break,
+            _ => {}
+        }
+    }
+    comma && !arrow
 }
 
 fn unit_body(p: &mut Parser<'_>) {

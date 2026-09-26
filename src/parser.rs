@@ -58,8 +58,16 @@ pub fn code_for(msg: &str) -> u16 {
         1072
     } else if msg.starts_with("Expected token kind mismatch") || msg.starts_with("expected '=' after the parameters") {
         1000
-    } else if msg.starts_with("`++` is not Codex") {
+    } else if msg.starts_with("`++` is not Codex") || msg.starts_with("`do` is not Codex") {
         1075
+    } else if msg.starts_with("A constructor field written (A, B)") {
+        1076
+    } else if msg.contains("begins no definition, so it would be dropped") {
+        1077
+    } else if msg.starts_with("The definition's expression has ended") {
+        1078
+    } else if msg.contains("is a bare literal before the last statement of an act block") {
+        1079
     } else if msg.starts_with("Application ended at newline") {
         1070
     } else if msg.starts_with("A line may not begin with '.'") || msg.starts_with("A '.' selector must be followed by a field name") {
@@ -237,6 +245,15 @@ impl<'a> Parser<'a> {
             .map_or(0, |t| t.line)
     }
 
+    /// The kind of the last significant token before the cursor.
+    pub(crate) fn prev_sig_kind(&self) -> Option<Kind> {
+        self.toks[..self.at()]
+            .iter()
+            .rev()
+            .find(|t| !t.kind.is_trivia() && !matches!(t.kind, Kind::Newline | Kind::Indent | Kind::Dedent))
+            .map(|t| t.kind)
+    }
+
     pub(crate) fn err(&mut self, msg: impl Into<String>) {
         let (line, col) = self.sig(0).map(|t| (t.line, t.col)).unwrap_or((0, 0));
         let msg: String = msg.into();
@@ -279,6 +296,7 @@ pub(crate) fn starts_an_item(k: Kind) -> bool {
             | Kind::UnitKeyword
             | Kind::CitesKeyword
             | Kind::QuotesKeyword
+            | Kind::TrustingKeyword
             | Kind::GroundsKeyword
             | Kind::PunctualKeyword
             | Kind::BoundedKeyword
@@ -355,6 +373,13 @@ pub fn parse(src: &[u8]) -> Parsed {
                 p.eat_to_end_of_line();
                 p.b.end();
             }
+            // Upstream reads `trusting` lines in the chapter header beside
+            // `quotes`; unknown here, each was a dropped token (CDX1077 since U63).
+            Kind::TrustingKeyword => {
+                p.b.start(NodeKind::Trusting);
+                p.eat_to_end_of_line();
+                p.b.end();
+            }
             // `effect` is checked before the type-definition test because it
             // has no `=` and would otherwise fall through to parse_def.
             Kind::EffectKeyword if t.col == TOP_LEVEL_COL => {
@@ -401,11 +426,24 @@ pub fn parse(src: &[u8]) -> Parsed {
                 // expression parser reads as an argument that fell off the
                 // application (CDX1070). Any other skipped line is prose-like
                 // and silent, as it is there.
+                //
+                // Since U63 a third: a token at column 2 or 3 that begins no
+                // item is `refuse-dropped-token` (CDX1077), where recovery used
+                // to drop it in silence -- `end` and `qed` excepted, as
+                // upstream's `drops-silently` excepts them. A line past column 3
+                // is still skipped silently at the top level; after a body it is
+                // CDX1078, reported in `body`.
                 let text = String::from_utf8_lossy(t.text(src)).to_string();
+                // U63 moved column 1 under the same rule: `%` at column 1 was
+                // CDX1000 at U62 and is CDX1077 now.
                 if t.col == 1 && t.kind != Kind::EndOfFile && text != "Page" {
-                    p.err(format!("Expected token kind mismatch, got '{text}'"));
+                    p.err(format!("`{text}` at column 1 begins no definition, so it would be dropped; indent a continuation past column 3"));
                 } else if t.col > TOP_LEVEL_COL && p.last_def_end_line + 1 == t.line {
                     p.err(format!("Application ended at newline; '{text}' on line {} is not parsed as an argument (column {}). Put the whole application on one line, or bind the argument with a let", t.line, t.col));
+                } else if (2..=TOP_LEVEL_COL).contains(&t.col)
+                    && !matches!(t.kind, Kind::EndOfFile | Kind::EndKeyword | Kind::QedKeyword)
+                {
+                    p.err(format!("`{text}` at column {} begins no definition, so it would be dropped; indent a continuation past column 3", t.col));
                 }
                 p.b.start(NodeKind::Loose);
                 p.eat_to_end_of_line();
@@ -635,7 +673,9 @@ fn body(p: &mut Parser<'_>, def_col: u32) {
     // `parse-def-body-seq`); without it the expression parser meets a Newline
     // in atom position, calls it an error and hands the whole body back.
     p.skip_newlines();
+    let body_start = p.at();
     crate::expr::parse_def_body_seq(p, def_col);
+    let body_end = p.at();
     // `qed` closes a proof and belongs to it. Upstream reaches it at the
     // document level and skips the line because its column is past 3; here it
     // is a named child of the definition it ends, which is where a reader
@@ -652,7 +692,10 @@ fn body(p: &mut Parser<'_>, def_col: u32) {
     // body. It is kept under a name that says it was not understood, and it is
     // counted, so an unread body cannot pass for an understood one.
     if let Some(t) = p.sig(0) {
-        let unread = !(t.kind == Kind::EndOfFile || (t.col <= def_col && starts_an_item(t.kind)));
+        // Since U63 upstream ends the body at any token at or left of the
+        // definition's column (`check-body-tokens-left`): one that begins no
+        // item is the document loop's to refuse (CDX1077), not this body's.
+        let unread = t.kind != Kind::EndOfFile && t.col > def_col;
         if unread {
             if in_prose_block(p) {
                 eat_prose_block(p);
@@ -669,12 +712,32 @@ fn body(p: &mut Parser<'_>, def_col: u32) {
                 // at the newline (`check-multiline-app`, CDX1070). A line
                 // beginning with `.` is refused by the expression parser
                 // itself (`parse_field_access`). A lone `end` is neither.
+                //
+                // Since U63 that fires only on a line deeper than the START of
+                // the line the application ended on, and whatever is left is
+                // then CDX1078 as well: a newline ends an application, so any
+                // token left inside the body is refused, once. A body that is
+                // the bare word `do` gets CDX1075 instead, naming act ... end.
                 let text = String::from_utf8_lossy(t.text(p.src)).to_string();
                 if matches!(
                     t.kind,
                     Kind::LeftParen | Kind::LeftBracket | Kind::IntegerLiteral | Kind::NumberLiteral | Kind::TextLiteral | Kind::CharLiteral
-                ) {
+                ) && t.col > line_start_col(p, p.prev_sig_line())
+                {
                     p.err(format!("Application ended at newline; '{text}' on line {} is not parsed as an argument (column {}). Put the whole application on one line, or bind the argument with a let", t.line, t.col));
+                }
+                let body_toks: Vec<Token> = p.toks[body_start..body_end]
+                    .iter()
+                    .copied()
+                    .filter(|b| !b.kind.is_trivia() && !matches!(b.kind, Kind::Newline | Kind::Indent | Kind::Dedent))
+                    .collect();
+                // A token the lexer already refused (an `ErrorToken`) is not
+                // refused twice: upstream halts on the lexer's diagnostic.
+                if t.kind == Kind::ErrorToken {
+                } else if body_toks.len() == 1 && body_toks[0].text(p.src) == b"do" {
+                    p.err_at(body_toks[0], "`do` is not Codex; use act ... end");
+                } else {
+                    p.err(format!("The definition's expression has ended, and '{text}' is left inside its body, so it is not part of the definition. A newline ends an application; prose belongs at column 2."));
                 }
                 let cp = p.b.checkpoint();
                 p.eat_to_end_of_line();
@@ -705,6 +768,18 @@ fn body(p: &mut Parser<'_>, def_col: u32) {
 /// continue that prose and are not code. Upstream keeps skipping while
 /// `column > 3`. Looking back for the trivia is how we know a run of
 /// deeply-indented words is a paragraph and not an unread expression.
+/// The column of the first significant token on `line` before the cursor:
+/// upstream's `line-start-column`, against which CDX1070 measures a
+/// continuation.
+fn line_start_col(p: &Parser<'_>, line: u32) -> u32 {
+    p.toks[..p.at()]
+        .iter()
+        .filter(|t| t.line == line && !t.kind.is_trivia() && !matches!(t.kind, Kind::Newline | Kind::Indent | Kind::Dedent))
+        .map(|t| t.col)
+        .min()
+        .unwrap_or(0)
+}
+
 pub(crate) fn in_prose_block(p: &Parser<'_>) -> bool {
     let mut i = p.at();
     while i > 0 {
