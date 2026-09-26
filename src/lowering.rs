@@ -447,7 +447,13 @@ pub fn expr(e: &Expr, want: &Ty, cx: &Lower) -> Result<IrExpr, String> {
                     }
                 }
             } else {
-                let prefix = if pname == "__dderiv-Show" { "__show_" } else { "__compare_" };
+                let prefix = match pname.as_str() {
+                    "__dderiv-Show" => "__show_",
+                    // U64: an Eq dictionary at a concrete type is its `__eq_`
+                    // helper (the primitive wrappers, or a derived one).
+                    "__dderiv-Eq" => "__eq_",
+                    _ => "__compare_",
+                };
                 let h = cx.syms.borrow().find(&format!("{prefix}{}", type_name_of(&arg_ty, cx)));
                 h.and_then(|h| cx.name_ty(h).map(|b| (h, b)))
             };

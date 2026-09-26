@@ -214,6 +214,10 @@ pub struct UnifyState {
     /// and `check-errors` is graded against the oracle. Counted so the gap is
     /// visible rather than swallowed.
     pub unify_gaps: usize,
+    /// `eq-sites` (U63/U64): every `==`/`/=` operand type, and every
+    /// dictionary an `Eq a =>` call passes (`true`: the type it binds),
+    /// judged per definition by `check-eq-on-declared-vars`.
+    pub eq_sites: Vec<(Ty, bool)>,
     /// Inside an induction proof's scrutinee. Stage 5 (`check-induction-def`)
     /// binds the forall's value binders there and this checker does not, so
     /// a name it cannot find is not CDX3002.
@@ -295,6 +299,9 @@ impl Cdx {
     /// `cdx-structural-eq-withheld` (U63): `==` on a type with a Real, Vector
     /// or SizedVec field, and a packed-vector comparison with no lane-wise form.
     pub const STRUCTURAL_EQ_WITHHELD: u16 = 2099;
+    /// `cdx-eq-on-type-variable` (U63): `==` on a value typed by (or holding)
+    /// a type variable of the definition's signature.
+    pub const EQ_ON_TYPE_VARIABLE: u16 = 2100;
     pub const TEXT_ORDERING_BANNED: u16 = 2089;
     pub const LIST_PATTERN_SHAPE: u16 = 2088;
     pub const UNREACHABLE_MATCH_ARM: u16 = 2096;
@@ -353,6 +360,7 @@ impl Default for UnifyState {
             pat_types: Vec::new(),
             diags: Vec::new(),
             unify_gaps: 0,
+            eq_sites: Vec::new(),
             in_proof: false,
             effect_exempt: false,
             list_name: None,
@@ -1947,6 +1955,37 @@ fn num_lit_out_of_range(val: &str) -> bool {
 
 /// `lint-vec-lane`: `vec-extract v N` and `vec4-extract v N` with a literal
 /// lane outside the builtin's own lane count.
+const EQ_ON_TYPE_VARIABLE_REFUSAL: &str = "== and /= are refused on a value whose type is a type variable of this definition's signature (or holds one): the body cannot see the type, so the comparison would compare the two values' words, which for Text, a list, a vector or a record are their addresses. Declare `Eq a =>` on the signature, take the comparison as a parameter (an `a, a -> Boolean` argument), or declare the concrete type.";
+
+/// `type-mentions-var-in`.
+fn type_mentions_var_in(t: &Ty, ids: &[u32]) -> bool {
+    if ids.is_empty() {
+        return false;
+    }
+    let mut vs = std::collections::BTreeSet::new();
+    collect_type_vars(t, &mut vs);
+    vs.iter().any(|v| ids.contains(v))
+}
+
+/// `eq-var-shape-ok`: the dictionary variable may appear bare, or under a
+/// List or a type constructor whose every argument is itself ok; any other
+/// shape needs a closure a helper cannot build.
+fn eq_var_shape_ok(t: &Ty, v: u32, depth: u32) -> bool {
+    if !type_mentions_var_in(t, &[v]) {
+        return true;
+    }
+    if depth >= 32 {
+        return false;
+    }
+    let all = |as_: &[Ty]| !as_.is_empty() && as_.iter().all(|a| eq_var_shape_ok(a, v, depth + 1));
+    match t {
+        Ty::Var(id) => *id == v,
+        Ty::List(e) => eq_var_shape_ok(e, v, depth + 1),
+        Ty::Constructed(_, as_) | Ty::Sum(_, as_) | Ty::Record(_, as_) => all(as_),
+        _ => false,
+    }
+}
+
 /// `strip-unit-ty`: a unit's base, anything else as it is.
 fn strip_unit(t: &Ty) -> &Ty {
     match t {
@@ -2540,6 +2579,24 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
         } else {
             own.clone().map(|t| st.instantiate(&t))
         };
+        let eq0 = st.eq_sites.len();
+        // `eq-dict-var-of`: an `Eq a =>` definition's first parameter is its
+        // dictionary, `__d-Eq-a : a -> a -> Boolean`; that `a` is the one
+        // variable its body may compare.
+        let eq_var: Option<u32> = if d.params.first().is_some_and(|p| ch.syms.text(p.name).starts_with("__d-Eq-")) {
+            match instantiated.as_ref().map(|t| strip_forall(t)) {
+                Some(Ty::Fun(dict, _, _)) => match st.deep_resolve(&dict) {
+                    Ty::Fun(a, _, _) => match st.deep_resolve(&a) {
+                        Ty::Var(id) => Some(id),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            }
+        } else {
+            None
+        };
         // The signature's variables as the body meets them: the ones the
         // instantiation just minted (`declared-vars`).
         let declared_vars: Vec<u32> =
@@ -2709,6 +2766,33 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
             // definition however many effects the body performs unnamed.
             if let Some((name, _)) = body.labels.iter().find(|(n, _)| !effect_covered_by(&allowed, n)) {
                 st.error(Cdx::EFFECT_UNDECLARED, format!("Effect '{name}' not declared in function signature"));
+            }
+        }
+        // `check-eq-on-declared-vars` (U63/U64), over the sites this body
+        // recorded. `__eq_` helpers compare their own variables by design.
+        let judged: Vec<u32> = if ch.syms.text(d.name).starts_with("__eq_") { Vec::new() } else { declared_vars.clone() };
+        let sites: Vec<(Ty, bool)> = st.eq_sites[eq0..].to_vec();
+        for (ty, is_dict) in sites {
+            let t = st.deep_resolve(&ty);
+            if eq_var.is_some_and(|v| t == Ty::Var(v)) {
+                continue;
+            }
+            let others: Vec<u32> = judged.iter().copied().filter(|v| Some(*v) != eq_var).collect();
+            if type_mentions_var_in(&t, &others) || eq_var.is_some_and(|v| !eq_var_shape_ok(&t, v, 0)) {
+                st.error(Cdx::EQ_ON_TYPE_VARIABLE, EQ_ON_TYPE_VARIABLE_REFUSAL);
+                continue;
+            }
+            if !is_dict {
+                continue;
+            }
+            match strip_unit(&t) {
+                Ty::Vector(_, e) => {
+                    let code = if matches!(strip_unit(e), Ty::Real(..)) { Cdx::REAL_EQUALITY_BANNED } else { Cdx::STRUCTURAL_EQ_WITHHELD };
+                    st.error(code, "This packed Vector comparison has no lane-wise form: == and /= are lane-wise on Vector 2 Integer, and ~ and ~0 on Vector 2 Real and Vector 4 (Real approximate). Real lanes compare with ~ or ~0, never ==; a 256-bit vector has none of the four yet.");
+                }
+                Ty::Real(..) => st.error(Cdx::REAL_EQUALITY_BANNED, "This call binds an Eq a => variable to a Real, and floating-point equality is not safe. Compare with ~ or ~0 in a function of your own."),
+                _ if eq_operand_withheld(&env, &t) => st.error(Cdx::STRUCTURAL_EQ_WITHHELD, "This call binds an Eq a => variable to a type with no equality: a field holds a Real, a Vector or a SizedVec, which have no single structural equality."),
+                _ => {}
             }
         }
         // `check-declared-rigidity`, before the signature is tied back: a
@@ -2923,6 +3007,13 @@ pub fn infer_row(
             let t = match raw {
                 Some(r) => {
                     let inst = st.instantiate(&r);
+                    // A call's Eq dictionary (`dict-ref-span`: an EMPTY span at
+                    // the callee) records the type it binds as an eq-site.
+                    if sp.len == 0 && env.syms.text(*n) == "__dderiv-Eq" {
+                        if let Ty::Fun(p, _, _) = strip_forall(&inst) {
+                            st.eq_sites.push((*p, true));
+                        }
+                    }
                     st.open_spine_rows(&inst)
                 }
                 // `infer-name`: a name no scope binds is CDX3002, and the
@@ -3036,6 +3127,9 @@ pub fn infer_row(
                 OpEq | OpNotEq | OpLt | OpGt | OpLtEq | OpGtEq | OpDefEq
                 | OpApproxEq | OpApproxEqExact => {
                     if !st.unify(&lt, &rt) { st.unify_gaps += 1; }
+                    if matches!(op, OpEq | OpNotEq) {
+                        st.eq_sites.push((lt.clone(), false));
+                    }
                     // `infer-comparison`: a `Vector n T` operand makes a
                     // `VectorMask n T`, since U63 carrying its lane type;
                     // anything else answers Boolean. `infer-binary-op` then

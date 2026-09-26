@@ -18,7 +18,44 @@ use crate::ast::{ActStmt, Chapter, Def, Expr, LetBind, MatchArm, Name, Param, Ty
 use crate::symbol::SymTab;
 
 fn is_derived_class(name: &str) -> bool {
-    matches!(name, "Show" | "Ord")
+    matches!(name, "Show" | "Ord" | "Eq")
+}
+
+/// `derived-takes-dict` (U64): Show and Ord take a dictionary when the FIRST
+/// parameter is the variable; Eq when ANY parameter mentions it, since
+/// `count : Eq a => List a, a -> Integer` is its common shape.
+fn derived_takes_dict(cls: &str, body: &TypeExpr, tv: Name) -> bool {
+    if cls == "Eq" {
+        let mut cur = body;
+        let mut depth = 0;
+        while let TypeExpr::Fun(p, r, _) = cur {
+            if depth >= 64 {
+                return false;
+            }
+            if type_mentions_name(p, tv, 0) {
+                return true;
+            }
+            cur = r;
+            depth += 1;
+        }
+        false
+    } else {
+        first_param_is_tyvar(body, tv)
+    }
+}
+
+/// `atype-mentions-name`.
+fn type_mentions_name(t: &TypeExpr, tv: Name, depth: u32) -> bool {
+    if depth >= 64 {
+        return false;
+    }
+    match t {
+        TypeExpr::Named(n, _) => *n == tv,
+        TypeExpr::Fun(p, r, _) => type_mentions_name(p, tv, depth + 1) || type_mentions_name(r, tv, depth + 1),
+        TypeExpr::App(h, as_, _) => type_mentions_name(h, tv, depth + 1) || as_.iter().any(|a| type_mentions_name(a, tv, depth + 1)),
+        TypeExpr::Linear(i, _) => type_mentions_name(i, tv, depth + 1),
+        _ => false,
+    }
 }
 
 fn derived_method(cls: &str) -> &'static str {
@@ -37,10 +74,17 @@ fn named(syms: &mut SymTab, s: &str) -> TypeExpr {
     TypeExpr::Named(syms.intern(s), synthetic())
 }
 
-/// `derived-dict-type`: `a -> Text` for Show, `a, a -> Integer` for Ord.
+/// `derived-dict-type`: `a -> Text` for Show, `a, a -> Boolean` for Eq,
+/// `a, a -> Integer` for Ord.
 fn derived_dict_type(cls: &str, tv: Name, syms: &mut SymTab) -> TypeExpr {
     let var = || TypeExpr::Named(tv, synthetic());
-    if cls == "Show" {
+    if cls == "Eq" {
+        TypeExpr::Fun(
+            Rc::new(var()),
+            Rc::new(TypeExpr::Fun(Rc::new(var()), Rc::new(named(syms, "Boolean")), synthetic())),
+            synthetic(),
+        )
+    } else if cls == "Show" {
         TypeExpr::Fun(Rc::new(var()), Rc::new(named(syms, "Text")), synthetic())
     } else {
         TypeExpr::Fun(
@@ -178,6 +222,25 @@ fn prim_compare_wrapper(syms: &mut SymTab, tn: &str) -> Def {
 
 const PRIM_WRAPPER_TYPES: [&str; 4] = ["Integer", "Boolean", "Text", "Real"];
 
+/// `prim-eq-wrapper` (U64): `__eq_T : T, T -> Boolean`,
+/// `__eq_T (__wx) (__wy) = __wx == __wy`, over Integer, Boolean, Text, Char.
+fn prim_eq_wrapper(syms: &mut SymTab, tn: &str) -> Def {
+    let declared = TypeExpr::Fun(
+        Rc::new(named(syms, tn)),
+        Rc::new(TypeExpr::Fun(Rc::new(named(syms, tn)), Rc::new(named(syms, "Boolean")), synthetic())),
+        synthetic(),
+    );
+    let body = Expr::Binary(
+        Rc::new(Expr::NameRef(syms.intern("__wx"), synthetic())),
+        crate::ast::BinaryOp::OpEq,
+        Rc::new(Expr::NameRef(syms.intern("__wy"), synthetic())),
+        synthetic(),
+    );
+    synth_def(syms, &format!("__eq_{tn}"), &["__wx", "__wy"], declared, body)
+}
+
+const PRIM_EQ_WRAPPER_TYPES: [&str; 4] = ["Integer", "Boolean", "Text", "Char"];
+
 /// `rewrite-constrained-defs`, then `insert-dicts-at-call-sites`, then
 /// `prepend-prim-wrappers`: a chapter with a definition that takes a
 /// derived dictionary gets `__show_T` (or `__compare_T`) over the four
@@ -190,7 +253,7 @@ pub fn apply(ch: &mut Chapter) {
     let instance_count = |cls: Name| instance_defs.iter().filter(|i| i.class_name == cls).count();
     // (definition, the dictionary its callers pass)
     let mut info: Vec<(Name, Name)> = Vec::new();
-    let (mut has_show, mut has_ord) = (false, false);
+    let (mut has_show, mut has_ord, mut has_eq) = (false, false, false);
     // The module the wrappers are written into: that of the first definition
     // taking a derived dictionary. The IR's chapter stays empty, as upstream's.
     let mut wrapper_origin = String::new();
@@ -199,7 +262,7 @@ pub fn apply(ch: &mut Chapter) {
         let cls_text = syms.text(cls).to_string();
         let tv_text = syms.text(tv).to_string();
         if is_derived_class(&cls_text) {
-            if !first_param_is_tyvar(&body, tv) {
+            if !derived_takes_dict(&cls_text, &body, tv) {
                 d.declared_type = vec![(*body).clone()];
                 continue;
             }
@@ -220,18 +283,22 @@ pub fn apply(ch: &mut Chapter) {
                     Expr::Apply(Rc::new(f.clone()), Rc::new(new_arg.clone()), sp)
                 })
             };
-            let body_expr = Rewrite { on_apply: &on_apply, deep: true }.expr(&d.body);
-            d.body = body_expr;
+            // Eq has no named method: its `==` is rewritten in lowering, where
+            // operand types exist, so the body is left as written.
+            if cls_text != "Eq" {
+                let body_expr = Rewrite { on_apply: &on_apply, deep: true }.expr(&d.body);
+                d.body = body_expr;
+            }
             d.params.insert(0, Param { name: dict_param, span: synthetic() });
             d.declared_type = vec![TypeExpr::Fun(Rc::new(dict_ty), body.clone(), synthetic())];
             info.push((d.name, syms.intern(&format!("__dderiv-{cls_text}"))));
             if wrapper_origin.is_empty() {
                 wrapper_origin = d.origin.clone();
             }
-            if cls_text == "Show" {
-                has_show = true;
-            } else {
-                has_ord = true;
+            match cls_text.as_str() {
+                "Show" => has_show = true,
+                "Eq" => has_eq = true,
+                _ => has_ord = true,
             }
             continue;
         }
@@ -285,10 +352,19 @@ pub fn apply(ch: &mut Chapter) {
     if !info.is_empty() {
         // `insert-dict-refs`: a call of a rewritten definition passes its
         // dictionary first.
+        // `dict-ref-span`: an Eq dictionary carries an EMPTY span at the
+        // callee's start, which is how the checker finds it (an eq-site);
+        // every other dictionary is synthetic.
+        let eq_dict = syms.find("__dderiv-Eq");
         let on_apply = |_: &Expr, f: &Expr, new_arg: &Expr, sp: crate::ast::Span| -> Option<Expr> {
-            let Expr::NameRef(n, _) = f else { return None };
+            let Expr::NameRef(n, ns) = f else { return None };
             let (_, dict) = info.iter().find(|(d, _)| d == n)?;
-            let with_dict = Expr::Apply(Rc::new(f.clone()), Rc::new(Expr::NameRef(*dict, synthetic())), sp);
+            let dsp = if Some(*dict) == eq_dict {
+                crate::ast::Span { line: ns.line, col: ns.col, offset: ns.offset, len: 0 }
+            } else {
+                synthetic()
+            };
+            let with_dict = Expr::Apply(Rc::new(f.clone()), Rc::new(Expr::NameRef(*dict, dsp)), sp);
             Some(Expr::Apply(Rc::new(with_dict), Rc::new(new_arg.clone()), sp))
         };
         let rw = Rewrite { on_apply: &on_apply, deep: true };
@@ -297,6 +373,9 @@ pub fn apply(ch: &mut Chapter) {
         }
     }
     let mut front: Vec<Def> = Vec::new();
+    if has_eq {
+        front.extend(PRIM_EQ_WRAPPER_TYPES.iter().map(|tn| prim_eq_wrapper(syms, tn)));
+    }
     if has_ord {
         front.extend(PRIM_WRAPPER_TYPES.iter().map(|tn| prim_compare_wrapper(syms, tn)));
     }
