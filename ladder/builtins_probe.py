@@ -242,8 +242,8 @@ def _name_aliases(text):
 
 
 def _named_rows(text):
-    """`identity-admin-row = EffectRow { labels = [ ... ] ... }` in
-    Types/TypeEnv.codex: each named row's labels, space-joined."""
+    """`identity-admin-row = EffectRow { labels = [ ... ] ... }`: each named
+    row's labels, space-joined."""
     out = {}
     for m in re.finditer(r'^\s*([a-z][\w-]*)\s*=\s*EffectRow\s*\{(.*?)^\s*\}', text, re.M | re.S):
         out[m.group(1)] = ' '.join(re.findall(r'name\s*=\s*Name\s*\{\s*value\s*=\s*"([^"]*)"', m.group(2)))
@@ -251,7 +251,13 @@ def _named_rows(text):
 
 
 NAME_ALIASES = _name_aliases(SOURCE.read_text(errors='replace'))
-NAMED_ROWS = _named_rows((CODEX / 'codex' / 'compiler' / 'Types' / 'TypeEnv.codex').read_text(errors='replace'))
+# Read from Builtins.codex AND TypeEnv.codex: the named rows lived in
+# TypeEnv through U62 and moved into Builtins.codex at U63, and reading only
+# the old home dropped `identity-set-proc` from the types table in silence.
+NAMED_ROWS = {}
+for _src in (SOURCE, CODEX / 'codex' / 'compiler' / 'Types' / 'TypeEnv.codex'):
+    if _src.is_file():
+        NAMED_ROWS.update(_named_rows(_src.read_text(errors='replace')))
 
 
 def _bare(form):
@@ -290,7 +296,7 @@ def _check_type(form):
         # so unlike an empty row it must NOT be minted a fresh one.
         if isinstance(row, list) and row and row[0] == 'row-var' and len(row) > 1:
             return f'(fn {a} (rowvar {row[1]}) {r})'
-        # A row NAMED in Types/TypeEnv.codex -- `(identity-admin-row)`.
+        # A NAMED row -- `(identity-admin-row)`; see NAMED_ROWS.
         if isinstance(row, list) and len(row) == 1 and row[0] in NAMED_ROWS:
             return f'(fn {a} (row {NAMED_ROWS[row[0]]}) {r})'
         return None
@@ -354,7 +360,7 @@ def _check_type(form):
 def check_types(text):
     """name -> the declared type as the checker's s-expression."""
     text = NAME_REC.sub(r'\1', text)
-    out = {}
+    out, unread = {}, []
     for chunk in text.split('BuiltinSpec {')[1:]:
         m = re.match(r'\s*bs-name\s*=\s*"([^"]*)"', chunk)
         if not m:
@@ -370,6 +376,13 @@ def check_types(text):
             r = _check_type(form)
         if r is not None:
             out[m.group(1)] = r
+        else:
+            unread.append(m.group(1))
+    # A declared type this cannot render is left out of the table, and a
+    # left-out type reads downstream as an untyped builtin. Say so.
+    if unread:
+        print(f'builtins_probe: {len(unread)} declared type(s) not rendered, '
+              f'left out: {" ".join(unread)}', file=sys.stderr)
     return out
 
 
