@@ -318,6 +318,13 @@ fn words(n: usize) -> i64 {
     WORD * (n as i64 + 1)
 }
 
+/// A list is a capacity word and a length word before its elements, as the
+/// x86 code generator lays it out: `[]` costs 16 bytes, a four-element
+/// literal 48 (`codex/test/list-nil-heap`).
+fn list_words(n: usize) -> i64 {
+    WORD * (n as i64 + 2)
+}
+
 /// Stamp a location on an error that does not have one. The innermost frame
 /// wins, which is the one a reader wants.
 fn at(e: Error, sp: Span) -> Error {
@@ -1494,12 +1501,12 @@ impl Interp {
             return xs.clone();
         }
         let cells = xs.borrow().clone();
-        let addr = self.bump.alloc(words(cells.len()));
+        let addr = self.bump.alloc(list_words(cells.len()));
         Rc::new(Cell { addr, cached: std::cell::Cell::new(false), v: RefCell::new(cells) })
     }
 
     fn list(&mut self, cells: Vec<Value>) -> Value {
-        let addr = self.bump.alloc(words(cells.len()));
+        let addr = self.bump.alloc(list_words(cells.len()));
         Value::List(Rc::new(Cell { addr, cached: std::cell::Cell::new(false), v: RefCell::new(cells) }))
     }
 
@@ -2265,7 +2272,7 @@ fn binary(syms: &SymTab, bump: &mut crate::bump::Bump, op: BinaryOp, mode: crate
         Text(Rc::new(Str::new(addr, units)))
     }
     fn mklist(bump: &mut crate::bump::Bump, cells: Vec<Value>) -> Value {
-        let addr = bump.alloc(words(cells.len()));
+        let addr = bump.alloc(list_words(cells.len()));
         List(Rc::new(Cell { addr, cached: std::cell::Cell::new(false), v: RefCell::new(cells) }))
     }
     use BinaryOp::*;
