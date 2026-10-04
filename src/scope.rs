@@ -57,6 +57,10 @@ pub fn bag_error_count(n: usize) -> usize {
 pub struct Resolved {
     /// Every error, uncapped. The bag's own count is `bag_error_count`.
     pub errors: Vec<ResolveError>,
+    /// `applied-local-builtin` (CDX3011, since U66): a name applied where it
+    /// is both a local and a builtin. Kept apart from `errors` because the
+    /// checker raises these itself (`name_rules`), with their code.
+    pub applied_local_builtins: Vec<ResolveError>,
     pub top_level_names: Vec<String>,
     pub type_names: Vec<String>,
     pub ctor_names: Vec<String>,
@@ -74,6 +78,7 @@ pub struct Resolved {
 /// binders, which are the three rules a reasonable guess gets backwards.
 pub struct Walk {
     pub errors: Vec<ResolveError>,
+    pub applied_local_builtins: Vec<ResolveError>,
     /// Symbols, not text: this is on the walk's hot path and the caller has
     /// the table to spell them with.
     pub refs: Vec<(usize, Sym)>,
@@ -83,7 +88,7 @@ pub struct Walk {
 
 impl Walk {
     fn new(collect_refs: bool) -> Self {
-        Walk { errors: Vec::new(), refs: Vec::new(), collect_refs, def_index: 0 }
+        Walk { errors: Vec::new(), applied_local_builtins: Vec::new(), refs: Vec::new(), collect_refs, def_index: 0 }
     }
     fn push(&mut self, e: ResolveError) {
         self.errors.push(e);
@@ -102,6 +107,8 @@ struct Scope<'a> {
     /// of a string.
     syms: &'a SymTab,
     names: &'a HashSet<Sym>,
+    /// The builtins among `names`, for `applied-local-builtin`.
+    builtins: &'a HashSet<Sym>,
     locals: HashSet<Sym>,
 }
 
@@ -111,7 +118,7 @@ impl Scope<'_> {
     }
     /// `scope-fork`: the locals are cloned, the chapter names are shared.
     fn fork(&self) -> Scope<'_> {
-        Scope { syms: self.syms, names: self.names, locals: self.locals.clone() }
+        Scope { syms: self.syms, names: self.names, builtins: self.builtins, locals: self.locals.clone() }
     }
 }
 
@@ -178,7 +185,8 @@ fn walk(ch: &Chapter, collect_refs: bool) -> (Resolved, Walk) {
     // **A builtin the chapter never names is not in the table, and cannot be
     // what any `Sym` in this tree means** -- so `find` rather than interning,
     // and the ones that are absent are absent for a reason.
-    names.extend(BUILTINS.iter().filter_map(|(s, _)| ch.syms.find(s)));
+    let builtins: HashSet<Sym> = BUILTINS.iter().filter_map(|(s, _)| ch.syms.find(s)).collect();
+    names.extend(builtins.iter().copied());
     for e in &ch.effect_defs {
         names.extend(e.ops.iter().map(|o| o.name));
     }
@@ -189,7 +197,7 @@ fn walk(ch: &Chapter, collect_refs: bool) -> (Resolved, Walk) {
     let mut w = Walk::new(collect_refs);
     for (i, d) in ch.defs.iter().enumerate() {
         w.def_index = i;
-        let mut sc = Scope { syms: &ch.syms, names: &names, locals: HashSet::new() };
+        let mut sc = Scope { syms: &ch.syms, names: &names, builtins: &builtins, locals: HashSet::new() };
         let mut seen = HashSet::new();
         for p in &d.params {
             if !seen.insert(p.name.clone()) {
@@ -213,6 +221,7 @@ fn walk(ch: &Chapter, collect_refs: bool) -> (Resolved, Walk) {
     }
 
     let errors = std::mem::take(&mut w.errors);
+    let applied_local_builtins = std::mem::take(&mut w.applied_local_builtins);
     // The public shape stays TEXT: these are read by the dumps and by `xref`,
     // and spelling them here keeps the table from rippling any further.
     let spell = |v: Vec<Sym>| -> Vec<String> {
@@ -221,6 +230,7 @@ fn walk(ch: &Chapter, collect_refs: bool) -> (Resolved, Walk) {
     (
         Resolved {
             errors,
+            applied_local_builtins,
             top_level_names: spell(top),
             type_names: spell(type_names),
             ctor_names: spell(ctor_names),
@@ -242,7 +252,23 @@ fn expr(sc: &mut Scope<'_>, e: &Expr, w: &mut Walk) {
                 w.push(undefined(sc.syms.text(*n), *s));
             }
         }
-        Expr::Apply(a, b, _) | Expr::Binary(a, _, b, _) | Expr::FieldAssign(a, _, b, _) => {
+        Expr::Apply(a, b, _) => {
+            // `applied-local-builtin`, ahead of the function's own errors.
+            if let Expr::NameRef(n, s) = &**a {
+                if sc.locals.contains(n) && sc.builtins.contains(n) {
+                    w.applied_local_builtins.push(ResolveError {
+                        msg: format!(
+                            "'{}' is applied here, and it is both a local binding and a builtin, so the call does not say which one it means; rename the local",
+                            sc.syms.text(*n)
+                        ),
+                        span: *s,
+                    });
+                }
+            }
+            expr(sc, a, w);
+            expr(sc, b, w);
+        }
+        Expr::Binary(a, _, b, _) | Expr::FieldAssign(a, _, b, _) => {
             expr(sc, a, w);
             expr(sc, b, w);
         }

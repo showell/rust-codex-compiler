@@ -294,6 +294,8 @@ impl Cdx {
     pub const TYPE_ARITY: u16 = 2032;
     pub const DUPLICATE_DEFINITION: u16 = 3001;
     pub const UNDEFINED_TYPE_NAME: u16 = 3008;
+    pub const CLASS_SHADOWS_DERIVED: u16 = 3009;
+    pub const APPLIED_LOCAL_IS_BUILTIN: u16 = 3011;
     pub const CITE_NOT_IN_UNIT: u16 = 3007;
     pub const TOO_MANY_ERRORS: u16 = 1;
     pub const UNKNOWN_PATTERN_CTOR: u16 = 2072;
@@ -331,6 +333,7 @@ impl Cdx {
     pub const UNTERMINATED_TEXT: u16 = 7;
     pub const UNTERMINATED_CHAR: u16 = 8;
     pub const NON_GRAMMATICAL_PROOF: u16 = 4024;
+    pub const PROOF_UNDECIDED: u16 = 4025;
     pub const EFFECT_UNDECLARED: u16 = 2031;
     pub const LET_BINDS_EFFECTFUL: u16 = 2033;
     pub const ROW_MISMATCH: u16 = 2090;
@@ -2905,7 +2908,15 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
     // A cite of a chapter the unit lacks (CDX3007) is the resolver's too:
     // upstream merges it into the same bag, ahead of the undefined names.
     let halts = |code: u16| {
-        code < 2000 || matches!(code, Cdx::DUPLICATE_DEFINITION | Cdx::UNDEFINED_NAME | Cdx::CITE_NOT_IN_UNIT)
+        code < 2000
+            || matches!(
+                code,
+                Cdx::DUPLICATE_DEFINITION
+                    | Cdx::UNDEFINED_NAME
+                    | Cdx::CITE_NOT_IN_UNIT
+                    | Cdx::CLASS_SHADOWS_DERIVED
+                    | Cdx::APPLIED_LOCAL_IS_BUILTIN
+            )
     };
     if st.diags.iter().any(|d| d.code < 2000) {
         st.diags.retain(|d| d.code < 2000);

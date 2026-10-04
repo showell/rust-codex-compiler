@@ -20,7 +20,32 @@ pub fn check(ch: &Chapter, tds: &TypeDefs, st: &mut UnifyState) {
     type_syntax(ch, st);
     cites_resolve(ch, st);
     duplicates(ch, st);
+    applied_local_builtins(ch, st);
+    derived_class_names(ch, st);
     type_names(ch, tds, st);
+}
+
+/// `applied-local-builtin` (NameResolver.codex, CDX3011, since U66): the
+/// resolver's walk finds them, since only it knows the locals at each point.
+fn applied_local_builtins(ch: &Chapter, st: &mut UnifyState) {
+    for e in crate::scope::resolve(ch).applied_local_builtins {
+        st.error(Cdx::APPLIED_LOCAL_IS_BUILTIN, e.msg);
+    }
+}
+
+/// `derived-class-name-errors` (NameResolver.codex, CDX3009, since U66): a
+/// user class named `Eq`, `Show` or `Ord` would never be consulted, since a
+/// constraint naming it means the derived class.
+fn derived_class_names(ch: &Chapter, st: &mut UnifyState) {
+    for c in &ch.class_defs {
+        let name = ch.syms.text(c.name);
+        if matches!(name, "Eq" | "Show" | "Ord") {
+            st.error(
+                Cdx::CLASS_SHADOWS_DERIVED,
+                format!("class '{name}' has the name of a derived class, so a constraint naming it would never consult this class or its instances; rename the class"),
+            );
+        }
+    }
 }
 
 /// `check-cites-resolve` (Semantics/ChapterScoper.codex): a `cites Q chapter

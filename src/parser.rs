@@ -62,6 +62,8 @@ pub fn code_for(msg: &str) -> u16 {
         1075
     } else if msg.starts_with("A constructor field written (A, B)") {
         1076
+    } else if msg.starts_with("Constructor return annotations are not supported") {
+        1080
     } else if msg.contains("begins no definition, so it would be dropped") {
         1077
     } else if msg.starts_with("The definition's expression has ended") {

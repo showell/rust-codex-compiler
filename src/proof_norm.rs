@@ -958,31 +958,59 @@ fn aexpr_to_cterm(e: &Expr, syms: &mut SymTab) -> Ty {
 // After every definition is checked: `Section: Proof Acyclicity` and
 // `check-proof-grammar` (TypeChecker.codex:2207, :2344).
 
-/// `type-mentions-proof`: a definition is proof-relevant when its CHECKED
-/// type mentions `Proof` or an equality anywhere. Fuel-capped, and answers
-/// yes on exhaustion, so a pathological type errs toward checking.
-fn type_mentions_proof(t: &Ty, fuel: i32, tds: &TypeDefs) -> bool {
+/// `type-proof-class`: whether a CHECKED type states a proof -- 0 no, 1 yes,
+/// 2 undecided (the fuel ran out first). A function's result costs no fuel, so
+/// a long chain of arrows is walked whole: an ordinary 80-parameter function
+/// is not a proof (COMPILER-110). Undecided is not yes; `check_proof_rules`
+/// refuses such a definition with CDX4025.
+fn type_proof_class(t: &Ty, fuel: i32, tds: &TypeDefs) -> u8 {
     if fuel <= 0 {
-        return true;
+        return 2;
     }
-    match t {
-        Ty::Proof | Ty::PropEq(..) => true,
-        Ty::Fun(p, _, r) => type_mentions_proof(p, fuel - 1, tds) || type_mentions_proof(r, fuel - 1, tds),
-        Ty::List(e) | Ty::LinkedList(e) | Ty::Linear(e) | Ty::Vector(_, e) | Ty::SizedVec(_, e) | Ty::VectorMask(_, e) | Ty::Unit(_, e) => {
-            type_mentions_proof(e, fuel - 1, tds)
+    let any = |ts: &mut dyn Iterator<Item = &Ty>| {
+        let mut acc = 0;
+        for x in ts {
+            acc = tp_or(acc, type_proof_class(x, fuel - 1, tds));
+            if acc == 1 {
+                break;
+            }
         }
-        Ty::ForAll(_, b) | Ty::ForAllEff(_, b) | Ty::Effectful(_, _, b) => type_mentions_proof(b, fuel - 1, tds),
-        Ty::TypeApply(f, a) => type_mentions_proof(f, fuel - 1, tds) || type_mentions_proof(a, fuel - 1, tds),
+        acc
+    };
+    match t {
+        Ty::Proof | Ty::PropEq(..) => 1,
+        Ty::Fun(p, _, r) => tp_or(type_proof_class(p, fuel - 1, tds), type_proof_class(r, fuel, tds)),
+        Ty::List(e) | Ty::LinkedList(e) | Ty::Linear(e) | Ty::Vector(_, e) | Ty::SizedVec(_, e) | Ty::VectorMask(_, e) | Ty::Unit(_, e) => {
+            type_proof_class(e, fuel - 1, tds)
+        }
+        Ty::ForAll(_, b) | Ty::ForAllEff(_, b) | Ty::Effectful(_, _, b) => type_proof_class(b, fuel - 1, tds),
+        Ty::TypeApply(f, a) => tp_or(type_proof_class(f, fuel - 1, tds), type_proof_class(a, fuel - 1, tds)),
         // A named type's ARGUMENTS only. Upstream's record carries its
         // fields inline and a recursive field is a bare constructed name,
         // so its walk ends; a lookup through the type table here would not,
-        // and running out of fuel answers yes -- which made every definition
-        // of the desk family a proof term.
-        Ty::Constructed(_, args) | Ty::Sum(_, args) | Ty::Record(_, args) => {
-            args.iter().any(|a| type_mentions_proof(a, fuel - 1, tds))
-        }
-        _ => false,
+        // and running out of fuel would make every definition of the desk
+        // family undecided.
+        Ty::Constructed(_, args) | Ty::Sum(_, args) | Ty::Record(_, args) => any(&mut args.iter()),
+        _ => 0,
     }
+}
+
+/// `tp-or`: a proof anywhere decides it; otherwise an undecided part leaves
+/// the whole undecided.
+fn tp_or(a: u8, b: u8) -> u8 {
+    if a == 1 || b == 1 {
+        1
+    } else if a == 2 || b == 2 {
+        2
+    } else {
+        0
+    }
+}
+
+/// `type-mentions-proof`: a definition is proof-relevant when its CHECKED
+/// type mentions `Proof` or an equality anywhere within the fuel.
+fn type_mentions_proof(t: &Ty, fuel: i32, tds: &TypeDefs) -> bool {
+    type_proof_class(t, fuel, tds) == 1
 }
 
 fn span_of(e: &Expr) -> Span {
@@ -1107,6 +1135,20 @@ impl Grammar<'_> {
 
 /// `check-proof-cycles` then `check-proof-grammar`, over the checked types.
 pub fn check_proof_rules(ch: &Chapter, per_def: &[Binding], tds: &TypeDefs, st: &mut UnifyState) {
+    // `proof-undecided`: a type too deep to say whether it states a proof is
+    // refused, not guessed (COMPILER-110).
+    for d in &ch.defs {
+        let Some(b) = per_def.iter().find(|b| b.name == d.name) else { continue };
+        if type_proof_class(&st.deep_resolve(&b.ty), 64, tds) == 2 {
+            st.error(
+                Cdx::PROOF_UNDECIDED,
+                format!(
+                    "'{}' has a type nested more than 64 levels deep, so whether it states a proof cannot be decided; the definition is refused rather than guessed. Name an inner type (a record or a sum) to shorten the nesting.",
+                    ch.syms.text(d.name)
+                ),
+            );
+        }
+    }
     let names: Vec<Name> = ch
         .defs
         .iter()

@@ -1616,10 +1616,9 @@ impl<'a> Desugar<'a> {
                         .children_of(NodeKind::CtorField)
                         .filter_map(|f| f.child_nodes().first().map(|t| self.type_expr(t)))
                         .collect(),
-                    return_type: c
-                        .children_of(NodeKind::CtorReturn)
-                        .filter_map(|r| r.child_nodes().first().map(|t| self.type_expr(t)))
-                        .collect(),
+                    // Always empty since U66: the parser refuses an
+                    // annotation (CDX1080), as upstream's does.
+                    return_type: Vec::new(),
                     span: head_span(c),
                 })
                 .collect();

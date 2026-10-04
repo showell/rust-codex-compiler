@@ -103,8 +103,6 @@ pub enum NodeKind {
     VariantCtor,
     /// One `(T)` of a constructor.
     CtorField,
-    /// A constructor's `: T`, which fixes its result type.
-    CtorReturn,
     /// `= unit T`
     UnitBody,
     /// `= unit family Millimeter`, and its `Member = <factor>` lines.

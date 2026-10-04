@@ -49,12 +49,13 @@ pub(crate) fn parse_type_def(p: &mut Parser<'_>, first: Token) {
     if p.kind(0) == Some(Kind::MutableKeyword) {
         p.bump();
     }
-    p.bump(); // the name; the document layer has already checked it is one
+    // the name; the document layer has already checked it is one
+    let name_col = p.bump().map_or(0, |t| t.col);
     type_params(p);
     if p.kind(0) == Some(Kind::Equals) {
         p.bump();
         p.skip_newlines();
-        body(p);
+        body(p, name_col);
         deriving(p);
     } else {
         p.err("expected '=' in a type definition");
@@ -144,12 +145,12 @@ fn type_params(p: &mut Parser<'_>) {
     }
 }
 
-fn body(p: &mut Parser<'_>) {
+fn body(p: &mut Parser<'_>, name_col: u32) {
     match p.kind(0) {
         Some(Kind::RecordKeyword) => record_body(p),
         Some(Kind::UnitKeyword) => unit_body(p),
-        Some(Kind::Pipe) => variant_body(p),
-        Some(Kind::TypeIdentifier) if looks_like_variant(p) => variant_body(p),
+        Some(Kind::Pipe) => variant_body(p, name_col),
+        Some(Kind::TypeIdentifier) if looks_like_variant(p) => variant_body(p, name_col),
         _ => {
             // Upstream answers `None` here and hands the whole definition
             // back. There is no such thing in a tree that must cover its
@@ -206,22 +207,53 @@ fn record_body(p: &mut Parser<'_>) {
     p.b.wrap_from(cp, NodeKind::RecordBody);
 }
 
-fn variant_body(p: &mut Parser<'_>) {
+fn variant_body(p: &mut Parser<'_>, name_col: u32) {
     let cp = p.b.checkpoint();
     if p.kind(0) == Some(Kind::TypeIdentifier) {
-        ctor(p);
+        ctor(p, name_col);
     }
     while p.kind(0) == Some(Kind::Pipe) {
         p.bump();
         p.skip_newlines();
-        ctor(p);
+        ctor(p, name_col);
     }
     p.b.wrap_from(cp, NodeKind::VariantBody);
 }
 
-fn ctor(p: &mut Parser<'_>) {
+fn ctor(p: &mut Parser<'_>, name_col: u32) {
     let cp = p.b.checkpoint();
     p.bump(); // the constructor's name
+    ctor_fields(p);
+    // The newlines go whether or not an annotation follows, which is what lets
+    // the constructors of a variant sit one per line.
+    p.skip_newlines();
+    // `| C : T` -- a constructor return annotation. Refused since U66
+    // (CDX1080, COMPILER-116), at the colon; the annotation is skipped to
+    // upstream's `ctor-return-end` (the next `|`, or the first token on a
+    // later line at or left of the type's name), and the fields resume.
+    while p.kind(0) == Some(Kind::Colon) {
+        let ecp = p.b.checkpoint();
+        let colon = p.bump().expect("a colon");
+        p.err_at(colon, "Constructor return annotations are not supported.");
+        while let Some(t) = p.sig(0) {
+            let stop = match t.kind {
+                Kind::Pipe | Kind::EndOfFile => true,
+                Kind::Newline | Kind::Indent | Kind::Dedent => false,
+                _ => t.line > colon.line && t.col <= name_col,
+            };
+            if stop {
+                break;
+            }
+            p.bump();
+        }
+        p.b.wrap_from(ecp, NodeKind::Error);
+        ctor_fields(p);
+        p.skip_newlines();
+    }
+    p.b.wrap_from(cp, NodeKind::VariantCtor);
+}
+
+fn ctor_fields(p: &mut Parser<'_>) {
     while p.kind(0) == Some(Kind::LeftParen) {
         let fcp = p.b.checkpoint();
         let open = p.sig(0);
@@ -242,17 +274,6 @@ fn ctor(p: &mut Parser<'_>) {
         }
         p.b.wrap_from(fcp, NodeKind::CtorField);
     }
-    // The newlines go whether or not a return type follows, which is what lets
-    // the constructors of a variant sit one per line.
-    p.skip_newlines();
-    if p.kind(0) == Some(Kind::Colon) {
-        let rcp = p.b.checkpoint();
-        p.bump();
-        crate::types::parse_type(p);
-        p.b.wrap_from(rcp, NodeKind::CtorReturn);
-        p.skip_newlines();
-    }
-    p.b.wrap_from(cp, NodeKind::VariantCtor);
 }
 
 /// From just inside a field's `(` to its `)`: a comma at depth 0 and no
