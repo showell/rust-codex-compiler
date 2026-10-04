@@ -3495,13 +3495,15 @@ impl<'a> Cx<'a> {
             // `Real approximate` and the overflow modes. A mode is on the
             // operations, so entering or leaving one is the identity; only a
             // change of width converts.
+            // In a device unit `Real` is already F32 (`real()`), the width of
+            // `Real approximate`, so both directions are the identity there.
             "to-real-approx" => {
                 want(1)?;
-                format!("F64.to_f32_wrap({})", xs[0])
+                if self.wgsl { xs[0].clone() } else { format!("F64.to_f32_wrap({})", xs[0]) }
             }
             "from-real-approx" => {
                 want(1)?;
-                format!("F32.to_f64({})", xs[0])
+                if self.wgsl { xs[0].clone() } else { format!("F32.to_f64({})", xs[0]) }
             }
             "to-real-trapping" | "to-real-saturating" | "from-real-trapping" | "from-real-saturating"
             | "to-real-approx-trapping" | "to-real-approx-saturating" | "from-real-approx-trapping"
