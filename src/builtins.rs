@@ -10,7 +10,7 @@
 // VALUE and not a function of one argument. `None` is one of the eight
 // that declare no type at all. Re-run the probe after a pin change; do
 // not edit by hand.
-pub const BUILTINS: [(&str, Option<usize>); 314] = [
+pub const BUILTINS: [(&str, Option<usize>); 317] = [
     ("negate", Some(1)),
     ("text-length", Some(1)),
     ("integer-to-text", Some(1)),
@@ -159,7 +159,7 @@ pub const BUILTINS: [(&str, Option<usize>); 314] = [
     ("chan-kern-recv-block", Some(1)),
     ("chan-text-send", Some(2)),
     ("chan-text-recv", Some(1)),
-    ("hardware-random", Some(0)),
+    ("__hardware-random-word", Some(0)),
     ("identity-whoami", Some(1)),
     ("identity-set", Some(2)),
     ("device-seed", Some(1)),
@@ -201,6 +201,9 @@ pub const BUILTINS: [(&str, Option<usize>); 314] = [
     ("__linked-list-to-list", Some(1)),
     ("__record-set", Some(3)),
     ("__heap-save", Some(0)),
+    ("__stack-save", Some(0)),
+    ("__cover-dump", Some(0)),
+    ("__cover-arm", Some(1)),
     ("address-of", Some(1)),
     ("variant-tag", Some(1)),
     ("__self-type-defs", Some(0)),
@@ -345,7 +348,7 @@ pub const BUILTIN_EFFECT_NAMES: [&str; 5] = ["Console.Read", "Process", "Device.
 /// whose type names `Task` is otherwise untyped in a program that never does.
 pub const BUILTIN_TYPE_NAMES: [&str; 4] = ["Maybe", "SChan", "Task", "TypeBinding"];
 
-pub const BUILTIN_TYPES: [(&str, &str); 302] = [
+pub const BUILTIN_TYPES: [(&str, &str); 305] = [
     ("negate", "(forall 0 (fn (tvar 0) empty (tvar 0)))"),
     ("text-length", "(fn text empty int)"),
     ("integer-to-text", "(fn int empty text)"),
@@ -469,7 +472,6 @@ pub const BUILTIN_TYPES: [(&str, &str); 302] = [
     ("process-yield", "int"),
     ("process-spawn", "(foralleff 0 (fn (fn int (rowvar 0) int) (row Concurrent) int))"),
     ("process-exit-self", "int"),
-    ("process-spawn-priority", "(foralleff 0 (fn (fn int (rowvar 0) int) empty (fn int empty (fn int (row Concurrent) int))))"),
     ("process-wait", "(fn int empty int)"),
     ("get-ticks", "int"),
     ("pit-input-hz", "int"),
@@ -493,7 +495,7 @@ pub const BUILTIN_TYPES: [(&str, &str); 302] = [
     ("chan-kern-recv-block", "(fn int (row Concurrent) int)"),
     ("chan-text-send", "(fn int empty (fn text (row Concurrent) int))"),
     ("chan-text-recv", "(fn int (row Concurrent) text)"),
-    ("hardware-random", "int"),
+    ("__hardware-random-word", "int"),
     ("identity-whoami", "(fn int (row Identity) int)"),
     ("identity-set", "(fn int empty (fn int (row Identity) int))"),
     ("device-seed", "(fn int (row Identity) int)"),
@@ -535,6 +537,9 @@ pub const BUILTIN_TYPES: [(&str, &str); 302] = [
     ("__linked-list-to-list", "(forall 0 (fn (llist (tvar 0)) empty (list (tvar 0))))"),
     ("__record-set", "(forall 0 (forall 1 (fn (tvar 0) empty (fn text empty (fn (tvar 1) empty (tvar 0))))))"),
     ("__heap-save", "int"),
+    ("__stack-save", "int"),
+    ("__cover-dump", "int"),
+    ("__cover-arm", "(fn int empty int)"),
     ("address-of", "(forall 0 (fn (tvar 0) empty int))"),
     ("variant-tag", "(forall 0 (fn (tvar 0) empty int))"),
     ("__self-type-defs", "(list (ctd TypeBinding))"),
@@ -579,7 +584,6 @@ pub const BUILTIN_TYPES: [(&str, &str); 302] = [
     ("vec-mul", "(fn (vec 2 real) empty (fn (vec 2 real) empty (vec 2 real)))"),
     ("vec-div", "(fn (vec 2 real) empty (fn (vec 2 real) empty (vec 2 real)))"),
     ("vec-reduce-add", "(fn (vec 2 real) empty real)"),
-    ("vec-select", "(forall 0 (forall 1 (fn (vec-mask 2 (tvar 1)) empty (fn (vec 2 (tvar 0)) empty (fn (vec 2 (tvar 0)) empty (vec 2 (tvar 0)))))))"),
     ("vec-load-at", "(forall 0 (fn int empty (vec 2 (tvar 0))))"),
     ("vec-store-at", "(forall 0 (fn int empty (fn (vec 2 (tvar 0)) empty int)))"),
     ("mask-any", "(forall 0 (fn (vec-mask 2 (tvar 0)) empty bool))"),
@@ -648,6 +652,8 @@ pub const BUILTIN_TYPES: [(&str, &str); 302] = [
     ("vec-length", "(forall 0 (fn (svec -1 (tvar 0)) empty int))"),
     ("s-new", "(forall 0 (ctd SChan (tvar 0)))"),
     ("s-recv-value", "(forall 0 (fn (ctd SChan (tvar 0)) empty int))"),
+    ("process-spawn-priority", "(foralleff 0 (fn (fn int (rowvar 0) int) empty (fn int empty (fn int (row Concurrent) int))))"),
+    ("vec-select", "(forall 0 (forall 1 (fn (vec-mask 2 (tvar 1)) empty (fn (vec 2 (tvar 0)) empty (fn (vec 2 (tvar 0)) empty (vec 2 (tvar 0)))))))"),
 ];
 
 /// `bs-alloc`: each builtin's measured allocation class, from upstream's
@@ -787,7 +793,10 @@ pub const BUILTIN_ALLOC: &[(&str, &str)] = &[
     ("chan-kern-recv-block", "none"),
     ("chan-text-send", "none"),
     ("chan-text-recv", "unknown"),
-    ("hardware-random", "none"),
+    ("__hardware-random-word", "none"),
+    ("__stack-save", "none"),
+    ("__cover-dump", "none"),
+    ("__cover-arm", "none"),
     ("identity-whoami", "none"),
     ("identity-set", "none"),
     ("device-seed", "none"),
