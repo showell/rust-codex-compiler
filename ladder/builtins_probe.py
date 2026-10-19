@@ -136,6 +136,32 @@ def _arity(form, name):
                      'arrow, or to ENDS_THE_SPINE if it cannot.')
 
 
+# `bs-type = let a = T in let b = U in Just (... a ... b ...)`: COMPILER-109's
+# 128-column reflow (Update 70) wrote two declared types this way, and a probe
+# that only read `Just (` refused them -- `process-spawn-priority` and
+# `vec-select` came out with no arity and no type. The bindings are inlined
+# textually, each value parenthesised, and the result read like any other type.
+LET_BIND = re.compile(r'let\s+([a-z][\w-]*)\s*=\s*(.*?)\s+in\s+(?=let\s|Just\b)', re.S)
+
+
+def _inline_lets(chunk):
+    m = re.search(r'bs-type\s*=\s*(?=let\s)', chunk)
+    if not m:
+        return chunk
+    rest, binds = chunk[m.end():], []
+    while True:
+        b = LET_BIND.match(rest)
+        if not b:
+            break
+        binds.append((b.group(1), b.group(2)))
+        rest = rest[b.end():]
+    if not binds or not rest.startswith('Just'):
+        return chunk
+    for name, value in reversed(binds):
+        rest = re.sub(rf'(?<![\w-]){re.escape(name)}(?![\w-])', lambda _: f'({value})', rest)
+    return chunk[:m.end()] + rest
+
+
 def arities(text):
     """name -> arity, for every builtin that DECLARES a type.
 
@@ -159,6 +185,7 @@ def arities(text):
     text = NAME_REC.sub(r'\1', text)
     out = {}
     for chunk in text.split('BuiltinSpec {')[1:]:
+        chunk = _inline_lets(chunk)
         m = re.match(r'\s*bs-name\s*=\s*"([^"]*)"', chunk)
         if not m:
             continue
@@ -366,6 +393,7 @@ def check_types(text):
     text = NAME_REC.sub(r'\1', text)
     out, unread = {}, []
     for chunk in text.split('BuiltinSpec {')[1:]:
+        chunk = _inline_lets(chunk)
         m = re.match(r'\s*bs-name\s*=\s*"([^"]*)"', chunk)
         if not m:
             continue
