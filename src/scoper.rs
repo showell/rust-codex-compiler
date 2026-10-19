@@ -3,9 +3,12 @@
 //! A compilation unit is several chapters, and two of them may define the
 //! same name. Upstream keeps both: a colliding name is MANGLED with its
 //! chapter (`slugify(chapter) & "_" & name`), each chapter's own mentions
-//! resolve to its own definition, and a chapter that defines neither gets
-//! the first chapter's. `opening` never collides. The mangled names are
-//! what the IR carries.
+//! resolve to its own definition, and a chapter that defines neither must
+//! CITE the one it means (`cites Q chapter C (name)`, `apply-cite-selected`).
+//! A mention that is neither its chapter's own nor cited is AMBIGUOUS: it is
+//! left unmangled and recorded in `Chapter::ambiguous_refs`, and the checker
+//! refuses it (CDX3027), as upstream's resolver does. `opening` never
+//! collides. The mangled names are what the IR carries.
 //!
 //! Without this, one environment held the last definition of a colliding
 //! name for every chapter, and the desk family's `format-time (dt) =
@@ -16,7 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use crate::ast::{ActStmt, Chapter, Expr, HandleClause, HandleExpr, LetBind, MatchArm, Name, Pat, TryExpr, WithTimeoutExpr};
+use crate::ast::{ActStmt, Chapter, Span, Expr, HandleClause, HandleExpr, LetBind, MatchArm, Name, Pat, TryExpr, WithTimeoutExpr};
 use crate::symbol::SymTab;
 
 /// `slugify`: spaces to dashes, uppercase to lowercase.
@@ -43,45 +46,124 @@ pub fn apply(ch: &mut Chapter) {
     if colliding.is_empty() {
         return;
     }
-    // The first chapter defining each colliding name, in definition order:
-    // what a chapter that defines neither resolves to.
-    let mut first_slug: BTreeMap<Name, String> = BTreeMap::new();
-    for d in &ch.defs {
-        if colliding.contains(&d.name) {
-            first_slug.entry(d.name).or_insert_with(|| d.chapter_slug.clone());
-        }
-    }
-    // `build-chapter-rename-map`, per chapter.
+    // `build-all-assignments`: one per definition the source wrote, in order.
+    // The desugarer's synthesised definitions carry no chapter and are not
+    // among them.
+    let assignments: Vec<(Name, String)> =
+        ch.defs.iter().filter(|d| !d.chapter_slug.is_empty()).map(|d| (d.name, d.chapter_slug.clone())).collect();
+    let slug_cache: Vec<String> = assignments.iter().map(|(_, s)| cite_key(s)).collect();
+    // `build-chapter-rename-map`, then `apply-cite-overrides`, per chapter.
     let slugs: BTreeSet<String> = ch.defs.iter().map(|d| d.chapter_slug.clone()).collect();
-    let mut maps: BTreeMap<String, BTreeMap<Name, Name>> = BTreeMap::new();
+    let mut maps: BTreeMap<String, BTreeMap<Name, Owner>> = BTreeMap::new();
     for slug in &slugs {
-        let mut map = BTreeMap::new();
-        for n in &colliding {
-            let defines_here = ch.defs.iter().any(|d| d.name == *n && d.chapter_slug == *slug);
-            let owner = if defines_here { slug.clone() } else { first_slug[n].clone() };
-            let mangled = ch.syms.intern(&mangle(&owner, ch.syms.text(*n)));
-            map.insert(*n, mangled);
+        let mut map: BTreeMap<Name, Owner> = BTreeMap::new();
+        for (n, owner) in &assignments {
+            if !colliding.contains(n) {
+                continue;
+            }
+            if owner == slug {
+                map.insert(*n, Owner::Mangled(owner.clone()));
+            } else {
+                match map.get_mut(n) {
+                    Some(Owner::Ambiguous(others)) => others.push(owner.clone()),
+                    Some(Owner::Mangled(_)) => {}
+                    None => {
+                        map.insert(*n, Owner::Ambiguous(vec![owner.clone()]));
+                    }
+                }
+            }
+        }
+        for c in ch.citations.iter().filter(|c| c.citing_chapter == *slug) {
+            let quire = ch.syms.text(c.quire).to_string();
+            let chapter = ch.syms.text(c.chapter_name).to_string();
+            let cite_slug = cite_slug_for(&quire, &chapter, &assignments, &slug_cache);
+            for n in &c.selected_names {
+                let defines_here = assignments.iter().any(|(a, s)| a == n && s == slug);
+                if colliding.contains(n) && !defines_here {
+                    map.insert(*n, Owner::Mangled(cite_slug.clone()));
+                }
+            }
         }
         maps.insert(slug.clone(), map);
     }
-    // Rename the definitions and rewrite every mention in their bodies.
-    for d in &mut ch.defs {
-        let map = &maps[&d.chapter_slug];
-        if colliding.contains(&d.name) {
-            d.name = map[&d.name];
+    // Every chapter's own mangled names, interned once.
+    let mut mangled: BTreeMap<String, BTreeMap<Name, Name>> = BTreeMap::new();
+    for (slug, map) in &maps {
+        let mut m = BTreeMap::new();
+        for (n, o) in map {
+            if let Owner::Mangled(owner) = o {
+                m.insert(*n, ch.syms.intern(&mangle(owner, ch.syms.text(*n))));
+            }
         }
-        let mut scope = Scope { map, shadowed: Vec::new() };
+        mangled.insert(slug.clone(), m);
+    }
+    // Rename the definitions and rewrite every mention in their bodies.
+    let mut ambiguous: Vec<(Span, String)> = Vec::new();
+    for d in &mut ch.defs {
+        let map = &mangled[&d.chapter_slug];
+        if colliding.contains(&d.name) {
+            if let Some(m) = map.get(&d.name) {
+                d.name = *m;
+            }
+        }
+        let mut scope = Scope {
+            map,
+            owners: &maps[&d.chapter_slug],
+            syms: &ch.syms,
+            shadowed: Vec::new(),
+            ambiguous: &mut ambiguous,
+        };
         scope.push_names(d.params.iter().map(|p| p.name));
         d.body = scope.expr(&d.body);
     }
-    let _ = &ch.syms as &SymTab;
+    for (sp, msg) in ambiguous {
+        ch.ambiguous_refs.insert((sp.offset, sp.len), msg);
+    }
+}
+
+/// Where a colliding name points from one chapter: a definition, by the
+/// chapter that owns it, or nowhere yet -- the chapters that define it, in
+/// definition order, none of them this one (`ambiguity-marker`).
+#[derive(Clone, Debug)]
+enum Owner {
+    Mangled(String),
+    Ambiguous(Vec<String>),
+}
+
+/// `cite-key`: spaces removed, ASCII letters lowered.
+fn cite_key(s: &str) -> String {
+    s.chars().filter(|c| *c != ' ').map(|c| c.to_ascii_lowercase()).collect()
+}
+
+/// `find-slug-for-cite-name`: the slug whose key is `quire--chapter`, else
+/// the one slug that is the bare chapter or ends in `--chapter`. The count is
+/// over ASSIGNMENTS, one per definition, as upstream's `count-bare-matches`
+/// walks the slug cache: a bare cite finds its chapter only when that chapter
+/// carries one definition. "" when nothing matches.
+fn cite_slug_for(quire: &str, chapter: &str, assignments: &[(Name, String)], slug_cache: &[String]) -> String {
+    let exact = cite_key(&format!("{quire}--{chapter}"));
+    if let Some(i) = slug_cache.iter().position(|s| *s == exact) {
+        return assignments[i].1.clone();
+    }
+    let bare = cite_key(chapter);
+    let suffix = format!("--{bare}");
+    let hits = |s: &String| *s == bare || s.ends_with(&suffix);
+    if slug_cache.iter().filter(|s| hits(s)).count() == 1 {
+        if let Some(i) = slug_cache.iter().position(hits) {
+            return assignments[i].1.clone();
+        }
+    }
+    String::new()
 }
 
 /// The chapter's rename map, minus the names bound locally around the
 /// expression being rewritten (`remove-renames-for-params` and kin).
 struct Scope<'a> {
     map: &'a BTreeMap<Name, Name>,
+    owners: &'a BTreeMap<Name, Owner>,
+    syms: &'a SymTab,
     shadowed: Vec<Name>,
+    ambiguous: &'a mut Vec<(Span, String)>,
 }
 
 impl Scope<'_> {
@@ -94,6 +176,27 @@ impl Scope<'_> {
             return n;
         }
         self.map.get(&n).copied().unwrap_or(n)
+    }
+
+    /// A mention: its chapter's name for it, or -- for a colliding name this
+    /// chapter neither defines nor cites -- the name unchanged, with the
+    /// resolver's CDX3027 message recorded against its span.
+    fn mention(&mut self, n: Name, sp: Span) -> Name {
+        if !self.shadowed.contains(&n) {
+            if let Some(Owner::Ambiguous(others)) = self.owners.get(&n) {
+                let name = self.syms.text(n);
+                self.ambiguous.push((
+                    sp,
+                    format!(
+                        "'{name}' is defined in more than one other chapter ({}) and in none of this chapter's; \
+                         cite the one you mean by name: cites <Quire> chapter <Name> ({name})",
+                        others.join(", ")
+                    ),
+                ));
+                return n;
+            }
+        }
+        self.lookup(n)
     }
 
     fn scoped<T>(&mut self, names: Vec<Name>, f: impl FnOnce(&mut Self) -> T) -> T {
@@ -142,7 +245,7 @@ impl Scope<'_> {
 
     fn expr(&mut self, e: &Expr) -> Expr {
         match e {
-            Expr::NameRef(n, sp) => Expr::NameRef(self.lookup(*n), *sp),
+            Expr::NameRef(n, sp) => Expr::NameRef(self.mention(*n, *sp), *sp),
             Expr::Lit(..) | Expr::Error(..) => e.clone(),
             Expr::Apply(f, a, sp) => Expr::Apply(self.rc(f), self.rc(a), *sp),
             Expr::Binary(l, op, r, sp) => Expr::Binary(self.rc(l), *op, self.rc(r), *sp),

@@ -206,6 +206,23 @@ impl<'a> Desugar<'a> {
         self.sym_str(&words.join(" "))
     }
 
+    /// The names a cite selects: `cites Q chapter C (a, b)` selects `a` and
+    /// `b`. The chapter scoper reads them -- a name defined in two chapters
+    /// resolves to the one the citing chapter names (`apply-cite-selected`).
+    fn cited_names(&self, n: &Node) -> Vec<Name> {
+        let toks: Vec<&Token> = n
+            .tokens()
+            .filter(|t| !t.kind.is_trivia() && !matches!(t.kind, Kind::Newline | Kind::Indent | Kind::Dedent))
+            .collect();
+        let Some(open) = toks.iter().position(|t| self.text(t) == "(") else { return Vec::new() };
+        toks[open + 1..]
+            .iter()
+            .take_while(|t| self.text(t) != ")")
+            .filter(|t| matches!(t.kind, Kind::Identifier | Kind::TypeIdentifier))
+            .map(|t| self.sym(t))
+            .collect()
+    }
+
     /// The first token whatever its kind -- a record field or a constructor
     /// may be named with a keyword.
     fn leading(&self, n: &Node) -> Name {
@@ -728,7 +745,7 @@ impl<'a> Desugar<'a> {
                 NodeKind::Cites => ch.citations.push(CitesDecl {
                     quire: self.name_of(child),
                     chapter_name: self.cited_chapter(child),
-                    selected_names: Vec::new(),
+                    selected_names: self.cited_names(child),
                     citing_chapter: slug.clone(),
                     span: head_span(child),
                 }),

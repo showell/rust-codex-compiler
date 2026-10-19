@@ -297,6 +297,9 @@ impl Cdx {
     pub const CLASS_SHADOWS_DERIVED: u16 = 3009;
     pub const APPLIED_LOCAL_IS_BUILTIN: u16 = 3011;
     pub const CITE_NOT_IN_UNIT: u16 = 3007;
+    /// `cdx-ambiguous-chapter-name`: a name two other chapters define, which
+    /// this chapter neither defines nor cites.
+    pub const AMBIGUOUS_CHAPTER_NAME: u16 = 3027;
     pub const TOO_MANY_ERRORS: u16 = 1;
     pub const UNKNOWN_PATTERN_CTOR: u16 = 2072;
     pub const NARROWING_RECORD_SET_LITERAL: u16 = 2050;
@@ -2496,6 +2499,7 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
     // defines `max` shadows the builtin, which the golds show for that name.
     let mut env = builtin_env(&ch.syms, &tds);
     env.derivings = &ch.derivings;
+    env.ambiguous_refs = Some(&ch.ambiguous_refs);
     env.method_local_dicts = method_local_dicts(ch);
     // Collected during the walk and appended after it, so a lookup by name
     // finds the instantiated type rather than the generalised one.
@@ -2914,6 +2918,7 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
                 Cdx::DUPLICATE_DEFINITION
                     | Cdx::UNDEFINED_NAME
                     | Cdx::CITE_NOT_IN_UNIT
+                    | Cdx::AMBIGUOUS_CHAPTER_NAME
                     | Cdx::CLASS_SHADOWS_DERIVED
                     | Cdx::APPLIED_LOCAL_IS_BUILTIN
             )
@@ -3075,7 +3080,10 @@ pub fn infer_row(
                 // CDX3002, and the checker never runs.
                 None => {
                     let name = env.syms.text(*n);
-                    if name == "Nothing" {
+                    let ambiguous = env.ambiguous_refs.and_then(|m| m.get(&(sp.offset, sp.len)));
+                    if let Some(msg) = ambiguous {
+                        st.error(Cdx::AMBIGUOUS_CHAPTER_NAME, msg.clone());
+                    } else if name == "Nothing" {
                         st.error(Cdx::NOTHING_AS_VALUE, "'Nothing' is a type, not a value. For an empty Maybe use 'None' (cite Foreword chapter Maybe); 'Nothing' is only the return type of effectful procedures, e.g. [Console] Nothing.");
                     } else if !st.in_proof && !known_untyped(env, *n) {
                         if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
@@ -4221,6 +4229,8 @@ pub struct TyEnv<'a> {
     pub const_ranges: Vec<(Sym, crate::narrowing::Range)>,
     /// The chapter's `deriving` clauses, by type name.
     pub derivings: &'a [(Sym, Vec<String>)],
+    /// The chapter scoper's ambiguous mentions, by span (CDX3027).
+    pub ambiguous_refs: Option<&'a std::collections::HashMap<(u32, u32), String>>,
     /// `__method-local` (U62): the dictionary record of every class with a
     /// method generic in type variables of its own. Only an instance
     /// declaration may build one; see `Cdx::CLASS_DICT_BY_HAND`.
@@ -4237,6 +4247,7 @@ impl<'a> TyEnv<'a> {
             local_ranges: Vec::new(),
             const_ranges: Vec::new(),
             derivings: &[],
+            ambiguous_refs: None,
             method_local_dicts: Vec::new(),
         }
     }
@@ -5220,4 +5231,31 @@ fn freshen_method_local(st: &mut UnifyState, ctor: &Ty, mut field: Ty) -> Ty {
         }
     }
     field
+}
+
+/// `cdx-ambiguous-chapter-name`: a name two other chapters define, used from a
+/// chapter that defines neither and cites neither, is refused; citing one by
+/// name resolves it (upstream's `errors/collide-ambiguous`, `collide-cited`).
+#[cfg(test)]
+mod an_ambiguous_chapter_name_is_cdx3027 {
+    fn codes(src: &str) -> Vec<u16> {
+        let bytes = src.as_bytes();
+        let parsed = crate::parser::parse(bytes);
+        let mut dg = crate::desugar::Desugar::new(bytes);
+        let ch = dg.chapter(&parsed.tree);
+        let (_, st, _) = super::check_chapter_full(&ch);
+        st.diags.iter().map(|d| d.code).collect()
+    }
+
+    fn unit(cite: &str) -> String {
+        format!(
+            "Chapter: A\n\nSection: S\n  h : Integer -> Integer\n  h (n) = n + 1\n\nChapter: B\n\nSection: S\n  h : Integer -> Integer\n  h (n) = n + 100\n\nChapter: C\n{cite}\nSection: E\n  opening : [Console] Nothing\n  opening = act\n   print-line-uni (show (h 1))\n  end\n"
+        )
+    }
+
+    #[test]
+    fn uncited_it_is_refused_and_cited_it_is_not() {
+        assert_eq!(codes(&unit("")), vec![super::Cdx::AMBIGUOUS_CHAPTER_NAME]);
+        assert_eq!(codes(&unit("  cites Codex chapter B (h)\n")), Vec::<u16>::new());
+    }
 }

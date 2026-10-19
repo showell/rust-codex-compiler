@@ -55,7 +55,7 @@ pub const MEMORY_OPS: [&str; 16] = [
 /// builtins become the machine's doors too. The Machine module is not written
 /// here: it is roc-apps' model of codex-vm and the kernel (machine/roc), and
 /// whatever runs the program supplies it beside the emitted modules.
-pub const MACHINE_OPS: [&str; 33] = [
+pub const MACHINE_OPS: [&str; 38] = [
     "gpu-out",
     "gpu-in",
     "gpu-mem-write",
@@ -89,6 +89,12 @@ pub const MACHINE_OPS: [&str; 33] = [
     "block-select",
     "process-get-pid",
     "process-get-scope",
+    // CPUID and the MSRs, as codex-vm answers them (machine/roc `cpuid`).
+    "cpu-cpuid-eax",
+    "cpu-cpuid-ebx",
+    "cpu-cpuid-ecx",
+    "cpu-cpuid-edx",
+    "rdmsr",
 ];
 
 const ROC_MODULES: [&str; 22] = [
@@ -2557,7 +2563,8 @@ impl<'a> Cx<'a> {
                 "port-out-32" | "port-out-byte" | "port-out-16" | "block-write-sector" | "process-restrict-cap"
                 | "process-set-scope" => Some(2),
                 "port-in-32" | "port-in-byte" | "port-in-16" | "block-read-sector" | "block-select" | "process-get-scope"
-                | "process-get-cap" | "process-get-network-scope" => Some(1),
+                | "process-get-cap" | "process-get-network-scope" | "cpu-cpuid-eax" | "cpu-cpuid-ebx" | "cpu-cpuid-ecx"
+                | "cpu-cpuid-edx" | "rdmsr" => Some(1),
                 "block-sector-count" | "process-get-pid" | "process-yield" | "uefi-read-key-ex" | "uefi-read-key" => Some(0),
                 _ => None,
             };

@@ -424,6 +424,10 @@ pub struct Chapter {
     /// type name. Upstream synthesises `__show_T` and `__compare_T` from
     /// these; the class-instance check reads them here.
     pub derivings: Vec<(Name, Vec<String>)>,
+    /// Mentions of a colliding name that their chapter neither defines nor
+    /// cites, by span `(offset, len)`, with the resolver's message: the
+    /// chapter scoper records them and the checker refuses them (CDX3027).
+    pub ambiguous_refs: std::collections::HashMap<(u32, u32), String>,
     pub conversions: Vec<String>,
     pub span: Span,
 }

@@ -1703,6 +1703,7 @@ impl Interp {
             // `program_writes` and `frozen` instead.
             ("list-push" | "list-snoc", [List(xs), v]) => {
                 let xs = self.cow(xs);
+                views::detach(&xs);
                 xs.borrow_mut().push(v.clone());
                 Ok(List(xs))
             }
@@ -1710,6 +1711,7 @@ impl Interp {
             // this writes through for the same reason `list-push` does.
             ("list-insert-at", [List(xs), Int(i), v]) => {
                 let xs = self.cow(xs);
+                views::detach(&xs);
                 let mut out = xs.borrow_mut();
                 let i = *i;
                 if i < 0 || i as usize > out.len() {
@@ -1735,6 +1737,7 @@ impl Interp {
                 }
                 cells[i] = v.clone();
                 drop(cells);
+                views::write_through(xs, i, v);
                 Ok(List(xs.clone()))
             }
 
@@ -1917,6 +1920,7 @@ impl Interp {
             ("__linked-list-empty", [Int(_)]) => Ok(self.list(Vec::new())),
             ("__linked-list-push", [List(xs), v]) => {
                 let xs = self.cow(xs);
+                views::detach(&xs);
                 xs.borrow_mut().push(v.clone());
                 Ok(List(xs))
             }
@@ -2435,13 +2439,18 @@ fn matches_pat(v: &Value, p: &PatCode, vals: &mut Vec<Value>) -> bool {
             Value::List(xs) => {
                 let cells = xs.v.borrow();
                 let Some(first) = cells.first() else { return false };
-                // The rest is a list of its own: nothing writes through it here,
-                // and it shares the parent's address, as a view of it would.
-                let rest = Value::List(Rc::new(Cell {
+                // The rest is a VIEW of the parent: it shares the parent's
+                // address, and `list-set-at` through either one is seen by the
+                // other (`views::link`).
+                let rest_cell = Rc::new(Cell {
                     addr: xs.addr,
                     cached: std::cell::Cell::new(false),
                     v: RefCell::new(cells[1..].to_vec()),
-                }));
+                });
+                if cells.len() > 1 {
+                    views::link(&rest_cell, xs, 1);
+                }
+                let rest = Value::List(rest_cell);
                 matches_pat(first, head, vals) && matches_pat(&rest, tail, vals)
             }
             Value::Ctor(n, fields) if *n == *name && fields.len() == 2 => {
@@ -2586,6 +2595,138 @@ fn type_name(v: &Value) -> &'static str {
     }
 }
 
+/// **A TAIL IS A VIEW OF ITS LIST, NOT A COPY OF IT.** `list-set-at` stores in
+/// place (DevelopersGuide, "`list-set-at` mutates in place"), and on bare metal
+/// the `tl` a `Cons` pattern binds points into the same element storage, so a
+/// store through the tail is a store into the list it came from, and the other
+/// way round. Update 70's `ops/lir-listat` pins it: filling `tail-of (tail-of
+/// base)` leaves `base` summing 32, not 42.
+///
+/// Every reader here takes a list's cells directly, so the tail stays a vector
+/// of its own and this table LINKS it to its parent at an offset: a store into
+/// either is copied into the other. A push or an insert DETACHES the list, as
+/// the reallocation behind one does on bare metal: `lp-grow` on a view leaves
+/// its base's length alone.
+///
+/// A view holds its parent, and the table holds a view only weakly, so a dead
+/// view costs one entry until the next prune; an `Rc`'s allocation outlives its
+/// weak references, so a key is never a recycled address.
+mod views {
+    use super::{Cell, Value};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::{Rc, Weak};
+
+    type List = Cell<RefCell<Vec<Value>>>;
+
+    #[derive(Default)]
+    struct Views {
+        /// child -> (child, parent, offset). The parent is held STRONGLY, as a
+        /// view holds its storage: `tail-of (tail-of base)` drops the middle
+        /// view at once, and the chain from the outer one to `base` runs
+        /// through it.
+        up: HashMap<*const List, (Weak<List>, Rc<List>, usize)>,
+        /// parent -> children
+        down: HashMap<*const List, Vec<*const List>>,
+        prune_at: usize,
+    }
+
+    thread_local! {
+        static VIEWS: RefCell<Views> = RefCell::new(Views { prune_at: 4096, ..Default::default() });
+    }
+
+    pub fn link(child: &Rc<List>, parent: &Rc<List>, offset: usize) {
+        VIEWS.with(|v| {
+            let mut v = v.borrow_mut();
+            if v.up.len() >= v.prune_at {
+                prune(&mut v);
+            }
+            let (c, p) = (Rc::as_ptr(child), Rc::as_ptr(parent));
+            v.up.insert(c, (Rc::downgrade(child), parent.clone(), offset));
+            v.down.entry(p).or_default().push(c);
+        })
+    }
+
+    fn prune(v: &mut Views) {
+        v.up.retain(|_, (c, _, _)| c.strong_count() > 0);
+        let live: std::collections::HashSet<*const List> = v.up.keys().copied().collect();
+        v.down.retain(|_, cs| {
+            cs.retain(|c| live.contains(c));
+            !cs.is_empty()
+        });
+        v.prune_at = (v.up.len() * 2).max(4096);
+    }
+
+    /// A list that grows or shifts is no longer a window onto anything, and
+    /// nothing is a window onto it.
+    pub fn detach(xs: &Rc<List>) {
+        VIEWS.with(|v| {
+            let mut v = v.borrow_mut();
+            if v.up.is_empty() {
+                return;
+            }
+            let me = Rc::as_ptr(xs);
+            if let Some((_, p, _)) = v.up.remove(&me) {
+                let pp = Rc::as_ptr(&p);
+                if let Some(cs) = v.down.get_mut(&pp) {
+                    cs.retain(|c| *c != me);
+                }
+            }
+            if let Some(cs) = v.down.remove(&me) {
+                for c in cs {
+                    v.up.remove(&c);
+                }
+            }
+        })
+    }
+
+    /// `xs[i] = val` has been stored; copy it into every list linked to `xs`,
+    /// up through its parents and down into their views.
+    pub fn write_through(xs: &Rc<List>, i: usize, val: &Value) {
+        VIEWS.with(|v| {
+            let v = v.borrow();
+            if v.up.is_empty() {
+                return;
+            }
+            let mut seen = std::collections::HashSet::new();
+            seen.insert(Rc::as_ptr(xs));
+            let mut stack: Vec<(Rc<List>, usize)> = vec![(xs.clone(), i)];
+            while let Some((cell, idx)) = stack.pop() {
+                let me = Rc::as_ptr(&cell);
+                let mut next: Vec<(Rc<List>, usize)> = Vec::new();
+                if let Some((_, p, off)) = v.up.get(&me) {
+                    next.push((p.clone(), off + idx));
+                }
+                if let Some(cs) = v.down.get(&me) {
+                    for c in cs {
+                        if let Some((cw, _, off)) = v.up.get(c) {
+                            if idx >= *off {
+                                if let Some(c) = cw.upgrade() {
+                                    next.push((c, idx - off));
+                                }
+                            }
+                        }
+                    }
+                }
+                for (n, j) in next {
+                    if !seen.insert(Rc::as_ptr(&n)) {
+                        continue;
+                    }
+                    {
+                        let mut cells = n.v.borrow_mut();
+                        if j < cells.len() {
+                            cells[j] = val.clone();
+                        } else {
+                            continue;
+                        }
+                    }
+                    stack.push((n, j));
+                }
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2620,6 +2761,22 @@ mod tests {
         let mut it = Interp::new(&ch);
         it.run().unwrap_or_else(|e| panic!("{}", e.0));
         String::from_utf8_lossy(&it.out).into_owned()
+    }
+
+    /// A tail is a view: a store through it lands in the list it came from,
+    /// a store into that list shows through the tail, and a push onto the
+    /// tail leaves the list's length alone (U70's `ops/lir-listat`).
+    #[test]
+    fn a_tail_shares_its_list_until_it_grows() {
+        let src = "Chapter: T\n\nSection: S\n\n  tail-of : List Integer -> List Integer\n  tail-of (xs) =\n    when xs\n     is Cons (hd) (tl) -> tl\n     is otherwise -> xs\n\nSection: E\n\n  opening : [Console] Nothing = act\n    let base = [1, 2, 3, 4]\n    in let view = tail-of (tail-of base)\n    in let w1 = list-set-at view 0 30\n    in let w2 = list-set-at base 3 40\n    in let grown = list-push view 50\n    in let w3 = list-set-at grown 0 99\n    in print-line-uni (show (list-at base 2) & \" \" & show (list-at view 1) & \" \" & show (list-length base) & \" \" & show (list-at base 2))\n  end\n";
+        assert_eq!(out(src), "30 40 4 30\n");
+    }
+
+    /// A name two chapters define resolves, from a third, to the one it cites.
+    #[test]
+    fn a_colliding_name_resolves_to_the_cited_chapter() {
+        let src = "Chapter: A\n\nSection: S\n  h : Integer -> Integer\n  h (n) = n + 1\n\nChapter: B\n\nSection: S\n  h : Integer -> Integer\n  h (n) = n + 100\n\nChapter: C\n  cites Codex chapter B (h)\n\nSection: E\n  opening : [Console] Nothing = act\n   print-line-uni (show (h 1))\n  end\n";
+        assert_eq!(out(src), "101\n");
     }
 
     /// Run a chapter that must fail, and answer why.
