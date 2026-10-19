@@ -304,18 +304,54 @@ fn bound_int(p: &mut Parser<'_>) {
     }
 }
 
-/// A comma continues a type only when what follows starts a parameter. An
-/// identifier followed by a colon is a record field, so the type stops.
-fn comma_starts_type_param(p: &Parser<'_>) -> bool {
-    match p.kind(1) {
+/// `type-param-after` (Parser.codex): what follows the comma, past any line
+/// break, starts a parameter. An identifier followed by a colon is a record
+/// field, so the type stops.
+fn type_param_after(p: &Parser<'_>) -> bool {
+    let at = past_break(p);
+    match p.kind(at) {
         Some(Kind::TypeIdentifier) | Some(Kind::LeftBracket) | Some(Kind::LeftParen) => true,
-        Some(Kind::Identifier) => p.kind(2) != Some(Kind::Colon),
+        Some(Kind::Identifier) => p.kind(at + 1) != Some(Kind::Colon),
         _ => false,
     }
 }
 
+/// How many significant tokens ahead the next real one is, past the current
+/// token and any newlines after it; 1 when the type does not break the line.
+fn past_break(p: &Parser<'_>) -> usize {
+    let mut at = 1;
+    while p.kind(at) == Some(Kind::Newline) {
+        at += 1;
+    }
+    at
+}
+
+/// A SIGNATURE MAY BREAK AFTER A COMMA OR AN ARROW (Update 70), onto a line
+/// indented deeper than the signature's first line: `type-breaks-line` and
+/// `type-continues-below` in Parser.codex. A break onto a line no deeper is
+/// refused (CDX1081) rather than read as the next definition.
+fn breaks_without_continuing(p: &Parser<'_>) -> bool {
+    let at = past_break(p);
+    if at == 1 {
+        return false;
+    }
+    match p.sig(at) {
+        Some(t) if t.kind != Kind::EndOfFile => t.col <= p.type_first_indent(),
+        _ => true,
+    }
+}
+
+fn signature_break_error(p: &mut Parser<'_>, what: &str) {
+    p.err(format!(
+        "a type line that ends in '{what}' continues only onto a line indented deeper than the \
+         signature's first line; indent the rest of the type, or keep it on one line"
+    ));
+    p.bump();
+}
+
 fn parse_type_continue(p: &mut Parser<'_>, cp: usize, allow_comma: bool) {
     match p.kind(0) {
+        Some(Kind::Arrow) if breaks_without_continuing(p) => signature_break_error(p, "->"),
         Some(Kind::Arrow) => {
             p.bump();
             p.skip_newlines();
@@ -344,7 +380,10 @@ fn parse_type_continue(p: &mut Parser<'_>, cp: usize, allow_comma: bool) {
             parse_type(p);
             p.b.wrap_from(cp, NodeKind::ConstrainedType);
         }
-        Some(Kind::Comma) if allow_comma && comma_starts_type_param(p) => {
+        Some(Kind::Comma) if allow_comma && breaks_without_continuing(p) && type_param_after(p) => {
+            signature_break_error(p, ",")
+        }
+        Some(Kind::Comma) if allow_comma && !breaks_without_continuing(p) && type_param_after(p) => {
             p.bump();
             p.skip_newlines();
             parse_type(p);
@@ -436,6 +475,23 @@ mod tests {
             "(TypeExpr (FunType (NamedType) (FunType (NamedType) (NamedType))))"
         );
         assert_eq!(ty("A -> B"), "(TypeExpr (FunType (NamedType) (NamedType)))");
+    }
+
+    #[test]
+    fn a_signature_breaks_after_a_comma_or_an_arrow_onto_a_deeper_line() {
+        let ok = "Chapter: C\n\nSection: S\n  f : Integer, Integer,\n    Integer -> Integer\n  f (a) (b) (c) = a\n\n  g : Integer ->\n    Integer\n  g (a) = a\n";
+        assert!(errors_in(ok).is_empty(), "{:?}", errors_in(ok));
+    }
+
+    #[test]
+    fn a_signature_break_onto_a_line_no_deeper_is_cdx1081() {
+        for (src, what) in [
+            ("Chapter: C\n\nSection: S\n  f : Integer,\n  Integer -> Integer\n  f (a) (b) = a\n", "','"),
+            ("Chapter: C\n\nSection: S\n  g : Integer ->\n  Integer\n  g (a) = a\n", "'->'"),
+        ] {
+            let errs = errors_in(src);
+            assert!(errs.first().is_some_and(|e| e.contains(&format!("ends in {what}"))), "{errs:?}");
+        }
     }
 
     #[test]

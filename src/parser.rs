@@ -64,6 +64,8 @@ pub fn code_for(msg: &str) -> u16 {
         1076
     } else if msg.starts_with("Constructor return annotations are not supported") {
         1080
+    } else if msg.starts_with("a type line that ends in") {
+        1081
     } else if msg.contains("begins no definition, so it would be dropped") {
         1077
     } else if msg.starts_with("The definition's expression has ended") {
@@ -231,6 +233,28 @@ impl<'a> Parser<'a> {
             return None;
         }
         it.find(|t| !matches!(t.kind, Kind::Newline | Kind::Indent | Kind::Dedent)).copied()
+    }
+
+    /// `type-first-indent` (Parser.codex): the column of the first token on the
+    /// first line of the signature the current token is in, walking back over
+    /// every line that ends in a comma or an arrow.
+    pub(crate) fn type_first_indent(&self) -> u32 {
+        let real = |t: &Token| !t.kind.is_trivia() && !t.kind.is_layout();
+        let Some(cur) = self.sig(0) else { return 0 };
+        let mut line = cur.line;
+        let mut end = self.at();
+        loop {
+            let first = self.toks[..end].iter().rposition(|t| real(t) && t.line < line).map_or(0, |i| i + 1);
+            let start = self.toks[first..end].iter().position(|t| real(t)).map(|i| i + first);
+            let col = start.map_or(cur.col, |i| self.toks[i].col);
+            match self.toks[..first].iter().rev().find(|t| real(t)) {
+                Some(prev) if matches!(prev.kind, Kind::Comma | Kind::Arrow) => {
+                    line = prev.line;
+                    end = first;
+                }
+                _ => return col,
+            }
+        }
     }
 
     /// The last significant token consumed.
