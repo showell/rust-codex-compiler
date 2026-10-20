@@ -2986,6 +2986,13 @@ impl<'a> Cx<'a> {
         if t == "__heap-base" {
             return Ok("6291456".into());
         }
+        // `cpu-read-cr3` is `mov rax, cr3`, and the boot process runs on the
+        // tables emit-start builds and loads at 0x8000 (X86_64Boot's
+        // emit-process-setup). The machine is booted with those tables in
+        // place (machine/roc `page_tables`), and it runs no other process.
+        if t == "cpu-read-cr3" {
+            return Ok("32768".into());
+        }
         Err(format!("builtin `{t}` used as a value"))
     }
 
@@ -3598,6 +3605,13 @@ impl<'a> Cx<'a> {
                     self.imports.insert("Prelude".into());
                     format!("Prelude.int_abs({})", xs[0])
                 }
+            }
+            // `mfence`, then 0 (X86_64Builtins' emit-memory-fence-builtin). One
+            // machine runs one thread here, in order, so there is nothing to
+            // order and the answer is the whole effect.
+            "memory-fence" => {
+                want(1)?;
+                "0".into()
             }
             "negate" => {
                 want(1)?;
