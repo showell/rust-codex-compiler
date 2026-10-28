@@ -346,9 +346,9 @@ pub const BUILTIN_EFFECT_NAMES: [&str; 6] = ["Console.Read", "Process", "Device.
 
 /// The type names the table above refers to, interned the same way: a builtin
 /// whose type names `Task` is otherwise untyped in a program that never does.
-pub const BUILTIN_TYPE_NAMES: [&str; 4] = ["Maybe", "SChan", "Task", "TypeBinding"];
+pub const BUILTIN_TYPE_NAMES: [&str; 7] = ["Maybe", "SChan", "SEnd", "SRecv", "SSend", "Task", "TypeBinding"];
 
-pub const BUILTIN_TYPES: [(&str, &str); 305] = [
+pub const BUILTIN_TYPES: [(&str, &str); 308] = [
     ("negate", "(forall 0 (fn (tvar 0) empty (tvar 0)))"),
     ("text-length", "(fn text empty int)"),
     ("integer-to-text", "(fn int empty text)"),
@@ -653,7 +653,10 @@ pub const BUILTIN_TYPES: [(&str, &str); 305] = [
     ("vec-cons", "(forall 0 (fn (tvar 0) empty (fn (svec -1 (tvar 0)) empty (svec -1 (tvar 0)))))"),
     ("vec-length", "(forall 0 (fn (svec -1 (tvar 0)) empty int))"),
     ("s-new", "(forall 0 (eff Concurrent (ctd SChan (tvar 0))))"),
+    ("s-send", "(forall 0 (forall 1 (fn (ctd SChan (ctd SSend (tvar 0) (tvar 1))) empty (fn (tvar 0) (row Concurrent) (ctd SChan (tvar 1))))))"),
+    ("s-recv", "(forall 0 (forall 1 (fn (ctd SChan (ctd SRecv (tvar 0) (tvar 1))) empty (ctd SChan (tvar 1)))))"),
     ("s-recv-value", "(forall 0 (fn (ctd SChan (tvar 0)) (row Concurrent) int))"),
+    ("s-close", "(fn (ctd SChan (ctd SEnd)) (row Concurrent) int)"),
 ];
 
 /// `bs-alloc`: each builtin's measured allocation class, from upstream's

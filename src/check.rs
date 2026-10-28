@@ -233,6 +233,9 @@ pub struct UnifyState {
     /// a list type; a state built without a symbol table has neither.
     pub list_name: Option<Name>,
     pub linked_list_name: Option<Name>,
+    /// The interned session states, `SSend`, `SRecv` and `SEnd` (U72), for
+    /// `report_conflict`; empty in a state built without a symbol table.
+    pub session_states: Vec<Name>,
     /// Inside an equality's two sides: every mismatch is the program's,
     /// because both sides are ground terms the normalizer already reduced.
     pub propeq_depth: u32,
@@ -376,6 +379,7 @@ impl Default for UnifyState {
             effect_exempt: false,
             list_name: None,
             linked_list_name: None,
+            session_states: Vec::new(),
             propeq_depth: 0,
             scope_grants: Vec::new(),
         }
@@ -873,6 +877,21 @@ impl UnifyState {
         if fun_vs_primitive {
             self.error(Cdx::TYPE_MISMATCH, format!("Type mismatch: {} vs {}", type_desc(&ra), type_desc(&rb)));
             return;
+        }
+        // Two session states (U72's `SSend`, `SRecv`, `SEnd`) of different
+        // heads: a channel used past its protocol, `session-typed-mismatch`.
+        // Upstream has no arm reconciling one state with another, and no
+        // wrapper or unit stands between them, so this pair is as final as
+        // two primitives.
+        let session_state = |t: &Ty| match t {
+            Ty::Constructed(n, _) | Ty::TypeCon(n) if self.session_states.contains(n) => Some(*n),
+            _ => None,
+        };
+        if let (Some(sa), Some(sb)) = (session_state(&ra), session_state(&rb)) {
+            if sa != sb {
+                self.error(Cdx::TYPE_MISMATCH, format!("Type mismatch: {} vs {}", type_desc(&ra), type_desc(&rb)));
+                return;
+            }
         }
         let (Some(ha), Some(hb)) = (primitive_head(&ra), primitive_head(&rb)) else {
             return;
@@ -2492,6 +2511,7 @@ pub fn check_chapter_full(ch: &crate::ast::Chapter) -> (Vec<Binding>, UnifyState
     let mut st = UnifyState::default();
     st.list_name = ch.syms.find("List");
     st.linked_list_name = ch.syms.find("LinkedList");
+    st.session_states = ["SSend", "SRecv", "SEnd"].iter().filter_map(|s| ch.syms.find(s)).collect();
     let tds = TypeDefs::new(ch);
     crate::name_rules::check(ch, &tds, &mut st);
     let bindings = register_defs(ch, &tds, &mut st);
@@ -5138,6 +5158,25 @@ mod unification_stays_acyclic {
         assert!(!st.unify(&int, &Ty::Text), "Integer and Text do not unify");
         assert_eq!(st.errors(), 1, "and it is reported");
         assert_eq!(st.diags[0].code, super::Cdx::TYPE_MISMATCH, "as CDX2001");
+    }
+
+    /// Two session states of different heads are a mismatch (U72,
+    /// `session-typed-mismatch`); one state against itself is not.
+    #[test]
+    fn two_different_session_states_are_a_type_mismatch() {
+        let mut syms = crate::symbol::SymTab::default();
+        let (send, end) = (syms.intern("SSend"), syms.intern("SEnd"));
+        let mut st = UnifyState::default();
+        st.session_states = vec![send, end];
+        let int = Ty::Integer(i64::MIN, i64::MAX, super::Overflow::Error);
+        let sending = Ty::Constructed(send, vec![int, Ty::TypeCon(end)]);
+        assert!(!st.unify(&sending, &Ty::TypeCon(end)));
+        assert_eq!(st.errors(), 1);
+        assert_eq!(st.diags[0].code, super::Cdx::TYPE_MISMATCH);
+        let mut st = UnifyState::default();
+        st.session_states = vec![send, end];
+        assert!(st.unify(&Ty::TypeCon(end), &Ty::TypeCon(end)));
+        assert_eq!(st.errors(), 0);
     }
 
     /// **TWO INTEGERS OF DIFFERENT RANGES ARE NOT A TYPE ERROR.** A byte meeting

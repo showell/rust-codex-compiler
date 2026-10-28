@@ -71,6 +71,16 @@ fn first(a: &str, b: &str) -> String {
     if a.is_empty() { b.to_string() } else { a.to_string() }
 }
 
+/// `lin-captured-by`: a closure that outlives this point captures what it
+/// uses, `what` saying how it got away (an argument, a list element).
+fn captured_by(c: LinResult, what: &str) -> LinResult {
+    if c.flagged() {
+        LinResult { ret: false, cap: first(&c.cap, what), ..c }
+    } else {
+        c
+    }
+}
+
 /// `lin-seq`: both happen, so the counts ADD.
 fn seq(a: LinResult, b: LinResult) -> LinResult {
     LinResult {
@@ -244,9 +254,11 @@ pub fn lin_of(env: &LinEnv, v: Sym, tail: bool, e: &Expr) -> LinResult {
             lin_of(env, v, false, scrut),
             lin_arms(env, v, tail, arms, 0),
         ),
-        Expr::List(xs, _) => {
-            xs.iter().fold(LinResult::zero(), |a, x| seq(a, lin_of(env, v, false, x)))
-        }
+        Expr::List(xs, _) => xs.iter().fold(LinResult::zero(), |a, x| {
+            let use_ = lin_of(env, v, false, x);
+            let use_ = if matches!(x, Expr::Lambda(..)) { captured_by(use_, "a closure stored in a list") } else { use_ };
+            seq(a, use_)
+        }),
         Expr::Record(_, fs, _) => fs
             .iter()
             .fold(LinResult::zero(), |a, f| seq(a, lin_of(env, v, false, &f.value))),
@@ -296,18 +308,7 @@ fn lin_arg(env: &LinEnv, v: Sym, head: Option<Sym>, k: usize, a: &Expr) -> LinRe
                 }
             }
         }
-        Expr::Lambda(..) => {
-            let c = lin_of(env, v, false, a);
-            if c.flagged() {
-                LinResult {
-                    ret: false,
-                    cap: first(&c.cap, "a closure passed as an argument"),
-                    ..c
-                }
-            } else {
-                c
-            }
-        }
+        Expr::Lambda(..) => captured_by(lin_of(env, v, false, a), "a closure passed as an argument"),
         other => lin_of(env, v, false, other),
     }
 }
@@ -1217,6 +1218,16 @@ mod the_discipline {
         let ch = dg.chapter(&parsed.tree);
         let (_, st, _) = crate::check::check_chapter_full(&ch);
         st.diags.iter().map(|d| d.code).collect()
+    }
+
+    /// U72's `lin-list`: a closure in a list literal outlives the expression,
+    /// as one passed as an argument does (`race-linear-list-let`).
+    #[test]
+    fn a_closure_stored_in_a_list_captures_what_it_uses() {
+        assert_eq!(
+            codes("  f : linear Integer -> List (Nothing -> Integer)\n  f (n) = [\\u -> consume n, \\u -> 3]\n"),
+            vec![crate::check::Cdx::LINEAR_CAPTURE]
+        );
     }
 
     #[test]

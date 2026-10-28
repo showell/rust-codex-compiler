@@ -237,13 +237,14 @@ def _elems(form):
     `[TypeVar 0]` is ONE element and arrives as two tokens: the source writes
     the brackets and omits the parens, so a flat split reads `TypeVar` and `0`
     as two type arguments. Only the one-argument heads need this, and they are
-    the only ones the file writes bare.
+    the only ones the file writes bare. `deck-record` is one since U72: a
+    session channel's state, `[deck-record (ConstructedTy ssend-name ...)]`.
     """
     if not (isinstance(form, list) and form[:1] == ['#list']):
         return None
     out, it = [], iter(form[1:])
     for e in it:
-        if e in ('TypeVar', 'ListTy', 'LinkedListTy'):
+        if e in ('TypeVar', 'ListTy', 'LinkedListTy', 'deck-record'):
             out.append([e, next(it, '')])
         else:
             out.append(e)

@@ -289,6 +289,7 @@ fn builtin_type_name(name: &str) -> bool {
     matches!(
         name,
         "Integer" | "Real" | "Text" | "Boolean" | "Char" | "Nothing" | "Proof" | "List" | "LinkedList" | "Vector" | "SizedVec"
+            | "Task" | "SChan" | "SSend" | "SRecv" | "SEnd"
     )
 }
 

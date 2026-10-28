@@ -77,7 +77,8 @@ pub fn check_opening_capabilities(env: &TyEnv<'_>, st: &mut UnifyState) {
 fn scoped_op_effect(n: &str) -> &'static str {
     match n {
         "read-file" | "read-file-raw" | "read-file-uni" | "read-text" | "file-exists" => "FileSystem.Read",
-        "write-file" => "FileSystem.Write",
+        "write-file" | "append-file" | "make-dir" => "FileSystem.Write",
+        "list-dir" => "FileSystem.Read",
         "fetch" | "resolve-dns" => "Network.Read",
         "post" => "Network.Write",
         _ => match console_channel_op(n) {
@@ -127,7 +128,21 @@ fn scope_admits(eff: &str, grant: &str, res: &str) -> bool {
     } else if eff.starts_with("Console") {
         res == grant
     } else {
-        res.starts_with(grant)
+        path_admits(grant, res)
+    }
+}
+
+/// `path-admits`: a path grant admits itself and what lies beneath it at a
+/// separator, so "A" admits "A" and "A/x" and never "AB".
+fn path_admits(grant: &str, res: &str) -> bool {
+    if res == grant {
+        true
+    } else if !res.starts_with(grant) {
+        false
+    } else if grant.is_empty() || grant.ends_with('/') {
+        true
+    } else {
+        res.as_bytes()[grant.len()] == b'/'
     }
 }
 
@@ -250,5 +265,22 @@ mod tests {
         assert!(!scope_admits("Network.Read", "api.example.com:443", "api.example.com:4433"));
         assert!(!scope_admits("Network.Read", "api.example.com", "api.example.com.evil.net:443"));
         assert!(!scope_admits("Console.Write", "stdout", "stderr"));
+    }
+
+    /// U72's `path-admits`: a path grant is a path, not a string prefix.
+    #[test]
+    fn a_path_grant_admits_itself_and_beneath_it_at_a_separator() {
+        assert!(scope_admits("FileSystem.Write", "OPS", "OPS"));
+        assert!(scope_admits("FileSystem.Write", "OPS", "OPS/LOG.TXT"));
+        assert!(!scope_admits("FileSystem.Write", "OPS", "OPSX/LOG.TXT"));
+        assert!(scope_admits("FileSystem.Read", "", "anything"));
+        assert!(!scope_admits("FileSystem.Read", "OPS/SUB", "OPS"));
+    }
+
+    #[test]
+    fn the_u72_file_operations_name_their_resource() {
+        assert_eq!(scoped_op_effect("append-file"), "FileSystem.Write");
+        assert_eq!(scoped_op_effect("make-dir"), "FileSystem.Write");
+        assert_eq!(scoped_op_effect("list-dir"), "FileSystem.Read");
     }
 }
