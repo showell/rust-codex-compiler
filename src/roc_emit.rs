@@ -2993,6 +2993,12 @@ impl<'a> Cx<'a> {
         if t == "cpu-read-cr3" {
             return Ok("32768".into());
         }
+        // `__hardware-random-word` is x86's RDRAND. A hosted program has no
+        // hardware source, and 0 is what upstream's callers read as none:
+        // `hrw-draw` answers None, and U72's `net-isn` keys on the clock alone.
+        if t == "__hardware-random-word" {
+            return Ok("0".into());
+        }
         Err(format!("builtin `{t}` used as a value"))
     }
 
